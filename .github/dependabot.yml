@@ -67,6 +67,11 @@ updates:
     fulfillment-service-container-images:
       patterns:
         - "*"
+  ignore:
+    # go-toolset tags use the Go version (1.x); UBI-versioned tags (10.x)
+    # ship older Go and break go.mod compatibility (see OSAC-3550)
+    - dependency-name: "ubi10/go-toolset"
+      versions: [">= 2"]
   commit-message:
     prefix: "NO-ISSUE"
 
@@ -79,5 +84,10 @@ updates:
     osac-operator-container-images:
       patterns:
         - "*"
+  ignore:
+    # go-toolset tags use the Go version (1.x); UBI-versioned tags (10.x)
+    # ship older Go and break go.mod compatibility (see OSAC-3550)
+    - dependency-name: "ubi10/go-toolset"
+      versions: [">= 2"]
   commit-message:
     prefix: "NO-ISSUE"
