@@ -104,7 +104,10 @@ jobs:
       test-infra-ref: ${{ inputs.test-infra-ref || 'main' }}
 
   e2e:
-    if: always()
+    if: >-
+      always()
+      && !(needs.e2e-vmaas-full-install.result == 'skipped'
+           && needs.changes.result == 'success')
     needs: [changes, e2e-vmaas-full-install]
     runs-on: ubuntu-latest
     steps:
