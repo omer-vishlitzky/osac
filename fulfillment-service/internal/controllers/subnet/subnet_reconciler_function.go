@@ -394,7 +394,7 @@ func (t *task) removeFinalizer() {
 // subnet from the database.
 func (t *task) buildSpec() osacv1alpha1.SubnetSpec {
 	spec := osacv1alpha1.SubnetSpec{
-		VirtualNetwork: t.subnet.GetSpec().GetVirtualNetwork(),
+		VirtualNetwork: controllers.RefKeyStr(t.subnet.GetSpec().GetVirtualNetwork()),
 	}
 
 	// Add IPv4 CIDR if present:

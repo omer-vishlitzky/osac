@@ -303,9 +303,10 @@ func (t *task) delete(ctx context.Context) (err error) {
 func (t *task) selectHub(ctx context.Context) error {
 	t.hubId = t.externalIP.GetStatus().GetHub()
 	if t.hubId == "" {
+		poolKey := controllers.RefKeyStr(t.externalIP.GetSpec().GetPool())
 		// Look up the parent pool to derive the hub:
 		poolResponse, err := t.r.externalIPPoolsClient.Get(ctx, privatev1.ExternalIPPoolsGetRequest_builder{
-			Id: t.externalIP.GetSpec().GetPool(),
+			Id: poolKey,
 		}.Build())
 		if err != nil {
 			return err
@@ -314,7 +315,7 @@ func (t *task) selectHub(ctx context.Context) error {
 		if poolHub == "" {
 			return fmt.Errorf(
 				"pool %s has no hub assigned yet, skipping",
-				t.externalIP.GetSpec().GetPool(),
+				poolKey,
 			)
 		}
 		t.hubId = poolHub
@@ -404,7 +405,7 @@ func (t *task) removeFinalizer() {
 // (address, state) originate from the operator side and flow K8s -> fulfillment-service.
 func (t *task) buildSpec() osacv1alpha1.ExternalIPSpec {
 	spec := osacv1alpha1.ExternalIPSpec{
-		Pool: t.externalIP.GetSpec().GetPool(),
+		Pool: controllers.RefKeyStr(t.externalIP.GetSpec().GetPool()),
 	}
 	return spec
 }

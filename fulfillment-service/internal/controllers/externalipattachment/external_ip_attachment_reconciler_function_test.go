@@ -98,13 +98,12 @@ func newTaskForDelete(attachmentID, hubID string, hubCache controllers.HubCache)
 
 var _ = Describe("buildSpec", func() {
 	It("Includes externalIP and computeInstance in spec", func() {
-		ci := "ci-uuid-abc123"
 		t := &task{
 			externalIPAttachment: privatev1.ExternalIPAttachment_builder{
 				Id: "eia-uuid-test-1",
 				Spec: privatev1.ExternalIPAttachmentSpec_builder{
-					ExternalIp:      "eip-uuid-abc123",
-					ComputeInstance: &ci,
+					ExternalIp:      privatev1.ExternalIPLocalReference_builder{Id: "eip-uuid-abc123"}.Build(),
+					ComputeInstance: privatev1.ComputeInstanceLocalReference_builder{Id: "ci-uuid-abc123"}.Build(),
 				}.Build(),
 			}.Build(),
 		}
@@ -121,7 +120,7 @@ var _ = Describe("buildSpec", func() {
 			externalIPAttachment: privatev1.ExternalIPAttachment_builder{
 				Id: "eia-uuid-test-2",
 				Spec: privatev1.ExternalIPAttachmentSpec_builder{
-					ExternalIp: "eip-uuid-abc456",
+					ExternalIp: privatev1.ExternalIPLocalReference_builder{Id: "eip-uuid-abc456"}.Build(),
 				}.Build(),
 			}.Build(),
 		}
@@ -133,13 +132,12 @@ var _ = Describe("buildSpec", func() {
 	})
 
 	It("Includes cluster and targetEndpoint in spec", func() {
-		cl := "cluster-uuid-abc123"
 		t := &task{
 			externalIPAttachment: privatev1.ExternalIPAttachment_builder{
 				Id: "eia-uuid-test-cluster",
 				Spec: privatev1.ExternalIPAttachmentSpec_builder{
-					ExternalIp:     "eip-uuid-cluster",
-					Cluster:        &cl,
+					ExternalIp:     privatev1.ExternalIPLocalReference_builder{Id: "eip-uuid-cluster"}.Build(),
+					Cluster:        privatev1.ClusterLocalReference_builder{Id: "cluster-uuid-abc123"}.Build(),
 					TargetEndpoint: privatev1.ExternalIPAttachmentEndpoint_EXTERNAL_IP_ATTACHMENT_ENDPOINT_API,
 				}.Build(),
 			}.Build(),
@@ -157,13 +155,12 @@ var _ = Describe("buildSpec", func() {
 	})
 
 	It("Includes cluster with ingress endpoint in spec", func() {
-		cl := "cluster-uuid-ingress"
 		t := &task{
 			externalIPAttachment: privatev1.ExternalIPAttachment_builder{
 				Id: "eia-uuid-test-ingress",
 				Spec: privatev1.ExternalIPAttachmentSpec_builder{
-					ExternalIp:     "eip-uuid-ingress",
-					Cluster:        &cl,
+					ExternalIp:     privatev1.ExternalIPLocalReference_builder{Id: "eip-uuid-ingress"}.Build(),
+					Cluster:        privatev1.ClusterLocalReference_builder{Id: "cluster-uuid-ingress"}.Build(),
 					TargetEndpoint: privatev1.ExternalIPAttachmentEndpoint_EXTERNAL_IP_ATTACHMENT_ENDPOINT_INGRESS,
 				}.Build(),
 			}.Build(),
@@ -176,13 +173,12 @@ var _ = Describe("buildSpec", func() {
 	})
 
 	It("Includes baremetalInstance in spec", func() {
-		bmi := "bmi-uuid-abc123"
 		t := &task{
 			externalIPAttachment: privatev1.ExternalIPAttachment_builder{
 				Id: "eia-uuid-test-bmi",
 				Spec: privatev1.ExternalIPAttachmentSpec_builder{
-					ExternalIp:        "eip-uuid-bmi",
-					BaremetalInstance: &bmi,
+					ExternalIp:        privatev1.ExternalIPLocalReference_builder{Id: "eip-uuid-bmi"}.Build(),
+					BaremetalInstance: privatev1.BareMetalInstanceLocalReference_builder{Id: "bmi-uuid-abc123"}.Build(),
 				}.Build(),
 			}.Build(),
 		}
@@ -198,13 +194,12 @@ var _ = Describe("buildSpec", func() {
 	})
 
 	It("Does not include status fields", func() {
-		ci := "ci-uuid-xyz"
 		t := &task{
 			externalIPAttachment: privatev1.ExternalIPAttachment_builder{
 				Id: "eia-uuid-test-3",
 				Spec: privatev1.ExternalIPAttachmentSpec_builder{
-					ExternalIp:      "eip-uuid-abc789",
-					ComputeInstance: &ci,
+					ExternalIp:      privatev1.ExternalIPLocalReference_builder{Id: "eip-uuid-abc789"}.Build(),
+					ComputeInstance: privatev1.ComputeInstanceLocalReference_builder{Id: "ci-uuid-xyz"}.Build(),
 				}.Build(),
 				Status: privatev1.ExternalIPAttachmentStatus_builder{
 					State:             privatev1.ExternalIPAttachmentState_EXTERNAL_IP_ATTACHMENT_STATE_READY,
@@ -623,7 +618,7 @@ var _ = Describe("selectHub", func() {
 		attachment := privatev1.ExternalIPAttachment_builder{
 			Id: "eia-uuid-existing-hub",
 			Spec: privatev1.ExternalIPAttachmentSpec_builder{
-				ExternalIp: "eip-uuid-1",
+				ExternalIp: privatev1.ExternalIPLocalReference_builder{Id: "eip-uuid-1"}.Build(),
 			}.Build(),
 			Status: privatev1.ExternalIPAttachmentStatus_builder{
 				Hub: "hub-1",
@@ -669,7 +664,7 @@ var _ = Describe("selectHub", func() {
 		attachment := privatev1.ExternalIPAttachment_builder{
 			Id: "eia-uuid-derive-hub",
 			Spec: privatev1.ExternalIPAttachmentSpec_builder{
-				ExternalIp: "eip-uuid-1",
+				ExternalIp: privatev1.ExternalIPLocalReference_builder{Id: "eip-uuid-1"}.Build(),
 			}.Build(),
 		}.Build()
 
@@ -703,7 +698,7 @@ var _ = Describe("selectHub", func() {
 		attachment := privatev1.ExternalIPAttachment_builder{
 			Id: "eia-uuid-eip-no-hub",
 			Spec: privatev1.ExternalIPAttachmentSpec_builder{
-				ExternalIp: "eip-uuid-no-hub",
+				ExternalIp: privatev1.ExternalIPLocalReference_builder{Id: "eip-uuid-no-hub"}.Build(),
 			}.Build(),
 		}.Build()
 
@@ -730,7 +725,7 @@ var _ = Describe("selectHub", func() {
 		attachment := privatev1.ExternalIPAttachment_builder{
 			Id: "eia-uuid-eip-error",
 			Spec: privatev1.ExternalIPAttachmentSpec_builder{
-				ExternalIp: "eip-uuid-missing",
+				ExternalIp: privatev1.ExternalIPLocalReference_builder{Id: "eip-uuid-missing"}.Build(),
 			}.Build(),
 		}.Build()
 

@@ -93,7 +93,7 @@ var _ = Describe("Private cluster catalog items server", func() {
 				Object: privatev1.ClusterCatalogItem_builder{
 					Title:       "My cluster catalog item",
 					Description: "My description.",
-					Template:    "my-template-id",
+					Template:    privatev1.ClusterTemplateReference_builder{Id: "my-template-id"}.Build(),
 					Published:   true,
 					Tenant:      "my-tenant",
 				}.Build(),
@@ -104,7 +104,7 @@ var _ = Describe("Private cluster catalog items server", func() {
 			Expect(object).ToNot(BeNil())
 			Expect(object.GetId()).ToNot(BeEmpty())
 			Expect(object.GetTitle()).To(Equal("My cluster catalog item"))
-			Expect(object.GetTemplate()).To(Equal("my-template-id"))
+			Expect(object.GetTemplate().GetId()).To(Equal("my-template-id"))
 			Expect(object.GetPublished()).To(BeTrue())
 			Expect(object.GetTenant()).To(Equal("my-tenant"))
 		})
@@ -116,7 +116,7 @@ var _ = Describe("Private cluster catalog items server", func() {
 					Object: privatev1.ClusterCatalogItem_builder{
 						Title:       fmt.Sprintf("Catalog item %d", i),
 						Description: fmt.Sprintf("Description %d.", i),
-						Template:    "my-template-id",
+						Template:    privatev1.ClusterTemplateReference_builder{Id: "my-template-id"}.Build(),
 					}.Build(),
 				}.Build())
 				Expect(err).ToNot(HaveOccurred())
@@ -135,7 +135,7 @@ var _ = Describe("Private cluster catalog items server", func() {
 				_, err := server.Create(ctx, privatev1.ClusterCatalogItemsCreateRequest_builder{
 					Object: privatev1.ClusterCatalogItem_builder{
 						Title:    fmt.Sprintf("Catalog item %d", i),
-						Template: "my-template-id",
+						Template: privatev1.ClusterTemplateReference_builder{Id: "my-template-id"}.Build(),
 					}.Build(),
 				}.Build())
 				Expect(err).ToNot(HaveOccurred())
@@ -155,7 +155,7 @@ var _ = Describe("Private cluster catalog items server", func() {
 				createResponse, err := server.Create(ctx, privatev1.ClusterCatalogItemsCreateRequest_builder{
 					Object: privatev1.ClusterCatalogItem_builder{
 						Title:    fmt.Sprintf("Catalog item %d", i),
-						Template: "my-template-id",
+						Template: privatev1.ClusterTemplateReference_builder{Id: "my-template-id"}.Build(),
 					}.Build(),
 				}.Build())
 				Expect(err).ToNot(HaveOccurred())
@@ -185,7 +185,7 @@ var _ = Describe("Private cluster catalog items server", func() {
 				Object: privatev1.ClusterCatalogItem_builder{
 					Title:       "My catalog item",
 					Description: "My description.",
-					Template:    "my-template-id",
+					Template:    privatev1.ClusterTemplateReference_builder{Id: "my-template-id"}.Build(),
 					Published:   true,
 				}.Build(),
 			}.Build())
@@ -210,7 +210,7 @@ var _ = Describe("Private cluster catalog items server", func() {
 				Object: privatev1.ClusterCatalogItem_builder{
 					Title:       "Original title",
 					Description: "Original description.",
-					Template:    "my-template-id",
+					Template:    privatev1.ClusterTemplateReference_builder{Id: "my-template-id"}.Build(),
 				}.Build(),
 			}.Build())
 			Expect(err).ToNot(HaveOccurred())
@@ -227,7 +227,7 @@ var _ = Describe("Private cluster catalog items server", func() {
 					Id:          object.GetId(),
 					Title:       "Updated title",
 					Description: "Updated description.",
-					Template:    "my-template-id",
+					Template:    privatev1.ClusterTemplateReference_builder{Id: "my-template-id"}.Build(),
 				}.Build(),
 			}.Build())
 			Expect(err).ToNot(HaveOccurred())
@@ -246,7 +246,7 @@ var _ = Describe("Private cluster catalog items server", func() {
 			createResponse, err := server.Create(ctx, privatev1.ClusterCatalogItemsCreateRequest_builder{
 				Object: privatev1.ClusterCatalogItem_builder{
 					Title:     "My catalog item",
-					Template:  "my-template-id",
+					Template:  privatev1.ClusterTemplateReference_builder{Id: "my-template-id"}.Build(),
 					Published: false,
 				}.Build(),
 			}.Build())
@@ -282,7 +282,7 @@ var _ = Describe("Private cluster catalog items server", func() {
 			response, err := server.Create(ctx, privatev1.ClusterCatalogItemsCreateRequest_builder{
 				Object: privatev1.ClusterCatalogItem_builder{
 					Title:    "Catalog item with fields",
-					Template: "my-template-id",
+					Template: privatev1.ClusterTemplateReference_builder{Id: "my-template-id"}.Build(),
 					FieldDefinitions: []*privatev1.FieldDefinition{
 						privatev1.FieldDefinition_builder{
 							Path:             "spec.network.pod_cidr",
@@ -336,7 +336,7 @@ var _ = Describe("Private cluster catalog items server", func() {
 						Finalizers: []string{"a"},
 					}.Build(),
 					Title:    "My catalog item",
-					Template: "my-template-id",
+					Template: privatev1.ClusterTemplateReference_builder{Id: "my-template-id"}.Build(),
 				}.Build(),
 			}.Build())
 			Expect(err).ToNot(HaveOccurred())
@@ -358,7 +358,7 @@ var _ = Describe("Private cluster catalog items server", func() {
 			createResponse, err := server.Create(ctx, privatev1.ClusterCatalogItemsCreateRequest_builder{
 				Object: privatev1.ClusterCatalogItem_builder{
 					Title:     "Referenced catalog item",
-					Template:  "my-template-id",
+					Template:  privatev1.ClusterTemplateReference_builder{Id: "my-template-id"}.Build(),
 					Published: true,
 				}.Build(),
 			}.Build())
@@ -377,8 +377,8 @@ var _ = Describe("Private cluster catalog items server", func() {
 						Tenant: "system",
 					}.Build(),
 					Spec: privatev1.ClusterSpec_builder{
-						CatalogItem: catalogItem.GetId(),
-						Template:    "my-template-id",
+						CatalogItem: privatev1.ClusterCatalogItemReference_builder{Id: catalogItem.GetId()}.Build(),
+						Template:    privatev1.ClusterTemplateReference_builder{Id: "my-template-id"}.Build(),
 					}.Build(),
 				}.Build(),
 			).Do(ctx)
@@ -401,7 +401,7 @@ var _ = Describe("Private cluster catalog items server", func() {
 						Name: "dev-sandbox",
 					}.Build(),
 					Title:    "First catalog item",
-					Template: "my-template-id",
+					Template: privatev1.ClusterTemplateReference_builder{Id: "my-template-id"}.Build(),
 				}.Build(),
 			}.Build())
 			Expect(err).ToNot(HaveOccurred())
@@ -412,7 +412,7 @@ var _ = Describe("Private cluster catalog items server", func() {
 						Name: "dev-sandbox",
 					}.Build(),
 					Title:    "Second catalog item",
-					Template: "my-template-id",
+					Template: privatev1.ClusterTemplateReference_builder{Id: "my-template-id"}.Build(),
 				}.Build(),
 			}.Build())
 			Expect(err).To(HaveOccurred())
@@ -430,7 +430,7 @@ var _ = Describe("Private cluster catalog items server", func() {
 						Tenant: "system",
 					}.Build(),
 					Title:    "Catalog item for system tenant",
-					Template: "my-template-id",
+					Template: privatev1.ClusterTemplateReference_builder{Id: "my-template-id"}.Build(),
 				}.Build(),
 			}.Build())
 			Expect(err).ToNot(HaveOccurred())
@@ -442,7 +442,7 @@ var _ = Describe("Private cluster catalog items server", func() {
 						Tenant: "shared",
 					}.Build(),
 					Title:    "Catalog item for shared tenant",
-					Template: "my-template-id",
+					Template: privatev1.ClusterTemplateReference_builder{Id: "my-template-id"}.Build(),
 				}.Build(),
 			}.Build())
 			Expect(err).ToNot(HaveOccurred())
@@ -455,7 +455,7 @@ var _ = Describe("Private cluster catalog items server", func() {
 						Name: "first-item",
 					}.Build(),
 					Title:    "First catalog item",
-					Template: "my-template-id",
+					Template: privatev1.ClusterTemplateReference_builder{Id: "my-template-id"}.Build(),
 				}.Build(),
 			}.Build())
 			Expect(err).ToNot(HaveOccurred())
@@ -466,7 +466,7 @@ var _ = Describe("Private cluster catalog items server", func() {
 						Name: "second-item",
 					}.Build(),
 					Title:    "Second catalog item",
-					Template: "my-template-id",
+					Template: privatev1.ClusterTemplateReference_builder{Id: "my-template-id"}.Build(),
 				}.Build(),
 			}.Build())
 			Expect(err).ToNot(HaveOccurred())
@@ -478,7 +478,7 @@ var _ = Describe("Private cluster catalog items server", func() {
 						Name: "first-item",
 					}.Build(),
 					Title:    "Second catalog item",
-					Template: "my-template-id",
+					Template: privatev1.ClusterTemplateReference_builder{Id: "my-template-id"}.Build(),
 				}.Build(),
 			}.Build())
 			Expect(err).To(HaveOccurred())
@@ -492,7 +492,7 @@ var _ = Describe("Private cluster catalog items server", func() {
 			_, err := server.Create(ctx, privatev1.ClusterCatalogItemsCreateRequest_builder{
 				Object: privatev1.ClusterCatalogItem_builder{
 					Title:    "Bad catalog item",
-					Template: "my-template-id",
+					Template: privatev1.ClusterTemplateReference_builder{Id: "my-template-id"}.Build(),
 					FieldDefinitions: []*privatev1.FieldDefinition{
 						privatev1.FieldDefinition_builder{
 							Path:     "spec.pull_secret",
@@ -513,7 +513,7 @@ var _ = Describe("Private cluster catalog items server", func() {
 			response, err := server.Create(ctx, privatev1.ClusterCatalogItemsCreateRequest_builder{
 				Object: privatev1.ClusterCatalogItem_builder{
 					Title:    "Good catalog item",
-					Template: "my-template-id",
+					Template: privatev1.ClusterTemplateReference_builder{Id: "my-template-id"}.Build(),
 					FieldDefinitions: []*privatev1.FieldDefinition{
 						privatev1.FieldDefinition_builder{
 							Path:     "spec.pull_secret",
@@ -538,7 +538,7 @@ var _ = Describe("Private cluster catalog items server", func() {
 			response, err := server.Create(ctx, privatev1.ClusterCatalogItemsCreateRequest_builder{
 				Object: privatev1.ClusterCatalogItem_builder{
 					Title:    "Editable no default",
-					Template: "my-template-id",
+					Template: privatev1.ClusterTemplateReference_builder{Id: "my-template-id"}.Build(),
 					FieldDefinitions: []*privatev1.FieldDefinition{
 						privatev1.FieldDefinition_builder{
 							Path:     "spec.pull_secret",
@@ -562,7 +562,7 @@ var _ = Describe("Private cluster catalog items server", func() {
 			_, err := server.Create(ctx, privatev1.ClusterCatalogItemsCreateRequest_builder{
 				Object: privatev1.ClusterCatalogItem_builder{
 					Title:    "Bad catalog item",
-					Template: "my-template-id",
+					Template: privatev1.ClusterTemplateReference_builder{Id: "my-template-id"}.Build(),
 					FieldDefinitions: []*privatev1.FieldDefinition{
 						privatev1.FieldDefinition_builder{
 							Path:     "spec.pull_secret",
@@ -586,7 +586,7 @@ var _ = Describe("Private cluster catalog items server", func() {
 			_, err := server.Create(ctx, privatev1.ClusterCatalogItemsCreateRequest_builder{
 				Object: privatev1.ClusterCatalogItem_builder{
 					Title:    "Bad schema catalog item",
-					Template: "my-template-id",
+					Template: privatev1.ClusterTemplateReference_builder{Id: "my-template-id"}.Build(),
 					FieldDefinitions: []*privatev1.FieldDefinition{
 						privatev1.FieldDefinition_builder{
 							Path:             "spec.network.pod_cidr",
@@ -608,7 +608,7 @@ var _ = Describe("Private cluster catalog items server", func() {
 			response, err := server.Create(ctx, privatev1.ClusterCatalogItemsCreateRequest_builder{
 				Object: privatev1.ClusterCatalogItem_builder{
 					Title:    "Valid schema catalog item",
-					Template: "my-template-id",
+					Template: privatev1.ClusterTemplateReference_builder{Id: "my-template-id"}.Build(),
 					FieldDefinitions: []*privatev1.FieldDefinition{
 						privatev1.FieldDefinition_builder{
 							Path:             "spec.network.pod_cidr",
@@ -633,7 +633,7 @@ var _ = Describe("Private cluster catalog items server", func() {
 			createResponse, err := server.Create(ctx, privatev1.ClusterCatalogItemsCreateRequest_builder{
 				Object: privatev1.ClusterCatalogItem_builder{
 					Title:    "Valid catalog item",
-					Template: "my-template-id",
+					Template: privatev1.ClusterTemplateReference_builder{Id: "my-template-id"}.Build(),
 				}.Build(),
 			}.Build())
 			Expect(err).ToNot(HaveOccurred())
@@ -671,7 +671,7 @@ var _ = Describe("Private cluster catalog items server", func() {
 			createResponse, err := server.Create(ctx, privatev1.ClusterCatalogItemsCreateRequest_builder{
 				Object: privatev1.ClusterCatalogItem_builder{
 					Title:    "Valid catalog item",
-					Template: "my-template-id",
+					Template: privatev1.ClusterTemplateReference_builder{Id: "my-template-id"}.Build(),
 				}.Build(),
 			}.Build())
 			Expect(err).ToNot(HaveOccurred())
@@ -709,7 +709,7 @@ var _ = Describe("Private cluster catalog items server", func() {
 			createResponse, err := server.Create(ctx, privatev1.ClusterCatalogItemsCreateRequest_builder{
 				Object: privatev1.ClusterCatalogItem_builder{
 					Title:    "Valid catalog item",
-					Template: "my-template-id",
+					Template: privatev1.ClusterTemplateReference_builder{Id: "my-template-id"}.Build(),
 				}.Build(),
 			}.Build())
 			Expect(err).ToNot(HaveOccurred())
@@ -762,7 +762,7 @@ var _ = Describe("Private cluster catalog items server", func() {
 				_, err := validatedServer.Create(ctx, privatev1.ClusterCatalogItemsCreateRequest_builder{
 					Object: privatev1.ClusterCatalogItem_builder{
 						Title:    "Bad version catalog item",
-						Template: "my-template-id",
+						Template: &privatev1.ClusterTemplateReference{Id: "my-template-id"},
 						FieldDefinitions: []*privatev1.FieldDefinition{
 							privatev1.FieldDefinition_builder{
 								Path:     "version_name",
@@ -806,7 +806,7 @@ var _ = Describe("Private cluster catalog items server", func() {
 				_, err = validatedServer.Create(ctx, privatev1.ClusterCatalogItemsCreateRequest_builder{
 					Object: privatev1.ClusterCatalogItem_builder{
 						Title:    "Obsolete version catalog item",
-						Template: "my-template-id",
+						Template: &privatev1.ClusterTemplateReference{Id: "my-template-id"},
 						FieldDefinitions: []*privatev1.FieldDefinition{
 							privatev1.FieldDefinition_builder{
 								Path:     "version_name",
@@ -827,7 +827,7 @@ var _ = Describe("Private cluster catalog items server", func() {
 				createResponse, err := validatedServer.Create(ctx, privatev1.ClusterCatalogItemsCreateRequest_builder{
 					Object: privatev1.ClusterCatalogItem_builder{
 						Title:    "Catalog item for update test",
-						Template: "my-template-id",
+						Template: &privatev1.ClusterTemplateReference{Id: "my-template-id"},
 					}.Build(),
 				}.Build())
 				Expect(err).ToNot(HaveOccurred())
@@ -836,7 +836,7 @@ var _ = Describe("Private cluster catalog items server", func() {
 					Object: privatev1.ClusterCatalogItem_builder{
 						Id:       createResponse.GetObject().GetId(),
 						Title:    "Catalog item for update test",
-						Template: "my-template-id",
+						Template: &privatev1.ClusterTemplateReference{Id: "my-template-id"},
 						FieldDefinitions: []*privatev1.FieldDefinition{
 							privatev1.FieldDefinition_builder{
 								Path:     "version_name",
@@ -858,7 +858,7 @@ var _ = Describe("Private cluster catalog items server", func() {
 			_, err := server.Create(ctx, privatev1.ClusterCatalogItemsCreateRequest_builder{
 				Object: privatev1.ClusterCatalogItem_builder{
 					Title:    "First unnamed item",
-					Template: "my-template-id",
+					Template: privatev1.ClusterTemplateReference_builder{Id: "my-template-id"}.Build(),
 				}.Build(),
 			}.Build())
 			Expect(err).ToNot(HaveOccurred())
@@ -866,7 +866,7 @@ var _ = Describe("Private cluster catalog items server", func() {
 			_, err = server.Create(ctx, privatev1.ClusterCatalogItemsCreateRequest_builder{
 				Object: privatev1.ClusterCatalogItem_builder{
 					Title:    "Second unnamed item",
-					Template: "my-template-id",
+					Template: privatev1.ClusterTemplateReference_builder{Id: "my-template-id"}.Build(),
 				}.Build(),
 			}.Build())
 			Expect(err).ToNot(HaveOccurred())

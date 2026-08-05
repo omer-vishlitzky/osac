@@ -136,6 +136,12 @@ func (s *PrivateClusterTemplatesServer) Create(ctx context.Context,
 		if err = s.validateSpecDefaultsVersionName(ctx, object); err != nil {
 			return
 		}
+		if object.GetMetadata().GetName() == "" && object.GetId() != "" {
+			if object.GetMetadata() == nil {
+				object.SetMetadata(&privatev1.Metadata{})
+			}
+			object.GetMetadata().SetName(templateNameFromID(object.GetId()))
+		}
 	}
 	err = s.generic.Create(ctx, request, &response)
 	return

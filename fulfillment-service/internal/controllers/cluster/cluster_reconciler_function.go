@@ -322,7 +322,7 @@ func (t *task) buildSpec(ctx context.Context) (osacv1alpha1.ClusterOrderSpec, er
 		return osacv1alpha1.ClusterOrderSpec{}, err
 	}
 	spec := osacv1alpha1.ClusterOrderSpec{
-		TemplateID:         t.cluster.GetSpec().GetTemplate(),
+		TemplateID:         controllers.RefKeyStr(t.cluster.GetSpec().GetTemplate()),
 		TemplateParameters: templateParameters,
 		NodeRequests:       t.prepareNodeRequests(),
 	}
@@ -416,7 +416,7 @@ func (t *task) prepareNodeRequests() []osacv1alpha1.NodeRequest {
 
 func (t *task) prepareNodeRequest(nodeSet *privatev1.ClusterNodeSet) osacv1alpha1.NodeRequest {
 	return osacv1alpha1.NodeRequest{
-		ResourceClass: nodeSet.GetHostType(),
+		ResourceClass: controllers.RefKeyStr(nodeSet.GetHostType()),
 		NumberOfNodes: int(nodeSet.GetSize()),
 	}
 }

@@ -395,7 +395,7 @@ func (t *task) removeFinalizer() {
 func (t *task) buildSpec() osacv1alpha1.VirtualNetworkSpec {
 	spec := osacv1alpha1.VirtualNetworkSpec{
 		Region:                 t.virtualNetwork.GetSpec().GetRegion(),
-		NetworkClass:           t.virtualNetwork.GetSpec().GetNetworkClass(),
+		NetworkClass:           controllers.RefKeyStr(t.virtualNetwork.GetSpec().GetNetworkClass()),
 		ImplementationStrategy: t.virtualNetwork.GetSpec().GetImplementationStrategy(),
 	}
 

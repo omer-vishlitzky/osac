@@ -562,14 +562,14 @@ func (t *task) mutateBMI(ctx context.Context, object *bmfov1alpha1.BareMetalInst
 
 	catalogItemID := t.bareMetalInstance.GetSpec().GetCatalogItem()
 	catalogItemResp, err := t.r.bareMetalInstanceCatalogItemsClient.Get(ctx, privatev1.BareMetalInstanceCatalogItemsGetRequest_builder{
-		Id: catalogItemID,
+		Id: catalogItemID.GetId(),
 	}.Build())
 	if err != nil {
 		return fmt.Errorf("failed to get catalog item '%s': %w", catalogItemID, err)
 	}
 
 	object.Spec.HostType = defaultHostType
-	object.Spec.TemplateID = catalogItemResp.GetObject().GetTemplate()
+	object.Spec.TemplateID = catalogItemResp.GetObject().GetTemplate().GetId()
 	object.Spec.TemplateParameters = ""
 	object.Spec.RunStrategy = bmfov1alpha1.RunStrategyUnspecified
 	object.Spec.RestartTrigger = t.bareMetalInstance.GetSpec().GetRestartTrigger()
@@ -617,9 +617,13 @@ func (t *task) mutateBMI(ctx context.Context, object *bmfov1alpha1.BareMetalInst
 	if len(protoAttachments) > 0 {
 		networkAttachments := make([]bmfov1alpha1.BareMetalNetworkAttachment, 0, len(protoAttachments))
 		for _, att := range protoAttachments {
+			secGroupRefs := make([]string, 0, len(att.GetSecurityGroups()))
+			for _, sg := range att.GetSecurityGroups() {
+				secGroupRefs = append(secGroupRefs, controllers.RefKeyStr(sg))
+			}
 			networkAttachments = append(networkAttachments, bmfov1alpha1.BareMetalNetworkAttachment{
-				SubnetRef:         att.GetSubnet(),
-				SecurityGroupRefs: att.GetSecurityGroups(),
+				SubnetRef:         controllers.RefKeyStr(att.GetSubnet()),
+				SecurityGroupRefs: secGroupRefs,
 				Interface:         att.GetInterface(),
 				Primary:           att.GetPrimary(),
 			})
