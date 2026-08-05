@@ -225,10 +225,7 @@ func run(ctx context.Context, logger logr.Logger, cfg *config) error {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		if err := hbGen.Run(ctx); err != nil {
-			logger.Error(err, "heartbeat generator exited with error")
-			runCancel()
-		}
+		_ = hbGen.Run(ctx)
 	}()
 
 	wg.Add(1)

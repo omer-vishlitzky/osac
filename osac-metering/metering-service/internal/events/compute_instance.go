@@ -53,6 +53,13 @@ func ComputeInstanceBillingDimensions(ci *privatev1.ComputeInstance) map[string]
 	return dims
 }
 
+// IsBillableState returns whether a ComputeInstance state string represents
+// a billable state. Single source of truth for billability — used by both
+// the Watch Consumer (via IsBillable) and the Reconciler.
+func IsBillableState(state string) bool {
+	return state == "RUNNING"
+}
+
 func (m *computeInstanceMapper) TenantID() string {
 	if md := m.ci.GetMetadata(); md != nil {
 		return md.GetTenant()

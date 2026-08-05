@@ -191,7 +191,7 @@ func (c *Consumer) shouldSkipUpdate(event *privatev1.Event, existing *projection
 	if existing.CurrentState != currentState || !events.DimensionsEqual(existing.BillingDimensions, dims) {
 		return false
 	}
-	if existing.TransitionTime != transitionTime.UTC() {
+	if !existing.TransitionTime.Truncate(time.Microsecond).Equal(transitionTime.UTC().Truncate(time.Microsecond)) {
 		c.logger.Info("skipping replayed event (upserted but likely unpublished)",
 			"resource_id", resourceID, "state", currentState)
 	} else {

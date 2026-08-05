@@ -28,6 +28,7 @@ const (
 	MissedDeletion         CorrectionReason = "missed_deletion"
 )
 
+// TODO: populate AffectedInterval once adapters consume it (deferred from Phase 2).
 type AffectedInterval struct {
 	From              time.Time `json:"from"`
 	To                time.Time `json:"to"`

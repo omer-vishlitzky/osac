@@ -146,7 +146,7 @@ func (r *Reconciler) reconcileFulfillmentResources(ctx context.Context, fulfillm
 			reconCorrections.WithLabelValues(string(MissedCreation), "compute_instance").Inc()
 			corrections++
 
-			isBillable := isBillableState(fs.state)
+			isBillable := events.IsBillableState(fs.state)
 			newState := projection.ResourceState{
 				ResourceID:         id,
 				ResourceType:       "compute_instance",
@@ -172,6 +172,10 @@ func (r *Reconciler) reconcileFulfillmentResources(ctx context.Context, fulfillm
 		}
 
 		if fs.version < ps.FulfillmentVersion {
+			r.logger.V(1).Info("projection ahead of fulfillment, skipping",
+				"resource_id", id,
+				"fulfillment_version", fs.version,
+				"projection_version", ps.FulfillmentVersion)
 			continue
 		}
 
@@ -197,7 +201,7 @@ func (r *Reconciler) reconcileFulfillmentResources(ctx context.Context, fulfillm
 			reconCorrections.WithLabelValues(string(StateDrift), "compute_instance").Inc()
 			corrections++
 
-			isBillable := isBillableState(fs.state)
+			isBillable := events.IsBillableState(fs.state)
 			ps.PreviousState = ps.CurrentState
 			ps.CurrentState = fs.state
 			wasBillable := ps.IsBillable
@@ -323,10 +327,6 @@ func (r *Reconciler) RunPeriodic(ctx context.Context, interval time.Duration) {
 			}
 		}
 	}
-}
-
-func isBillableState(state string) bool {
-	return state == "RUNNING"
 }
 
 type fulfillmentResource struct {

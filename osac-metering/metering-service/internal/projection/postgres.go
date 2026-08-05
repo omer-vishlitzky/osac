@@ -103,7 +103,7 @@ func (s *PostgresStore) Upsert(ctx context.Context, state ResourceState) error {
 		state.ResourceID,
 		state.ResourceType,
 		state.TenantID,
-		state.ProjectID,
+		nullIfEmpty(state.ProjectID),
 		state.CurrentState,
 		nullIfEmpty(state.PreviousState),
 		state.IsBillable,
