@@ -13,48 +13,90 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"github.com/IBM/sarama"
 	cloudevents "github.com/cloudevents/sdk-go/v2"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+)
+
+var (
+	eventsPublished = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "osac_metering_events_published_total",
+		Help: "Total metering events published to Kafka",
+	}, []string{"topic", "event_type", "resource_type"})
+
+	publishErrors = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "osac_metering_kafka_publish_errors_total",
+		Help: "Total Kafka publish errors",
+	}, []string{"topic", "error_type"})
+
+	publishLatency = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "osac_metering_kafka_publish_latency_seconds",
+		Help:    "Kafka publish latency",
+		Buckets: prometheus.DefBuckets,
+	}, []string{"topic"})
 )
 
 type EventPublisher interface {
 	Publish(ctx context.Context, event cloudevents.Event) error
 }
 
+var topicRoutes = map[string]string{
+	"osac.resource.created.v1":    "osac.metering.lifecycle",
+	"osac.resource.started.v1":    "osac.metering.lifecycle",
+	"osac.resource.updated.v1":    "osac.metering.lifecycle",
+	"osac.resource.suspended.v1":  "osac.metering.lifecycle",
+	"osac.resource.resumed.v1":    "osac.metering.lifecycle",
+	"osac.resource.deleted.v1":    "osac.metering.lifecycle",
+	"osac.resource.heartbeat.v1":  "osac.metering.heartbeat",
+	"osac.resource.correction.v1": "osac.metering.corrections",
+	"osac.inference.usage.v1":     "osac.metering.inference",
+}
+
 type Publisher struct {
 	producer sarama.SyncProducer
-	topic    string
 }
 
-func NewPublisher(producer sarama.SyncProducer, topic string) *Publisher {
-	return &Publisher{
-		producer: producer,
-		topic:    topic,
+func NewPublisher(producer sarama.SyncProducer) *Publisher {
+	return &Publisher{producer: producer}
+}
+
+func TopicFor(eventType string) (string, error) {
+	topic, ok := topicRoutes[eventType]
+	if !ok {
+		return "", fmt.Errorf("no topic route for event type %q", eventType)
 	}
+	return topic, nil
 }
 
-// Publish serializes a CloudEvent as JSON and sends it to the configured Kafka topic.
-// The osacresourceid extension attribute is used as the partition key to ensure
-// per-resource ordering.
 func (p *Publisher) Publish(ctx context.Context, event cloudevents.Event) error {
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("publish aborted: %w", err)
 	}
 
+	topic, err := TopicFor(event.Type())
+	if err != nil {
+		publishErrors.WithLabelValues("unknown", "routing").Inc()
+		return err
+	}
+
 	data, err := json.Marshal(event)
 	if err != nil {
+		publishErrors.WithLabelValues(topic, "serialization").Inc()
 		return fmt.Errorf("serializing CloudEvent: %w", err)
 	}
 
 	extensions := event.Extensions()
 	resourceID, ok := extensions["osacresourceid"]
 	if !ok {
+		publishErrors.WithLabelValues(topic, "missing_key").Inc()
 		return fmt.Errorf("missing osacresourceid extension")
 	}
 
 	msg := &sarama.ProducerMessage{
-		Topic: p.topic,
+		Topic: topic,
 		Key:   sarama.StringEncoder(fmt.Sprintf("%v", resourceID)),
 		Value: sarama.ByteEncoder(data),
 		Headers: []sarama.RecordHeader{
@@ -65,10 +107,20 @@ func (p *Publisher) Publish(ctx context.Context, event cloudevents.Event) error 
 		},
 	}
 
+	start := time.Now()
 	_, _, err = p.producer.SendMessage(msg)
+	publishLatency.WithLabelValues(topic).Observe(time.Since(start).Seconds())
+
 	if err != nil {
-		return fmt.Errorf("publishing to Kafka: %w", err)
+		publishErrors.WithLabelValues(topic, "send").Inc()
+		return fmt.Errorf("publishing to Kafka topic %s: %w", topic, err)
 	}
+
+	resourceType := ""
+	if rt, ok := extensions["osacresourcetype"]; ok {
+		resourceType = fmt.Sprintf("%v", rt)
+	}
+	eventsPublished.WithLabelValues(topic, event.Type(), resourceType).Inc()
 
 	return nil
 }
@@ -77,8 +129,6 @@ func (p *Publisher) Close() error {
 	return p.producer.Close()
 }
 
-// NewProducerConfig returns a sarama configuration suitable for the metering
-// producer: idempotent, acks=all, synchronous.
 func NewProducerConfig() *sarama.Config {
 	config := sarama.NewConfig()
 	config.Version = sarama.V3_9_0_0
