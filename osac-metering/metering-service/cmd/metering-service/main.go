@@ -18,7 +18,9 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -32,18 +34,28 @@ import (
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/oauth"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+
 	privatev1 "github.com/osac-project/osac-metering/internal/api/osac/private/v1"
+	"github.com/osac-project/osac-metering/internal/database"
+	"github.com/osac-project/osac-metering/internal/heartbeat"
 	kafkapub "github.com/osac-project/osac-metering/internal/kafka"
+	"github.com/osac-project/osac-metering/internal/projection"
+	"github.com/osac-project/osac-metering/internal/reconciliation"
 	"github.com/osac-project/osac-metering/internal/watch"
 )
 
 type config struct {
-	fulfillmentAddr  string
-	fulfillmentToken string
-	tlsCACert        string
-	kafkaTopic       string
-	healthAddr       string
-	kafka            kafkapub.ConnectionConfig
+	fulfillmentAddr        string
+	fulfillmentToken       string
+	tlsCACert              string
+	healthAddr             string
+	kafka                  kafkapub.ConnectionConfig
+	dbURLFile              string
+	heartbeatInterval      string
+	reconciliationInterval string
 }
 
 func main() {
@@ -69,7 +81,6 @@ func configFromEnv() *config {
 		fulfillmentAddr:  os.Getenv("FULFILLMENT_SERVER_ADDRESS"),
 		fulfillmentToken: envOrDefault("FULFILLMENT_TOKEN_FILE", "/var/run/secrets/kubernetes.io/serviceaccount/token"),
 		tlsCACert:        os.Getenv("TLS_CA_CERT"),
-		kafkaTopic:       envOrDefault("KAFKA_TOPIC", "osac.metering.lifecycle"),
 		healthAddr:       envOrDefault("HEALTH_ADDR", ":8080"),
 		kafka: kafkapub.ConnectionConfig{
 			Brokers:      os.Getenv("KAFKA_BROKERS"),
@@ -77,6 +88,9 @@ func configFromEnv() *config {
 			SASLUser:     os.Getenv("KAFKA_SASL_USERNAME"),
 			SASLPassFile: os.Getenv("KAFKA_SASL_PASSWORD_FILE"),
 		},
+		dbURLFile:              envOrDefault("DB_URL_FILE", "/etc/metering/db"),
+		heartbeatInterval:      os.Getenv("HEARTBEAT_INTERVAL"),
+		reconciliationInterval: os.Getenv("RECONCILIATION_INTERVAL"),
 	}
 }
 
@@ -94,16 +108,42 @@ func (c *config) validate() error {
 	if c.kafka.Brokers == "" {
 		return fmt.Errorf("KAFKA_BROKERS is required")
 	}
-	if c.kafkaTopic == "" {
-		return fmt.Errorf("KAFKA_TOPIC is required")
-	}
 	if c.kafka.SASLUser == "" {
 		return fmt.Errorf("KAFKA_SASL_USERNAME is required")
 	}
 	if c.kafka.SASLPassFile == "" {
 		return fmt.Errorf("KAFKA_SASL_PASSWORD_FILE is required")
 	}
+	if c.dbURLFile == "" {
+		return fmt.Errorf("DB_URL_FILE is required")
+	}
+	if c.heartbeatInterval != "" {
+		d, err := time.ParseDuration(c.heartbeatInterval)
+		if err != nil {
+			return fmt.Errorf("HEARTBEAT_INTERVAL %q is not a valid duration: %w", c.heartbeatInterval, err)
+		}
+		if d <= 0 {
+			return fmt.Errorf("HEARTBEAT_INTERVAL must be greater than zero")
+		}
+	}
+	if c.reconciliationInterval != "" {
+		d, err := time.ParseDuration(c.reconciliationInterval)
+		if err != nil {
+			return fmt.Errorf("RECONCILIATION_INTERVAL %q is not a valid duration: %w", c.reconciliationInterval, err)
+		}
+		if d <= 0 {
+			return fmt.Errorf("RECONCILIATION_INTERVAL must be greater than zero")
+		}
+	}
 	return nil
+}
+
+func readDBURL(dir string) (string, error) {
+	data, err := os.ReadFile(filepath.Join(dir, "url"))
+	if err != nil {
+		return "", fmt.Errorf("reading database URL from %s/url: %w", dir, err)
+	}
+	return strings.TrimSpace(string(data)), nil
 }
 
 type serviceHealth struct {
@@ -143,6 +183,30 @@ func run(ctx context.Context, logger logr.Logger, cfg *config) error {
 	}
 	logger.Info("connected to fulfillment service", "address", cfg.fulfillmentAddr)
 
+	dbURL, err := readDBURL(cfg.dbURLFile)
+	if err != nil {
+		return fmt.Errorf("reading database URL: %w", err)
+	}
+
+	poolCfg, err := pgxpool.ParseConfig(dbURL)
+	if err != nil {
+		return fmt.Errorf("parsing database config: %w", err)
+	}
+
+	dbPool, err := pgxpool.NewWithConfig(ctx, poolCfg)
+	if err != nil {
+		return fmt.Errorf("creating database connection pool: %w", err)
+	}
+	defer dbPool.Close()
+	logger.Info("database pool connected", "urlFile", cfg.dbURLFile)
+
+	dbTool := database.NewTool(logger, dbURL)
+	if err := dbTool.Migrate(ctx); err != nil {
+		return fmt.Errorf("running database migrations: %w", err)
+	}
+
+	store := projection.NewPostgresStore(dbPool)
+
 	producer, err := kafkapub.NewSyncProducer(cfg.kafka)
 	if err != nil {
 		return fmt.Errorf("creating kafka producer: %w", err)
@@ -150,19 +214,60 @@ func run(ctx context.Context, logger logr.Logger, cfg *config) error {
 	defer func() { _ = producer.Close() }()
 	logger.Info("kafka producer connected", "brokers", cfg.kafka.Brokers)
 
-	if err := kafkapub.VerifyTopicExists(cfg.kafka, cfg.kafkaTopic); err != nil {
-		return fmt.Errorf("kafka topic %q not available: %w", cfg.kafkaTopic, err)
+	for _, topic := range []string{
+		"osac.metering.lifecycle",
+		"osac.metering.heartbeat",
+		"osac.metering.corrections",
+	} {
+		if err := kafkapub.VerifyTopicExists(cfg.kafka, topic); err != nil {
+			return fmt.Errorf("kafka topic %q not available: %w", topic, err)
+		}
+		logger.Info("kafka topic verified", "topic", topic)
 	}
-	logger.Info("kafka topic verified", "topic", cfg.kafkaTopic)
 
-	publisher := kafkapub.NewPublisher(producer, cfg.kafkaTopic)
-	eventsClient := privatev1.NewEventsClient(grpcConn)
-	consumer := watch.NewConsumer(eventsClient, publisher, logger)
+	publisher := kafkapub.NewPublisher(producer)
+
+	heartbeatInterval := parseDurationOrDefault(cfg.heartbeatInterval, 60*time.Second)
+	reconInterval := parseDurationOrDefault(cfg.reconciliationInterval, 60*time.Minute)
+
+	computeClient := privatev1.NewComputeInstancesClient(grpcConn)
+	reconciler := reconciliation.NewReconciler(computeClient, store, publisher, logger, heartbeatInterval)
+
+	logger.Info("running startup reconciliation")
+	if err := reconciler.RunFull(ctx); err != nil {
+		return fmt.Errorf("startup reconciliation failed: %w", err)
+	}
+	logger.Info("startup reconciliation completed")
 
 	health.conn = grpcConn
 	health.ready.Store(true)
-	logger.Info("service ready, starting watch consumer")
-	return consumer.Run(ctx)
+	logger.Info("service ready")
+
+	hbGen := heartbeat.NewGenerator(store, publisher, logger, heartbeatInterval)
+
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := hbGen.Run(ctx); err != nil {
+			logger.Error(err, "heartbeat generator exited with error")
+			runCancel()
+		}
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		reconciler.RunPeriodic(ctx, reconInterval)
+	}()
+
+	eventsClient := privatev1.NewEventsClient(grpcConn)
+	consumer := watch.NewConsumer(eventsClient, publisher, store, logger)
+	err = consumer.Run(ctx)
+	runCancel()
+	wg.Wait()
+	return err
 }
 
 func dialFulfillment(addr, caCertPath, tokenFile string) (*grpc.ClientConn, error) {
@@ -212,8 +317,20 @@ func tlsCredentialsFromCA(caCertPath string) (credentials.TransportCredentials, 
 	}), nil
 }
 
+func parseDurationOrDefault(s string, fallback time.Duration) time.Duration {
+	if s == "" {
+		return fallback
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		return fallback
+	}
+	return d
+}
+
 func serveHealth(listener net.Listener, health *serviceHealth, logger logr.Logger, cancel context.CancelFunc) {
 	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.Handler())
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = fmt.Fprintln(w, "ok")
@@ -235,8 +352,15 @@ func serveHealth(listener net.Listener, health *serviceHealth, logger logr.Logge
 		w.WriteHeader(http.StatusOK)
 		_, _ = fmt.Fprintln(w, "ok")
 	})
+	srv := &http.Server{
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
 	logger.Info("health probe listening", "address", listener.Addr().String())
-	if err := http.Serve(listener, mux); err != nil {
+	if err := srv.Serve(listener); err != nil {
 		logger.Error(err, "health server failed")
 		cancel()
 	}
