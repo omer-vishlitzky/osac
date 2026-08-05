@@ -431,6 +431,83 @@ var _ = Describe("Reconciler", func() {
 			Expect(store.states["vm-dims-drift"].BillingDimensions["instance_type"]).To(Equal("m5.xlarge"))
 		})
 
+		It("preserves BillableSince on billing_dimensions_drift for billable resource", func() {
+			instanceType := "m5.xlarge"
+			originalStart := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Microsecond)
+			client := &mockComputeClient{
+				items: []*privatev1.ComputeInstance{
+					{
+						Id: "vm-keep-billable",
+						Metadata: &privatev1.Metadata{
+							Tenant:  "tenant-1",
+							Version: 2,
+						},
+						Spec: &privatev1.ComputeInstanceSpec{
+							InstanceType: &instanceType,
+						},
+						Status: &privatev1.ComputeInstanceStatus{
+							State: privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_RUNNING,
+						},
+					},
+				},
+			}
+			store := newMockStore()
+			store.states["vm-keep-billable"] = projection.ResourceState{
+				ResourceID:         "vm-keep-billable",
+				ResourceType:       "compute_instance",
+				TenantID:           "tenant-1",
+				CurrentState:       "RUNNING",
+				IsBillable:         true,
+				BillableSince:      &originalStart,
+				FulfillmentVersion: 1,
+				BillingDimensions:  map[string]any{"instance_type": "m5.large"},
+			}
+			pub := &mockPublisher{}
+			recon := reconciliation.NewReconciler(client, store, pub, logr.Discard(), 60*time.Second)
+
+			Expect(recon.Reconcile(ctx)).To(Succeed())
+
+			store.mu.Lock()
+			defer store.mu.Unlock()
+			updated := store.states["vm-keep-billable"]
+			Expect(updated.BillingDimensions["instance_type"]).To(Equal("m5.xlarge"))
+			Expect(updated.BillableSince).ToNot(BeNil())
+			Expect(*updated.BillableSince).To(Equal(originalStart))
+		})
+
+		It("advances fulfillment version when state and dimensions match but version is newer", func() {
+			client := &mockComputeClient{
+				items: []*privatev1.ComputeInstance{
+					makeCI("vm-version-advance", "tenant-1", "RUNNING", 10),
+				},
+			}
+			store := newMockStore()
+			store.states["vm-version-advance"] = projection.ResourceState{
+				ResourceID:         "vm-version-advance",
+				ResourceType:       "compute_instance",
+				TenantID:           "tenant-1",
+				CurrentState:       "RUNNING",
+				FulfillmentVersion: 5,
+				BillingDimensions: map[string]any{
+					"instance_type":      "m5.large",
+					"image_ref":          "rhel-9",
+					"boot_disk_size_gib": int32(50),
+				},
+			}
+			pub := &mockPublisher{}
+			recon := reconciliation.NewReconciler(client, store, pub, logr.Discard(), 60*time.Second)
+
+			Expect(recon.Reconcile(ctx)).To(Succeed())
+
+			pub.mu.Lock()
+			defer pub.mu.Unlock()
+			Expect(pub.published).To(BeEmpty())
+
+			store.mu.Lock()
+			defer store.mu.Unlock()
+			Expect(store.states["vm-version-advance"].FulfillmentVersion).To(Equal(int32(10)))
+		})
+
 		It("emits no correction when state and dimensions both match", func() {
 			instanceType := "m5.large"
 			client := &mockComputeClient{

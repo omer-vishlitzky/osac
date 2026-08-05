@@ -175,6 +175,16 @@ func (r *Reconciler) reconcileFulfillmentResources(ctx context.Context, fulfillm
 			continue
 		}
 
+		if fs.version > ps.FulfillmentVersion &&
+			ps.CurrentState == fs.state &&
+			events.DimensionsEqual(ps.BillingDimensions, fs.billingDimensions) {
+			ps.FulfillmentVersion = fs.version
+			if err := r.store.Upsert(ctx, ps); err != nil && !errors.Is(err, projection.ErrStaleVersion) {
+				return corrections, fmt.Errorf("advancing fulfillment version for %s: %w", id, err)
+			}
+			continue
+		}
+
 		if ps.CurrentState != fs.state {
 			ce, ceErr := buildCorrectionEvent(id, "compute_instance", fs.tenantID, fs.projectID,
 				StateDrift, ps.CurrentState, fs.state, fs.billingDimensions, nil, now)
@@ -222,9 +232,6 @@ func (r *Reconciler) reconcileFulfillmentResources(ctx context.Context, fulfillm
 			ps.BillingDimensions = fs.billingDimensions
 			ps.FulfillmentVersion = fs.version
 			ps.TransitionTime = now
-			if ps.IsBillable {
-				ps.BillableSince = &now
-			}
 			if err := r.store.Upsert(ctx, ps); err != nil {
 				if errors.Is(err, projection.ErrStaleVersion) {
 					r.logger.Info("stale version during reconciliation, skipping", "resource_id", id)

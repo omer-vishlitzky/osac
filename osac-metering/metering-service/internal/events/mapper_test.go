@@ -817,3 +817,43 @@ var _ = Describe("MapWatchEvent", func() {
 		})
 	})
 })
+
+var _ = Describe("DimensionsEqual", func() {
+	It("returns true for equal maps", func() {
+		a := map[string]any{"k": "v", "n": int32(50)}
+		b := map[string]any{"k": "v", "n": int32(50)}
+		Expect(events.DimensionsEqual(a, b)).To(BeTrue())
+	})
+
+	It("returns false for different values", func() {
+		a := map[string]any{"k": "v1"}
+		b := map[string]any{"k": "v2"}
+		Expect(events.DimensionsEqual(a, b)).To(BeFalse())
+	})
+
+	It("returns false for different lengths", func() {
+		a := map[string]any{"k": "v"}
+		b := map[string]any{"k": "v", "k2": "v2"}
+		Expect(events.DimensionsEqual(a, b)).To(BeFalse())
+	})
+
+	It("handles int32 vs float64 from JSON round-trip", func() {
+		a := map[string]any{"boot_disk_size_gib": int32(50)}
+		b := map[string]any{"boot_disk_size_gib": float64(50)}
+		Expect(events.DimensionsEqual(a, b)).To(BeTrue())
+	})
+
+	It("handles large numbers without scientific notation mismatch", func() {
+		a := map[string]any{"count": int32(1000000)}
+		b := map[string]any{"count": float64(1000000)}
+		Expect(events.DimensionsEqual(a, b)).To(BeTrue())
+	})
+
+	It("returns true for empty maps", func() {
+		Expect(events.DimensionsEqual(map[string]any{}, map[string]any{})).To(BeTrue())
+	})
+
+	It("returns true for nil maps", func() {
+		Expect(events.DimensionsEqual(nil, nil)).To(BeTrue())
+	})
+})

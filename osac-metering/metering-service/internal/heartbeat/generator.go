@@ -98,7 +98,9 @@ func (g *Generator) tick(ctx context.Context) error {
 	for i := range billable {
 		ce, ceErr := g.buildHeartbeatEvent(&billable[i], now)
 		if ceErr != nil {
-			return fmt.Errorf("building heartbeat event for %s: %w", billable[i].ResourceID, ceErr)
+			g.logger.Error(ceErr, "building heartbeat event, skipping resource",
+				"resource_id", billable[i].ResourceID)
+			continue
 		}
 		if err := g.publisher.Publish(ctx, ce); err != nil {
 			if len(publishedIDs) > 0 {
