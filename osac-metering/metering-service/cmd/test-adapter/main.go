@@ -25,14 +25,12 @@ import (
 	kafkapub "github.com/osac-project/osac-metering/internal/kafka"
 )
 
+// Bounded ring buffer for CI — drops oldest events to prevent OOM.
+// Not a production store; the test adapter is a read-only consumer
+// used only for E2E test assertions.
 const maxEvents = 10000
 
-var topics = []string{
-	"osac.metering.lifecycle",
-	"osac.metering.heartbeat",
-	"osac.metering.corrections",
-	"osac.metering.inference",
-}
+var topics = kafkapub.Topics
 
 type eventStore struct {
 	mu     sync.RWMutex

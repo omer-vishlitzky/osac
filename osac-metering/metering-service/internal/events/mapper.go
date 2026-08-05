@@ -41,13 +41,8 @@ type StateContext struct {
 
 // MapWatchEvent converts a fulfillment-service Watch Event into a CloudEvents 1.0
 // event using the appropriate ResourceMapper for the payload type.
-// stateCtx enriches the event with previous_state and duration_seconds from the
-// State Projection. Pass nil for Phase 1 compatibility (nil previous_state/duration).
 func MapWatchEvent(event *privatev1.Event, mapper ResourceMapper, stateCtx *StateContext) (*cloudevents.Event, error) {
-	var previousState string
-	if stateCtx != nil {
-		previousState = stateCtx.PreviousState
-	}
+	previousState := stateCtx.PreviousState
 
 	ceType, err := mapper.CloudEventType(event.GetType(), previousState)
 	if err != nil {
@@ -81,13 +76,10 @@ func MapWatchEvent(event *privatev1.Event, mapper ResourceMapper, stateCtx *Stat
 	}
 
 	var prevStatePtr *string
-	var durationPtr *float64
-	if stateCtx != nil {
-		if stateCtx.PreviousState != "" {
-			prevStatePtr = &stateCtx.PreviousState
-		}
-		durationPtr = stateCtx.DurationSeconds
+	if stateCtx.PreviousState != "" {
+		prevStatePtr = &stateCtx.PreviousState
 	}
+	durationPtr := stateCtx.DurationSeconds
 
 	data := meteringData{
 		ResourceID:        mapper.ResourceID(),

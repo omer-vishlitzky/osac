@@ -63,7 +63,7 @@ var _ = Describe("MapWatchEvent", func() {
 				Payload: &privatev1.Event_ComputeInstance{ComputeInstance: ci},
 			}
 
-			ce, err := mapEvent(event, nil)
+			ce, err := mapEvent(event, &events.StateContext{})
 			Expect(err).NotTo(HaveOccurred())
 			Expect(ce.Type()).To(Equal("osac.resource.created.v1"))
 		})
@@ -77,7 +77,7 @@ var _ = Describe("MapWatchEvent", func() {
 				Payload: &privatev1.Event_ComputeInstance{ComputeInstance: ci},
 			}
 
-			ce, err := mapEvent(event, nil)
+			ce, err := mapEvent(event, &events.StateContext{})
 			Expect(err).NotTo(HaveOccurred())
 			Expect(ce.Type()).To(Equal("osac.resource.started.v1"))
 		})
@@ -91,7 +91,7 @@ var _ = Describe("MapWatchEvent", func() {
 				Payload: &privatev1.Event_ComputeInstance{ComputeInstance: ci},
 			}
 
-			ce, err := mapEvent(event, nil)
+			ce, err := mapEvent(event, &events.StateContext{})
 			Expect(err).NotTo(HaveOccurred())
 			Expect(ce.Type()).To(Equal("osac.resource.suspended.v1"))
 		})
@@ -105,7 +105,7 @@ var _ = Describe("MapWatchEvent", func() {
 				Payload: &privatev1.Event_ComputeInstance{ComputeInstance: ci},
 			}
 
-			ce, err := mapEvent(event, nil)
+			ce, err := mapEvent(event, &events.StateContext{})
 			Expect(err).NotTo(HaveOccurred())
 			Expect(ce.Type()).To(Equal("osac.resource.suspended.v1"))
 		})
@@ -119,7 +119,7 @@ var _ = Describe("MapWatchEvent", func() {
 				Payload: &privatev1.Event_ComputeInstance{ComputeInstance: ci},
 			}
 
-			ce, err := mapEvent(event, nil)
+			ce, err := mapEvent(event, &events.StateContext{})
 			Expect(err).NotTo(HaveOccurred())
 			Expect(ce.Type()).To(Equal("osac.resource.suspended.v1"))
 		})
@@ -133,7 +133,7 @@ var _ = Describe("MapWatchEvent", func() {
 				Payload: &privatev1.Event_ComputeInstance{ComputeInstance: ci},
 			}
 
-			ce, err := mapEvent(event, nil)
+			ce, err := mapEvent(event, &events.StateContext{})
 			Expect(err).NotTo(HaveOccurred())
 			Expect(ce.Type()).To(Equal("osac.resource.updated.v1"))
 		})
@@ -147,7 +147,7 @@ var _ = Describe("MapWatchEvent", func() {
 				Payload: &privatev1.Event_ComputeInstance{ComputeInstance: ci},
 			}
 
-			ce, err := mapEvent(event, nil)
+			ce, err := mapEvent(event, &events.StateContext{})
 			Expect(err).NotTo(HaveOccurred())
 			Expect(ce.Type()).To(Equal("osac.resource.updated.v1"))
 		})
@@ -197,6 +197,102 @@ var _ = Describe("MapWatchEvent", func() {
 			Expect(ce.Type()).To(Equal("osac.resource.started.v1"))
 		})
 
+		It("maps FAILED→RUNNING to osac.resource.started.v1", func() {
+			ci.Status.State = privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_RUNNING
+
+			event := &privatev1.Event{
+				Id:      "evt-failed-to-running",
+				Type:    privatev1.EventType_EVENT_TYPE_OBJECT_UPDATED,
+				Payload: &privatev1.Event_ComputeInstance{ComputeInstance: ci},
+			}
+
+			stateCtx := &events.StateContext{PreviousState: "FAILED"}
+			ce, err := mapEvent(event, stateCtx)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(ce.Type()).To(Equal("osac.resource.started.v1"))
+		})
+
+		It("maps RUNNING→RUNNING (prev=RUNNING) to osac.resource.started.v1", func() {
+			ci.Status.State = privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_RUNNING
+
+			event := &privatev1.Event{
+				Id:      "evt-running-to-running",
+				Type:    privatev1.EventType_EVENT_TYPE_OBJECT_UPDATED,
+				Payload: &privatev1.Event_ComputeInstance{ComputeInstance: ci},
+			}
+
+			stateCtx := &events.StateContext{PreviousState: "RUNNING"}
+			ce, err := mapEvent(event, stateCtx)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(ce.Type()).To(Equal("osac.resource.started.v1"))
+		})
+
+		It("maps DELETING to osac.resource.updated.v1", func() {
+			ci.Status.State = privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_DELETING
+
+			event := &privatev1.Event{
+				Id:      "evt-deleting",
+				Type:    privatev1.EventType_EVENT_TYPE_OBJECT_UPDATED,
+				Payload: &privatev1.Event_ComputeInstance{ComputeInstance: ci},
+			}
+
+			ce, err := mapEvent(event, &events.StateContext{})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(ce.Type()).To(Equal("osac.resource.updated.v1"))
+		})
+
+		It("maps UNSPECIFIED to osac.resource.updated.v1", func() {
+			ci.Status.State = privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_UNSPECIFIED
+
+			event := &privatev1.Event{
+				Id:      "evt-unspecified",
+				Type:    privatev1.EventType_EVENT_TYPE_OBJECT_UPDATED,
+				Payload: &privatev1.Event_ComputeInstance{ComputeInstance: ci},
+			}
+
+			ce, err := mapEvent(event, &events.StateContext{})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(ce.Type()).To(Equal("osac.resource.updated.v1"))
+		})
+
+		It("maps RUNNING→STOPPED with duration to osac.resource.suspended.v1", func() {
+			ci.Status.State = privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_STOPPED
+
+			event := &privatev1.Event{
+				Id:      "evt-stopped-with-duration",
+				Type:    privatev1.EventType_EVENT_TYPE_OBJECT_UPDATED,
+				Payload: &privatev1.Event_ComputeInstance{ComputeInstance: ci},
+			}
+
+			duration := 7200.0
+			stateCtx := &events.StateContext{
+				PreviousState:   "RUNNING",
+				DurationSeconds: &duration,
+			}
+			ce, err := mapEvent(event, stateCtx)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(ce.Type()).To(Equal("osac.resource.suspended.v1"))
+
+			var data map[string]any
+			Expect(json.Unmarshal(ce.Data(), &data)).To(Succeed())
+			Expect(data["duration_seconds"]).To(BeNumerically("==", 7200.0))
+		})
+
+		It("maps RUNNING→FAILED (prev=RUNNING) to osac.resource.suspended.v1", func() {
+			ci.Status.State = privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_FAILED
+
+			event := &privatev1.Event{
+				Id:      "evt-running-to-failed",
+				Type:    privatev1.EventType_EVENT_TYPE_OBJECT_UPDATED,
+				Payload: &privatev1.Event_ComputeInstance{ComputeInstance: ci},
+			}
+
+			stateCtx := &events.StateContext{PreviousState: "RUNNING"}
+			ce, err := mapEvent(event, stateCtx)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(ce.Type()).To(Equal("osac.resource.suspended.v1"))
+		})
+
 		It("includes previous_state and duration_seconds when state context provided", func() {
 			ci.Status.State = privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_STOPPED
 
@@ -229,7 +325,7 @@ var _ = Describe("MapWatchEvent", func() {
 				Payload: &privatev1.Event_ComputeInstance{ComputeInstance: ci},
 			}
 
-			ce, err := mapEvent(event, nil)
+			ce, err := mapEvent(event, &events.StateContext{})
 			Expect(err).NotTo(HaveOccurred())
 			Expect(ce.Type()).To(Equal("osac.resource.deleted.v1"))
 		})
@@ -243,7 +339,7 @@ var _ = Describe("MapWatchEvent", func() {
 				Payload: &privatev1.Event_ComputeInstance{ComputeInstance: ci},
 			}
 
-			ce, err := mapEvent(event, nil)
+			ce, err := mapEvent(event, &events.StateContext{})
 			Expect(err).NotTo(HaveOccurred())
 			Expect(ce.SpecVersion()).To(Equal("1.0"))
 		})
@@ -255,7 +351,7 @@ var _ = Describe("MapWatchEvent", func() {
 				Payload: &privatev1.Event_ComputeInstance{ComputeInstance: ci},
 			}
 
-			ce, err := mapEvent(event, nil)
+			ce, err := mapEvent(event, &events.StateContext{})
 			Expect(err).NotTo(HaveOccurred())
 			Expect(ce.Source()).To(Equal("osac-metering"))
 		})
@@ -267,7 +363,7 @@ var _ = Describe("MapWatchEvent", func() {
 				Payload: &privatev1.Event_ComputeInstance{ComputeInstance: ci},
 			}
 
-			ce, err := mapEvent(event, nil)
+			ce, err := mapEvent(event, &events.StateContext{})
 			Expect(err).NotTo(HaveOccurred())
 			Expect(ce.ID()).To(Equal("fulfillment-evt-abc-123"))
 		})
@@ -279,7 +375,7 @@ var _ = Describe("MapWatchEvent", func() {
 				Payload: &privatev1.Event_ComputeInstance{ComputeInstance: ci},
 			}
 
-			ce, err := mapEvent(event, nil)
+			ce, err := mapEvent(event, &events.StateContext{})
 			Expect(err).NotTo(HaveOccurred())
 			Expect(ce.Time().IsZero()).To(BeFalse())
 		})
@@ -293,7 +389,7 @@ var _ = Describe("MapWatchEvent", func() {
 				Payload: &privatev1.Event_ComputeInstance{ComputeInstance: ci},
 			}
 
-			ce, err := mapEvent(event, nil)
+			ce, err := mapEvent(event, &events.StateContext{})
 			Expect(err).NotTo(HaveOccurred())
 			Expect(ce.Extensions()["osacresourceid"]).To(Equal("ci-abc-123"))
 		})
@@ -305,7 +401,7 @@ var _ = Describe("MapWatchEvent", func() {
 				Payload: &privatev1.Event_ComputeInstance{ComputeInstance: ci},
 			}
 
-			ce, err := mapEvent(event, nil)
+			ce, err := mapEvent(event, &events.StateContext{})
 			Expect(err).NotTo(HaveOccurred())
 			Expect(ce.Extensions()["osacresourcetype"]).To(Equal("compute_instance"))
 		})
@@ -317,7 +413,7 @@ var _ = Describe("MapWatchEvent", func() {
 				Payload: &privatev1.Event_ComputeInstance{ComputeInstance: ci},
 			}
 
-			ce, err := mapEvent(event, nil)
+			ce, err := mapEvent(event, &events.StateContext{})
 			Expect(err).NotTo(HaveOccurred())
 			Expect(ce.Extensions()["osactenant"]).To(Equal("tenant-1"))
 		})
@@ -331,7 +427,7 @@ var _ = Describe("MapWatchEvent", func() {
 				Payload: &privatev1.Event_ComputeInstance{ComputeInstance: ci},
 			}
 
-			ce, err := mapEvent(event, nil)
+			ce, err := mapEvent(event, &events.StateContext{})
 			Expect(err).NotTo(HaveOccurred())
 
 			var data map[string]any
@@ -352,7 +448,7 @@ var _ = Describe("MapWatchEvent", func() {
 				Payload: &privatev1.Event_ComputeInstance{ComputeInstance: ci},
 			}
 
-			ce, err := mapEvent(event, nil)
+			ce, err := mapEvent(event, &events.StateContext{})
 			Expect(err).NotTo(HaveOccurred())
 
 			var data map[string]any
@@ -373,7 +469,7 @@ var _ = Describe("MapWatchEvent", func() {
 				Payload: &privatev1.Event_ComputeInstance{ComputeInstance: ci},
 			}
 
-			ce, err := mapEvent(event, nil)
+			ce, err := mapEvent(event, &events.StateContext{})
 			Expect(err).NotTo(HaveOccurred())
 
 			var data map[string]any
@@ -393,7 +489,7 @@ var _ = Describe("MapWatchEvent", func() {
 				Payload: &privatev1.Event_ComputeInstance{ComputeInstance: ci},
 			}
 
-			ce, err := mapEvent(event, nil)
+			ce, err := mapEvent(event, &events.StateContext{})
 			Expect(err).NotTo(HaveOccurred())
 
 			var data map[string]any
@@ -410,7 +506,7 @@ var _ = Describe("MapWatchEvent", func() {
 				Payload: &privatev1.Event_ComputeInstance{ComputeInstance: ci},
 			}
 
-			ce, err := mapEvent(event, nil)
+			ce, err := mapEvent(event, &events.StateContext{})
 			Expect(err).NotTo(HaveOccurred())
 
 			var data map[string]any
@@ -428,7 +524,7 @@ var _ = Describe("MapWatchEvent", func() {
 				// No payload set
 			}
 
-			_, err := mapEvent(event, nil)
+			_, err := mapEvent(event, &events.StateContext{})
 			Expect(err).To(HaveOccurred())
 			Expect(err.Error()).To(ContainSubstring("unsupported"))
 		})
@@ -440,7 +536,7 @@ var _ = Describe("MapWatchEvent", func() {
 				Payload: &privatev1.Event_Cluster{Cluster: &privatev1.Cluster{}},
 			}
 
-			_, err := mapEvent(event, nil)
+			_, err := mapEvent(event, &events.StateContext{})
 			Expect(err).To(HaveOccurred())
 			Expect(err.Error()).To(ContainSubstring("unsupported"))
 		})
@@ -456,7 +552,7 @@ var _ = Describe("MapWatchEvent", func() {
 				Payload: &privatev1.Event_ComputeInstance{ComputeInstance: ci},
 			}
 
-			ce, err := mapEvent(event, nil)
+			ce, err := mapEvent(event, &events.StateContext{})
 			Expect(err).NotTo(HaveOccurred())
 
 			var data map[string]any
@@ -475,7 +571,7 @@ var _ = Describe("MapWatchEvent", func() {
 				Payload: &privatev1.Event_ComputeInstance{ComputeInstance: ci},
 			}
 
-			ce, err := mapEvent(event, nil)
+			ce, err := mapEvent(event, &events.StateContext{})
 			Expect(err).NotTo(HaveOccurred())
 
 			var data map[string]any
@@ -494,7 +590,7 @@ var _ = Describe("MapWatchEvent", func() {
 				Payload: &privatev1.Event_ComputeInstance{ComputeInstance: ci},
 			}
 
-			ce, err := mapEvent(event, nil)
+			ce, err := mapEvent(event, &events.StateContext{})
 			Expect(err).NotTo(HaveOccurred())
 
 			var data map[string]any
@@ -513,7 +609,7 @@ var _ = Describe("MapWatchEvent", func() {
 				Payload: &privatev1.Event_ComputeInstance{ComputeInstance: ci},
 			}
 
-			ce, err := mapEvent(event, nil)
+			ce, err := mapEvent(event, &events.StateContext{})
 			Expect(err).NotTo(HaveOccurred())
 
 			var data map[string]any
@@ -532,7 +628,7 @@ var _ = Describe("MapWatchEvent", func() {
 				Payload: &privatev1.Event_ComputeInstance{ComputeInstance: ci},
 			}
 
-			_, err := mapEvent(event, nil)
+			_, err := mapEvent(event, &events.StateContext{})
 			Expect(err).To(HaveOccurred())
 			Expect(err).To(MatchError(ContainSubstring("no tenant_id")))
 			Expect(errors.Is(err, events.ErrDataQuality)).To(BeTrue())
@@ -547,7 +643,7 @@ var _ = Describe("MapWatchEvent", func() {
 				Payload: &privatev1.Event_ComputeInstance{ComputeInstance: ci},
 			}
 
-			_, err := mapEvent(event, nil)
+			_, err := mapEvent(event, &events.StateContext{})
 			Expect(err).To(HaveOccurred())
 			Expect(err).To(MatchError(ContainSubstring("no tenant_id")))
 			Expect(errors.Is(err, events.ErrDataQuality)).To(BeTrue())
@@ -562,7 +658,7 @@ var _ = Describe("MapWatchEvent", func() {
 				Payload: &privatev1.Event_ComputeInstance{ComputeInstance: ci},
 			}
 
-			ce, err := mapEvent(event, nil)
+			ce, err := mapEvent(event, &events.StateContext{})
 			Expect(err).NotTo(HaveOccurred())
 
 			var data map[string]any
@@ -580,7 +676,7 @@ var _ = Describe("MapWatchEvent", func() {
 				Payload: &privatev1.Event_ComputeInstance{ComputeInstance: ci},
 			}
 
-			ce, err := mapEvent(event, nil)
+			ce, err := mapEvent(event, &events.StateContext{})
 			Expect(err).NotTo(HaveOccurred())
 
 			var data map[string]any
@@ -599,7 +695,7 @@ var _ = Describe("MapWatchEvent", func() {
 				Payload: &privatev1.Event_ComputeInstance{ComputeInstance: ci},
 			}
 
-			ce, err := mapEvent(event, nil)
+			ce, err := mapEvent(event, &events.StateContext{})
 			Expect(err).NotTo(HaveOccurred())
 
 			var data map[string]any
@@ -618,7 +714,7 @@ var _ = Describe("MapWatchEvent", func() {
 				Payload: &privatev1.Event_ComputeInstance{ComputeInstance: ci},
 			}
 
-			ce, err := mapEvent(event, nil)
+			ce, err := mapEvent(event, &events.StateContext{})
 			Expect(err).NotTo(HaveOccurred())
 
 			var data map[string]any
@@ -640,7 +736,7 @@ var _ = Describe("MapWatchEvent", func() {
 				Payload: &privatev1.Event_ComputeInstance{ComputeInstance: ci},
 			}
 
-			ce, err := mapEvent(event, nil)
+			ce, err := mapEvent(event, &events.StateContext{})
 			Expect(err).NotTo(HaveOccurred())
 			Expect(ce.Time()).To(Equal(createTime.AsTime()))
 		})
@@ -654,7 +750,7 @@ var _ = Describe("MapWatchEvent", func() {
 				Payload: &privatev1.Event_ComputeInstance{ComputeInstance: ci},
 			}
 
-			_, err := mapEvent(event, nil)
+			_, err := mapEvent(event, &events.StateContext{})
 			Expect(err).To(HaveOccurred())
 			Expect(err).To(MatchError(ContainSubstring("no creation_timestamp")))
 			Expect(errors.Is(err, events.ErrDataQuality)).To(BeTrue())
@@ -670,7 +766,7 @@ var _ = Describe("MapWatchEvent", func() {
 				Payload: &privatev1.Event_ComputeInstance{ComputeInstance: ci},
 			}
 
-			ce, err := mapEvent(event, nil)
+			ce, err := mapEvent(event, &events.StateContext{})
 			Expect(err).NotTo(HaveOccurred())
 			Expect(ce.Time()).To(Equal(transTime.AsTime()))
 		})
@@ -684,7 +780,7 @@ var _ = Describe("MapWatchEvent", func() {
 				Payload: &privatev1.Event_ComputeInstance{ComputeInstance: ci},
 			}
 
-			_, err := mapEvent(event, nil)
+			_, err := mapEvent(event, &events.StateContext{})
 			Expect(err).To(HaveOccurred())
 			Expect(err).To(MatchError(ContainSubstring("no state_transition_time")))
 			Expect(errors.Is(err, events.ErrDataQuality)).To(BeTrue())
@@ -700,7 +796,7 @@ var _ = Describe("MapWatchEvent", func() {
 				Payload: &privatev1.Event_ComputeInstance{ComputeInstance: ci},
 			}
 
-			ce, err := mapEvent(event, nil)
+			ce, err := mapEvent(event, &events.StateContext{})
 			Expect(err).NotTo(HaveOccurred())
 			Expect(ce.Time()).To(Equal(deleteTime.AsTime()))
 		})
@@ -714,7 +810,7 @@ var _ = Describe("MapWatchEvent", func() {
 				Payload: &privatev1.Event_ComputeInstance{ComputeInstance: ci},
 			}
 
-			_, err := mapEvent(event, nil)
+			_, err := mapEvent(event, &events.StateContext{})
 			Expect(err).To(HaveOccurred())
 			Expect(err).To(MatchError(ContainSubstring("no deletion_timestamp")))
 			Expect(errors.Is(err, events.ErrDataQuality)).To(BeTrue())

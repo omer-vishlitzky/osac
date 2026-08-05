@@ -38,6 +38,9 @@ const (
 	computeInstanceFilter = "has(event.compute_instance)"
 )
 
+// Consumer connects to the fulfillment-service gRPC Watch stream, maps
+// incoming events to CloudEvents, and publishes them to Kafka. It
+// automatically reconnects with exponential backoff when the stream breaks.
 type Consumer struct {
 	client    privatev1.EventsClient
 	publisher kafkapub.EventPublisher
@@ -66,6 +69,9 @@ func NewConsumer(
 	}
 }
 
+// Run starts consuming the Watch stream. It blocks until ctx is cancelled,
+// at which point it returns nil. Stream errors trigger automatic reconnection
+// with exponential backoff.
 func (c *Consumer) Run(ctx context.Context) error {
 	delay := c.InitialDelay
 	for {
@@ -131,17 +137,13 @@ func (c *Consumer) handleEvent(ctx context.Context, event *privatev1.Event) erro
 		return fmt.Errorf("reading projection for %s: %w", resourceID, err)
 	}
 
-	if event.GetType() == privatev1.EventType_EVENT_TYPE_OBJECT_UPDATED && existing != nil {
-		if existing.CurrentState == currentState && events.DimensionsEqual(existing.BillingDimensions, dims) {
-			c.logger.V(1).Info("same state and dimensions, skipping",
-				"resource_id", resourceID, "state", currentState)
-			return nil
-		}
-	}
-
 	transitionTime, err := mapper.TransitionTime(event.GetType())
 	if err != nil {
 		return err
+	}
+
+	if c.shouldSkipUpdate(event, existing, currentState, dims, transitionTime, resourceID) {
+		return nil
 	}
 
 	stateCtx := c.buildStateContext(existing, isBillable, transitionTime, dims)
@@ -151,31 +153,7 @@ func (c *Consumer) handleEvent(ctx context.Context, event *privatev1.Event) erro
 		return err
 	}
 
-	tt := transitionTime.UTC()
-	projState := projection.ResourceState{
-		ResourceID:         resourceID,
-		ResourceType:       mapper.ResourceType(),
-		TenantID:           mapper.TenantID(),
-		CurrentState:       currentState,
-		IsBillable:         isBillable,
-		TransitionTime:     tt,
-		FulfillmentVersion: version,
-		BillingDimensions:  dims,
-	}
-	if p := mapper.ProjectID(); p != nil {
-		projState.ProjectID = *p
-	}
-	if existing != nil {
-		projState.PreviousState = existing.CurrentState
-		projState.LastHeartbeatAt = existing.LastHeartbeatAt
-	}
-	if isBillable {
-		if existing == nil || !existing.IsBillable || !events.DimensionsEqual(existing.BillingDimensions, dims) {
-			projState.BillableSince = &tt
-		} else {
-			projState.BillableSince = existing.BillableSince
-		}
-	}
+	projState := c.buildProjectionState(mapper, existing, transitionTime, version, currentState, isBillable, dims)
 
 	if event.GetType() == privatev1.EventType_EVENT_TYPE_OBJECT_DELETED {
 		if err := c.publishWithRetry(ctx, ce); err != nil {
@@ -204,6 +182,52 @@ func (c *Consumer) handleEvent(ctx context.Context, event *privatev1.Event) erro
 	}
 
 	return nil
+}
+
+func (c *Consumer) shouldSkipUpdate(event *privatev1.Event, existing *projection.ResourceState, currentState string, dims map[string]any, transitionTime time.Time, resourceID string) bool {
+	if event.GetType() != privatev1.EventType_EVENT_TYPE_OBJECT_UPDATED || existing == nil {
+		return false
+	}
+	if existing.CurrentState != currentState || !events.DimensionsEqual(existing.BillingDimensions, dims) {
+		return false
+	}
+	if existing.TransitionTime != transitionTime.UTC() {
+		c.logger.Info("skipping replayed event (upserted but likely unpublished)",
+			"resource_id", resourceID, "state", currentState)
+	} else {
+		c.logger.V(1).Info("same state and dimensions, skipping",
+			"resource_id", resourceID, "state", currentState)
+	}
+	return true
+}
+
+func (c *Consumer) buildProjectionState(mapper events.ResourceMapper, existing *projection.ResourceState, transitionTime time.Time, version int32, currentState string, isBillable bool, dims map[string]any) projection.ResourceState {
+	tt := transitionTime.UTC()
+	projState := projection.ResourceState{
+		ResourceID:         mapper.ResourceID(),
+		ResourceType:       mapper.ResourceType(),
+		TenantID:           mapper.TenantID(),
+		CurrentState:       currentState,
+		IsBillable:         isBillable,
+		TransitionTime:     tt,
+		FulfillmentVersion: version,
+		BillingDimensions:  dims,
+	}
+	if p := mapper.ProjectID(); p != nil {
+		projState.ProjectID = *p
+	}
+	if existing != nil {
+		projState.PreviousState = existing.CurrentState
+		projState.LastHeartbeatAt = existing.LastHeartbeatAt
+	}
+	if isBillable {
+		if existing == nil || !existing.IsBillable || !events.DimensionsEqual(existing.BillingDimensions, dims) {
+			projState.BillableSince = &tt
+		} else {
+			projState.BillableSince = existing.BillableSince
+		}
+	}
+	return projState
 }
 
 func (c *Consumer) buildStateContext(existing *projection.ResourceState, nowBillable bool, transitionTime time.Time, newDims map[string]any) *events.StateContext {

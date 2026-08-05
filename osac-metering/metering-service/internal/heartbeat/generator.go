@@ -92,11 +92,14 @@ func (g *Generator) tick(ctx context.Context) error {
 	now := time.Now().UTC()
 	var publishedIDs []string
 
-	// TODO: All-or-nothing is a scale concern past ~1K billable resources. At 10K VMs,
-	// one Kafka failure after 9999 publishes discards all progress. Revisit with
-	// batch checkpointing when we hit scale.
+	// Partial checkpoint: on Kafka failure, already-published IDs are checkpointed
+	// to prevent duplicate heartbeats on retry. At scale (>10K VMs), consider
+	// Kafka transactional producer for atomic batch publish.
 	for i := range billable {
-		ce := g.buildHeartbeatEvent(&billable[i], now)
+		ce, ceErr := g.buildHeartbeatEvent(&billable[i], now)
+		if ceErr != nil {
+			return fmt.Errorf("building heartbeat event for %s: %w", billable[i].ResourceID, ceErr)
+		}
 		if err := g.publisher.Publish(ctx, ce); err != nil {
 			if len(publishedIDs) > 0 {
 				if cpErr := g.store.UpdateLastHeartbeat(ctx, publishedIDs, now); cpErr != nil {
@@ -117,7 +120,7 @@ func (g *Generator) tick(ctx context.Context) error {
 	return nil
 }
 
-func (g *Generator) buildHeartbeatEvent(state *projection.ResourceState, now time.Time) cloudevents.Event {
+func (g *Generator) buildHeartbeatEvent(state *projection.ResourceState, now time.Time) (cloudevents.Event, error) {
 	ce := cloudevents.NewEvent()
 	ce.SetID(uuid.NewString())
 	ce.SetSource("osac-metering")
@@ -146,9 +149,11 @@ func (g *Generator) buildHeartbeatEvent(state *projection.ResourceState, now tim
 		BillingDimensions: state.BillingDimensions,
 		SchemaVersion:     "v1",
 	}
-	_ = ce.SetData(cloudevents.ApplicationJSON, data)
+	if err := ce.SetData(cloudevents.ApplicationJSON, data); err != nil {
+		return ce, fmt.Errorf("setting heartbeat CloudEvent data: %w", err)
+	}
 
-	return ce
+	return ce, nil
 }
 
 func (g *Generator) updateGauges(billable []projection.ResourceState) {

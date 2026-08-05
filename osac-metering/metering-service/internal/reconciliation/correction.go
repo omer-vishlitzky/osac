@@ -10,6 +10,7 @@ in compliance with the License. You may obtain a copy of the License at
 package reconciliation
 
 import (
+	"fmt"
 	"time"
 
 	cloudevents "github.com/cloudevents/sdk-go/v2"
@@ -37,7 +38,9 @@ type correctionData struct {
 	ResourceID              string            `json:"resource_id"`
 	ResourceType            string            `json:"resource_type"`
 	TenantID                string            `json:"tenant_id"`
+	ProjectID               *string           `json:"project_id"`
 	Reason                  CorrectionReason  `json:"reason"`
+	Description             string            `json:"description"`
 	CorrectedState          *string           `json:"corrected_state"`
 	PreviousStateProjection *string           `json:"previous_state_in_projection"`
 	ActualStateFromSource   *string           `json:"actual_state_from_source"`
@@ -46,14 +49,29 @@ type correctionData struct {
 	SchemaVersion           string            `json:"schema_version"`
 }
 
+func correctionDescription(reason CorrectionReason) string {
+	switch reason {
+	case MissedCreation:
+		return "Resource found in fulfillment-service but missing from metering projection"
+	case StateDrift:
+		return "Resource state in fulfillment-service differs from metering projection"
+	case BillingDimensionsDrift:
+		return "Billing dimensions in fulfillment-service differ from metering projection"
+	case MissedDeletion:
+		return "Resource found in metering projection but missing from fulfillment-service"
+	default:
+		return string(reason)
+	}
+}
+
 func buildCorrectionEvent(
-	resourceID, resourceType, tenantID string,
+	resourceID, resourceType, tenantID, projectID string,
 	reason CorrectionReason,
 	projectionState, sourceState string,
 	billingDimensions map[string]any,
 	interval *AffectedInterval,
 	now time.Time,
-) cloudevents.Event {
+) (cloudevents.Event, error) {
 	ce := cloudevents.NewEvent()
 	ce.SetID(uuid.NewString())
 	ce.SetSource("osac-metering/reconciler")
@@ -67,7 +85,9 @@ func buildCorrectionEvent(
 		ResourceID:              resourceID,
 		ResourceType:            resourceType,
 		TenantID:                tenantID,
+		ProjectID:               events.NilIfEmpty(projectID),
 		Reason:                  reason,
+		Description:             correctionDescription(reason),
 		CorrectedState:          events.NilIfEmpty(sourceState),
 		PreviousStateProjection: events.NilIfEmpty(projectionState),
 		ActualStateFromSource:   events.NilIfEmpty(sourceState),
@@ -75,7 +95,9 @@ func buildCorrectionEvent(
 		AffectedInterval:        interval,
 		SchemaVersion:           "v1",
 	}
-	_ = ce.SetData(cloudevents.ApplicationJSON, data)
+	if err := ce.SetData(cloudevents.ApplicationJSON, data); err != nil {
+		return ce, fmt.Errorf("setting correction CloudEvent data: %w", err)
+	}
 
-	return ce
+	return ce, nil
 }

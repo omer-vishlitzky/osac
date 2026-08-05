@@ -54,8 +54,8 @@ type config struct {
 	healthAddr             string
 	kafka                  kafkapub.ConnectionConfig
 	dbURLFile              string
-	heartbeatInterval      string
-	reconciliationInterval string
+	heartbeatInterval      time.Duration
+	reconciliationInterval time.Duration
 }
 
 func main() {
@@ -89,8 +89,8 @@ func configFromEnv() *config {
 			SASLPassFile: os.Getenv("KAFKA_SASL_PASSWORD_FILE"),
 		},
 		dbURLFile:              envOrDefault("DB_URL_FILE", "/etc/metering/db"),
-		heartbeatInterval:      os.Getenv("HEARTBEAT_INTERVAL"),
-		reconciliationInterval: os.Getenv("RECONCILIATION_INTERVAL"),
+		heartbeatInterval:      parseDurationOrDefault(os.Getenv("HEARTBEAT_INTERVAL"), 60*time.Second),
+		reconciliationInterval: parseDurationOrDefault(os.Getenv("RECONCILIATION_INTERVAL"), 60*time.Minute),
 	}
 }
 
@@ -116,24 +116,6 @@ func (c *config) validate() error {
 	}
 	if c.dbURLFile == "" {
 		return fmt.Errorf("DB_URL_FILE is required")
-	}
-	if c.heartbeatInterval != "" {
-		d, err := time.ParseDuration(c.heartbeatInterval)
-		if err != nil {
-			return fmt.Errorf("HEARTBEAT_INTERVAL %q is not a valid duration: %w", c.heartbeatInterval, err)
-		}
-		if d <= 0 {
-			return fmt.Errorf("HEARTBEAT_INTERVAL must be greater than zero")
-		}
-	}
-	if c.reconciliationInterval != "" {
-		d, err := time.ParseDuration(c.reconciliationInterval)
-		if err != nil {
-			return fmt.Errorf("RECONCILIATION_INTERVAL %q is not a valid duration: %w", c.reconciliationInterval, err)
-		}
-		if d <= 0 {
-			return fmt.Errorf("RECONCILIATION_INTERVAL must be greater than zero")
-		}
 	}
 	return nil
 }
@@ -214,11 +196,7 @@ func run(ctx context.Context, logger logr.Logger, cfg *config) error {
 	defer func() { _ = producer.Close() }()
 	logger.Info("kafka producer connected", "brokers", cfg.kafka.Brokers)
 
-	for _, topic := range []string{
-		"osac.metering.lifecycle",
-		"osac.metering.heartbeat",
-		"osac.metering.corrections",
-	} {
+	for _, topic := range kafkapub.Topics {
 		if err := kafkapub.VerifyTopicExists(cfg.kafka, topic); err != nil {
 			return fmt.Errorf("kafka topic %q not available: %w", topic, err)
 		}
@@ -227,14 +205,11 @@ func run(ctx context.Context, logger logr.Logger, cfg *config) error {
 
 	publisher := kafkapub.NewPublisher(producer)
 
-	heartbeatInterval := parseDurationOrDefault(cfg.heartbeatInterval, 60*time.Second)
-	reconInterval := parseDurationOrDefault(cfg.reconciliationInterval, 60*time.Minute)
-
 	computeClient := privatev1.NewComputeInstancesClient(grpcConn)
-	reconciler := reconciliation.NewReconciler(computeClient, store, publisher, logger, heartbeatInterval)
+	reconciler := reconciliation.NewReconciler(computeClient, store, publisher, logger, cfg.heartbeatInterval)
 
 	logger.Info("running startup reconciliation")
-	if err := reconciler.RunFull(ctx); err != nil {
+	if err := reconciler.Reconcile(ctx); err != nil {
 		return fmt.Errorf("startup reconciliation failed: %w", err)
 	}
 	logger.Info("startup reconciliation completed")
@@ -243,7 +218,7 @@ func run(ctx context.Context, logger logr.Logger, cfg *config) error {
 	health.ready.Store(true)
 	logger.Info("service ready")
 
-	hbGen := heartbeat.NewGenerator(store, publisher, logger, heartbeatInterval)
+	hbGen := heartbeat.NewGenerator(store, publisher, logger, cfg.heartbeatInterval)
 
 	var wg sync.WaitGroup
 
@@ -259,7 +234,7 @@ func run(ctx context.Context, logger logr.Logger, cfg *config) error {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		reconciler.RunPeriodic(ctx, reconInterval)
+		reconciler.RunPeriodic(ctx, cfg.reconciliationInterval)
 	}()
 
 	eventsClient := privatev1.NewEventsClient(grpcConn)
@@ -322,7 +297,7 @@ func parseDurationOrDefault(s string, fallback time.Duration) time.Duration {
 		return fallback
 	}
 	d, err := time.ParseDuration(s)
-	if err != nil {
+	if err != nil || d <= 0 {
 		return fallback
 	}
 	return d

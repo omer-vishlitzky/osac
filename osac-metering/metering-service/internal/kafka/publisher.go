@@ -43,16 +43,25 @@ type EventPublisher interface {
 	Publish(ctx context.Context, event cloudevents.Event) error
 }
 
+const (
+	TopicLifecycle   = "osac.metering.lifecycle"
+	TopicHeartbeat   = "osac.metering.heartbeat"
+	TopicCorrections = "osac.metering.corrections"
+	TopicInference   = "osac.metering.inference"
+)
+
+var Topics = []string{TopicLifecycle, TopicHeartbeat, TopicCorrections}
+
 var topicRoutes = map[string]string{
-	"osac.resource.created.v1":    "osac.metering.lifecycle",
-	"osac.resource.started.v1":    "osac.metering.lifecycle",
-	"osac.resource.updated.v1":    "osac.metering.lifecycle",
-	"osac.resource.suspended.v1":  "osac.metering.lifecycle",
-	"osac.resource.resumed.v1":    "osac.metering.lifecycle",
-	"osac.resource.deleted.v1":    "osac.metering.lifecycle",
-	"osac.resource.heartbeat.v1":  "osac.metering.heartbeat",
-	"osac.resource.correction.v1": "osac.metering.corrections",
-	"osac.inference.usage.v1":     "osac.metering.inference",
+	"osac.resource.created.v1":    TopicLifecycle,
+	"osac.resource.started.v1":    TopicLifecycle,
+	"osac.resource.updated.v1":    TopicLifecycle,
+	"osac.resource.suspended.v1":  TopicLifecycle,
+	"osac.resource.resumed.v1":    TopicLifecycle,
+	"osac.resource.deleted.v1":    TopicLifecycle,
+	"osac.resource.heartbeat.v1":  TopicHeartbeat,
+	"osac.resource.correction.v1": TopicCorrections,
+	"osac.inference.usage.v1":     TopicInference,
 }
 
 type Publisher struct {
@@ -71,6 +80,9 @@ func TopicFor(eventType string) (string, error) {
 	return topic, nil
 }
 
+// Publish serializes a CloudEvent as JSON and sends it to the appropriate Kafka
+// topic. The osacresourceid extension is used as the partition key to ensure
+// per-resource ordering.
 func (p *Publisher) Publish(ctx context.Context, event cloudevents.Event) error {
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("publish aborted: %w", err)
@@ -129,6 +141,8 @@ func (p *Publisher) Close() error {
 	return p.producer.Close()
 }
 
+// NewProducerConfig returns a sarama configuration suitable for the metering
+// producer: idempotent, acks=all, synchronous.
 func NewProducerConfig() *sarama.Config {
 	config := sarama.NewConfig()
 	config.Version = sarama.V3_9_0_0

@@ -66,7 +66,7 @@ func (t *Tool) Migrate(ctx context.Context) error {
 	case err == nil:
 		t.logger.Info("schema version before migration", "version", version, "dirty", dirty)
 		if dirty {
-			return fmt.Errorf("schema version %d is dirty: manual intervention required (run migrations.Force(%d) to resolve)", version, version)
+			return fmt.Errorf("schema version %d is dirty: manual intervention required", version)
 		}
 	case errors.Is(err, migrate.ErrNilVersion):
 		t.logger.Info("schema not created yet, will create now")

@@ -26,6 +26,9 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+// Container manages a PostgreSQL instance in podman/docker for integration
+// tests. Lives in internal/database (not a _test.go file) because test files
+// in other packages (projection/) import it.
 type Container struct {
 	logger        logr.Logger
 	tool          string

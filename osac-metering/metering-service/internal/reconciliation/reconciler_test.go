@@ -150,7 +150,7 @@ var _ = Describe("Reconciler", func() {
 	})
 	AfterEach(func() { cancel() })
 
-	Describe("RunFull", func() {
+	Describe("Reconcile", func() {
 		It("detects missed_creation when resource in fulfillment but not in projection", func() {
 			client := &mockComputeClient{
 				items: []*privatev1.ComputeInstance{
@@ -161,7 +161,7 @@ var _ = Describe("Reconciler", func() {
 			pub := &mockPublisher{}
 			recon := reconciliation.NewReconciler(client, store, pub, logr.Discard(), 60*time.Second)
 
-			Expect(recon.RunFull(ctx)).To(Succeed())
+			Expect(recon.Reconcile(ctx)).To(Succeed())
 
 			pub.mu.Lock()
 			defer pub.mu.Unlock()
@@ -194,7 +194,7 @@ var _ = Describe("Reconciler", func() {
 			pub := &mockPublisher{}
 			recon := reconciliation.NewReconciler(client, store, pub, logr.Discard(), 60*time.Second)
 
-			Expect(recon.RunFull(ctx)).To(Succeed())
+			Expect(recon.Reconcile(ctx)).To(Succeed())
 
 			pub.mu.Lock()
 			defer pub.mu.Unlock()
@@ -225,7 +225,7 @@ var _ = Describe("Reconciler", func() {
 			pub := &mockPublisher{}
 			recon := reconciliation.NewReconciler(client, store, pub, logr.Discard(), 60*time.Second)
 
-			Expect(recon.RunFull(ctx)).To(Succeed())
+			Expect(recon.Reconcile(ctx)).To(Succeed())
 
 			pub.mu.Lock()
 			defer pub.mu.Unlock()
@@ -255,7 +255,7 @@ var _ = Describe("Reconciler", func() {
 			pub := &mockPublisher{}
 			recon := reconciliation.NewReconciler(client, store, pub, logr.Discard(), 60*time.Second)
 
-			Expect(recon.RunFull(ctx)).To(Succeed())
+			Expect(recon.Reconcile(ctx)).To(Succeed())
 
 			store.mu.Lock()
 			defer store.mu.Unlock()
@@ -285,7 +285,7 @@ var _ = Describe("Reconciler", func() {
 			pub := &mockPublisher{}
 			recon := reconciliation.NewReconciler(client, store, pub, logr.Discard(), 60*time.Second)
 
-			Expect(recon.RunFull(ctx)).To(Succeed())
+			Expect(recon.Reconcile(ctx)).To(Succeed())
 
 			pub.mu.Lock()
 			defer pub.mu.Unlock()
@@ -309,7 +309,7 @@ var _ = Describe("Reconciler", func() {
 			pub := &mockPublisher{}
 			recon := reconciliation.NewReconciler(client, store, pub, logr.Discard(), 60*time.Second)
 
-			Expect(recon.RunFull(ctx)).To(Succeed())
+			Expect(recon.Reconcile(ctx)).To(Succeed())
 
 			store.mu.Lock()
 			defer store.mu.Unlock()
@@ -341,7 +341,7 @@ var _ = Describe("Reconciler", func() {
 			pub := &mockPublisher{}
 			recon := reconciliation.NewReconciler(client, store, pub, logr.Discard(), 60*time.Second)
 
-			Expect(recon.RunFull(ctx)).To(Succeed())
+			Expect(recon.Reconcile(ctx)).To(Succeed())
 
 			pub.mu.Lock()
 			defer pub.mu.Unlock()
@@ -354,7 +354,7 @@ var _ = Describe("Reconciler", func() {
 			pub := &mockPublisher{}
 			recon := reconciliation.NewReconciler(client, store, pub, logr.Discard(), 60*time.Second)
 
-			err := recon.RunFull(ctx)
+			err := recon.Reconcile(ctx)
 			Expect(err).To(HaveOccurred())
 			Expect(err.Error()).To(ContainSubstring("connection refused"))
 		})
@@ -369,7 +369,7 @@ var _ = Describe("Reconciler", func() {
 			pub := &mockPublisher{err: fmt.Errorf("kafka down")}
 			recon := reconciliation.NewReconciler(client, store, pub, logr.Discard(), 60*time.Second)
 
-			err := recon.RunFull(ctx)
+			err := recon.Reconcile(ctx)
 			Expect(err).To(HaveOccurred())
 			Expect(err.Error()).To(ContainSubstring("kafka down"))
 
@@ -410,7 +410,7 @@ var _ = Describe("Reconciler", func() {
 			pub := &mockPublisher{}
 			recon := reconciliation.NewReconciler(client, store, pub, logr.Discard(), 60*time.Second)
 
-			Expect(recon.RunFull(ctx)).To(Succeed())
+			Expect(recon.Reconcile(ctx)).To(Succeed())
 
 			pub.mu.Lock()
 			defer pub.mu.Unlock()
@@ -467,7 +467,7 @@ var _ = Describe("Reconciler", func() {
 			pub := &mockPublisher{}
 			recon := reconciliation.NewReconciler(client, store, pub, logr.Discard(), 60*time.Second)
 
-			Expect(recon.RunFull(ctx)).To(Succeed())
+			Expect(recon.Reconcile(ctx)).To(Succeed())
 
 			pub.mu.Lock()
 			defer pub.mu.Unlock()
@@ -500,7 +500,7 @@ var _ = Describe("Reconciler", func() {
 			pub := &mockPublisher{}
 			recon := reconciliation.NewReconciler(client, store, pub, logr.Discard(), 60*time.Second)
 
-			Expect(recon.RunFull(ctx)).To(Succeed())
+			Expect(recon.Reconcile(ctx)).To(Succeed())
 
 			pub.mu.Lock()
 			defer pub.mu.Unlock()
@@ -517,7 +517,7 @@ var _ = Describe("Reconciler", func() {
 			pub := &mockPublisher{}
 			recon := reconciliation.NewReconciler(client, store, pub, logr.Discard(), 60*time.Second)
 
-			Expect(recon.RunFull(ctx)).To(Succeed())
+			Expect(recon.Reconcile(ctx)).To(Succeed())
 
 			pub.mu.Lock()
 			defer pub.mu.Unlock()
