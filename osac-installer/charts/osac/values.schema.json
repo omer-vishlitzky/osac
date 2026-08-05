@@ -1011,6 +1011,16 @@
             "tag": { "type": "string" },
             "pullPolicy": { "type": "string", "enum": ["Always", "IfNotPresent", "Never"] }
           }
+        },
+        "database": {
+          "type": "object",
+          "description": "Database configuration",
+          "properties": {
+            "connection": {
+              "type": "array",
+              "description": "Database connection volume sources (secret or configMap references)"
+            }
+          }
         }
       }
     },
