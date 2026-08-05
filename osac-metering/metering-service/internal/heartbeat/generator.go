@@ -1,5 +1,5 @@
 /*
-Copyright (c) 2025 Red Hat, Inc.
+Copyright (c) 2026 Red Hat, Inc.
 
 Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 in compliance with the License. You may obtain a copy of the License at
@@ -129,12 +129,7 @@ func (g *Generator) buildHeartbeatEvent(state *projection.ResourceState, now tim
 	ce.SetType("osac.resource.heartbeat.v1")
 	ce.SetTime(now)
 
-	ce.SetExtension("osacresourceid", state.ResourceID)
-	ce.SetExtension("osacresourcetype", state.ResourceType)
-	ce.SetExtension("osactenant", state.TenantID)
-	if state.ProjectID != "" {
-		ce.SetExtension("osacproject", state.ProjectID)
-	}
+	events.SetOSACExtensions(&ce, state.ResourceID, state.ResourceType, state.TenantID, state.ProjectID)
 
 	var durationSeconds float64
 	if state.BillableSince != nil {

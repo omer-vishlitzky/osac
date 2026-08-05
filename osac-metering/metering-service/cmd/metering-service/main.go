@@ -1,5 +1,5 @@
 /*
-Copyright (c) 2025 Red Hat, Inc.
+Copyright (c) 2026 Red Hat, Inc.
 
 Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 in compliance with the License. You may obtain a copy of the License at
@@ -298,6 +298,7 @@ func parseDurationOrDefault(s string, fallback time.Duration) time.Duration {
 	}
 	d, err := time.ParseDuration(s)
 	if err != nil || d <= 0 {
+		fmt.Fprintf(os.Stderr, "warning: ignoring invalid duration %q, using default %s\n", s, fallback)
 		return fallback
 	}
 	return d

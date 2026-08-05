@@ -1,5 +1,5 @@
 /*
-Copyright (c) 2025 Red Hat, Inc.
+Copyright (c) 2026 Red Hat, Inc.
 
 Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 in compliance with the License. You may obtain a copy of the License at
@@ -389,12 +389,7 @@ func buildSyntheticHeartbeat(ps projection.ResourceState, now time.Time) (cloude
 	ce.SetSource("osac-metering/reconciler")
 	ce.SetType("osac.resource.heartbeat.v1")
 	ce.SetTime(now)
-	ce.SetExtension("osacresourceid", ps.ResourceID)
-	ce.SetExtension("osacresourcetype", ps.ResourceType)
-	ce.SetExtension("osactenant", ps.TenantID)
-	if ps.ProjectID != "" {
-		ce.SetExtension("osacproject", ps.ProjectID)
-	}
+	events.SetOSACExtensions(&ce, ps.ResourceID, ps.ResourceType, ps.TenantID, ps.ProjectID)
 
 	var durationSeconds float64
 	if ps.BillableSince != nil {

@@ -68,12 +68,11 @@ func MapWatchEvent(event *privatev1.Event, mapper ResourceMapper, stateCtx *Stat
 	ce.SetType(ceType)
 	ce.SetTime(transitionTime)
 
-	ce.SetExtension("osacresourceid", mapper.ResourceID())
-	ce.SetExtension("osacresourcetype", mapper.ResourceType())
-	ce.SetExtension("osactenant", mapper.TenantID())
-	if p := mapper.ProjectID(); p != nil && *p != "" {
-		ce.SetExtension("osacproject", *p)
+	projectID := ""
+	if p := mapper.ProjectID(); p != nil {
+		projectID = *p
 	}
+	SetOSACExtensions(&ce, mapper.ResourceID(), mapper.ResourceType(), mapper.TenantID(), projectID)
 
 	var prevStatePtr *string
 	if stateCtx.PreviousState != "" {

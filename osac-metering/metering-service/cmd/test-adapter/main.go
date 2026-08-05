@@ -1,5 +1,5 @@
 /*
-Copyright (c) 2025 Red Hat, Inc.
+Copyright (c) 2026 Red Hat, Inc.
 
 Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 in compliance with the License. You may obtain a copy of the License at
@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"sync"
 	"syscall"
 	"time"
@@ -28,19 +29,20 @@ import (
 // Bounded ring buffer for CI — drops oldest events to prevent OOM.
 // Not a production store; the test adapter is a read-only consumer
 // used only for E2E test assertions.
-const maxEvents = 10000
+const defaultMaxEvents = 10000
 
 var topics = kafkapub.Topics
 
 type eventStore struct {
-	mu     sync.RWMutex
-	events []json.RawMessage
+	mu        sync.RWMutex
+	events    []json.RawMessage
+	maxEvents int
 }
 
 func (s *eventStore) add(data []byte) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if len(s.events) >= maxEvents {
+	if len(s.events) >= s.maxEvents {
 		s.events = s.events[1:]
 	}
 	s.events = append(s.events, json.RawMessage(data))
@@ -104,12 +106,19 @@ func main() {
 		listenAddr = ":8080"
 	}
 
+	maxEvents := defaultMaxEvents
+	if v := os.Getenv("MAX_EVENTS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			maxEvents = n
+		}
+	}
+
 	if cfg.Brokers == "" || cfg.SASLPassFile == "" {
 		fmt.Fprintln(os.Stderr, "KAFKA_BROKERS and KAFKA_SASL_PASSWORD_FILE are required")
 		os.Exit(2)
 	}
 
-	store := &eventStore{}
+	store := &eventStore{maxEvents: maxEvents}
 
 	sc := sarama.NewConfig()
 	sc.Version = sarama.V3_9_0_0

@@ -1,5 +1,5 @@
 /*
-Copyright (c) 2025 Red Hat, Inc.
+Copyright (c) 2026 Red Hat, Inc.
 
 Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 in compliance with the License. You may obtain a copy of the License at
@@ -77,9 +77,7 @@ func buildCorrectionEvent(
 	ce.SetSource("osac-metering/reconciler")
 	ce.SetType("osac.resource.correction.v1")
 	ce.SetTime(now)
-	ce.SetExtension("osacresourceid", resourceID)
-	ce.SetExtension("osacresourcetype", resourceType)
-	ce.SetExtension("osactenant", tenantID)
+	events.SetOSACExtensions(&ce, resourceID, resourceType, tenantID, projectID)
 
 	data := correctionData{
 		ResourceID:              resourceID,

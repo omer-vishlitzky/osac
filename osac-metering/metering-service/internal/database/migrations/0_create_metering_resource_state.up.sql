@@ -23,7 +23,7 @@ CREATE TABLE metering_resource_state (
 );
 
 CREATE INDEX idx_metering_resource_state_billable
-    ON metering_resource_state (is_billable)
+    ON metering_resource_state (is_billable, last_heartbeat_at)
     WHERE is_billable = TRUE;
 
 CREATE INDEX idx_metering_resource_state_tenant
