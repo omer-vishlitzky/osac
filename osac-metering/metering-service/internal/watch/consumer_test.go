@@ -712,26 +712,31 @@ var _ = Describe("Consumer", func() {
 
 		It("preserves billing context through RUNNING→STOPPING→STOPPED sequence", func() {
 			store := newMockStore()
-			now := time.Now().Add(-1 * time.Hour).UTC().Truncate(time.Microsecond)
+			billableStart := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
 			store.states["vm-stop-seq"] = projection.ResourceState{
 				ResourceID:         "vm-stop-seq",
 				ResourceType:       "compute_instance",
 				TenantID:           "tenant-1",
 				CurrentState:       "RUNNING",
 				IsBillable:         true,
-				BillableSince:      &now,
+				BillableSince:      &billableStart,
 				FulfillmentVersion: 1,
 				BillingDimensions:  map[string]any{},
-				TransitionTime:     now,
+				TransitionTime:     billableStart,
 			}
 
 			// Two events: RUNNING→STOPPING, then STOPPING→STOPPED
+			stoppingTime := billableStart.Add(30 * time.Minute)
+			stoppedTime := billableStart.Add(1 * time.Hour)
+
 			ciStopping := makeComputeInstance("vm-stop-seq", "tenant-1")
 			ciStopping.Status.State = privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_STOPPING
+			ciStopping.Status.StateTransitionTime = timestamppb.New(stoppingTime)
 			ciStopping.Metadata.Version = 2
 
 			ciStopped := makeComputeInstance("vm-stop-seq", "tenant-1")
 			ciStopped.Status.State = privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_STOPPED
+			ciStopped.Status.StateTransitionTime = timestamppb.New(stoppedTime)
 			ciStopped.Metadata.Version = 3
 
 			stream := &mockWatchStream{
@@ -764,14 +769,13 @@ var _ = Describe("Consumer", func() {
 			Expect(pub.published).To(HaveLen(1))
 			Expect(pub.published[0].Type()).To(Equal("osac.resource.suspended.v1"))
 
-			// suspended.v1 should have duration_seconds > 0 because
-			// billing context (IsBillable, BillableSince) was preserved
-			// through the transient STOPPING state.
+			// suspended.v1 should have duration_seconds = 3600 (1 hour from
+			// BillableSince to STOPPED transition time), proving billing context
+			// was preserved through STOPPING, not reset to STOPPING time.
 			var data map[string]any
 			Expect(json.Unmarshal(pub.published[0].Data(), &data)).To(Succeed())
 			Expect(data["previous_state"]).To(Equal("STOPPING"))
-			Expect(data["duration_seconds"]).ToNot(BeNil())
-			Expect(data["duration_seconds"]).To(BeNumerically(">", 0))
+			Expect(data["duration_seconds"]).To(BeNumerically("~", 3600.0, 0.1))
 
 			// Projection should show STOPPED, non-billable
 			store.mu.Lock()

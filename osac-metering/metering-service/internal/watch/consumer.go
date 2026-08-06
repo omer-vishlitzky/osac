@@ -188,9 +188,9 @@ func (c *Consumer) handleEvent(ctx context.Context, event *privatev1.Event) erro
 }
 
 // handleTransientState updates the projection's CurrentState and
-// FulfillmentVersion for transient states (STOPPING, STARTING, DELETING)
-// without changing billing fields or emitting a CloudEvent. This preserves
-// the billing context (IsBillable, BillableSince) so that the subsequent
+// FulfillmentVersion for transient states (STOPPING, STARTING) without
+// changing billing fields or emitting a CloudEvent. This preserves the
+// billing context (IsBillable, BillableSince) so that the subsequent
 // final state transition (e.g., STOPPED) can compute duration_seconds
 // correctly on the suspended.v1 event.
 func (c *Consumer) handleTransientState(

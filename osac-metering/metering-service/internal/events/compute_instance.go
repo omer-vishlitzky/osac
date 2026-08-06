@@ -121,9 +121,9 @@ func (m *computeInstanceMapper) resolveUpdatedEventType(previousState string) (s
 		return "osac.resource.resumed.v1", nil
 	case currentState == "RUNNING":
 		return "osac.resource.started.v1", nil
-	case currentState == "STOPPED" || currentState == "PAUSED" || currentState == "FAILED":
+	case currentState == "STOPPED" || currentState == "PAUSED" || currentState == "FAILED" || currentState == "DELETING":
 		return "osac.resource.suspended.v1", nil
-	case currentState == "STOPPING" || currentState == "STARTING" || currentState == "DELETING":
+	case currentState == "STOPPING" || currentState == "STARTING":
 		return "", ErrTransientState
 	case currentState == "UNSPECIFIED":
 		return "osac.resource.updated.v1", nil

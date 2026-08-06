@@ -152,7 +152,7 @@ var _ = Describe("MapWatchEvent", func() {
 			Expect(errors.Is(err, events.ErrTransientState)).To(BeTrue())
 		})
 
-		It("returns ErrTransientState for DELETING state", func() {
+		It("maps DELETING to osac.resource.suspended.v1", func() {
 			ci.Status.State = privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_DELETING
 
 			event := &privatev1.Event{
@@ -161,9 +161,10 @@ var _ = Describe("MapWatchEvent", func() {
 				Payload: &privatev1.Event_ComputeInstance{ComputeInstance: ci},
 			}
 
-			_, err := mapEvent(event, &events.StateContext{})
-			Expect(err).To(HaveOccurred())
-			Expect(errors.Is(err, events.ErrTransientState)).To(BeTrue())
+			stateCtx := &events.StateContext{PreviousState: "RUNNING"}
+			ce, err := mapEvent(event, stateCtx)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(ce.Type()).To(Equal("osac.resource.suspended.v1"))
 		})
 
 		It("maps STOPPED→RUNNING to osac.resource.resumed.v1 with state context", func() {
