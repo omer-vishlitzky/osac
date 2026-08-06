@@ -774,7 +774,7 @@ var _ = Describe("Consumer", func() {
 			// was preserved through STOPPING, not reset to STOPPING time.
 			var data map[string]any
 			Expect(json.Unmarshal(pub.published[0].Data(), &data)).To(Succeed())
-			Expect(data["previous_state"]).To(Equal("STOPPING"))
+			Expect(data["previous_state"]).To(Equal("RUNNING"))
 			Expect(data["duration_seconds"]).To(BeNumerically("~", 3600.0, 0.1))
 
 			// Projection should show STOPPED, non-billable
