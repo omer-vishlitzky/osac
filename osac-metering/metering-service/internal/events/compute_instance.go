@@ -41,8 +41,8 @@ func ComputeInstanceBillingDimensions(ci *privatev1.ComputeInstance) map[string]
 	if spec == nil {
 		return dims
 	}
-	if spec.InstanceType != nil {
-		dims["instance_type"] = spec.GetInstanceType()
+	if it := spec.GetInstanceType(); it != nil {
+		dims["instance_type"] = it.GetName()
 	}
 	if img := spec.GetImage(); img != nil {
 		dims["image_ref"] = img.GetSourceRef()
@@ -76,14 +76,18 @@ func (m *computeInstanceMapper) ProjectID() *string {
 
 func (m *computeInstanceMapper) CatalogItemID() *string {
 	if s := m.ci.GetSpec(); s != nil {
-		return NilIfEmpty(s.GetCatalogItem())
+		if ci := s.GetCatalogItem(); ci != nil {
+			return NilIfEmpty(ci.GetName())
+		}
 	}
 	return nil
 }
 
 func (m *computeInstanceMapper) TemplateID() *string {
 	if s := m.ci.GetSpec(); s != nil {
-		return NilIfEmpty(s.GetTemplate())
+		if t := s.GetTemplate(); t != nil {
+			return NilIfEmpty(t.GetName())
+		}
 	}
 	return nil
 }

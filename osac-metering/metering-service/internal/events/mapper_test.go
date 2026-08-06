@@ -38,9 +38,9 @@ var _ = Describe("MapWatchEvent", func() {
 				CreationTimestamp: timestamppb.Now(),
 			},
 			Spec: &privatev1.ComputeInstanceSpec{
-				Template:     "tmpl-gpu",
-				CatalogItem:  "catalog-item-1",
-				InstanceType: &instanceType,
+				Template:     &privatev1.ComputeInstanceTemplateReference{Name: "tmpl-gpu"},
+				CatalogItem:  &privatev1.ComputeInstanceCatalogItemReference{Name: "catalog-item-1"},
+				InstanceType: &privatev1.InstanceTypeReference{Name: instanceType},
 				Image: &privatev1.ComputeInstanceImage{
 					SourceRef: "rhel-10.2-x86_64",
 				},
@@ -686,8 +686,8 @@ var _ = Describe("MapWatchEvent", func() {
 			Expect(data["project_id"]).To(BeNil())
 		})
 
-		It("sets template_id to null when template is empty string", func() {
-			ci.Spec.Template = ""
+		It("sets template_id to null when template is nil", func() {
+			ci.Spec.Template = nil
 
 			event := &privatev1.Event{
 				Id:      "evt-1",
@@ -705,8 +705,8 @@ var _ = Describe("MapWatchEvent", func() {
 			Expect(data["template_id"]).To(BeNil())
 		})
 
-		It("sets catalog_item_id to null when catalog_item is empty string", func() {
-			ci.Spec.CatalogItem = ""
+		It("sets catalog_item_id to null when catalog_item is nil", func() {
+			ci.Spec.CatalogItem = nil
 
 			event := &privatev1.Event{
 				Id:      "evt-1",

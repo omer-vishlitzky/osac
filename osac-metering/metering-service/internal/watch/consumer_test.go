@@ -673,7 +673,7 @@ var _ = Describe("Consumer", func() {
 			ci := makeComputeInstance("vm-resize", "tenant-1")
 			ci.Status.State = privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_RUNNING
 			ci.Metadata.Version = 2
-			ci.Spec = &privatev1.ComputeInstanceSpec{InstanceType: &newType}
+			ci.Spec = &privatev1.ComputeInstanceSpec{InstanceType: &privatev1.InstanceTypeReference{Name: newType}}
 			_ = instanceType
 
 			event := &privatev1.Event{
