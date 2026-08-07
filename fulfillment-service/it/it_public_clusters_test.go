@@ -767,6 +767,9 @@ var _ = Describe("Public clusters", func() {
 		version := nextCVVersion()
 		cvResponse, err := cvClient.Create(ctx, privatev1.ClusterVersionsCreateRequest_builder{
 			Object: privatev1.ClusterVersion_builder{
+				Metadata: privatev1.Metadata_builder{
+					Name: fmt.Sprintf("test-cv-%s", uuid.New()[24:32]),
+				}.Build(),
 				Spec: privatev1.ClusterVersionSpec_builder{
 					Version: version,
 					Image:   fmt.Sprintf("quay.io/openshift-release-dev/ocp-release:%s-multi", version),
@@ -787,6 +790,9 @@ var _ = Describe("Public clusters", func() {
 		// Create a cluster specifying that version:
 		createResponse, err := clustersClient.Create(ctx, publicv1.ClustersCreateRequest_builder{
 			Object: publicv1.Cluster_builder{
+				Metadata: publicv1.Metadata_builder{
+					Name: fmt.Sprintf("test-cluster-%s", uuid.New()[24:32]),
+				}.Build(),
 				Spec: publicv1.ClusterSpec_builder{
 					Template: publicv1.ClusterTemplateReference_builder{Id: templateId}.Build(),
 					Version:  publicv1.ClusterVersionReference_builder{Name: cvName}.Build(),

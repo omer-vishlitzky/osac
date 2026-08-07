@@ -71,7 +71,7 @@ var _ = Describe("Protovalidate validation", func() {
 		status, ok := grpcstatus.FromError(err)
 		Expect(ok).To(BeTrue(), "error should be a gRPC status error")
 		Expect(status.Code()).To(Equal(grpccodes.InvalidArgument), "should return InvalidArgument")
-		Expect(status.Message()).To(ContainSubstring("metadata is required"))
+		Expect(status.Message()).To(ContainSubstring("'metadata.name' is mandatory"))
 	})
 
 	It("Rejects Tenant with invalid metadata name (too long)", func() {
