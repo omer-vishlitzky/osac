@@ -1,0 +1,30 @@
+---
+name: jira-check
+
+permissions:
+  contents: read
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+    branches: [main]
+  merge_group:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate Jira reference in PR title
+        if: github.event_name == 'pull_request'
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          if [[ "$PR_TITLE" =~ ^[A-Z]+-[0-9]+: ]] || [[ "$PR_TITLE" =~ ^NO-ISSUE: ]]; then
+            echo "Valid Jira reference: $PR_TITLE"
+          else
+            echo "::error::PR title must start with a Jira key (e.g., OSAC-1234: description) or NO-ISSUE:"
+            exit 1
+          fi
+      - name: Auto-pass for merge queue
+        if: github.event_name == 'merge_group'
+        run: echo "Jira reference already validated on PR"
