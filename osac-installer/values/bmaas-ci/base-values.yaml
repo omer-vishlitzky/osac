@@ -1,7 +1,4 @@
-# Base layer values for multi-instance (pooltool) deployment.
-# Used with: make install-base VALUES_FILE=values/pooltool/base-values.yaml
-
-# --- Prerequisites (shared with operators/prereqs phases) ---
+# BMaaS CI — base layer values (phases 1-3: operators + prereqs + base)
 certManager:
   enabled: true
 trustManager:
@@ -15,21 +12,12 @@ aapOperator:
 lvms:
   enabled: true
 metallb:
-  enabled: true
+  enabled: false
 cnv:
-  enabled: true
+  enabled: false
 mce:
   enabled: false
-kafka:
-  enabled: true
 
-# --- CRDs ---
-operatorCrds:
-  install: true
-
-bmfCrds: {}
-
-# --- AAP (shared across all workload namespaces) ---
 aap:
   aap:
     instance:
@@ -45,18 +33,10 @@ aap:
     eeImage: "ghcr.io/osac-project/osac-aap:latest"
     projectGitUri: "https://github.com/omer-vishlitzky/osac"
     projectGitBranch: "feat/base-workload-chart-split"
-  instanceGroups:
-    storageFulfillment:
-      enabled: true
 
-# --- Shared PostgreSQL ---
 sharedPostgres:
   enabled: true
   adminUser: "osac_admin"
-
-# --- Validation ---
-validation:
-  enabled: true
 
 certs:
   issuerRef:
@@ -64,3 +44,6 @@ certs:
     name: default-ca
   caBundle:
     configMap: ca-bundle
+
+validation:
+  enabled: true

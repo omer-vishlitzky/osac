@@ -1,9 +1,6 @@
-# Workload layer values for multi-instance (pooltool) deployment.
-# Used with: make install-workload NAMESPACE=pool-xyz VALUES_FILE=values/pooltool/workload-values.yaml
-
+# BMaaS CI — workload layer values (phase 4: per-namespace)
 baseNamespace: osac-base
 
-# --- Operator ---
 operator:
   image:
     repository: ghcr.io/osac-project/osac-operator
@@ -23,17 +20,17 @@ operator:
     tokenFile: "/var/run/secrets/kubernetes.io/serviceaccount/token"
   controllers:
     clusterOrder: false
-    computeInstance: true
+    computeInstance: false
     tenant: true
     networking: true
     storage: true
+    bareMetalInstance: true
   hubAccess:
     enabled: true
   tenants:
   - name: shared
   - name: osac-e2e-ci
 
-# --- Fulfillment Service ---
 service:
   variant: openshift
   images:
@@ -91,11 +88,6 @@ service:
   log:
     level: debug
 
-# --- Shared PostgreSQL ---
-sharedPostgres:
-  enabled: true
-
-# --- UI ---
 ui:
   enabled: true
   images:
@@ -110,18 +102,18 @@ ui:
       caBundle:
         configMap: ca-bundle
 
-# --- CI/dev only ---
-hubAccess:
+sharedPostgres:
   enabled: true
 
-# --- BMF ---
 bmf:
-  enabled: false
+  enabled: true
+  image:
+    repository: ghcr.io/osac-project/bare-metal-fulfillment-operator
+    tag: latest
+    pullPolicy: Always
+  env:
+    aapUrl: "http://osac-aap.osac-base.svc.cluster.local/api/controller"
+    aapInsecureSkipVerify: "true"
 
-# --- Metering ---
-metering:
-  enabled: false
-
-# --- Validation ---
-validation:
-  enabled: false
+hubAccess:
+  enabled: true

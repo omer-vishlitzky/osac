@@ -1,0 +1,63 @@
+# CaaS CI — base layer values (phases 1-3: operators + prereqs + base)
+certManager:
+  enabled: true
+trustManager:
+  enabled: true
+caIssuer:
+  enabled: true
+keycloak:
+  enabled: true
+aapOperator:
+  enabled: true
+lvms:
+  enabled: true
+metallb:
+  enabled: true
+cnv:
+  enabled: false
+mce:
+  enabled: true
+  osImages:
+    - openshiftVersion: "4.22"
+      version: "9.8.20260428-0"
+      url: "https://mirror.openshift.com/pub/openshift-v4/x86_64/dependencies/rhcos/4.22/4.22.0/rhcos-4.22.0-x86_64-live-iso.x86_64.iso"
+      cpuArchitecture: "x86_64"
+
+aap:
+  aap:
+    instance:
+      enabled: true
+      name: "osac-aap"
+  bootstrap:
+    enabled: true
+    image: ghcr.io/osac-project/osac-aap:latest
+    backoffLimit: 15
+  configAsCode:
+    manifestSecret: "config-as-code-manifest-ig"
+    secret: "config-as-code-ig"
+    eeImage: "ghcr.io/osac-project/osac-aap:latest"
+    projectGitUri: "https://github.com/omer-vishlitzky/osac"
+    projectGitBranch: "feat/base-workload-chart-split"
+  instanceGroups:
+    clusterFulfillment:
+      enabled: true
+      config:
+        NETWORK_STEPS_COLLECTION: "ci.steps"
+        HOSTED_CLUSTER_CONTROLLER_AVAILABILITY_POLICY: "SingleReplica"
+        HOSTED_CLUSTER_INFRASTRUCTURE_AVAILABILITY_POLICY: "SingleReplica"
+    networkFulfillment:
+      enabled: true
+
+sharedPostgres:
+  enabled: true
+  adminUser: "osac_admin"
+
+certs:
+  issuerRef:
+    kind: ClusterIssuer
+    name: default-ca
+  caBundle:
+    configMap: ca-bundle
+
+validation:
+  enabled: true
