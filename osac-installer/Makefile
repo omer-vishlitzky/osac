@@ -1,9 +1,9 @@
 INSTALLER_NAMESPACE ?= osac
+BASE_NAMESPACE ?= osac-base
+NAMESPACE ?= $(INSTALLER_NAMESPACE)
 VALUES_FILE ?= values/development/values.yaml
-# Extra helm --set/--set-string args appended to install-osac's install command
-# (e.g. e2e passing component image overrides), so the FIRST install already
-# uses them instead of a separate patch applied after the fact.
 EXTRA_HELM_ARGS ?=
+AAP_LICENSE_FILE ?= $(dir $(VALUES_FILE))license.zip
 
 .PHONY: help
 help: ## Display this help
@@ -12,10 +12,11 @@ help: ## Display this help
 ##@ Installation
 
 .PHONY: install
-install: install-operators install-prereqs install-osac ## Full install (operators + prereqs + OSAC)
+install: install-operators install-prereqs install-base ## Full install (operators + prereqs + base + default workload)
+	$(MAKE) install-workload NAMESPACE=$(NAMESPACE)
 
 .PHONY: wait-for-api
-wait-for-api: ## Wait for the Kubernetes API server to be consistently reachable
+wait-for-api:
 	@echo "Waiting for API server to be reachable..."
 	@for i in $$(seq 1 30); do \
 		if oc get --raw /version >/dev/null 2>&1; then \
@@ -31,14 +32,14 @@ wait-for-api: ## Wait for the Kubernetes API server to be consistently reachable
 	done
 
 .PHONY: wait-for-operators-namespaces
-wait-for-operators-namespaces: ## Wait for operator namespaces left Terminating by a prior uninstall
+wait-for-operators-namespaces:
 	@bash -c 'source scripts/lib.sh && \
 		for ns in ansible-aap cert-manager-operator cert-manager openshift-storage metallb-system multicluster-engine openshift-cnv; do \
 			wait_for_namespace_cleanup "$$ns"; \
 		done'
 
 .PHONY: install-operators
-install-operators: wait-for-api wait-for-operators-namespaces ## Phase 1: Install OLM operators (cert-manager, AAP, LVMS, etc.)
+install-operators: wait-for-api wait-for-operators-namespaces ## Phase 1: Install OLM operators
 	$(eval OCP_VERSION := $(shell oc get clusterversion version -o jsonpath='{.status.desired.version}' | cut -d. -f1,2))
 	helm upgrade --install osac-operators charts/osac-operators/ \
 		--namespace osac-operators --create-namespace \
@@ -47,70 +48,21 @@ install-operators: wait-for-api wait-for-operators-namespaces ## Phase 1: Instal
 		--timeout 30m --wait
 
 .PHONY: wait-for-prereqs-namespaces
-wait-for-prereqs-namespaces: ## Wait for the keycloak namespace left Terminating by a prior uninstall
+wait-for-prereqs-namespaces:
 	@bash -c 'source scripts/lib.sh && wait_for_namespace_cleanup keycloak'
 
 .PHONY: install-prereqs
-install-prereqs: wait-for-prereqs-namespaces ## Phase 2: Configure prerequisites (certificates, keycloak, operator CRs)
+install-prereqs: wait-for-prereqs-namespaces ## Phase 2: Configure prerequisites (certs, keycloak, operator CRs)
 	$(eval OCP_VERSION := $(shell oc get clusterversion version -o jsonpath='{.status.desired.version}' | cut -d. -f1,2))
 	$(eval DOMAIN := $(shell oc get ingresses.config/cluster -o jsonpath='{.spec.domain}'))
 	helm upgrade --install osac-prereqs charts/osac-prereqs/ \
 		--namespace osac-prereqs --create-namespace \
 		--values $(VALUES_FILE) \
-		--set osacNamespace=$(INSTALLER_NAMESPACE) \
+		--set osacNamespace=$(BASE_NAMESPACE) \
 		--set lvms.channel=stable-$(OCP_VERSION) \
 		$(if $(DOMAIN),--set keycloak.hostname=https://keycloak-keycloak.$(DOMAIN)) \
 		$(if $(DOMAIN),--set keycloak.route.hostname=keycloak-keycloak.$(DOMAIN)) \
 		--timeout 30m --wait-for-jobs
-
-AAP_LICENSE_FILE ?= $(dir $(VALUES_FILE))license.zip
-
-.PHONY: install-secrets
-install-secrets: ## Create pre-install secrets (AAP license)
-	@[[ -f "$(AAP_LICENSE_FILE)" ]] || { echo "ERROR: AAP license not found at $(AAP_LICENSE_FILE)"; exit 1; }
-	@bash -c 'source scripts/lib.sh && wait_for_namespace_cleanup "$(INSTALLER_NAMESPACE)"'
-	oc create namespace $(INSTALLER_NAMESPACE) --dry-run=client -o yaml | oc apply -f -
-	# Server-side apply avoids last-applied-configuration (256KiB limit on large
-	# license.zip) while remaining idempotent when the license file changes.
-	oc create secret generic config-as-code-manifest-ig \
-		--from-file=license.zip="$(AAP_LICENSE_FILE)" \
-		-n $(INSTALLER_NAMESPACE) --dry-run=client -o yaml | oc apply --server-side -f -
-	oc label secret config-as-code-manifest-ig \
-		osac.openshift.io/project=osac-aap \
-		-n $(INSTALLER_NAMESPACE) --overwrite
-
-.PHONY: check-postgres
-check-postgres: ## Verify in-cluster PostgreSQL is reachable before installing OSAC
-	@bash -c 'source scripts/lib.sh && check_postgres_prerequisites "$(INSTALLER_NAMESPACE)" "$(VALUES_FILE)"'
-
-.PHONY: install-osac
-install-osac: helm-deps install-secrets check-postgres ## Phase 3: Install OSAC
-	$(eval DOMAIN := $(shell oc get ingresses.config/cluster -o jsonpath='{.spec.domain}'))
-	@[[ -n "$(DOMAIN)" ]] || { echo "ERROR: Could not determine cluster domain. Is oc logged in?"; exit 1; }
-	helm upgrade --install osac charts/osac/ \
-		--namespace $(INSTALLER_NAMESPACE) --create-namespace \
-		--values $(VALUES_FILE) \
-		--set service.externalHostname=fulfillment-api-$(INSTALLER_NAMESPACE).$(DOMAIN) \
-		--set service.internalHostname=fulfillment-internal-api-$(INSTALLER_NAMESPACE).$(DOMAIN) \
-		--set service.auth.issuerUrl=https://keycloak-keycloak.$(DOMAIN)/realms/osac \
-		$(EXTRA_HELM_ARGS) \
-		--timeout 40m --wait
-
-.PHONY: uninstall
-uninstall: ## Full uninstall (OSAC + prereqs + operators)
-	-helm uninstall osac --namespace $(INSTALLER_NAMESPACE) --wait --timeout 20m
-	-helm uninstall osac-prereqs --namespace osac-prereqs --wait --timeout 10m
-	-helm uninstall osac-operators --namespace osac-operators
-
-##@ Multi-Instance Deployment
-
-BASE_NAMESPACE ?= osac-base
-
-.PHONY: install-multi
-install-multi: ## Full multi-instance setup (operators + prereqs + base)
-	$(MAKE) install-operators
-	$(MAKE) install-prereqs INSTALLER_NAMESPACE=$(BASE_NAMESPACE)
-	$(MAKE) install-base
 
 .PHONY: install-base
 install-base: helm-deps-base install-secrets-base ## Phase 3: Install shared base layer (CRDs + AAP + PostgreSQL)
@@ -150,6 +102,15 @@ install-workload: helm-deps-workload copy-base-secrets ## Phase 4: Install workl
 		$(EXTRA_HELM_ARGS) \
 		--timeout 20m --wait
 
+##@ Uninstall
+
+.PHONY: uninstall
+uninstall: ## Full uninstall (workload + base + prereqs + operators)
+	-helm uninstall osac-$(NAMESPACE) --namespace $(NAMESPACE) --wait --timeout 10m
+	-helm uninstall osac-base --namespace $(BASE_NAMESPACE) --wait --timeout 20m
+	-helm uninstall osac-prereqs --namespace osac-prereqs --wait --timeout 10m
+	-helm uninstall osac-operators --namespace osac-operators
+
 .PHONY: uninstall-workload
 uninstall-workload: ## Uninstall workload from NAMESPACE
 	@[[ -n "$(NAMESPACE)" ]] || { echo "ERROR: NAMESPACE is required."; exit 1; }
@@ -173,15 +134,6 @@ copy-base-secrets:
 
 ##@ Helm Chart Management
 
-.PHONY: sync-charts
-sync-charts: ## Update submodules and rebuild chart dependencies
-	git submodule update --init --recursive
-	helm dependency build charts/osac/
-
-.PHONY: helm-deps
-helm-deps: ## Build Helm chart dependencies
-	helm dependency build charts/osac/
-
 .PHONY: helm-deps-base
 helm-deps-base: ## Build base chart dependencies
 	helm dependency build charts/osac-base/
@@ -194,8 +146,6 @@ helm-deps-workload: ## Build workload chart dependencies
 helm-lint: ## Lint all charts
 	helm lint charts/osac-operators/
 	helm lint charts/osac-prereqs/
-	helm dependency build charts/osac/
-	helm lint charts/osac/ --set service.externalHostname=lint --set service.internalHostname=lint
 	helm dependency build charts/osac-base/
 	helm lint charts/osac-base/ -f charts/osac-base/ci/default-values.yaml
 	helm dependency build charts/osac-workload/
@@ -205,17 +155,14 @@ helm-lint: ## Lint all charts
 helm-template: ## Dry-run render all templates
 	helm template osac-operators charts/osac-operators/ --values $(VALUES_FILE)
 	helm template osac-prereqs charts/osac-prereqs/ --values $(VALUES_FILE)
-	helm dependency build charts/osac/
-	helm template osac charts/osac/ --values $(VALUES_FILE)
+	helm dependency build charts/osac-base/
+	helm template osac-base charts/osac-base/ --values $(VALUES_FILE)
+	helm dependency build charts/osac-workload/
+	helm template osac-workload charts/osac-workload/ --values $(VALUES_FILE) \
+		--set service.externalHostname=lint --set service.internalHostname=lint
 
 ##@ Validation
 
 .PHONY: helm-validate
-helm-validate: helm-lint ## Validate all charts (lint + template)
-	@for f in values/*/values.yaml; do \
-		echo "Validating $$f..."; \
-		helm template osac-operators charts/osac-operators/ --values "$$f" > /dev/null; \
-		helm template osac-prereqs charts/osac-prereqs/ --values "$$f" > /dev/null; \
-	done
-	./scripts/validate-keycloak-credentials.sh
+helm-validate: helm-lint ## Validate all charts
 	@echo "Validation passed."
