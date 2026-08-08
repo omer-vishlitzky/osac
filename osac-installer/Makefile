@@ -2,6 +2,7 @@ INSTALLER_NAMESPACE ?= osac
 BASE_NAMESPACE ?= osac-base
 NAMESPACE ?= $(INSTALLER_NAMESPACE)
 VALUES_FILE ?= values/development/values.yaml
+WORKLOAD_VALUES_FILE ?= $(dir $(VALUES_FILE))workload-values.yaml
 EXTRA_HELM_ARGS ?=
 AAP_LICENSE_FILE ?= $(dir $(VALUES_FILE))license.zip
 
@@ -92,7 +93,7 @@ install-workload: helm-deps-workload copy-base-secrets ## Phase 4: Install workl
 	@[[ -n "$(DOMAIN)" ]] || { echo "ERROR: Could not determine cluster domain. Is oc logged in?"; exit 1; }
 	helm upgrade --install osac-$(NAMESPACE) charts/osac-workload/ \
 		--namespace $(NAMESPACE) --create-namespace \
-		--values $(VALUES_FILE) \
+		--values $(WORKLOAD_VALUES_FILE) \
 		--set baseNamespace=$(BASE_NAMESPACE) \
 		--set service.externalHostname=fulfillment-api-$(NAMESPACE).$(DOMAIN) \
 		--set service.internalHostname=fulfillment-internal-api-$(NAMESPACE).$(DOMAIN) \
