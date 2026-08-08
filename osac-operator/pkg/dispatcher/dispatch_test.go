@@ -27,8 +27,10 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
+	privatev1 "github.com/osac-project/osac/osac-operator/internal/api/osac/private/v1"
 	"github.com/osac-project/osac/osac-operator/pkg/dispatcher"
 	"github.com/osac-project/osac/osac-operator/pkg/networkmanager"
+	"google.golang.org/grpc"
 )
 
 var _ = Describe("DispatchTable", func() {
@@ -36,49 +38,42 @@ var _ = Describe("DispatchTable", func() {
 		cfg := dispatcher.LookupDispatchConfig("VirtualNetwork")
 		Expect(cfg).NotTo(BeNil())
 		Expect(cfg.Roles).To(ConsistOf(dispatcher.ManagerRoleFabric))
-		Expect(cfg.K8sFallback).To(BeTrue())
 	})
 
 	It("returns config for Subnet with both roles", func() {
 		cfg := dispatcher.LookupDispatchConfig("Subnet")
 		Expect(cfg).NotTo(BeNil())
 		Expect(cfg.Roles).To(ConsistOf(dispatcher.ManagerRoleFabric, dispatcher.ManagerRoleK8s))
-		Expect(cfg.K8sFallback).To(BeTrue())
 	})
 
 	It("returns config for SecurityGroup", func() {
 		cfg := dispatcher.LookupDispatchConfig("SecurityGroup")
 		Expect(cfg).NotTo(BeNil())
 		Expect(cfg.Roles).To(ConsistOf(dispatcher.ManagerRoleFabric))
-		Expect(cfg.K8sFallback).To(BeTrue())
 	})
 
 	It("returns config for ExternalIP", func() {
 		cfg := dispatcher.LookupDispatchConfig("ExternalIP")
 		Expect(cfg).NotTo(BeNil())
 		Expect(cfg.Roles).To(ConsistOf(dispatcher.ManagerRoleFabric))
-		Expect(cfg.K8sFallback).To(BeTrue())
 	})
 
 	It("returns config for ExternalIPPool", func() {
 		cfg := dispatcher.LookupDispatchConfig("ExternalIPPool")
 		Expect(cfg).NotTo(BeNil())
 		Expect(cfg.Roles).To(ConsistOf(dispatcher.ManagerRoleFabric))
-		Expect(cfg.K8sFallback).To(BeTrue())
 	})
 
 	It("returns config for ExternalIPAttachment", func() {
 		cfg := dispatcher.LookupDispatchConfig("ExternalIPAttachment")
 		Expect(cfg).NotTo(BeNil())
 		Expect(cfg.Roles).To(ConsistOf(dispatcher.ManagerRoleFabric))
-		Expect(cfg.K8sFallback).To(BeTrue())
 	})
 
-	It("returns config for NATGateway with no k8s fallback", func() {
+	It("returns config for NATGateway", func() {
 		cfg := dispatcher.LookupDispatchConfig("NATGateway")
 		Expect(cfg).NotTo(BeNil())
 		Expect(cfg.Roles).To(ConsistOf(dispatcher.ManagerRoleFabric))
-		Expect(cfg.K8sFallback).To(BeFalse())
 	})
 
 	It("returns nil for unknown kind", func() {
@@ -155,19 +150,22 @@ var _ = Describe("Dispatcher", func() {
 		Expect(corev1.AddToScheme(scheme)).To(Succeed())
 	})
 
-	newStubWithManagers := func(fabricName, k8sName string) *stubNetworkClassClient {
-		return &stubNetworkClassClient{
-			getFunc: func(_ context.Context, _ string) (*dispatcher.NetworkClassManagers, error) {
-				return &dispatcher.NetworkClassManagers{
-					FabricManager: fabricName,
-					K8sManager:    k8sName,
+	newStubWithManagers := func(fabricName string, k8sName *string) *stubNetworkClassesClient {
+		return &stubNetworkClassesClient{
+			getFunc: func(_ context.Context, _ *privatev1.NetworkClassesGetRequest, _ ...grpc.CallOption) (*privatev1.NetworkClassesGetResponse, error) {
+				return &privatev1.NetworkClassesGetResponse{
+					Object: &privatev1.NetworkClass{
+						Id:            "nc-test",
+						FabricManager: fabricName,
+						K8SManager:    k8sName,
+					},
 				}, nil
 			},
 		}
 	}
 
 	It("dispatches VirtualNetwork to fabric only", func() {
-		stub := newStubWithManagers("netris", "")
+		stub := newStubWithManagers("netris", nil)
 		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
 			newFabricManagerConfigMap("fm-netris", "netris", "ipv4"),
 		).Build()
@@ -185,7 +183,8 @@ var _ = Describe("Dispatcher", func() {
 	})
 
 	It("dispatches Subnet to fabric + k8s when both configured", func() {
-		stub := newStubWithManagers("neutron", "cudn_localnet")
+		k8sName := "cudn_localnet"
+		stub := newStubWithManagers("neutron", &k8sName)
 		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
 			newFabricManagerConfigMap("fm-neutron", "neutron", "ipv4,ipv6,dualStack"),
 			newK8sManagerConfigMap("km-cudn", "cudn_localnet", "ipv4,ipv6,dualStack"),
@@ -206,7 +205,7 @@ var _ = Describe("Dispatcher", func() {
 	})
 
 	It("dispatches Subnet to fabric only when k8sManager is nil", func() {
-		stub := newStubWithManagers("netris", "")
+		stub := newStubWithManagers("netris", nil)
 		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
 			newFabricManagerConfigMap("fm-netris", "netris", "ipv4"),
 		).Build()
@@ -224,7 +223,7 @@ var _ = Describe("Dispatcher", func() {
 	})
 
 	It("dispatches SecurityGroup to fabric only", func() {
-		stub := newStubWithManagers("netris", "")
+		stub := newStubWithManagers("netris", nil)
 		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
 			newFabricManagerConfigMap("fm-netris", "netris", "ipv4"),
 		).Build()
@@ -241,7 +240,7 @@ var _ = Describe("Dispatcher", func() {
 	})
 
 	It("dispatches NATGateway to fabric only", func() {
-		stub := newStubWithManagers("netris", "")
+		stub := newStubWithManagers("netris", nil)
 		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
 			newFabricManagerConfigMap("fm-netris", "netris", "ipv4"),
 		).Build()
@@ -258,7 +257,7 @@ var _ = Describe("Dispatcher", func() {
 	})
 
 	It("returns error for unknown resource kind", func() {
-		stub := newStubWithManagers("netris", "")
+		stub := newStubWithManagers("netris", nil)
 		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
 			newFabricManagerConfigMap("fm-netris", "netris", "ipv4"),
 		).Build()
@@ -274,98 +273,9 @@ var _ = Describe("Dispatcher", func() {
 		Expect(err.Error()).To(ContainSubstring("UnknownKind"))
 	})
 
-	It("dispatches VirtualNetwork to k8s manager when no fabric manager is set (fallback)", func() {
-		stub := newStubWithManagers("", "cudn_localnet")
-		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
-			newK8sManagerConfigMap("km-cudn", "cudn_localnet", "ipv4,ipv6,dualStack"),
-		).Build()
-
-		disc, err := networkmanager.NewDiscovery(cl, "osac")
-		Expect(err).NotTo(HaveOccurred())
-
-		d := dispatcher.NewDispatcher(dispatcher.NewResolver(stub, disc))
-
-		plan, err := d.Dispatch(ctx, "VirtualNetwork", "nc-test")
-		Expect(err).NotTo(HaveOccurred())
-		Expect(plan.Targets).To(HaveLen(1))
-		Expect(plan.Targets[0].Role).To(Equal(dispatcher.ManagerRoleK8s))
-		Expect(plan.Targets[0].Manager.Name).To(Equal("cudn_localnet"))
-	})
-
-	DescribeTable("dispatches fallback-eligible kinds to the k8s manager when no fabric manager is set",
-		func(kind string) {
-			stub := newStubWithManagers("", "cudn_localnet")
-			cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
-				newK8sManagerConfigMap("km-cudn", "cudn_localnet", "ipv4,ipv6,dualStack"),
-			).Build()
-
-			disc, err := networkmanager.NewDiscovery(cl, "osac")
-			Expect(err).NotTo(HaveOccurred())
-
-			d := dispatcher.NewDispatcher(dispatcher.NewResolver(stub, disc))
-
-			plan, err := d.Dispatch(ctx, kind, "nc-test")
-			Expect(err).NotTo(HaveOccurred())
-			Expect(plan.HasRole(dispatcher.ManagerRoleK8s)).To(BeTrue())
-			Expect(plan.K8sTarget().Manager.Name).To(Equal("cudn_localnet"))
-		},
-		Entry("SecurityGroup", "SecurityGroup"),
-		Entry("ExternalIP", "ExternalIP"),
-		Entry("ExternalIPPool", "ExternalIPPool"),
-		Entry("ExternalIPAttachment", "ExternalIPAttachment"),
-	)
-
-	It("dispatches Subnet to exactly one k8s target when no fabric manager is set (dedupe)", func() {
-		stub := newStubWithManagers("", "cudn_localnet")
-		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
-			newK8sManagerConfigMap("km-cudn", "cudn_localnet", "ipv4,ipv6,dualStack"),
-		).Build()
-
-		disc, err := networkmanager.NewDiscovery(cl, "osac")
-		Expect(err).NotTo(HaveOccurred())
-
-		d := dispatcher.NewDispatcher(dispatcher.NewResolver(stub, disc))
-
-		plan, err := d.Dispatch(ctx, "Subnet", "nc-test")
-		Expect(err).NotTo(HaveOccurred())
-		Expect(plan.Targets).To(HaveLen(1))
-		Expect(plan.Targets[0].Role).To(Equal(dispatcher.ManagerRoleK8s))
-		Expect(plan.Targets[0].Manager.Name).To(Equal("cudn_localnet"))
-	})
-
-	It("returns an error dispatching NATGateway when no fabric manager is set (no fallback)", func() {
-		stub := newStubWithManagers("", "cudn_localnet")
-		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
-			newK8sManagerConfigMap("km-cudn", "cudn_localnet", "ipv4,ipv6,dualStack"),
-		).Build()
-
-		disc, err := networkmanager.NewDiscovery(cl, "osac")
-		Expect(err).NotTo(HaveOccurred())
-
-		d := dispatcher.NewDispatcher(dispatcher.NewResolver(stub, disc))
-
-		_, err = d.Dispatch(ctx, "NATGateway", "nc-test")
-		Expect(err).To(HaveOccurred())
-		Expect(err.Error()).To(ContainSubstring("no manager available"))
-	})
-
-	It("returns an error dispatching a fallback-eligible kind when neither manager is set", func() {
-		stub := newStubWithManagers("", "")
-		cl := fake.NewClientBuilder().WithScheme(scheme).Build()
-
-		disc, err := networkmanager.NewDiscovery(cl, "osac")
-		Expect(err).NotTo(HaveOccurred())
-
-		d := dispatcher.NewDispatcher(dispatcher.NewResolver(stub, disc))
-
-		_, err = d.Dispatch(ctx, "VirtualNetwork", "nc-test")
-		Expect(err).To(HaveOccurred())
-		Expect(err.Error()).To(ContainSubstring("neither fabricManager nor k8sManager is set"))
-	})
-
 	It("propagates resolver errors", func() {
-		stub := &stubNetworkClassClient{
-			getFunc: func(_ context.Context, _ string) (*dispatcher.NetworkClassManagers, error) {
+		stub := &stubNetworkClassesClient{
+			getFunc: func(_ context.Context, _ *privatev1.NetworkClassesGetRequest, _ ...grpc.CallOption) (*privatev1.NetworkClassesGetResponse, error) {
 				return nil, fmt.Errorf("connection refused")
 			},
 		}
