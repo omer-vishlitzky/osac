@@ -1,5 +1,8 @@
 sharedPostgres:
   enabled: false
 
+kafka:
+  enabled: false
+
 validation:
   enabled: false

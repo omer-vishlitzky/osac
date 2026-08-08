@@ -100,6 +100,7 @@ install-workload: helm-deps-workload copy-base-secrets ## Phase 4: Install workl
 		--set service.auth.issuerUrl=https://keycloak-keycloak.$(DOMAIN)/realms/osac \
 		--set operator.consoleProxy.disabled=true \
 		--set operator.aap.url=http://osac-aap.$(BASE_NAMESPACE).svc.cluster.local/api/controller \
+		--set metering.topicPrefix=$(NAMESPACE) \
 		$(EXTRA_HELM_ARGS) \
 		--timeout 20m --wait
 

@@ -13,6 +13,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/IBM/sarama"
@@ -43,11 +44,18 @@ type EventPublisher interface {
 	Publish(ctx context.Context, event cloudevents.Event) error
 }
 
-const (
-	TopicLifecycle   = "osac.metering.lifecycle"
-	TopicHeartbeat   = "osac.metering.heartbeat"
-	TopicCorrections = "osac.metering.corrections"
-	TopicInference   = "osac.metering.inference"
+var topicPrefix = func() string {
+	if p := os.Getenv("OSAC_METERING_TOPIC_PREFIX"); p != "" {
+		return p
+	}
+	return "osac"
+}()
+
+var (
+	TopicLifecycle   = topicPrefix + ".metering.lifecycle"
+	TopicHeartbeat   = topicPrefix + ".metering.heartbeat"
+	TopicCorrections = topicPrefix + ".metering.corrections"
+	TopicInference   = topicPrefix + ".metering.inference"
 )
 
 var Topics = []string{TopicLifecycle, TopicHeartbeat, TopicCorrections}

@@ -1,0 +1,151 @@
+{{- if .Values.metering.enabled }}
+{{- $prefix := .Values.metering.topicPrefix | default .Release.Namespace }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "osac-workload.fullname" . }}-kafka-resources
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "osac-workload.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-5"
+    "helm.sh/hook-delete-policy": before-hook-creation
+data:
+  {{- range list
+    (dict "suffix" "lifecycle"    "partitions" 3 "retentionDays" 30)
+    (dict "suffix" "heartbeat"    "partitions" 3 "retentionDays" 30)
+    (dict "suffix" "inference"    "partitions" 3 "retentionDays" 30)
+    (dict "suffix" "corrections"  "partitions" 3 "retentionDays" 30)
+    (dict "suffix" "dlq"          "partitions" 1 "retentionDays" 90)
+  }}
+  topic-{{ .suffix }}.yaml: |
+    apiVersion: kafka.strimzi.io/v1
+    kind: KafkaTopic
+    metadata:
+      name: {{ $prefix }}.metering.{{ .suffix }}
+      namespace: osac-kafka
+      labels:
+        strimzi.io/cluster: osac-kafka
+        osac.openshift.io/workload-namespace: {{ $.Release.Namespace }}
+    spec:
+      partitions: {{ .partitions }}
+      replicas: 3
+      config:
+        retention.ms: "{{ mul .retentionDays 86400000 }}"
+        min.insync.replicas: "2"
+        cleanup.policy: delete
+  {{- end }}
+  kafka-user.yaml: |
+    apiVersion: kafka.strimzi.io/v1
+    kind: KafkaUser
+    metadata:
+      name: {{ $prefix }}-metering
+      namespace: osac-kafka
+      labels:
+        strimzi.io/cluster: osac-kafka
+        osac.openshift.io/workload-namespace: {{ .Release.Namespace }}
+    spec:
+      authentication:
+        type: scram-sha-512
+      authorization:
+        type: simple
+        acls:
+          - resource:
+              type: topic
+              name: {{ $prefix }}.metering.
+              patternType: prefix
+            operations:
+              - Write
+              - Describe
+            host: "*"
+          - resource:
+              type: cluster
+              name: kafka-cluster
+              patternType: literal
+            operations:
+              - IdempotentWrite
+            host: "*"
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "osac-workload.fullname" . }}-kafka-topics
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "osac-workload.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-4"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 5
+  activeDeadlineSeconds: 900
+  template:
+    metadata:
+      labels:
+        {{- include "osac-workload.labels" . | nindent 8 }}
+    spec:
+      restartPolicy: OnFailure
+      serviceAccountName: {{ include "osac-workload.fullname" . }}-kafka-topics
+      automountServiceAccountToken: true
+      volumes:
+      - name: kafka-resources
+        configMap:
+          name: {{ include "osac-workload.fullname" . }}-kafka-resources
+      - name: tmp
+        emptyDir: {}
+      containers:
+      - name: create-topics
+        image: {{ .Values.cliImage }}
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
+        env:
+        - name: HOME
+          value: /tmp
+        - name: KAFKA_USER_SECRET
+          value: {{ $prefix }}-metering
+        command:
+        - /bin/bash
+        - -euo
+        - pipefail
+        - -c
+        - |
+          echo "Applying Kafka resources..."
+          oc apply -f /config/
+          echo "Kafka resources applied."
+
+          echo "Waiting for Strimzi to create secret ${KAFKA_USER_SECRET}..."
+          for i in $(seq 1 60); do
+            if oc get secret "${KAFKA_USER_SECRET}" -n osac-kafka -o name; then
+              echo "Secret ready."
+              break
+            fi
+            echo "  Attempt ${i}/60, waiting 10s..."
+            sleep 10
+          done
+          oc get secret "${KAFKA_USER_SECRET}" -n osac-kafka -o name
+
+          echo "Copying secret ${KAFKA_USER_SECRET} to {{ .Release.Namespace }}..."
+          PASSWORD=$(oc get secret "${KAFKA_USER_SECRET}" -n osac-kafka -o go-template='{{ "{{" }} index .data "password" {{ "}}" }}' | base64 -d)
+          oc create secret generic "${KAFKA_USER_SECRET}" \
+            --from-literal=password="${PASSWORD}" \
+            -n {{ .Release.Namespace }} \
+            --dry-run=client -o yaml | oc apply -f -
+
+          echo "Done."
+        volumeMounts:
+        - name: kafka-resources
+          mountPath: /config
+        - name: tmp
+          mountPath: /tmp
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            cpu: 200m
+            memory: 128Mi
+{{- end }}

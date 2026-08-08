@@ -48,11 +48,11 @@ osac-kafka-cluster-ca-cert
 {{- end -}}
 
 {{- define "osac-metering.kafkaSaslUsername" -}}
-osac-metering
+{{ .Values.topicPrefix | default "osac" }}-metering
 {{- end -}}
 
 {{- define "osac-metering.kafkaSaslSecretName" -}}
-osac-metering
+{{ .Values.topicPrefix | default "osac" }}-metering
 {{- end -}}
 
 {{- define "osac-metering.kafkaReplicas" -}}

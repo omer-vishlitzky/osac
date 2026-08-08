@@ -26,6 +26,9 @@ sharedPostgres:
       cpu: "1"
       memory: 512Mi
 
+kafka:
+  enabled: false
+
 certs:
   issuerRef:
     kind: ClusterIssuer
