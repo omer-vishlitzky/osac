@@ -220,6 +220,9 @@ func (s *PrivateBareMetalInstancesServer) Create(ctx context.Context,
 	if err = s.validateNetworkAttachments(ctx, request.GetObject()); err != nil {
 		return
 	}
+	if err = s.validateNetworkAttachmentsRequireFabricManager(ctx, request.GetObject()); err != nil {
+		return
+	}
 	err = s.generic.Create(ctx, request, &response)
 	return
 }
@@ -761,6 +764,64 @@ func (s *PrivateBareMetalInstancesServer) validateNetworkAttachments(ctx context
 		}
 	}
 
+	return nil
+}
+
+// validateNetworkAttachmentsRequireFabricManager rejects Create when any network_attachments entry
+// resolves (Subnet -> VirtualNetwork -> NetworkClass) to a NetworkClass with no fabric_manager.
+// BareMetalInstance provisioning is a fabric-level operation with no k8sManager fallback. Attachments
+// whose subnet, virtual network, or network class cannot be found are skipped rather than rejected:
+// resolution to a concrete instance (via AAP) already fails independently for a dangling reference, and
+// many existing fixtures use placeholder subnet IDs that predate this check.
+func (s *PrivateBareMetalInstancesServer) validateNetworkAttachmentsRequireFabricManager(
+	ctx context.Context, bmi *privatev1.BareMetalInstance) error {
+	for i, a := range bmi.GetSpec().GetNetworkAttachments() {
+		subnetKey := refKey(a.GetSubnet())
+		if subnetKey == "" {
+			continue
+		}
+
+		subnetResp, err := s.subnetsDao.Get().SetId(subnetKey).Do(ctx)
+		if err != nil {
+			var notFoundErr *dao.ErrNotFound
+			if errors.As(err, &notFoundErr) {
+				continue
+			}
+			s.logger.ErrorContext(ctx, "Failed to lookup subnet for fabric manager validation",
+				slog.String("subnet_id", subnetKey), slog.Any("error", err))
+			return grpcstatus.Errorf(grpccodes.Internal, "failed to validate network_attachments")
+		}
+
+		virtualNetworkKey := refKey(subnetResp.GetObject().GetSpec().GetVirtualNetwork())
+		vnResp, err := s.virtualNetworksDao.Get().SetId(virtualNetworkKey).Do(ctx)
+		if err != nil {
+			var notFoundErr *dao.ErrNotFound
+			if errors.As(err, &notFoundErr) {
+				continue
+			}
+			s.logger.ErrorContext(ctx, "Failed to lookup virtual network for fabric manager validation",
+				slog.String("virtual_network_id", virtualNetworkKey), slog.Any("error", err))
+			return grpcstatus.Errorf(grpccodes.Internal, "failed to validate network_attachments")
+		}
+
+		networkClassKey := refKey(vnResp.GetObject().GetSpec().GetNetworkClass())
+		ncResp, err := s.networkClassesDao.Get().SetId(networkClassKey).Do(ctx)
+		if err != nil {
+			var notFoundErr *dao.ErrNotFound
+			if errors.As(err, &notFoundErr) {
+				continue
+			}
+			s.logger.ErrorContext(ctx, "Failed to lookup network class for fabric manager validation",
+				slog.String("network_class_id", networkClassKey), slog.Any("error", err))
+			return grpcstatus.Errorf(grpccodes.Internal, "failed to validate network_attachments")
+		}
+
+		if !ncResp.GetObject().HasFabricManager() {
+			return grpcstatus.Errorf(grpccodes.FailedPrecondition,
+				"network_attachments[%d]: subnet '%s' uses NetworkClass '%s' which has no 'fabric_manager'; "+
+					"bare metal instances require a fabric manager", i, subnetKey, networkClassKey)
+		}
+	}
 	return nil
 }
 
