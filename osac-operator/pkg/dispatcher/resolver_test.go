@@ -18,7 +18,6 @@ package dispatcher_test
 
 import (
 	"context"
-	"errors"
 	"fmt"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -28,17 +27,20 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
+	privatev1 "github.com/osac-project/osac/osac-operator/internal/api/osac/private/v1"
 	"github.com/osac-project/osac/osac-operator/pkg/dispatcher"
 	"github.com/osac-project/osac/osac-operator/pkg/networkmanager"
+	"google.golang.org/grpc"
 )
 
-// stubNetworkClassClient implements dispatcher.NetworkClassClient for testing.
-type stubNetworkClassClient struct {
-	getFunc func(ctx context.Context, networkClassID string) (*dispatcher.NetworkClassManagers, error)
+// stubNetworkClassesClient implements privatev1.NetworkClassesClient for testing.
+type stubNetworkClassesClient struct {
+	privatev1.NetworkClassesClient
+	getFunc func(ctx context.Context, in *privatev1.NetworkClassesGetRequest, opts ...grpc.CallOption) (*privatev1.NetworkClassesGetResponse, error)
 }
 
-func (s *stubNetworkClassClient) GetNetworkClass(ctx context.Context, networkClassID string) (*dispatcher.NetworkClassManagers, error) {
-	return s.getFunc(ctx, networkClassID)
+func (s *stubNetworkClassesClient) Get(ctx context.Context, in *privatev1.NetworkClassesGetRequest, opts ...grpc.CallOption) (*privatev1.NetworkClassesGetResponse, error) {
+	return s.getFunc(ctx, in, opts...)
 }
 
 func newFabricManagerConfigMap(name, managerName, capabilities string) *corev1.ConfigMap {
@@ -82,11 +84,16 @@ var _ = Describe("Resolver", func() {
 	})
 
 	It("resolves a fabric-only NetworkClass", func() {
-		stub := &stubNetworkClassClient{
-			getFunc: func(_ context.Context, networkClassID string) (*dispatcher.NetworkClassManagers, error) {
-				Expect(networkClassID).To(Equal("nc-1"))
-				return &dispatcher.NetworkClassManagers{
-					FabricManager: "netris",
+		k8sManagerStr := ""
+		stub := &stubNetworkClassesClient{
+			getFunc: func(_ context.Context, req *privatev1.NetworkClassesGetRequest, _ ...grpc.CallOption) (*privatev1.NetworkClassesGetResponse, error) {
+				Expect(req.GetId()).To(Equal("nc-1"))
+				return &privatev1.NetworkClassesGetResponse{
+					Object: &privatev1.NetworkClass{
+						Id:            "nc-1",
+						FabricManager: "netris",
+						K8SManager:    &k8sManagerStr,
+					},
 				}, nil
 			},
 		}
@@ -100,17 +107,20 @@ var _ = Describe("Resolver", func() {
 
 		result, err := resolver.Resolve(ctx, "nc-1")
 		Expect(err).NotTo(HaveOccurred())
-		Expect(result.FabricManager).NotTo(BeNil())
 		Expect(result.FabricManager.Name).To(Equal("netris"))
 		Expect(result.K8sManager).To(BeNil())
 	})
 
 	It("resolves a NetworkClass with both fabric and k8s managers", func() {
-		stub := &stubNetworkClassClient{
-			getFunc: func(_ context.Context, _ string) (*dispatcher.NetworkClassManagers, error) {
-				return &dispatcher.NetworkClassManagers{
-					FabricManager: "neutron",
-					K8sManager:    "cudn_localnet",
+		k8sManagerName := "cudn_localnet"
+		stub := &stubNetworkClassesClient{
+			getFunc: func(_ context.Context, _ *privatev1.NetworkClassesGetRequest, _ ...grpc.CallOption) (*privatev1.NetworkClassesGetResponse, error) {
+				return &privatev1.NetworkClassesGetResponse{
+					Object: &privatev1.NetworkClass{
+						Id:            "nc-2",
+						FabricManager: "neutron",
+						K8SManager:    &k8sManagerName,
+					},
 				}, nil
 			},
 		}
@@ -125,7 +135,6 @@ var _ = Describe("Resolver", func() {
 
 		result, err := resolver.Resolve(ctx, "nc-2")
 		Expect(err).NotTo(HaveOccurred())
-		Expect(result.FabricManager).NotTo(BeNil())
 		Expect(result.FabricManager.Name).To(Equal("neutron"))
 		Expect(result.FabricManager.Type).To(Equal(networkmanager.FabricManager))
 		Expect(result.K8sManager).NotTo(BeNil())
@@ -134,8 +143,8 @@ var _ = Describe("Resolver", func() {
 	})
 
 	It("returns error when NetworkClass is not found", func() {
-		stub := &stubNetworkClassClient{
-			getFunc: func(_ context.Context, _ string) (*dispatcher.NetworkClassManagers, error) {
+		stub := &stubNetworkClassesClient{
+			getFunc: func(_ context.Context, _ *privatev1.NetworkClassesGetRequest, _ ...grpc.CallOption) (*privatev1.NetworkClassesGetResponse, error) {
 				return nil, fmt.Errorf("rpc error: code = NotFound")
 			},
 		}
@@ -150,69 +159,36 @@ var _ = Describe("Resolver", func() {
 		Expect(err.Error()).To(ContainSubstring("fetching NetworkClass"))
 	})
 
-	It("returns error when the client returns no object", func() {
-		stub := &stubNetworkClassClient{
-			getFunc: func(_ context.Context, _ string) (*dispatcher.NetworkClassManagers, error) {
-				return nil, nil
-			},
-		}
-
-		cl := fake.NewClientBuilder().WithScheme(scheme).Build()
-		disc, err := networkmanager.NewDiscovery(cl, "osac")
-		Expect(err).NotTo(HaveOccurred())
-		resolver := dispatcher.NewResolver(stub, disc)
-
-		_, err = resolver.Resolve(ctx, "nc-no-object")
-		Expect(err).To(HaveOccurred())
-		Expect(err.Error()).To(ContainSubstring("response contains no object"))
-	})
-
-	It("resolves a k8s-only NetworkClass (no fabricManager)", func() {
-		stub := &stubNetworkClassClient{
-			getFunc: func(_ context.Context, _ string) (*dispatcher.NetworkClassManagers, error) {
-				return &dispatcher.NetworkClassManagers{
-					K8sManager: "cudn_localnet",
+	It("returns error when fabricManager is empty", func() {
+		stub := &stubNetworkClassesClient{
+			getFunc: func(_ context.Context, _ *privatev1.NetworkClassesGetRequest, _ ...grpc.CallOption) (*privatev1.NetworkClassesGetResponse, error) {
+				return &privatev1.NetworkClassesGetResponse{
+					Object: &privatev1.NetworkClass{
+						Id:            "nc-empty",
+						FabricManager: "",
+					},
 				}, nil
 			},
 		}
 
-		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
-			newK8sManagerConfigMap("km-cudn", "cudn_localnet", "ipv4,ipv6,dualStack"),
-		).Build()
-		disc, err := networkmanager.NewDiscovery(cl, "osac")
-		Expect(err).NotTo(HaveOccurred())
-		resolver := dispatcher.NewResolver(stub, disc)
-
-		result, err := resolver.Resolve(ctx, "nc-k8s-only")
-		Expect(err).NotTo(HaveOccurred())
-		Expect(result.FabricManager).To(BeNil())
-		Expect(result.K8sManager).NotTo(BeNil())
-		Expect(result.K8sManager.Name).To(Equal("cudn_localnet"))
-	})
-
-	It("returns error when neither fabricManager nor k8sManager is set", func() {
-		stub := &stubNetworkClassClient{
-			getFunc: func(_ context.Context, _ string) (*dispatcher.NetworkClassManagers, error) {
-				return &dispatcher.NetworkClassManagers{}, nil
-			},
-		}
-
 		cl := fake.NewClientBuilder().WithScheme(scheme).Build()
 		disc, err := networkmanager.NewDiscovery(cl, "osac")
 		Expect(err).NotTo(HaveOccurred())
 		resolver := dispatcher.NewResolver(stub, disc)
 
-		_, err = resolver.Resolve(ctx, "nc-no-manager")
+		_, err = resolver.Resolve(ctx, "nc-empty")
 		Expect(err).To(HaveOccurred())
-		Expect(err.Error()).To(ContainSubstring("neither fabricManager nor k8sManager is set"))
-		Expect(errors.Is(err, dispatcher.ErrNoManagerConfigured)).To(BeTrue())
+		Expect(err.Error()).To(ContainSubstring("fabricManager is required but not set"))
 	})
 
 	It("returns error when fabric manager is not registered", func() {
-		stub := &stubNetworkClassClient{
-			getFunc: func(_ context.Context, _ string) (*dispatcher.NetworkClassManagers, error) {
-				return &dispatcher.NetworkClassManagers{
-					FabricManager: "unknown-fabric",
+		stub := &stubNetworkClassesClient{
+			getFunc: func(_ context.Context, _ *privatev1.NetworkClassesGetRequest, _ ...grpc.CallOption) (*privatev1.NetworkClassesGetResponse, error) {
+				return &privatev1.NetworkClassesGetResponse{
+					Object: &privatev1.NetworkClass{
+						Id:            "nc-bad-fabric",
+						FabricManager: "unknown-fabric",
+					},
 				}, nil
 			},
 		}
@@ -229,11 +205,15 @@ var _ = Describe("Resolver", func() {
 	})
 
 	It("returns error when k8s manager is not registered", func() {
-		stub := &stubNetworkClassClient{
-			getFunc: func(_ context.Context, _ string) (*dispatcher.NetworkClassManagers, error) {
-				return &dispatcher.NetworkClassManagers{
-					FabricManager: "netris",
-					K8sManager:    "missing-k8s",
+		k8sManagerName := "missing-k8s"
+		stub := &stubNetworkClassesClient{
+			getFunc: func(_ context.Context, _ *privatev1.NetworkClassesGetRequest, _ ...grpc.CallOption) (*privatev1.NetworkClassesGetResponse, error) {
+				return &privatev1.NetworkClassesGetResponse{
+					Object: &privatev1.NetworkClass{
+						Id:            "nc-bad-k8s",
+						FabricManager: "netris",
+						K8SManager:    &k8sManagerName,
+					},
 				}, nil
 			},
 		}

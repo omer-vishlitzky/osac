@@ -14,9 +14,6 @@ language governing permissions and limitations under the License.
 package servers
 
 import (
-	"fmt"
-
-	"github.com/google/uuid"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	grpccodes "google.golang.org/grpc/codes"
@@ -34,7 +31,6 @@ var _ = Describe("Private NAT gateways server", func() {
 		vnDao             *dao.GenericDAO[*privatev1.VirtualNetwork]
 		externalIPPoolDao *dao.GenericDAO[*privatev1.ExternalIPPool]
 		externalIPDao     *dao.GenericDAO[*privatev1.ExternalIP]
-		networkClassDao   *dao.GenericDAO[*privatev1.NetworkClass]
 		sharedPool        *privatev1.ExternalIPPool
 	)
 
@@ -58,17 +54,10 @@ var _ = Describe("Private NAT gateways server", func() {
 			Build()
 		Expect(err).ToNot(HaveOccurred())
 
-		networkClassDao, err = dao.NewGenericDAO[*privatev1.NetworkClass]().
-			SetLogger(logger).
-			SetTenancyLogic(tenancy).
-			Build()
-		Expect(err).ToNot(HaveOccurred())
-
 		poolResp, err := externalIPPoolDao.Create().SetObject(
 			privatev1.ExternalIPPool_builder{
 				Metadata: privatev1.Metadata_builder{
 					Tenant: auth.SharedTenant,
-					Name:   fmt.Sprintf("test-%s", uuid.NewString()[:8]),
 				}.Build(),
 				Spec: privatev1.ExternalIPPoolSpec_builder{
 					Cidrs: []string{"203.0.113.0/24"},
@@ -85,53 +74,11 @@ var _ = Describe("Private NAT gateways server", func() {
 		sharedPool = poolResp.GetObject()
 	})
 
-	// createNetworkClass creates a NetworkClass with the given managers via the DAO
-	// (bypassing NetworkClass server validation, matching this file's existing fixture pattern).
-	createNetworkClass := func(fabricManager, k8sManager *string) *privatev1.NetworkClass {
-		resp, err := networkClassDao.Create().SetObject(
-			privatev1.NetworkClass_builder{
-				ImplementationStrategy: "test-strategy",
-				FabricManager:          fabricManager,
-				K8SManager:             k8sManager,
-				Metadata: privatev1.Metadata_builder{
-					Tenant: auth.SharedTenant,
-					Name:   fmt.Sprintf("test-%s", uuid.NewString()[:8]),
-				}.Build(),
-			}.Build(),
-		).Do(ctx)
-		Expect(err).ToNot(HaveOccurred())
-		return resp.GetObject()
-	}
-
 	createVirtualNetwork := func() string {
-		nc := createNetworkClass(new("netris"), nil)
 		resp, err := vnDao.Create().SetObject(
 			privatev1.VirtualNetwork_builder{
 				Metadata: privatev1.Metadata_builder{
 					Tenant: auth.SharedTenant,
-					Name:   fmt.Sprintf("test-%s", uuid.NewString()[:8]),
-				}.Build(),
-				Spec: privatev1.VirtualNetworkSpec_builder{
-					NetworkClass: privatev1.NetworkClassReference_builder{Id: nc.GetId()}.Build(),
-				}.Build(),
-			}.Build(),
-		).Do(ctx)
-		Expect(err).ToNot(HaveOccurred())
-		return resp.GetObject().GetId()
-	}
-
-	// createVirtualNetworkWithoutFabricManager creates a VirtualNetwork backed by a k8s-only
-	// NetworkClass (no fabric_manager) for the fabric-manager rejection tests.
-	createVirtualNetworkWithoutFabricManager := func() string {
-		nc := createNetworkClass(nil, new("cudn_localnet"))
-		resp, err := vnDao.Create().SetObject(
-			privatev1.VirtualNetwork_builder{
-				Metadata: privatev1.Metadata_builder{
-					Tenant: auth.SharedTenant,
-					Name:   fmt.Sprintf("test-%s", uuid.NewString()[:8]),
-				}.Build(),
-				Spec: privatev1.VirtualNetworkSpec_builder{
-					NetworkClass: privatev1.NetworkClassReference_builder{Id: nc.GetId()}.Build(),
 				}.Build(),
 			}.Build(),
 		).Do(ctx)
@@ -262,7 +209,7 @@ var _ = Describe("Private NAT gateways server", func() {
 				eip := createAllocatedExternalIP()
 				_, err := natGatewaysServer.Create(ctx, privatev1.NATGatewaysCreateRequest_builder{
 					Object: privatev1.NATGateway_builder{
-						Metadata: privatev1.Metadata_builder{Name: fmt.Sprintf("test-%s", uuid.NewString()[:8]), Tenant: auth.SharedTenant}.Build(),
+						Metadata: privatev1.Metadata_builder{Name: "test-nat-gateway", Tenant: auth.SharedTenant}.Build(),
 						Spec: privatev1.NATGatewaySpec_builder{
 							VirtualNetwork: privatev1.VirtualNetworkLocalReference_builder{Id: vn}.Build(),
 							ExternalIp:     privatev1.ExternalIPLocalReference_builder{Id: eip.GetId()}.Build(),
@@ -277,7 +224,7 @@ var _ = Describe("Private NAT gateways server", func() {
 			Expect(response.GetItems()).To(HaveLen(count))
 		})
 
-		It("Rejects update of the name of NATGateway", func() {
+		It("updates NATGateway metadata", func() {
 			eip := createAllocatedExternalIP()
 			createResponse, err := natGatewaysServer.Create(ctx, privatev1.NATGatewaysCreateRequest_builder{
 				Object: privatev1.NATGateway_builder{
@@ -292,11 +239,11 @@ var _ = Describe("Private NAT gateways server", func() {
 
 			object := createResponse.GetObject()
 			object.GetMetadata().SetName("updated-name")
-			_, err = natGatewaysServer.Update(ctx, privatev1.NATGatewaysUpdateRequest_builder{
+			updateResponse, err := natGatewaysServer.Update(ctx, privatev1.NATGatewaysUpdateRequest_builder{
 				Object: object,
 			}.Build())
-			Expect(err).To(HaveOccurred())
-			Expect(err.Error()).To(ContainSubstring("immutable"))
+			Expect(err).ToNot(HaveOccurred())
+			Expect(updateResponse.GetObject().GetMetadata().GetName()).To(Equal("updated-name"))
 		})
 
 		It("soft deletes NATGateway", func() {
@@ -473,52 +420,6 @@ var _ = Describe("Private NAT gateways server", func() {
 			Expect(err).To(HaveOccurred())
 			Expect(grpcstatus.Code(err)).To(Equal(grpccodes.FailedPrecondition))
 			Expect(err.Error()).To(ContainSubstring("already attached"))
-		})
-	})
-
-	Describe("Fabric manager validation", func() {
-		var natGatewaysServer *PrivateNATGatewaysServer
-
-		BeforeEach(func() {
-			var err error
-			natGatewaysServer, err = NewPrivateNATGatewaysServer().
-				SetLogger(logger).
-				SetAttributionLogic(attribution).
-				SetTenancyLogic(tenancy).
-				Build()
-			Expect(err).ToNot(HaveOccurred())
-		})
-
-		It("rejects Create when the VirtualNetwork's NetworkClass has no fabric_manager", func() {
-			vnID := createVirtualNetworkWithoutFabricManager()
-			eip := createAllocatedExternalIP()
-			_, err := natGatewaysServer.Create(ctx, privatev1.NATGatewaysCreateRequest_builder{
-				Object: privatev1.NATGateway_builder{
-					Metadata: privatev1.Metadata_builder{Tenant: auth.SharedTenant}.Build(),
-					Spec: privatev1.NATGatewaySpec_builder{
-						VirtualNetwork: privatev1.VirtualNetworkLocalReference_builder{Id: vnID}.Build(),
-						ExternalIp:     privatev1.ExternalIPLocalReference_builder{Id: eip.GetId()}.Build(),
-					}.Build(),
-				}.Build(),
-			}.Build())
-			Expect(err).To(HaveOccurred())
-			Expect(grpcstatus.Code(err)).To(Equal(grpccodes.FailedPrecondition))
-			Expect(err.Error()).To(ContainSubstring("fabric_manager"))
-		})
-
-		It("allows Create when the VirtualNetwork's NetworkClass has a fabric_manager", func() {
-			vnID := createVirtualNetwork()
-			eip := createAllocatedExternalIP()
-			_, err := natGatewaysServer.Create(ctx, privatev1.NATGatewaysCreateRequest_builder{
-				Object: privatev1.NATGateway_builder{
-					Metadata: privatev1.Metadata_builder{Tenant: auth.SharedTenant}.Build(),
-					Spec: privatev1.NATGatewaySpec_builder{
-						VirtualNetwork: privatev1.VirtualNetworkLocalReference_builder{Id: vnID}.Build(),
-						ExternalIp:     privatev1.ExternalIPLocalReference_builder{Id: eip.GetId()}.Build(),
-					}.Build(),
-				}.Build(),
-			}.Build())
-			Expect(err).ToNot(HaveOccurred())
 		})
 	})
 

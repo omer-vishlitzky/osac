@@ -14,9 +14,6 @@ language governing permissions and limitations under the License.
 package servers
 
 import (
-	"fmt"
-
-	"github.com/google/uuid"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
@@ -72,7 +69,6 @@ var _ = Describe("Public NAT gateways server", func() {
 			vnDao             *dao.GenericDAO[*privatev1.VirtualNetwork]
 			externalIPPoolDao *dao.GenericDAO[*privatev1.ExternalIPPool]
 			externalIPDao     *dao.GenericDAO[*privatev1.ExternalIP]
-			networkClassDao   *dao.GenericDAO[*privatev1.NetworkClass]
 			sharedPool        *privatev1.ExternalIPPool
 		)
 
@@ -104,17 +100,10 @@ var _ = Describe("Public NAT gateways server", func() {
 				Build()
 			Expect(err).ToNot(HaveOccurred())
 
-			networkClassDao, err = dao.NewGenericDAO[*privatev1.NetworkClass]().
-				SetLogger(logger).
-				SetTenancyLogic(tenancy).
-				Build()
-			Expect(err).ToNot(HaveOccurred())
-
 			poolResp, err := externalIPPoolDao.Create().SetObject(
 				privatev1.ExternalIPPool_builder{
 					Metadata: privatev1.Metadata_builder{
 						Tenant: auth.SharedTenant,
-						Name:   fmt.Sprintf("test-%s", uuid.NewString()[:8]),
 					}.Build(),
 					Spec: privatev1.ExternalIPPoolSpec_builder{
 						Cidrs: []string{"203.0.113.0/24"},
@@ -132,26 +121,10 @@ var _ = Describe("Public NAT gateways server", func() {
 		})
 
 		createVirtualNetwork := func() string {
-			ncResp, err := networkClassDao.Create().SetObject(
-				privatev1.NetworkClass_builder{
-					ImplementationStrategy: "test-strategy",
-					FabricManager:          new("netris"),
-					Metadata: privatev1.Metadata_builder{
-						Tenant: auth.SharedTenant,
-						Name:   fmt.Sprintf("test-%s", uuid.NewString()[:8]),
-					}.Build(),
-				}.Build(),
-			).Do(ctx)
-			Expect(err).ToNot(HaveOccurred())
-
 			resp, err := vnDao.Create().SetObject(
 				privatev1.VirtualNetwork_builder{
 					Metadata: privatev1.Metadata_builder{
 						Tenant: auth.SharedTenant,
-						Name:   fmt.Sprintf("test-%s", uuid.NewString()[:8]),
-					}.Build(),
-					Spec: privatev1.VirtualNetworkSpec_builder{
-						NetworkClass: privatev1.NetworkClassReference_builder{Id: ncResp.GetObject().GetId()}.Build(),
 					}.Build(),
 				}.Build(),
 			).Do(ctx)
@@ -169,9 +142,7 @@ var _ = Describe("Public NAT gateways server", func() {
 			eip := createAllocatedExternalIP()
 			createResp, err := publicServer.Create(ctx, publicv1.NATGatewaysCreateRequest_builder{
 				Object: publicv1.NATGateway_builder{
-					Metadata: publicv1.Metadata_builder{Tenant: auth.SharedTenant,
-						Name: fmt.Sprintf("test-%s", uuid.NewString()[:8]),
-					}.Build(),
+					Metadata: publicv1.Metadata_builder{Tenant: auth.SharedTenant}.Build(),
 					Spec: publicv1.NATGatewaySpec_builder{
 						VirtualNetwork: publicv1.VirtualNetworkLocalReference_builder{Id: vnID}.Build(),
 						ExternalIp:     publicv1.ExternalIPLocalReference_builder{Id: eip.GetId()}.Build(),
@@ -194,9 +165,7 @@ var _ = Describe("Public NAT gateways server", func() {
 				eip := createAllocatedExternalIP()
 				_, err := publicServer.Create(ctx, publicv1.NATGatewaysCreateRequest_builder{
 					Object: publicv1.NATGateway_builder{
-						Metadata: publicv1.Metadata_builder{Tenant: auth.SharedTenant,
-							Name: fmt.Sprintf("test-%s", uuid.NewString()[:8]),
-						}.Build(),
+						Metadata: publicv1.Metadata_builder{Tenant: auth.SharedTenant}.Build(),
 						Spec: publicv1.NATGatewaySpec_builder{
 							VirtualNetwork: publicv1.VirtualNetworkLocalReference_builder{Id: vnID}.Build(),
 							ExternalIp:     publicv1.ExternalIPLocalReference_builder{Id: eip.GetId()}.Build(),
@@ -211,15 +180,12 @@ var _ = Describe("Public NAT gateways server", func() {
 			Expect(listResp.GetItems()).To(HaveLen(3))
 		})
 
-		It("Rejects update of the name of NATGateway", func() {
+		It("updates a NATGateway", func() {
 			vnID := createVirtualNetwork()
 			eip := createAllocatedExternalIP()
 			createResp, err := publicServer.Create(ctx, publicv1.NATGatewaysCreateRequest_builder{
 				Object: publicv1.NATGateway_builder{
-					Metadata: publicv1.Metadata_builder{
-						Tenant: auth.SharedTenant,
-						Name:   fmt.Sprintf("test-%s", uuid.NewString()[:8]),
-					}.Build(),
+					Metadata: publicv1.Metadata_builder{Tenant: auth.SharedTenant}.Build(),
 					Spec: publicv1.NATGatewaySpec_builder{
 						VirtualNetwork: publicv1.VirtualNetworkLocalReference_builder{Id: vnID}.Build(),
 						ExternalIp:     publicv1.ExternalIPLocalReference_builder{Id: eip.GetId()}.Build(),
@@ -230,11 +196,11 @@ var _ = Describe("Public NAT gateways server", func() {
 
 			object := createResp.GetObject()
 			object.GetMetadata().SetName("updated-name")
-			_, err = publicServer.Update(ctx, publicv1.NATGatewaysUpdateRequest_builder{
+			updateResp, err := publicServer.Update(ctx, publicv1.NATGatewaysUpdateRequest_builder{
 				Object: object,
 			}.Build())
-			Expect(err).To(HaveOccurred())
-			Expect(err.Error()).To(ContainSubstring("immutable"))
+			Expect(err).ToNot(HaveOccurred())
+			Expect(updateResp.GetObject().GetMetadata().GetName()).To(Equal("updated-name"))
 		})
 
 		It("deletes a NATGateway", func() {
@@ -244,7 +210,6 @@ var _ = Describe("Public NAT gateways server", func() {
 				Object: publicv1.NATGateway_builder{
 					Metadata: publicv1.Metadata_builder{
 						Tenant: auth.SharedTenant,
-						Name:   fmt.Sprintf("test-%s", uuid.NewString()[:8]),
 					}.Build(),
 					Spec: publicv1.NATGatewaySpec_builder{
 						VirtualNetwork: publicv1.VirtualNetworkLocalReference_builder{Id: vnID}.Build(),
