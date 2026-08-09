@@ -34,8 +34,13 @@ const operatorNamespace = "osac"
 var _ = BeforeSuite(func() {
 	By("verifying controller-manager pod is running with zero restarts")
 	Eventually(func() error {
+		// Scoped to app.kubernetes.io/name=operator (the alias osac-operator's
+		// chart renders as when deployed by the osac umbrella chart) -- the bare
+		// control-plane=controller-manager label is also carried by BMF's pod in
+		// this same shared namespace, so a generic selector could pass while
+		// osac-operator's own pod is down.
 		cmd := exec.Command("kubectl", "get", "pods",
-			"-l", "control-plane=controller-manager",
+			"-l", "control-plane=controller-manager,app.kubernetes.io/name=operator",
 			"-n", operatorNamespace, "-o", "json")
 		output, err := utils.Run(cmd)
 		if err != nil {
@@ -79,8 +84,8 @@ var _ = BeforeSuite(func() {
 			}
 			running++
 		}
-		if running == 0 {
-			return fmt.Errorf("no running controller-manager pods found")
+		if running != 1 {
+			return fmt.Errorf("expected exactly 1 running controller-manager pod, found %d", running)
 		}
 		return nil
 	}, 5*time.Minute, 5*time.Second).Should(Succeed())

@@ -97,6 +97,11 @@ var _ = Describe("Console Proxy", Ordered, func() {
 		_, err := utils.Run(cmd)
 		Expect(err).NotTo(HaveOccurred())
 
+		By("verifying it's listable via the 'ci' shortname")
+		cmd = exec.Command("kubectl", "get", "ci", "test-ci-no-vm", "-n", operatorNamespace)
+		_, err = utils.Run(cmd)
+		Expect(err).NotTo(HaveOccurred())
+
 		By("attempting console access")
 		cmd = exec.Command("kubectl", "get", "--raw",
 			fmt.Sprintf("/apis/console.osac.openshift.io/v1alpha1/namespaces/%s/computeinstances/test-ci-no-vm/console",

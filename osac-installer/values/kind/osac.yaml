@@ -113,6 +113,9 @@ aap:
 # --- Bare Metal Fulfillment (disabled by default) ---
 bmf:
   enabled: false
+  testBackend:
+    metal3:
+      enabled: true
 
 # --- Bundled PostgreSQL for fulfillment-service ---
 bundledPostgres:
