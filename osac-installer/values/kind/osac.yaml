@@ -30,6 +30,14 @@ operator:
     computeInstance: true
     tenant: true
     networking: true
+    # bareMetalInstance is intentionally left unset here (chart default: true) --
+    # the old kind-dev/values-kind.yaml this file replaced explicitly disabled it.
+    # osac-operator's cmd/main.go now registers the BareMetalInstance scheme
+    # whenever networking is enabled regardless of this flag (ExternalIPAttachment
+    # watches BareMetalInstance), so leaving it at the chart default keeps this
+    # consistent with that; not independently re-verified beyond scheme
+    # registration whether osac-operator's own bareMetalInstance controller
+    # running by default here has any other effect on Kind.
     storage: false
   certs:
     issuerRef:
@@ -116,6 +124,12 @@ bmf:
   testBackend:
     metal3:
       enabled: true
+  # Repoint at the fake-backend secrets seeded by
+  # templates/bmf-metal3-test-secrets.yaml -- see that file's comment for why
+  # these are named differently from the (unchanged) real-credential defaults.
+  secrets:
+    inventoryConfig: osac-inventory-config-metal3-test
+    managementConfig: osac-management-config-metal3-test
 
 # --- Bundled PostgreSQL for fulfillment-service ---
 bundledPostgres:

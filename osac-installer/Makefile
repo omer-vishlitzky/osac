@@ -131,9 +131,14 @@ helm-template: ## Dry-run render all templates
 
 .PHONY: helm-validate
 helm-validate: helm-lint ## Validate all charts (lint + template)
-	@for f in values/*/values.yaml; do \
+	@set -e; for f in values/*/values.yaml; do \
 		echo "Validating $$f..."; \
-		helm template osac-operators charts/osac-operators/ --values "$$f" > /dev/null; \
-		helm template osac-prereqs charts/osac-prereqs/ --values "$$f" > /dev/null; \
+		helm template osac-operators charts/osac-operators/ --values "$$f"; \
+		helm template osac-prereqs charts/osac-prereqs/ --values "$$f"; \
 	done
+	@echo "Validating values/kind/prereqs.yaml..."
+	helm template osac-prereqs charts/osac-prereqs/ --values values/kind/prereqs.yaml
+	@echo "Validating values/kind/osac.yaml..."
+	helm dependency build charts/osac/
+	helm template osac charts/osac/ --values values/kind/osac.yaml
 	@echo "Validation passed."
