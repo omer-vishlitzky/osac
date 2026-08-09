@@ -264,6 +264,14 @@ bmf:
     metal3:
       enabled: false
       namespace: ""
+      # Names for the fake Secrets this seeds -- deliberately a separate field
+      # from bmf.secrets.* (the real-credential defaults) rather than derived
+      # from them, since values/kind/osac.yaml also overrides bmf.secrets.* to
+      # point at these same names, and deriving one from the other here would
+      # be circular. See templates/bmf-metal3-test-secrets.yaml.
+      secretNames:
+        inventoryConfig: "osac-inventory-config-metal3-test"
+        managementConfig: "osac-management-config-metal3-test"
   configMaps:
     profiles: "osac-profiles"
   env:

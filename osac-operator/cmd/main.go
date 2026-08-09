@@ -879,8 +879,8 @@ func main() {
 		TLSOpts: tlsOpts,
 	})
 
-	// Metrics endpoint is enabled in 'config/default/kustomization.yaml'. The Metrics options configure the server.
-	// More info:
+	// Metrics endpoint is enabled by the Helm chart (charts/operator/templates/).
+	// The Metrics options configure the server. More info:
 	// - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.19.0/pkg/metrics/server
 	// - https://book.kubebuilder.io/reference/metrics.html
 	metricsServerOptions := metricsserver.Options{

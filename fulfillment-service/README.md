@@ -186,7 +186,12 @@ it:
 
 The project includes integration tests that run against a real Kubernetes cluster created using
 [kind](https://kind.sigs.k8s.io). These tests verify the end-to-end functionality of the fulfillment
-service by deploying it to a temporary cluster and exercising the APIs.
+service by deploying it to that cluster and exercising the APIs.
+
+The cluster itself is not created or torn down by the tests -- from the `osac-workspace/osac` repo
+root, run `make dev-env` once (creates the Kind cluster and installs prerequisites + the `osac` chart),
+then `ginkgo run it` here to build/load the fulfillment-service image, deploy it, and run the suite.
+The cluster is reused across runs; tear it down when done with `make teardown` from the repo root.
 
 The integration tests use TLS with SNI (_Server Name Indication_) routing through the Envoy Gateway.
 This means that the services are accessed using their Kubernetes internal host names, but routed
@@ -212,42 +217,28 @@ To run the integration tests:
 $ ginkgo run it
 ```
 
-The integration tests will automatically:
+Each run will:
 
-1. Create a kind cluster named "fulfillment-service-it".
-2. Build and load the container image.
+1. Connect to the pre-existing Kind cluster (fails if `make dev-env` hasn't been run yet).
+2. Build and load the fulfillment-service container image.
 3. Deploy the fulfillment service.
 4. Run all test cases.
-5. Clean up the kind cluster.
 
-### Preserving the test cluster
+The cluster is left running afterwards either way -- there is no "preserve vs. clean up" choice to
+make per run, unlike the old per-run-cluster model. `IT_KEEP_KIND` still exists but only controls
+whether cluster diagnostic logs are dumped on failure; it no longer affects cluster lifetime.
 
-By default, the kind cluster is deleted after the tests complete. If you want to preserve the cluster
-for debugging or manual inspection, you can set the `IT_KEEP_KIND` environment variable:
+The `setup` label gets you a deployed environment without running any actual test, useful for manual
+poking:
 
 ```bash
-$ IT_KEEP_KIND=true ginkgo run it
+$ ginkgo run --label-filter setup it
 ```
 
-When `IT_KEEP_KIND=true`, the cluster will remain running after the tests finish, allowing you to:
-- Inspect the deployed resources with `kubectl`.
-- Debug test failures manually.
-- Examine logs and cluster state.
-
-The `setup` label can be combined with this to get a fresh integration environment where you can then
-run your manual tests:
+To tear down the cluster when you're done, from the `osac-workspace/osac` repo root:
 
 ```bash
-$ IT_KEEP_KIND=true ginkgo run --label-filter setup it
-```
-
-That will create the Kind cluster, install the dependencies and deploy the application, but will not
-run any actual test.
-
-To clean up a preserved cluster manually:
-
-```bash
-$ kind delete cluster --name fulfillment-service-it
+$ make teardown
 ```
 
 ### Secret for passwords and credentials
