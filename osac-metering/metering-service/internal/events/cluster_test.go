@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 
 	cloudevents "github.com/cloudevents/sdk-go/v2"
 	. "github.com/onsi/ginkgo/v2"
@@ -352,7 +353,8 @@ var _ = Describe("CaaS Cluster Mapper", func() {
 
 		It("DecomposeClusterComponents works on fresh (non-JSONB) output", func() {
 			dims := events.ClusterBillingDimensions(cl)
-			records := events.DecomposeClusterComponents(dims)
+			records, err := events.DecomposeClusterComponents(dims)
+			Expect(err).NotTo(HaveOccurred())
 			Expect(records).To(HaveLen(3))
 			Expect(records[0].NodeSet).To(Equal("_control_plane"))
 			Expect(records[0].Component).To(Equal("control_plane"))
@@ -524,7 +526,8 @@ var _ = Describe("DecomposeClusterComponents", func() {
 			},
 		}
 
-		records := events.DecomposeClusterComponents(dims)
+		records, err := events.DecomposeClusterComponents(dims)
+		Expect(err).NotTo(HaveOccurred())
 		Expect(records).To(HaveLen(3))
 
 		Expect(records[0].NodeSet).To(Equal("_control_plane"))
@@ -554,19 +557,70 @@ var _ = Describe("DecomposeClusterComponents", func() {
 			},
 		}
 
-		records := events.DecomposeClusterComponents(dims)
+		records, err := events.DecomposeClusterComponents(dims)
+		Expect(err).NotTo(HaveOccurred())
 		Expect(records).To(HaveLen(2))
 		Expect(records[0].NodeCount).To(Equal(int32(1)))
 		Expect(records[1].NodeCount).To(Equal(int32(2)))
 	})
 
-	It("returns nil when no components key", func() {
+	It("returns ErrDataQuality when no components key", func() {
 		dims := map[string]any{"cluster_template": "tmpl"}
-		Expect(events.DecomposeClusterComponents(dims)).To(BeNil())
+		_, err := events.DecomposeClusterComponents(dims)
+		Expect(errors.Is(err, events.ErrDataQuality)).To(BeTrue())
 	})
 
-	It("returns nil for empty dims", func() {
-		Expect(events.DecomposeClusterComponents(map[string]any{})).To(BeNil())
+	It("returns ErrDataQuality for empty dims", func() {
+		_, err := events.DecomposeClusterComponents(map[string]any{})
+		Expect(errors.Is(err, events.ErrDataQuality)).To(BeTrue())
+	})
+
+	It("rejects a component with fractional node_count instead of billing a truncated value", func() {
+		dims := map[string]any{
+			"cluster_template": "tmpl",
+			"components": []any{
+				map[string]any{"node_set": "gpu-workers", "component": "worker", "host_type": "gpu-h100", "node_count": 2.7},
+			},
+		}
+		_, err := events.DecomposeClusterComponents(dims)
+		Expect(errors.Is(err, events.ErrDataQuality)).To(BeTrue(),
+			"a corrupt fractional node_count must not silently produce a truncated billed value")
+	})
+
+	It("rejects a component with negative node_count", func() {
+		dims := map[string]any{
+			"cluster_template": "tmpl",
+			"components": []any{
+				map[string]any{"node_set": "gpu-workers", "component": "worker", "host_type": "gpu-h100", "node_count": -1.0},
+			},
+		}
+		_, err := events.DecomposeClusterComponents(dims)
+		Expect(errors.Is(err, events.ErrDataQuality)).To(BeTrue())
+	})
+
+	It("rejects a component with node_count exceeding int32 range", func() {
+		dims := map[string]any{
+			"cluster_template": "tmpl",
+			"components": []any{
+				map[string]any{"node_set": "gpu-workers", "component": "worker", "host_type": "gpu-h100", "node_count": float64(math.MaxInt32) + 1},
+			},
+		}
+		_, err := events.DecomposeClusterComponents(dims)
+		Expect(errors.Is(err, events.ErrDataQuality)).To(BeTrue(),
+			"an out-of-range node_count must not silently wrap to a negative or truncated billed value")
+	})
+
+	It("rejects the whole decomposition when one sibling's node_count is corrupt, rather than leaking partial results", func() {
+		dims := map[string]any{
+			"cluster_template": "tmpl",
+			"components": []any{
+				map[string]any{"node_set": "_control_plane", "component": "control_plane", "host_type": "_control_plane", "node_count": int32(1)},
+				map[string]any{"node_set": "gpu-workers", "component": "worker", "host_type": "gpu-h100", "node_count": -1.0},
+			},
+		}
+		records, err := events.DecomposeClusterComponents(dims)
+		Expect(errors.Is(err, events.ErrDataQuality)).To(BeTrue())
+		Expect(records).To(BeNil(), "a corrupt component must fail the whole decomposition, not leak partial results for its healthy siblings")
 	})
 })
 
@@ -642,7 +696,8 @@ var _ = Describe("ChangedComponents", func() {
 			},
 		}
 
-		changed := events.ChangedComponents(oldDims, newDims)
+		changed, err := events.ChangedComponents(oldDims, newDims)
+		Expect(err).NotTo(HaveOccurred())
 		Expect(changed).To(HaveLen(1))
 		Expect(changed[0].HostType).To(Equal("gpu-h100"))
 		Expect(changed[0].NodeCount).To(Equal(int32(4)))
@@ -656,7 +711,9 @@ var _ = Describe("ChangedComponents", func() {
 			},
 		}
 
-		Expect(events.ChangedComponents(dims, dims)).To(BeEmpty())
+		changed, err := events.ChangedComponents(dims, dims)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(changed).To(BeEmpty())
 	})
 
 	It("detects newly added worker node set", func() {
@@ -674,7 +731,8 @@ var _ = Describe("ChangedComponents", func() {
 			},
 		}
 
-		changed := events.ChangedComponents(oldDims, newDims)
+		changed, err := events.ChangedComponents(oldDims, newDims)
+		Expect(err).NotTo(HaveOccurred())
 		Expect(changed).To(HaveLen(1))
 		Expect(changed[0].HostType).To(Equal("gpu-h100"))
 	})
@@ -694,7 +752,8 @@ var _ = Describe("ChangedComponents", func() {
 			},
 		}
 
-		changed := events.ChangedComponents(oldDims, newDims)
+		changed, err := events.ChangedComponents(oldDims, newDims)
+		Expect(err).NotTo(HaveOccurred())
 		Expect(changed).To(HaveLen(1))
 		Expect(changed[0].HostType).To(Equal("gpu-h100"))
 		Expect(changed[0].NodeCount).To(Equal(int32(0)))
@@ -717,7 +776,8 @@ var _ = Describe("ChangedComponents", func() {
 			},
 		}
 
-		changed := events.ChangedComponents(oldDims, newDims)
+		changed, err := events.ChangedComponents(oldDims, newDims)
+		Expect(err).NotTo(HaveOccurred())
 		Expect(changed).To(HaveLen(2))
 
 		nodeSetToHostType := map[string]string{}
@@ -750,7 +810,8 @@ var _ = Describe("ChangedComponents", func() {
 			},
 		}
 
-		changed := events.ChangedComponents(oldDims, newDims)
+		changed, err := events.ChangedComponents(oldDims, newDims)
+		Expect(err).NotTo(HaveOccurred())
 		Expect(changed).To(HaveLen(2))
 
 		byNodeSet := map[string]events.ComponentRecord{}
@@ -780,10 +841,53 @@ var _ = Describe("ChangedComponents", func() {
 			},
 		}
 
-		changed := events.ChangedComponents(oldDims, newDims)
+		changed, err := events.ChangedComponents(oldDims, newDims)
+		Expect(err).NotTo(HaveOccurred())
 		Expect(changed).To(HaveLen(1))
 		Expect(changed[0].HostType).To(Equal("gpu-a100"))
 		Expect(changed[0].NodeCount).To(Equal(int32(2)))
+	})
+
+	It("detects cluster_template change with unchanged node_count and host_type", func() {
+		oldDims := map[string]any{
+			"cluster_template": "ocp-ci-small",
+			"components": []any{
+				map[string]any{"node_set": "gpu-workers", "component": "worker", "host_type": "gpu-h100", "node_count": int32(2)},
+			},
+		}
+		newDims := map[string]any{
+			"cluster_template": "ocp-ci-large",
+			"components": []any{
+				map[string]any{"node_set": "gpu-workers", "component": "worker", "host_type": "gpu-h100", "node_count": int32(2)},
+			},
+		}
+
+		changed, err := events.ChangedComponents(oldDims, newDims)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(changed).To(HaveLen(1), "a cluster_template-only change must still be reported so it can be published")
+		Expect(changed[0].ClusterTemplate).To(Equal("ocp-ci-large"))
+	})
+
+	It("detects release_image change with unchanged node_count and host_type", func() {
+		oldDims := map[string]any{
+			"cluster_template": "tmpl",
+			"release_image":    "quay.io/openshift-release-dev/ocp-release:4.17.0-x86_64",
+			"components": []any{
+				map[string]any{"node_set": "gpu-workers", "component": "worker", "host_type": "gpu-h100", "node_count": int32(2)},
+			},
+		}
+		newDims := map[string]any{
+			"cluster_template": "tmpl",
+			"release_image":    "quay.io/openshift-release-dev/ocp-release:4.18.0-x86_64",
+			"components": []any{
+				map[string]any{"node_set": "gpu-workers", "component": "worker", "host_type": "gpu-h100", "node_count": int32(2)},
+			},
+		}
+
+		changed, err := events.ChangedComponents(oldDims, newDims)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(changed).To(HaveLen(1), "a cluster upgrade (release_image-only change) must still be reported so it can be published")
+		Expect(changed[0].ReleaseImage).To(Equal("quay.io/openshift-release-dev/ocp-release:4.18.0-x86_64"))
 	})
 
 	It("handles int32 vs float64 from JSONB round-trip", func() {
@@ -800,7 +904,9 @@ var _ = Describe("ChangedComponents", func() {
 			},
 		}
 
-		Expect(events.ChangedComponents(oldDims, newDims)).To(BeEmpty())
+		changed, err := events.ChangedComponents(oldDims, newDims)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(changed).To(BeEmpty())
 	})
 })
 

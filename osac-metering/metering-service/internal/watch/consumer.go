@@ -295,7 +295,10 @@ func (c *Consumer) handleScalingEvent(ctx context.Context, event *privatev1.Even
 
 	return c.publishAndUpsert(ctx, func() error {
 		if mapper.ResourceType() == events.ResourceTypeClusterOrder {
-			changed := events.ChangedComponents(existing.BillingDimensions, dims)
+			changed, err := events.ChangedComponents(existing.BillingDimensions, dims)
+			if err != nil {
+				return err
+			}
 			if len(changed) == 0 {
 				c.logger.V(1).Info("non-component dimension change, projection updated",
 					"resource_id", resourceID)
@@ -307,7 +310,6 @@ func (c *Consumer) handleScalingEvent(ctx context.Context, event *privatev1.Even
 					scalingCtx = &events.StateContext{
 						PreviousState: stateCtx.PreviousState,
 						WasBillable:   stateCtx.WasBillable,
-						NewDimensions: stateCtx.NewDimensions,
 					}
 				}
 				ce, ceErr := c.buildScalingEvent(
@@ -358,6 +360,9 @@ func (c *Consumer) buildComponentEvent(baseCE *cloudevents.Event, eventID string
 	if err := baseCE.DataAs(&baseData); err != nil {
 		return ce, fmt.Errorf("reading base event data: %w", err)
 	}
+	if baseData == nil {
+		baseData = map[string]any{}
+	}
 
 	baseData["billing_dimensions"] = dims
 	if err := ce.SetData(cloudevents.ApplicationJSON, baseData); err != nil {
@@ -379,25 +384,7 @@ func (c *Consumer) buildScalingEvent(eventID string, mapper events.ResourceMappe
 	}
 	events.SetOSACExtensions(&ce, mapper.ResourceID(), mapper.ResourceType(), mapper.TenantID(), projectID)
 
-	var prevStatePtr *string
-	if stateCtx.PreviousState != "" {
-		prevStatePtr = &stateCtx.PreviousState
-	}
-
-	data := map[string]any{
-		"resource_id":        mapper.ResourceID(),
-		"resource_type":      mapper.ResourceType(),
-		"tenant_id":          mapper.TenantID(),
-		"project_id":         mapper.ProjectID(),
-		"catalog_item_id":    mapper.CatalogItemID(),
-		"template_id":        mapper.TemplateID(),
-		"previous_state":     prevStatePtr,
-		"current_state":      mapper.CurrentState(),
-		"transition_time":    transitionTime.Format(time.RFC3339Nano),
-		"duration_seconds":   stateCtx.DurationSeconds,
-		"billing_dimensions": dims,
-		"schema_version":     "v1",
-	}
+	data := events.BuildLifecycleData(mapper, dims, stateCtx.PreviousState, stateCtx.DurationSeconds, transitionTime)
 	if err := ce.SetData(cloudevents.ApplicationJSON, data); err != nil {
 		return ce, fmt.Errorf("setting scaling event data: %w", err)
 	}
@@ -464,7 +451,6 @@ func (c *Consumer) buildStateContext(existing *projection.ResourceState, nowBill
 	sc := &events.StateContext{
 		PreviousState: existing.CurrentState,
 		WasBillable:   existing.IsBillable,
-		NewDimensions: newDims,
 	}
 
 	if existing.IsBillable && existing.BillableSince != nil {

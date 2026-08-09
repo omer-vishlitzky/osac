@@ -1378,7 +1378,8 @@ var _ = Describe("Consumer", func() {
 				BillableSince:      &billableStart,
 				FulfillmentVersion: 1,
 				BillingDimensions: map[string]any{
-					"cluster_template": "tmpl",
+					"cluster_template": "ocp-ci-small",
+					"release_image":    "4.17.0",
 					"components": []any{
 						map[string]any{"node_set": "_control_plane", "component": "control_plane", "host_type": "_control_plane", "node_count": int32(1)},
 					},
@@ -1432,6 +1433,7 @@ var _ = Describe("Consumer", func() {
 				FulfillmentVersion: 1,
 				BillingDimensions: map[string]any{
 					"cluster_template": "ocp-ci-small",
+					"release_image":    "4.17.0",
 					"components": []any{
 						map[string]any{"node_set": "_control_plane", "component": "control_plane", "host_type": "_control_plane", "node_count": int32(1)},
 						map[string]any{"node_set": "gpu-workers", "component": "worker", "host_type": "gpu-h100", "node_count": int32(2)},

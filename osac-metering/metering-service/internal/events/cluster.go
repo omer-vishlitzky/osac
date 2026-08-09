@@ -11,6 +11,7 @@ package events
 
 import (
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 	"time"
@@ -254,19 +255,22 @@ func (cr ComponentRecord) FlatBillingDimensions() map[string]any {
 
 // DecomposeClusterComponents extracts N+1 component records from stored
 // billing dimensions. Used by Watch Consumer, Heartbeat Generator, and
-// Reconciler to fan out one cluster into per-component events.
-func DecomposeClusterComponents(billingDims map[string]any) []ComponentRecord {
+// Reconciler to fan out one cluster into per-component events. Returns
+// ErrDataQuality if any component's node_count is corrupt — the caller must
+// not proceed on a partial or wrong decomposition (fail fast, consistent
+// with every other data-quality check in this package).
+func DecomposeClusterComponents(billingDims map[string]any) ([]ComponentRecord, error) {
 	clusterTemplate, _ := billingDims["cluster_template"].(string)
 	releaseImage, _ := billingDims[DimensionReleaseImage].(string)
 
 	componentsRaw, ok := billingDims["components"]
 	if !ok {
-		return nil
+		return nil, fmt.Errorf("%w: billing dimensions have no components", ErrDataQuality)
 	}
 
 	components, ok := componentsRaw.([]any)
 	if !ok {
-		return nil
+		return nil, fmt.Errorf("%w: billing dimensions components is not a list (got %T)", ErrDataQuality, componentsRaw)
 	}
 
 	records := make([]ComponentRecord, 0, len(components))
@@ -281,6 +285,9 @@ func DecomposeClusterComponents(billingDims map[string]any) []ComponentRecord {
 
 		var nodeCount int32
 		if nc, ok := toFloat64(cm["node_count"]); ok {
+			if nc != math.Trunc(nc) || nc < 0 || nc > math.MaxInt32 {
+				return nil, fmt.Errorf("%w: node_count %v for node_set %q is not a valid non-negative int32", ErrDataQuality, nc, nodeSet)
+			}
 			nodeCount = int32(nc)
 		}
 
@@ -294,7 +301,7 @@ func DecomposeClusterComponents(billingDims map[string]any) []ComponentRecord {
 		})
 	}
 
-	return records
+	return records, nil
 }
 
 // ComponentEventID derives a deterministic CloudEvent ID for a decomposed
@@ -307,7 +314,10 @@ func ComponentEventID(baseEventID string, comp ComponentRecord) string {
 // Returns error if billing dimensions have no components (data quality issue).
 // buildFn receives (per-component billing dimensions, deterministic event ID).
 func DecomposeClusterEvents(billingDims map[string]any, baseID string, buildFn EventBuilder) ([]cloudevents.Event, error) {
-	components := DecomposeClusterComponents(billingDims)
+	components, err := DecomposeClusterComponents(billingDims)
+	if err != nil {
+		return nil, err
+	}
 	if len(components) == 0 {
 		return nil, fmt.Errorf("%w: cluster has no components in billing dimensions", ErrDataQuality)
 	}
@@ -324,11 +334,21 @@ func DecomposeClusterEvents(billingDims map[string]any, baseID string, buildFn E
 }
 
 // ChangedComponents compares old and new billing dimensions and returns
-// component records that changed: node_count differs, newly added, or removed.
+// component records that changed — including newly added or removed node
+// sets. "Changed" is defined as "the component's billing-relevant wire
+// representation differs" (via FlatBillingDimensions + DimensionsEqual),
+// the same equality used to gate entry into this comparison in the first
+// place — so this can never miss a field DimensionsEqual would catch.
 // Removed components are returned with NodeCount=0.
-func ChangedComponents(oldDims, newDims map[string]any) []ComponentRecord {
-	oldRecords := DecomposeClusterComponents(oldDims)
-	newRecords := DecomposeClusterComponents(newDims)
+func ChangedComponents(oldDims, newDims map[string]any) ([]ComponentRecord, error) {
+	oldRecords, err := DecomposeClusterComponents(oldDims)
+	if err != nil {
+		return nil, err
+	}
+	newRecords, err := DecomposeClusterComponents(newDims)
+	if err != nil {
+		return nil, err
+	}
 
 	oldByKey := make(map[string]ComponentRecord, len(oldRecords))
 	for _, r := range oldRecords {
@@ -340,7 +360,7 @@ func ChangedComponents(oldDims, newDims map[string]any) []ComponentRecord {
 	for _, r := range newRecords {
 		newByKey[r.NodeSet] = true
 		old, exists := oldByKey[r.NodeSet]
-		if !exists || old.NodeCount != r.NodeCount || old.HostType != r.HostType {
+		if !exists || !DimensionsEqual(old.FlatBillingDimensions(), r.FlatBillingDimensions()) {
 			r.IsNew = !exists
 			changed = append(changed, r)
 		}
@@ -359,5 +379,5 @@ func ChangedComponents(oldDims, newDims map[string]any) []ComponentRecord {
 		}
 	}
 
-	return changed
+	return changed, nil
 }

@@ -54,17 +54,29 @@ func (s *mockStore) UpdateLastHeartbeat(_ context.Context, ids []string, at time
 }
 
 type mockPublisher struct {
-	mu        sync.Mutex
-	published []cloudevents.Event
-	err       error
-	failAfter int
-	callCount int
+	mu             sync.Mutex
+	published      []cloudevents.Event
+	err            error
+	failAfter      int
+	callCount      int
+	failResourceID string // if set, Publish persistently fails for this resource's events only
 }
 
 func (p *mockPublisher) Publish(_ context.Context, event cloudevents.Event) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.callCount++
+	if p.failResourceID != "" {
+		// Self-contained mode: only this resource's events fail, regardless
+		// of failAfter/err, which drive the (mutually exclusive) call-count-based mode below.
+		if rid, err := event.Context.GetExtension("osacresourceid"); err == nil {
+			if s, ok := rid.(string); ok && s == p.failResourceID {
+				return p.err
+			}
+		}
+		p.published = append(p.published, event)
+		return nil
+	}
 	if p.failAfter > 0 && p.callCount > p.failAfter {
 		return p.err
 	}
@@ -192,6 +204,32 @@ var _ = Describe("Generator", func() {
 			store.mu.Lock()
 			defer store.mu.Unlock()
 			Expect(store.updatedIDs).To(HaveLen(2))
+		})
+
+		It("still heartbeats other resources when one resource's publish persistently fails", func() {
+			store := &mockStore{
+				billable: []projection.ResourceState{
+					makeBillableState("vm-fail"),
+					makeBillableState("vm-ok"),
+				},
+			}
+			pub := &mockPublisher{
+				err:            fmt.Errorf("kafka unavailable"),
+				failResourceID: "vm-fail",
+			}
+			gen := heartbeat.NewGenerator(store, pub, logr.Discard(), 100*time.Millisecond)
+
+			ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+			defer cancel()
+
+			err := gen.Run(ctx)
+			Expect(err).ToNot(HaveOccurred())
+
+			store.mu.Lock()
+			defer store.mu.Unlock()
+			Expect(store.updatedIDs).To(ContainElement("vm-ok"),
+				"a resource whose publish fails must not block heartbeats for other resources in the same tick")
+			Expect(store.updatedIDs).NotTo(ContainElement("vm-fail"))
 		})
 
 		It("fails tick when ListBillable returns error", func() {

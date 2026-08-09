@@ -16,7 +16,6 @@ import (
 
 	cloudevents "github.com/cloudevents/sdk-go/v2"
 	"github.com/go-logr/logr"
-	"github.com/google/uuid"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 
@@ -92,9 +91,10 @@ func (g *Generator) tick(ctx context.Context) error {
 	now := time.Now().UTC()
 	var publishedIDs []string
 
-	// Partial checkpoint: on Kafka failure, already-published IDs are checkpointed
-	// to prevent duplicate heartbeats on retry. At scale (>10K VMs), consider
-	// Kafka transactional producer for atomic batch publish.
+	// One resource's publish failure is isolated to that resource: it is
+	// skipped for this tick (so its checkpoint does not advance and the
+	// reconciler's stale-heartbeat detection picks it back up), but it does
+	// not block heartbeats for the other resources in the same tick.
 	for i := range billable {
 		hbEvents, ceErr := g.buildHeartbeatEvents(&billable[i], now)
 		if ceErr != nil {
@@ -102,26 +102,34 @@ func (g *Generator) tick(ctx context.Context) error {
 				"resource_id", billable[i].ResourceID)
 			continue
 		}
-		for j := range hbEvents {
-			if err := g.publisher.Publish(ctx, hbEvents[j]); err != nil {
-				if len(publishedIDs) > 0 {
-					if cpErr := g.store.UpdateLastHeartbeat(ctx, publishedIDs, now); cpErr != nil {
-						g.logger.Error(cpErr, "failed to checkpoint partial heartbeat progress",
-							"published", len(publishedIDs))
-					}
-				}
-				return fmt.Errorf("publishing heartbeat for %s: %w", billable[i].ResourceID, err)
-			}
+		if !g.publishResourceHeartbeats(ctx, hbEvents, billable[i].ResourceID) {
+			continue
 		}
 		publishedIDs = append(publishedIDs, billable[i].ResourceID)
 	}
 
-	if err := g.store.UpdateLastHeartbeat(ctx, publishedIDs, now); err != nil {
-		return fmt.Errorf("updating last heartbeat: %w", err)
+	if len(publishedIDs) > 0 {
+		if err := g.store.UpdateLastHeartbeat(ctx, publishedIDs, now); err != nil {
+			return fmt.Errorf("updating last heartbeat: %w", err)
+		}
 	}
 
-	g.logger.Info("heartbeat tick completed", "count", len(publishedIDs))
+	g.logger.Info("heartbeat tick completed", "published", len(publishedIDs), "total", len(billable))
 	return nil
+}
+
+// publishResourceHeartbeats publishes every event in one resource's N+1
+// fan-out. A failure partway through means the resource is not checkpointed
+// this tick, but it does not prevent other resources from heartbeating.
+func (g *Generator) publishResourceHeartbeats(ctx context.Context, hbEvents []cloudevents.Event, resourceID string) bool {
+	for j := range hbEvents {
+		if err := g.publisher.Publish(ctx, hbEvents[j]); err != nil {
+			g.logger.Error(err, "publishing heartbeat, resource will not be checkpointed this tick",
+				"resource_id", resourceID)
+			return false
+		}
+	}
+	return true
 }
 
 func (g *Generator) buildHeartbeatEvents(state *projection.ResourceState, now time.Time) ([]cloudevents.Event, error) {
@@ -129,7 +137,12 @@ func (g *Generator) buildHeartbeatEvents(state *projection.ResourceState, now ti
 		return g.buildHeartbeatEvent(state, eventID, dims, now)
 	}
 
-	return events.BuildResourceEvents(state.ResourceType, state.BillingDimensions, uuid.NewString(), buildFn)
+	// Base ID should be reproducible for a given resource and heartbeat
+	// window, so that building this same tick's events more than once —
+	// e.g. a future in-tick retry — reproduces the same per-component
+	// CloudEvent IDs.
+	baseID := fmt.Sprintf("hb/%s/%d", state.ResourceID, now.Truncate(g.interval).Unix())
+	return events.BuildResourceEvents(state.ResourceType, state.BillingDimensions, baseID, buildFn)
 }
 
 func (g *Generator) buildHeartbeatEvent(state *projection.ResourceState, eventID string, dims map[string]any, now time.Time) (cloudevents.Event, error) {

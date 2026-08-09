@@ -36,7 +36,6 @@ type StateContext struct {
 	WasBillable     bool
 	BillableSince   *time.Time
 	DurationSeconds *float64
-	NewDimensions   map[string]any
 }
 
 // MapWatchEvent converts a fulfillment-service Watch Event into a CloudEvents 1.0
@@ -76,26 +75,7 @@ func MapWatchEvent(event *privatev1.Event, mapper ResourceMapper, stateCtx *Stat
 	}
 	SetOSACExtensions(&ce, mapper.ResourceID(), mapper.ResourceType(), mapper.TenantID(), projectID)
 
-	var prevStatePtr *string
-	if stateCtx.PreviousState != "" {
-		prevStatePtr = &stateCtx.PreviousState
-	}
-	durationPtr := stateCtx.DurationSeconds
-
-	data := meteringData{
-		ResourceID:        mapper.ResourceID(),
-		ResourceType:      mapper.ResourceType(),
-		TenantID:          mapper.TenantID(),
-		ProjectID:         mapper.ProjectID(),
-		CatalogItemID:     mapper.CatalogItemID(),
-		TemplateID:        mapper.TemplateID(),
-		PreviousState:     prevStatePtr,
-		CurrentState:      mapper.CurrentState(),
-		TransitionTime:    transitionTime.Format(time.RFC3339Nano),
-		DurationSeconds:   durationPtr,
-		BillingDimensions: billingDims,
-		SchemaVersion:     "v1",
-	}
+	data := BuildLifecycleData(mapper, billingDims, stateCtx.PreviousState, stateCtx.DurationSeconds, transitionTime)
 	if err := ce.SetData(cloudevents.ApplicationJSON, data); err != nil {
 		return nil, fmt.Errorf("setting CloudEvent data: %w", err)
 	}
@@ -121,8 +101,11 @@ func mapperForEvent(event *privatev1.Event) (ResourceMapper, error) {
 	return nil, fmt.Errorf("unsupported event payload type for event %s", event.GetId())
 }
 
-// meteringData is the shared JSON payload for all resource types.
-type meteringData struct {
+// LifecycleData is the shared JSON payload for lifecycle and scaling events
+// across all resource types. Exported and built exclusively through
+// BuildLifecycleData so every producer (MapWatchEvent, and the Watch
+// Consumer's scaling-event builder) emits the identical shape.
+type LifecycleData struct {
 	ResourceID        string         `json:"resource_id"`
 	ResourceType      string         `json:"resource_type"`
 	TenantID          string         `json:"tenant_id"`
@@ -135,6 +118,29 @@ type meteringData struct {
 	DurationSeconds   *float64       `json:"duration_seconds"`
 	BillingDimensions map[string]any `json:"billing_dimensions"`
 	SchemaVersion     string         `json:"schema_version"`
+}
+
+// BuildLifecycleData constructs the shared lifecycle/scaling event payload
+// from a resource mapper.
+func BuildLifecycleData(mapper ResourceMapper, billingDims map[string]any, previousState string, durationSeconds *float64, transitionTime time.Time) LifecycleData {
+	var prevStatePtr *string
+	if previousState != "" {
+		prevStatePtr = &previousState
+	}
+	return LifecycleData{
+		ResourceID:        mapper.ResourceID(),
+		ResourceType:      mapper.ResourceType(),
+		TenantID:          mapper.TenantID(),
+		ProjectID:         mapper.ProjectID(),
+		CatalogItemID:     mapper.CatalogItemID(),
+		TemplateID:        mapper.TemplateID(),
+		PreviousState:     prevStatePtr,
+		CurrentState:      mapper.CurrentState(),
+		TransitionTime:    transitionTime.Format(time.RFC3339Nano),
+		DurationSeconds:   durationSeconds,
+		BillingDimensions: billingDims,
+		SchemaVersion:     "v1",
+	}
 }
 
 func NilIfEmpty(s string) *string {

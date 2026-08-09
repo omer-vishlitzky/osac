@@ -477,12 +477,28 @@ func (r *Reconciler) loadClusters(ctx context.Context, result map[string]fulfill
 }
 
 func buildSyntheticHeartbeats(ps projection.ResourceState, now time.Time) ([]cloudevents.Event, error) {
-	baseID := fmt.Sprintf("synthetic-hb/%s/%d", ps.ResourceID, now.UTC().Unix())
+	baseID := fmt.Sprintf("synthetic-hb/%s/%d", ps.ResourceID, staleReferencePoint(ps, now).Unix())
 	buildFn := func(dims map[string]any, eventID string) (cloudevents.Event, error) {
 		return buildSingleSyntheticHeartbeat(ps, dims, eventID, now)
 	}
 
 	return events.BuildResourceEvents(ps.ResourceType, ps.BillingDimensions, baseID, buildFn)
+}
+
+// staleReferencePoint returns the timestamp identifying the billing gap a
+// synthetic heartbeat is catching up on, rather than the moment reconciliation
+// happened to run. Keying the CloudEvent base ID off this value means retries
+// across reconciliation cycles for the SAME unresolved gap reproduce the SAME
+// ID (so adapter-side ID dedup recognizes them as the same logical catch-up),
+// while a genuinely new gap (LastHeartbeatAt has since advanced) gets a new one.
+func staleReferencePoint(ps projection.ResourceState, now time.Time) time.Time {
+	if ps.LastHeartbeatAt != nil {
+		return *ps.LastHeartbeatAt
+	}
+	if ps.BillableSince != nil {
+		return *ps.BillableSince
+	}
+	return now
 }
 
 func buildSingleSyntheticHeartbeat(ps projection.ResourceState, billingDims map[string]any, eventID string, now time.Time) (cloudevents.Event, error) {

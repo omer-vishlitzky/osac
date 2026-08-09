@@ -10,7 +10,9 @@ in compliance with the License. You may obtain a copy of the License at
 package reconciliation
 
 import (
+	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"time"
 
 	cloudevents "github.com/cloudevents/sdk-go/v2"
@@ -73,7 +75,8 @@ func buildCorrectionEvents(
 	interval *AffectedInterval,
 	now time.Time,
 ) ([]cloudevents.Event, error) {
-	baseID := fmt.Sprintf("correction/%s/%s/%s/%s", resourceID, reason, projectionState, sourceState)
+	baseID := fmt.Sprintf("correction/%s/%s/%s/%s/%s", resourceID, reason, projectionState, sourceState,
+		correctionFingerprint(billingDimensions, interval))
 	buildFn := func(dims map[string]any, eventID string) (cloudevents.Event, error) {
 		ce, err := buildCorrectionEvent(resourceID, resourceType, tenantID, projectID,
 			reason, projectionState, sourceState, dims, interval, now)
@@ -85,6 +88,24 @@ func buildCorrectionEvents(
 	}
 
 	return events.BuildResourceEvents(resourceType, billingDimensions, baseID, buildFn)
+}
+
+// correctionFingerprint discriminates corrections that share resourceID,
+// reason, and states but describe different discrepancies (e.g. two separate
+// billing_dimensions_drift detections for the same resource while it stays
+// in the same state). Content-based rather than time-based: repeat detection
+// of the SAME unresolved discrepancy across reconciliation cycles must keep
+// producing the SAME ID so it dedups as the design intends ("duplicate
+// corrections... are acceptable"), while a genuinely different discrepancy
+// must not collide with a prior one and get silently dropped.
+func correctionFingerprint(billingDimensions map[string]any, interval *AffectedInterval) string {
+	enc, _ := json.Marshal(struct {
+		Dims     map[string]any    `json:"dims"`
+		Interval *AffectedInterval `json:"interval,omitempty"`
+	}{billingDimensions, interval})
+	h := fnv.New64a()
+	_, _ = h.Write(enc)
+	return fmt.Sprintf("%x", h.Sum64())
 }
 
 func buildCorrectionEvent(
