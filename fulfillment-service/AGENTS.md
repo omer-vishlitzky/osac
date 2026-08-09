@@ -72,18 +72,24 @@ ginkgo run -r
 
 ### Integration Tests
 
+IT assumes a pre-existing Kind cluster with the `osac` chart already deployed --
+it no longer creates or tears down the cluster itself. From the `osac-workspace/osac`
+repo root: `make dev-env` once, then `make integration-test-fulfillment` (which
+builds+loads the service image and re-deploys before running IT), or run `ginkgo`
+directly against an already-deployed cluster:
+
 ```bash
-# Run integration tests (creates a kind cluster)
+# One-time: create the Kind cluster + deploy prereqs/osac (root Makefile)
+make dev-env
+
+# Run integration tests against the running cluster
 ginkgo run it
 
-# Preserve cluster for debugging
-IT_KEEP_KIND=true ginkgo run it
+# Run only setup (connect + verify the pre-existing deployment, no tests)
+ginkgo run --label-filter=setup it
 
-# Run only setup (create cluster without tests)
-IT_KEEP_KIND=true ginkgo run --label-filter=setup it
-
-# Clean up preserved cluster
-kind delete cluster --name fulfillment-service-it
+# Clean up the cluster when done
+kind delete cluster --name osac-dev  # or: make teardown (from repo root)
 ```
 
 Requires `/etc/hosts` entries:
@@ -284,7 +290,7 @@ As with any proto change, run `uv run dev.py lint proto && buf generate` afterwa
 - `SERVICE_SUFFIX` lint rule is intentionally excluded in `buf.yaml`
 - Unit tests: run `ginkgo run -r internal` (not `ginkgo run -r`) to avoid triggering integration tests
 - CI timeout: 1 hour for unit and integration test runs
-- Integration test logs uploaded as `logs-helm` and `logs-kustomize` artifacts (always, even on failure)
+- Integration test logs uploaded as the `logs` artifact (always, even on failure)
 
 See [Linting and Code Generation](#linting-and-code-generation) for the required `uv run dev.py lint proto && buf generate` step, and [Files Requiring Extra Caution](#files-requiring-extra-caution) for generated paths that must never be hand-edited.
 

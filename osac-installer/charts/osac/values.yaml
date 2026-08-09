@@ -247,6 +247,11 @@ bmf:
     inventoryConfig: "osac-inventory-config"
     managementConfig: "osac-management-config"
     osClouds: "osac-os-clouds"
+  # Kind/IT only -- see templates/bmf-metal3-test-secrets.yaml
+  testBackend:
+    metal3:
+      enabled: false
+      namespace: ""
   configMaps:
     profiles: "osac-profiles"
   env:

@@ -142,11 +142,17 @@ var _ = Describe("Manager", Ordered, func() {
 
 		It("should ensure the metrics endpoint is serving metrics", func() {
 			By("creating a ClusterRoleBinding for the service account to allow access to metrics")
-			cmd := exec.Command("kubectl", "create", "clusterrolebinding", metricsRoleBindingName,
+			// Delete any leftover binding first -- this suite runs against a
+			// persistent, reused Kind cluster rather than a fresh one per run.
+			cmd := exec.Command("kubectl", "delete", "clusterrolebinding", metricsRoleBindingName, "--ignore-not-found")
+			_, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "Failed to delete leftover ClusterRoleBinding")
+
+			cmd = exec.Command("kubectl", "create", "clusterrolebinding", metricsRoleBindingName,
 				"--clusterrole=bmf-operator-metrics-reader",
 				fmt.Sprintf("--serviceaccount=%s:%s", namespace, serviceAccountName),
 			)
-			_, err := utils.Run(cmd)
+			_, err = utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred(), "Failed to create ClusterRoleBinding")
 
 			By("validating that the metrics service is available")
@@ -179,6 +185,13 @@ var _ = Describe("Manager", Ordered, func() {
 			Eventually(verifyMetricsServerStarted).Should(Succeed())
 
 			By("creating the curl-metrics pod to access the metrics endpoint")
+			// Delete any leftover pod first -- same reused-cluster reasoning as
+			// the ClusterRoleBinding above; a stale Succeeded pod from a prior
+			// run would otherwise make the next run report last run's output.
+			cmd = exec.Command("kubectl", "delete", "pod", "curl-metrics", "-n", namespace, "--ignore-not-found")
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "Failed to delete leftover curl-metrics pod")
+
 			cmd = exec.Command("kubectl", "run", "curl-metrics", "--restart=Never",
 				"--namespace", namespace,
 				"--image=curlimages/curl:latest",

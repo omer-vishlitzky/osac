@@ -82,7 +82,7 @@ install-fake-crds: ## Install fake CRDs for HyperShift, KubeVirt, OVN-K
 		case "$$(basename "$$f")" in \
 			kustomization.yaml|*osac.openshift.io*) continue ;; \
 		esac; \
-		kubectl apply --server-side -f "$$f"; \
+		kubectl apply --server-side --force-conflicts -f "$$f"; \
 	done
 
 ##@ Integration Tests
@@ -117,6 +117,7 @@ integration-test-operator: ## Run osac-operator integration tests
 integration-test-bmf: ## Run bare-metal-fulfillment-operator integration tests
 	$(CONTAINER_TOOL) build -t localhost/bmf-operator:it -f bare-metal-fulfillment-operator/Containerfile .
 	$(call kind-load-image,localhost/bmf-operator:it)
+	kubectl apply --server-side --force-conflicts -f bare-metal-fulfillment-operator/test/crds/
 	helm upgrade --install osac $(OSAC_CHART) \
 		-f $(KIND_OSAC_VALUES) \
 		--set bmf.enabled=true \
@@ -124,15 +125,15 @@ integration-test-bmf: ## Run bare-metal-fulfillment-operator integration tests
 		--set bmf.image.tag=it \
 		--set bmf.image.pullPolicy=Never \
 		--namespace $(OSAC_NAMESPACE) --wait --timeout 5m
-	kubectl apply --server-side -f bare-metal-fulfillment-operator/test/crds/
 	cd bare-metal-fulfillment-operator && ginkgo run --timeout 30m -v test/integration
 
 ##@ Full Environment (opt-in)
 
 .PHONY: install-kubevirt
 install-kubevirt: ## Install KubeVirt + CDI + Multus (for compute instance testing)
-	@echo "Installing Multus..."
-	kubectl apply -f https://raw.githubusercontent.com/k8snetworkplumbingwg/multus-cni/master/deployments/multus-daemonset.yml
+	@MULTUS_VERSION=$$(curl -sL "https://api.github.com/repos/k8snetworkplumbingwg/multus-cni/releases/latest" | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": "\(.*\)".*/\1/'); \
+	echo "Installing Multus $${MULTUS_VERSION}..."; \
+	kubectl apply -f "https://raw.githubusercontent.com/k8snetworkplumbingwg/multus-cni/$${MULTUS_VERSION}/deployments/multus-daemonset.yml"
 	@KUBEVIRT_VERSION=$$(curl -sL https://storage.googleapis.com/kubevirt-prow/release/kubevirt/kubevirt/stable.txt); \
 	echo "Installing KubeVirt $${KUBEVIRT_VERSION}..."; \
 	kubectl apply -f "https://github.com/kubevirt/kubevirt/releases/download/$${KUBEVIRT_VERSION}/kubevirt-operator.yaml"; \

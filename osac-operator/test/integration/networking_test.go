@@ -105,6 +105,19 @@ var _ = Describe("Networking Resources", Ordered, func() {
 			output, err = utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(string(output)).To(Equal("cudn-net"))
+
+			cmd = exec.Command("kubectl", "get", "virtualnetwork", virtualNetworkName,
+				"-n", operatorNamespace, "-o", "jsonpath={.spec.implementationStrategy}")
+			output, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(string(output)).To(Equal("cudn-net"))
+		})
+
+		It("should be listable with shortname", func() {
+			cmd := exec.Command("kubectl", "get", "vnet", "-n", operatorNamespace)
+			output, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(string(output)).To(ContainSubstring(virtualNetworkName))
 		})
 
 		It("should have a finalizer added by controller", func() {
@@ -147,6 +160,27 @@ var _ = Describe("Networking Resources", Ordered, func() {
 				}
 				return nil
 			}, 30*time.Second, time.Second).Should(Succeed())
+		})
+
+		It("should have correct spec fields", func() {
+			cmd := exec.Command("kubectl", "get", "subnet", subnetName,
+				"-n", operatorNamespace, "-o", "jsonpath={.spec.virtualNetwork}")
+			output, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(string(output)).To(Equal(virtualNetworkName))
+
+			cmd = exec.Command("kubectl", "get", "subnet", subnetName,
+				"-n", operatorNamespace, "-o", "jsonpath={.spec.ipv4Cidr}")
+			output, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(string(output)).To(Equal("10.0.1.0/24"))
+		})
+
+		It("should be listable with shortname", func() {
+			cmd := exec.Command("kubectl", "get", "subnet", "-n", operatorNamespace)
+			output, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(string(output)).To(ContainSubstring(subnetName))
 		})
 
 		It("should have a finalizer added by controller", func() {
