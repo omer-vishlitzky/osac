@@ -656,7 +656,6 @@ var _ = Describe("Reconciler", func() {
 
 	Describe("CaaS cluster reconciliation", func() {
 		makeClusterProto := func(id, tenant string, state privatev1.ClusterState, version int32) *privatev1.Cluster {
-			versionName := "4.17.0"
 			return &privatev1.Cluster{
 				Id: id,
 				Metadata: &privatev1.Metadata{
@@ -664,8 +663,8 @@ var _ = Describe("Reconciler", func() {
 					Version: version,
 				},
 				Spec: &privatev1.ClusterSpec{
-					Template:    &privatev1.ClusterTemplateReference{Name: "ocp-ci-small"},
-					VersionName: &versionName,
+					Template: &privatev1.ClusterTemplateReference{Name: "ocp-ci-small"},
+					Version:  &privatev1.ClusterVersionReference{Id: "4.17.0", Name: "4.17.0"},
 					NodeSets: map[string]*privatev1.ClusterNodeSet{
 						"gpu-workers": {HostType: &privatev1.HostTypeReference{Name: "gpu-h100"}, Size: 2},
 					},

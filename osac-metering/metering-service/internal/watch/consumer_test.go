@@ -983,7 +983,6 @@ var _ = Describe("Consumer", func() {
 
 	Describe("CaaS Cluster events", func() {
 		makeCluster := func(id, tenant string, state privatev1.ClusterState, nodeSets map[string]*privatev1.ClusterNodeSet) *privatev1.Cluster {
-			versionName := "4.17.0"
 			return &privatev1.Cluster{
 				Id: id,
 				Metadata: &privatev1.Metadata{
@@ -992,9 +991,9 @@ var _ = Describe("Consumer", func() {
 					CreationTimestamp: timestamppb.Now(),
 				},
 				Spec: &privatev1.ClusterSpec{
-					Template:    &privatev1.ClusterTemplateReference{Name: "ocp-ci-small"},
-					VersionName: &versionName,
-					NodeSets:    nodeSets,
+					Template: &privatev1.ClusterTemplateReference{Name: "ocp-ci-small"},
+					Version:  &privatev1.ClusterVersionReference{Id: "4.17.0", Name: "4.17.0"},
+					NodeSets: nodeSets,
 				},
 				Status: &privatev1.ClusterStatus{
 					State:               state,
@@ -1327,7 +1326,12 @@ var _ = Describe("Consumer", func() {
 				BillableSince:      &now,
 				FulfillmentVersion: 1,
 				BillingDimensions:  clusterBillingDims(),
-				TransitionTime:     now,
+				ComponentBillableSince: map[string]time.Time{
+					"_control_plane": now,
+					"cpu-workers":    now,
+					"gpu-workers":    now,
+				},
+				TransitionTime: now,
 			}
 
 			// Scale gpu-h100 from 2 to 4, cpu-only stays at 3
@@ -1439,6 +1443,10 @@ var _ = Describe("Consumer", func() {
 						map[string]any{"node_set": "gpu-workers", "component": "worker", "host_type": "gpu-h100", "node_count": int32(2)},
 					},
 				},
+				ComponentBillableSince: map[string]time.Time{
+					"_control_plane": billableStart,
+					"gpu-workers":    billableStart,
+				},
 				TransitionTime: billableStart,
 			}
 
@@ -1483,6 +1491,86 @@ var _ = Describe("Consumer", func() {
 			Expect(eventsByNodeSet).To(HaveKey("tpu-workers"))
 			Expect(eventsByNodeSet["tpu-workers"]["duration_seconds"]).To(BeNil(),
 				"newly-added component should have nil duration_seconds (no prior interval)")
+		})
+
+		It("computes duration_seconds from each component's own last change, not the cluster-wide reset, across two sequential scaling events", func() {
+			store := newMockStore()
+			t0 := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+			t1 := t0.Add(1 * time.Hour)
+			t2 := t0.Add(3 * time.Hour)
+
+			store.states["cl-staggered"] = projection.ResourceState{
+				ResourceID:         "cl-staggered",
+				ResourceType:       events.ResourceTypeClusterOrder,
+				TenantID:           "tenant-1",
+				CurrentState:       "READY",
+				IsBillable:         true,
+				BillableSince:      &t0,
+				FulfillmentVersion: 1,
+				BillingDimensions:  clusterBillingDims(),
+				ComponentBillableSince: map[string]time.Time{
+					"_control_plane": t0,
+					"cpu-workers":    t0,
+					"gpu-workers":    t0,
+				},
+				TransitionTime: t0,
+			}
+
+			// T1: cpu-workers scales 3->5, gpu-workers stays at 2 (unchanged since T0).
+			clAtT1 := makeCluster("cl-staggered", "tenant-1", privatev1.ClusterState_CLUSTER_STATE_READY, map[string]*privatev1.ClusterNodeSet{
+				"cpu-workers": {HostType: &privatev1.HostTypeReference{Name: "cpu-only"}, Size: 5},
+				"gpu-workers": {HostType: &privatev1.HostTypeReference{Name: "gpu-h100"}, Size: 2},
+			})
+			clAtT1.Status.StateTransitionTime = timestamppb.New(t1)
+			eventT1 := &privatev1.Event{
+				Id:      "evt-t1",
+				Type:    privatev1.EventType_EVENT_TYPE_OBJECT_UPDATED,
+				Payload: &privatev1.Event_Cluster{Cluster: clAtT1},
+			}
+
+			// T2: gpu-workers scales 2->4, cpu-workers stays at 5 (unchanged since T1).
+			clAtT2 := makeCluster("cl-staggered", "tenant-1", privatev1.ClusterState_CLUSTER_STATE_READY, map[string]*privatev1.ClusterNodeSet{
+				"cpu-workers": {HostType: &privatev1.HostTypeReference{Name: "cpu-only"}, Size: 5},
+				"gpu-workers": {HostType: &privatev1.HostTypeReference{Name: "gpu-h100"}, Size: 4},
+			})
+			clAtT2.Status.StateTransitionTime = timestamppb.New(t2)
+			eventT2 := &privatev1.Event{
+				Id:      "evt-t2",
+				Type:    privatev1.EventType_EVENT_TYPE_OBJECT_UPDATED,
+				Payload: &privatev1.Event_Cluster{Cluster: clAtT2},
+			}
+
+			stream := &mockWatchStream{
+				responses: []*privatev1.EventsWatchResponse{makeResponse(eventT1), makeResponse(eventT2)},
+			}
+			client.results = []mockStreamResult{{stream: stream}}
+
+			pub := &mockPublisher{published: make([]cloudevents.Event, 0, 2), cancelFunc: cancel}
+			consumer := newConsumerWithStore(pub, store)
+
+			err := consumer.Run(ctx)
+			Expect(err).ToNot(HaveOccurred())
+
+			pub.mu.Lock()
+			defer pub.mu.Unlock()
+			Expect(pub.published).To(HaveLen(2))
+
+			eventsByNodeSet := map[string]map[string]any{}
+			for _, e := range pub.published {
+				var data map[string]any
+				Expect(json.Unmarshal(e.Data(), &data)).To(Succeed())
+				bd := data["billing_dimensions"].(map[string]any)
+				eventsByNodeSet[bd["node_set"].(string)] = data
+			}
+
+			Expect(eventsByNodeSet).To(HaveKey("cpu-workers"))
+			Expect(eventsByNodeSet["cpu-workers"]["duration_seconds"]).To(BeNumerically("~", t1.Sub(t0).Seconds(), 1),
+				"cpu-workers' first-ever change should close a 1-hour interval since T0")
+
+			Expect(eventsByNodeSet).To(HaveKey("gpu-workers"))
+			Expect(eventsByNodeSet["gpu-workers"]["duration_seconds"]).To(BeNumerically("~", t2.Sub(t0).Seconds(), 1),
+				"gpu-workers was unchanged since T0, so its closed interval must span T0->T2 (3 hours), "+
+					"not T1->T2 (2 hours) from the cluster-wide reset caused by cpu-workers' unrelated change")
 		})
 
 		It("advances projection version on same-state-same-dims update with higher version", func() {

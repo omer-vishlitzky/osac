@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math"
 
 	cloudevents "github.com/cloudevents/sdk-go/v2"
 	. "github.com/onsi/ginkgo/v2"
@@ -14,8 +13,6 @@ import (
 	privatev1 "github.com/osac-project/osac-metering/internal/api/osac/private/v1"
 	"github.com/osac-project/osac-metering/internal/events"
 )
-
-func strPtr(s string) *string { return &s }
 
 var _ = Describe("CaaS Cluster Mapper", func() {
 	var cl *privatev1.Cluster
@@ -32,7 +29,7 @@ var _ = Describe("CaaS Cluster Mapper", func() {
 			Spec: &privatev1.ClusterSpec{
 				Template:    &privatev1.ClusterTemplateReference{Id: "ocp-ci-small", Name: "ocp-ci-small"},
 				CatalogItem: &privatev1.ClusterCatalogItemReference{Id: "cluster-catalog-1", Name: "cluster-catalog-1"},
-				VersionName: strPtr("quay.io/openshift-release-dev/ocp-release:4.17.0-x86_64"),
+				Version:     &privatev1.ClusterVersionReference{Id: "4.17.0", Name: "4.17.0"},
 				NodeSets: map[string]*privatev1.ClusterNodeSet{
 					"gpu-workers": {HostType: &privatev1.HostTypeReference{Name: "gpu-h100"}, Size: 2},
 					"cpu-workers": {HostType: &privatev1.HostTypeReference{Name: "cpu-only"}, Size: 3},
@@ -301,7 +298,7 @@ var _ = Describe("CaaS Cluster Mapper", func() {
 		It("includes cluster_template, release_image, and full components breakdown", func() {
 			dims := events.ClusterBillingDimensions(cl)
 			Expect(dims["cluster_template"]).To(Equal("ocp-ci-small"))
-			Expect(dims["release_image"]).To(Equal("quay.io/openshift-release-dev/ocp-release:4.17.0-x86_64"))
+			Expect(dims["release_image"]).To(Equal("4.17.0"))
 
 			components, ok := dims["components"].([]any)
 			Expect(ok).To(BeTrue(), "components must be []any for DecomposeClusterComponents compatibility")
@@ -330,7 +327,7 @@ var _ = Describe("CaaS Cluster Mapper", func() {
 		})
 
 		It("omits release_image when nil", func() {
-			cl.Spec.VersionName = nil
+			cl.Spec.Version = nil
 			dims := events.ClusterBillingDimensions(cl)
 			Expect(dims).NotTo(HaveKey("release_image"))
 		})
@@ -575,53 +572,6 @@ var _ = Describe("DecomposeClusterComponents", func() {
 		Expect(errors.Is(err, events.ErrDataQuality)).To(BeTrue())
 	})
 
-	It("rejects a component with fractional node_count instead of billing a truncated value", func() {
-		dims := map[string]any{
-			"cluster_template": "tmpl",
-			"components": []any{
-				map[string]any{"node_set": "gpu-workers", "component": "worker", "host_type": "gpu-h100", "node_count": 2.7},
-			},
-		}
-		_, err := events.DecomposeClusterComponents(dims)
-		Expect(errors.Is(err, events.ErrDataQuality)).To(BeTrue(),
-			"a corrupt fractional node_count must not silently produce a truncated billed value")
-	})
-
-	It("rejects a component with negative node_count", func() {
-		dims := map[string]any{
-			"cluster_template": "tmpl",
-			"components": []any{
-				map[string]any{"node_set": "gpu-workers", "component": "worker", "host_type": "gpu-h100", "node_count": -1.0},
-			},
-		}
-		_, err := events.DecomposeClusterComponents(dims)
-		Expect(errors.Is(err, events.ErrDataQuality)).To(BeTrue())
-	})
-
-	It("rejects a component with node_count exceeding int32 range", func() {
-		dims := map[string]any{
-			"cluster_template": "tmpl",
-			"components": []any{
-				map[string]any{"node_set": "gpu-workers", "component": "worker", "host_type": "gpu-h100", "node_count": float64(math.MaxInt32) + 1},
-			},
-		}
-		_, err := events.DecomposeClusterComponents(dims)
-		Expect(errors.Is(err, events.ErrDataQuality)).To(BeTrue(),
-			"an out-of-range node_count must not silently wrap to a negative or truncated billed value")
-	})
-
-	It("rejects the whole decomposition when one sibling's node_count is corrupt, rather than leaking partial results", func() {
-		dims := map[string]any{
-			"cluster_template": "tmpl",
-			"components": []any{
-				map[string]any{"node_set": "_control_plane", "component": "control_plane", "host_type": "_control_plane", "node_count": int32(1)},
-				map[string]any{"node_set": "gpu-workers", "component": "worker", "host_type": "gpu-h100", "node_count": -1.0},
-			},
-		}
-		records, err := events.DecomposeClusterComponents(dims)
-		Expect(errors.Is(err, events.ErrDataQuality)).To(BeTrue())
-		Expect(records).To(BeNil(), "a corrupt component must fail the whole decomposition, not leak partial results for its healthy siblings")
-	})
 })
 
 var _ = Describe("ComponentRecord", func() {

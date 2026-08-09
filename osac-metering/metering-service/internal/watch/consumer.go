@@ -305,12 +305,12 @@ func (c *Consumer) handleScalingEvent(ctx context.Context, event *privatev1.Even
 				return nil
 			}
 			for _, comp := range changed {
-				scalingCtx := stateCtx
-				if comp.IsNew {
-					scalingCtx = &events.StateContext{
-						PreviousState: stateCtx.PreviousState,
-						WasBillable:   stateCtx.WasBillable,
-					}
+				scalingCtx := &events.StateContext{
+					PreviousState: stateCtx.PreviousState,
+					WasBillable:   stateCtx.WasBillable,
+				}
+				if !comp.IsNew {
+					scalingCtx.DurationSeconds = c.componentDurationSeconds(existing, comp.NodeSet, transitionTime)
 				}
 				ce, ceErr := c.buildScalingEvent(
 					events.ComponentEventID(event.GetId(), comp),
@@ -439,8 +439,36 @@ func (c *Consumer) buildProjectionState(mapper events.ResourceMapper, existing *
 		} else {
 			projState.BillableSince = existing.BillableSince
 		}
+		var oldDims map[string]any
+		var oldSince map[string]time.Time
+		if existing != nil {
+			oldDims = existing.BillingDimensions
+			oldSince = existing.ComponentBillableSince
+		}
+		projState.ComponentBillableSince = events.NextComponentBillableSince(oldDims, oldSince, dims, tt)
 	}
 	return projState
+}
+
+// componentDurationSeconds returns how long a component's prior billing
+// dimensions were in effect. Returns nil if no per-component timestamp is
+// recorded for nodeSet — an honest "unknown" (the same signal already used
+// for a genuinely new component) rather than guessing via the resource-wide
+// BillableSince, which would silently reintroduce a narrower version of the
+// cross-component bug this exists to fix. The only path that can leave an
+// entry missing is a Reconciler correction that hasn't been updated to
+// maintain ComponentBillableSince (see events.NextComponentBillableSince
+// callers in the reconciliation package) — logged so an unexpected rate of
+// occurrence is debuggable rather than silently absorbed.
+func (c *Consumer) componentDurationSeconds(existing *projection.ResourceState, nodeSet string, transitionTime time.Time) *float64 {
+	since, ok := existing.ComponentBillableSince[nodeSet]
+	if !ok {
+		c.logger.V(1).Info("no per-component billable-since recorded, reporting nil duration_seconds",
+			"resource_id", existing.ResourceID, "node_set", nodeSet)
+		return nil
+	}
+	duration := transitionTime.Sub(since).Seconds()
+	return &duration
 }
 
 func (c *Consumer) buildStateContext(existing *projection.ResourceState, nowBillable bool, transitionTime time.Time, newDims map[string]any) *events.StateContext {

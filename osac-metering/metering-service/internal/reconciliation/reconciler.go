@@ -179,6 +179,7 @@ func (r *Reconciler) reconcileFulfillmentResources(ctx context.Context, fulfillm
 			}
 			if isBillable {
 				newState.BillableSince = &now
+				newState.ComponentBillableSince = events.NextComponentBillableSince(nil, nil, fs.billingDimensions, now)
 			}
 			if err := r.store.Upsert(ctx, newState); err != nil {
 				if errors.Is(err, projection.ErrStaleVersion) {
@@ -227,9 +228,11 @@ func (r *Reconciler) reconcileFulfillmentResources(ctx context.Context, fulfillm
 			ps.TransitionTime = now
 			if isBillable && !wasBillable {
 				ps.BillableSince = &now
+				ps.ComponentBillableSince = events.NextComponentBillableSince(nil, nil, fs.billingDimensions, now)
 			}
 			if !isBillable {
 				ps.BillableSince = nil
+				ps.ComponentBillableSince = nil
 			}
 			if err := r.store.Upsert(ctx, ps); err != nil {
 				if errors.Is(err, projection.ErrStaleVersion) {

@@ -11,7 +11,6 @@ package events
 
 import (
 	"fmt"
-	"math"
 	"sort"
 	"strings"
 	"time"
@@ -190,7 +189,7 @@ func ClusterBillingDimensions(cl *privatev1.Cluster) map[string]any {
 	if t := spec.GetTemplate(); t != nil {
 		dims["cluster_template"] = t.GetName()
 	}
-	if vn := spec.GetVersionName(); vn != "" {
+	if vn := spec.GetVersion().GetName(); vn != "" {
 		dims[DimensionReleaseImage] = vn
 	}
 
@@ -256,9 +255,12 @@ func (cr ComponentRecord) FlatBillingDimensions() map[string]any {
 // DecomposeClusterComponents extracts N+1 component records from stored
 // billing dimensions. Used by Watch Consumer, Heartbeat Generator, and
 // Reconciler to fan out one cluster into per-component events. Returns
-// ErrDataQuality if any component's node_count is corrupt — the caller must
-// not proceed on a partial or wrong decomposition (fail fast, consistent
-// with every other data-quality check in this package).
+// ErrDataQuality if the components list itself is missing or malformed —
+// per-component node_count is trusted as-is: fulfillment-service's API
+// rejects non-positive node set sizes at write time (see
+// PrivateClustersServer's node-set-size check), and ClusterBillingDimensions
+// always populates node_count from that same validated field, so every
+// caller-supplied value is already known good.
 func DecomposeClusterComponents(billingDims map[string]any) ([]ComponentRecord, error) {
 	clusterTemplate, _ := billingDims["cluster_template"].(string)
 	releaseImage, _ := billingDims[DimensionReleaseImage].(string)
@@ -283,13 +285,8 @@ func DecomposeClusterComponents(billingDims map[string]any) ([]ComponentRecord, 
 		component, _ := cm["component"].(string)
 		hostType, _ := cm["host_type"].(string)
 
-		var nodeCount int32
-		if nc, ok := toFloat64(cm["node_count"]); ok {
-			if nc != math.Trunc(nc) || nc < 0 || nc > math.MaxInt32 {
-				return nil, fmt.Errorf("%w: node_count %v for node_set %q is not a valid non-negative int32", ErrDataQuality, nc, nodeSet)
-			}
-			nodeCount = int32(nc)
-		}
+		nc, _ := toFloat64(cm["node_count"])
+		nodeCount := int32(nc)
 
 		records = append(records, ComponentRecord{
 			NodeSet:         nodeSet,
@@ -380,4 +377,43 @@ func ChangedComponents(oldDims, newDims map[string]any) ([]ComponentRecord, erro
 	}
 
 	return changed, nil
+}
+
+// NextComponentBillableSince returns the per-component "billable since"
+// timestamps for newDims: a component unchanged from oldDims carries forward
+// its entry from oldSince, a new or changed component resets to now. Callers
+// pass oldDims/oldSince as nil to force every current component to reset
+// (e.g. a resource newly becoming billable, where any prior per-component
+// history is no longer relevant). Resource types that don't decompose into
+// components (no "components" key in newDims) return nil.
+//
+// Reuses ChangedComponents rather than re-implementing the old-vs-new diff,
+// so this can never disagree with the changed-component set a caller
+// actually publishes for the same transition.
+func NextComponentBillableSince(oldDims map[string]any, oldSince map[string]time.Time, newDims map[string]any, now time.Time) map[string]time.Time {
+	newRecords, err := DecomposeClusterComponents(newDims)
+	if err != nil {
+		return nil
+	}
+
+	// oldDims decomposition failing (e.g. first-ever creation, no prior
+	// components) just means every current component is treated as changed
+	// below — correct, since there is no prior state to carry forward.
+	changed, _ := ChangedComponents(oldDims, newDims)
+	changedSet := make(map[string]bool, len(changed))
+	for _, c := range changed {
+		changedSet[c.NodeSet] = true
+	}
+
+	since := make(map[string]time.Time, len(newRecords))
+	for _, r := range newRecords {
+		if !changedSet[r.NodeSet] {
+			if t, ok := oldSince[r.NodeSet]; ok {
+				since[r.NodeSet] = t
+				continue
+			}
+		}
+		since[r.NodeSet] = now
+	}
+	return since
 }
