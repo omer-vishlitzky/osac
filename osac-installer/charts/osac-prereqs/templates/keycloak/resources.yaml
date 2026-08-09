@@ -504,6 +504,7 @@ spec:
   tls:
     termination: passthrough
 {{- end }}
+{{- if .Values.keycloak.devFixtures.enabled }}
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -637,4 +638,5 @@ spec:
           defaultMode: 0755
       - name: tmp
         emptyDir: {}
+{{- end }}
 {{- end }}

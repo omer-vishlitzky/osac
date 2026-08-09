@@ -20,10 +20,6 @@ mce:
   enabled: false
 kafka:
   enabled: false
-awx:
-  enabled: false
-kubevirt:
-  enabled: false
 
 # --- Envoy Gateway resources (Gateway, GatewayClass, EnvoyProxy) ---
 envoygateway:
@@ -40,6 +36,9 @@ keycloak:
   enabled: true
   hostname: "https://keycloak.keycloak.svc.cluster.local:8443"
   extraPort: 8443
+  # Kind/IT only: seed known passwords for the realm's built-in test users.
+  devFixtures:
+    enabled: true
 
 # --- Fake CRDs (HyperShift, OVN-K stubs for controllers) ---
 fakeCrds:

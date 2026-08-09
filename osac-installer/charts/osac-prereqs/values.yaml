@@ -4,29 +4,16 @@ osacNamespace: osac
 certManager:
   enabled: true
   channel: "stable-v1"
-  upstream:
-    enabled: false
-
-cert-manager:
-  crds:
-    enabled: true
 
 trustManager:
   enabled: true
   upstream:
     enabled: false
 
-trust-manager:
-  defaultPackage:
-    enabled: false
-
 caIssuer:
   enabled: true
 
 envoygateway:
-  enabled: false
-
-awx:
   enabled: false
 
 keycloak:
@@ -38,12 +25,14 @@ keycloak:
   defaultUserPassword: foobar
   route:
     hostname: ""
+  # devFixtures seeds known, non-random passwords for the realm's built-in
+  # tenant/test users (admin, user, tenant1_admin, ...). Must stay disabled
+  # outside Kind/CI -- this chart is also used for real installs.
+  devFixtures:
+    enabled: false
   images:
     keycloak: quay.io/keycloak/keycloak:26.6.4
     postgres: quay.io/sclorg/postgresql-18-c10s@sha256:6be2c9d855f06fb665257a6b0911676a38d740be7022cc61acee1c99a832b1b2
-
-kubevirt:
-  enabled: false
 
 fakeCrds:
   enabled: false
