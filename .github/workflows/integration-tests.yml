@@ -49,11 +49,13 @@ jobs:
               - '!.skillsaw.yaml'
               - '!.pre-commit-config.yaml'
 
-  # fulfillment-service, osac-operator, and osac-aap use genuinely different
-  # integration test mechanisms (ginkgo directly, a Kind cluster + Makefile
-  # target, and a Kind cluster + uv/pytest respectively), so these stay
-  # separate jobs rather than a matrix -- there's no shared step sequence to
-  # parameterize, only the workflow-level trigger/name were duplicated before.
+  # fulfillment-service, osac-operator, and bare-metal-fulfillment-operator now
+  # all follow the same Kind cluster + root Makefile step sequence (only the
+  # go-version-file, integration-test-* target, and diagnostic label selector
+  # differ per component); osac-aap uses a distinct Kind cluster + uv/pytest
+  # mechanism. These stay separate jobs rather than a matrix for now -- not
+  # because there's no shared sequence to parameterize (there increasingly is,
+  # for the first three), but that wasn't done here; worth revisiting.
   fulfillment-service:
     name: Run integration test (fulfillment-service)
     needs: changes

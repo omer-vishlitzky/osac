@@ -78,13 +78,8 @@ var OIDCTenants = map[string][]string{
 type ToolBuilder struct {
 	logger      *slog.Logger
 	projectDir  string
-	crdFiles    []string
 	keepCluster bool
-	keepService bool
-	debug       bool
 	secret      string
-	caKeyFile   string
-	caCrtFile   string
 }
 
 // Tool is an instance of the integration test tool that sets up the test environment. Don't create instances of this
@@ -92,12 +87,7 @@ type ToolBuilder struct {
 type Tool struct {
 	logger        *slog.Logger
 	projectDir    string
-	crdFiles      []string
 	keepKind      bool
-	keepService   bool
-	debug         bool
-	caKeyFile     string
-	caCrtFile     string
 	tmpDir        string
 	cluster       *testing.Kind
 	kubeClient    crclient.Client
@@ -142,39 +132,12 @@ func (b *ToolBuilder) SetProjectDir(value string) *ToolBuilder {
 	return b
 }
 
-// AddCrdFile adds a CRD file to be installed in the cluster.
-func (b *ToolBuilder) AddCrdFile(value string) *ToolBuilder {
-	b.crdFiles = append(b.crdFiles, value)
-	return b
-}
-
-// AddCrdFiles adds multiple CRD files to be installed in the cluster.
-func (b *ToolBuilder) AddCrdFiles(values ...string) *ToolBuilder {
-	b.crdFiles = append(b.crdFiles, values...)
-	return b
-}
-
-// SetKeepCluster sets whether to keep the cluster after the tests complete. The default is to destroy the cluster.
+// SetKeepCluster no longer controls cluster lifetime -- Setup()/Cleanup() never create or
+// destroy the Kind cluster, only connect to and disconnect from a pre-existing one. Setting
+// this to true skips Cleanup()'s `kind export logs` dump, on the assumption that if you're
+// keeping the cluster around you'll inspect it directly rather than from an exported dump.
 func (b *ToolBuilder) SetKeepCluster(value bool) *ToolBuilder {
 	b.keepCluster = value
-	return b
-}
-
-// SetKeepService sets whether to keep the service after the tests complete. The default is to undeploy the service.
-func (b *ToolBuilder) SetKeepService(value bool) *ToolBuilder {
-	b.keepService = value
-	return b
-}
-
-// SetDebug sets whether to enable the debug mode. This means that the debugger binary will be added to the container
-// image, and that the services will be started under the control of the debugger. Access to the debugger will be done
-// via the following ports:
-//
-// - gRPC server: 30001
-// - REST gateway: 30002
-// - Controller: 30003
-func (b *ToolBuilder) SetDebug(value bool) *ToolBuilder {
-	b.debug = value
 	return b
 }
 
@@ -185,23 +148,11 @@ func (b *ToolBuilder) SetSecret(value string) *ToolBuilder {
 	return b
 }
 
-// SetCaFiles sets the paths to PEM files containing a pre-generated CA private key and certificate. When set, the
-// Kind cluster will use these files instead of generating a new CA each time. This is optional.
-func (b *ToolBuilder) SetCaFiles(keyFile, crtFile string) *ToolBuilder {
-	b.caKeyFile = keyFile
-	b.caCrtFile = crtFile
-	return b
-}
-
 // Build uses the data stored in the builder to create a new instance of the integration test tool.
 func (b *ToolBuilder) Build() (result *Tool, err error) {
 	// Check parameters:
 	if b.logger == nil {
 		err = errors.New("logger is mandatory")
-		return
-	}
-	if (b.caKeyFile == "") != (b.caCrtFile == "") {
-		err = errors.New("key file and certificate file must both be provided or both be omitted")
 		return
 	}
 
@@ -225,16 +176,11 @@ func (b *ToolBuilder) Build() (result *Tool, err error) {
 
 	// Create and populate the object:
 	result = &Tool{
-		logger:      b.logger,
-		projectDir:  projectDir,
-		crdFiles:    slices.Clone(b.crdFiles),
-		keepKind:    b.keepCluster,
-		keepService: b.keepService,
-		debug:       b.debug,
-		caKeyFile:   b.caKeyFile,
-		caCrtFile:   b.caCrtFile,
-		secret:      b.secret,
-		jqTool:      jqTool,
+		logger:     b.logger,
+		projectDir: projectDir,
+		keepKind:   b.keepCluster,
+		secret:     b.secret,
+		jqTool:     jqTool,
 	}
 	return
 }

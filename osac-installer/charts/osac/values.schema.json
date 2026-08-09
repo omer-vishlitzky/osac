@@ -1209,6 +1209,20 @@
                   "type": "string",
                   "description": "Namespace containing the fake BareMetalHost objects (defaults to the release namespace if empty)",
                   "default": ""
+                },
+                "secretNames": {
+                  "type": "object",
+                  "description": "Names for the fake inventory/management Secrets this seeds -- distinct from bmf.secrets.* on purpose, see values.yaml",
+                  "properties": {
+                    "inventoryConfig": {
+                      "type": "string",
+                      "default": "osac-inventory-config-metal3-test"
+                    },
+                    "managementConfig": {
+                      "type": "string",
+                      "default": "osac-management-config-metal3-test"
+                    }
+                  }
                 }
               }
             }
