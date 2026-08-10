@@ -21,7 +21,6 @@ import (
 	"github.com/go-logr/logr"
 	"github.com/kelseyhightower/envconfig"
 	. "github.com/onsi/ginkgo/v2/dsl/core"
-	. "github.com/onsi/ginkgo/v2/dsl/decorators"
 	. "github.com/onsi/gomega"
 	"k8s.io/klog/v2"
 	crlog "sigs.k8s.io/controller-runtime/pkg/log"
@@ -32,11 +31,6 @@ import (
 
 // Config contains configuration options for the integration tests.
 type Config struct {
-	// KeepKind skips Cleanup()'s `kind export logs` dump -- see SetKeepCluster's doc comment.
-	// It does not affect cluster lifetime; Setup()/Cleanup() never create or destroy the
-	// cluster, only connect to and disconnect from a pre-existing one.
-	KeepKind bool `json:"keep_kind" envconfig:"keep_kind" default:"false"`
-
 	// Secret is the secret used in all places where passwords or secrets are needed, such as service account
 	// client secrets and user passwords. If the environment variable is set then that value will be used, otherwise
 	// a random one will be generated.
@@ -78,14 +72,12 @@ var _ = BeforeSuite(func() {
 	Expect(err).ToNot(HaveOccurred())
 	logger.Info(
 		"Configuration",
-		slog.Bool("keep_kind", config.KeepKind),
 		slog.String("!secret", config.Secret),
 	)
 
 	// Create and setup the tool:
 	tool, err = NewTool().
 		SetLogger(logger).
-		SetKeepCluster(config.KeepKind).
 		SetSecret(config.Secret).
 		Build()
 	Expect(err).ToNot(HaveOccurred())
@@ -111,15 +103,4 @@ var _ = BeforeSuite(func() {
 		}.Build(),
 	}.Build())
 	Expect(err).ToNot(HaveOccurred())
-})
-
-var _ = Describe("Integration", func() {
-	It("Setup", Label("setup"), func() {
-		// This is a dummy test to have a mechanism to run the setup of the integration tests without running
-		// any actual tests, with a command like this:
-		//
-		// ginkgo run --label-filter setup it
-		//
-		// This will create the kind cluster, install the dependencies, and deploy the application.
-	})
 })

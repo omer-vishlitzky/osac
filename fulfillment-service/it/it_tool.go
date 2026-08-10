@@ -77,10 +77,9 @@ var OIDCTenants = map[string][]string{
 // ToolBuilder contains the data and logic needed to create an instance of the integration test tool. Don't create
 // instances of this directly, use the NewTool function instead.
 type ToolBuilder struct {
-	logger      *slog.Logger
-	projectDir  string
-	keepCluster bool
-	secret      string
+	logger     *slog.Logger
+	projectDir string
+	secret     string
 }
 
 // Tool is an instance of the integration test tool that sets up the test environment. Don't create instances of this
@@ -88,7 +87,6 @@ type ToolBuilder struct {
 type Tool struct {
 	logger        *slog.Logger
 	projectDir    string
-	keepKind      bool
 	tmpDir        string
 	clusterName   string
 	kubeClient    crclient.Client
@@ -133,15 +131,6 @@ func (b *ToolBuilder) SetProjectDir(value string) *ToolBuilder {
 	return b
 }
 
-// SetKeepCluster no longer controls cluster lifetime -- Setup()/Cleanup() never create or
-// destroy the Kind cluster, only connect to and disconnect from a pre-existing one. Setting
-// this to true skips Cleanup()'s `kind export logs` dump, on the assumption that if you're
-// keeping the cluster around you'll inspect it directly rather than from an exported dump.
-func (b *ToolBuilder) SetKeepCluster(value bool) *ToolBuilder {
-	b.keepCluster = value
-	return b
-}
-
 // SetSecret sets the secret used in all places where passwords or secrets are needed, such as service account client
 // secrets and user passwords. If not set then a random one will be generated.
 func (b *ToolBuilder) SetSecret(value string) *ToolBuilder {
@@ -179,7 +168,6 @@ func (b *ToolBuilder) Build() (result *Tool, err error) {
 	result = &Tool{
 		logger:     b.logger,
 		projectDir: projectDir,
-		keepKind:   b.keepCluster,
 		secret:     b.secret,
 		jqTool:     jqTool,
 	}
@@ -1496,12 +1484,10 @@ func (t *Tool) Cleanup(ctx context.Context) error {
 	}
 
 	// Dump the logs:
-	if !t.keepKind {
-		logsDir := filepath.Join(t.projectDir, "logs")
-		_, dumpErr := t.runCommand(ctx, "kind", "export", "logs", logsDir, "--name", t.clusterName)
-		if dumpErr != nil {
-			errs = append(errs, fmt.Errorf("failed to dump cluster logs: %w", dumpErr))
-		}
+	logsDir := filepath.Join(t.projectDir, "logs")
+	_, dumpErr := t.runCommand(ctx, "kind", "export", "logs", logsDir, "--name", t.clusterName)
+	if dumpErr != nil {
+		errs = append(errs, fmt.Errorf("failed to dump cluster logs: %w", dumpErr))
 	}
 
 	// Remove temporary directory:
@@ -1516,12 +1502,6 @@ func (t *Tool) Cleanup(ctx context.Context) error {
 		return errors.Join(errs...)
 	}
 	return nil
-}
-
-func (t *Tool) Dump(ctx context.Context) error {
-	logsDir := filepath.Join(t.projectDir, "logs")
-	_, err := t.runCommand(ctx, "kind", "export", "logs", logsDir, "--name", t.clusterName)
-	return err
 }
 
 // KubeClient returns the Kubernetes client.
