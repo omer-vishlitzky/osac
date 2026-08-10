@@ -211,6 +211,32 @@ var _ = Describe("BareMetalPool provisioning", Ordered, func() {
 			cmd := exec.Command("kubectl", "delete", "baremetalpool", poolName,
 				"-n", namespace, "--ignore-not-found", "--wait=false")
 			_, _ = utils.Run(cmd)
+
+			// Delete by label rather than the It block's captured instanceName -- this
+			// still cleans up if the It block failed before that variable was set.
+			cmd = exec.Command("kubectl", "delete", "baremetalinstance", "-n", namespace,
+				"-l", fmt.Sprintf("osac.openshift.io/host-type=%s", hostType),
+				"--ignore-not-found", "--wait=false")
+			_, _ = utils.Run(cmd)
+
+			By("waiting for the pool and any spawned instance to be fully deleted")
+			Eventually(func() error {
+				cmd := exec.Command("kubectl", "get", "baremetalinstance", "-n", namespace,
+					"-l", fmt.Sprintf("osac.openshift.io/host-type=%s", hostType), "-o", "name")
+				output, err := utils.Run(cmd)
+				if err != nil {
+					return err
+				}
+				if len(strings.TrimSpace(output)) != 0 {
+					return fmt.Errorf("baremetalinstance(s) still present: %s", output)
+				}
+				cmd = exec.Command("kubectl", "get", "baremetalpool", poolName, "-n", namespace)
+				if _, err := utils.Run(cmd); err == nil {
+					return fmt.Errorf("baremetalpool %s still exists", poolName)
+				}
+				return nil
+			}, time.Minute, 2*time.Second).Should(Succeed())
+
 			deleteBareMetalHost(bmhName, namespace)
 		})
 
@@ -221,16 +247,20 @@ var _ = Describe("BareMetalPool provisioning", Ordered, func() {
 			_, err := utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
 
-			By("waiting for the pool to spawn a BareMetalInstance")
+			By("waiting for the pool to spawn exactly one BareMetalInstance")
 			Eventually(func() error {
 				cmd := exec.Command("kubectl", "get", "baremetalinstance", "-n", namespace,
 					"-l", fmt.Sprintf("osac.openshift.io/host-type=%s", hostType),
-					"-o", "jsonpath={.items[0].metadata.name}")
+					"-o", "jsonpath={.items[*].metadata.name}")
 				output, err := utils.Run(cmd)
-				if err != nil || output == "" {
-					return fmt.Errorf("no BareMetalInstance spawned yet")
+				if err != nil {
+					return err
 				}
-				instanceName = output
+				names := strings.Fields(output)
+				if len(names) != 1 {
+					return fmt.Errorf("expected exactly 1 spawned BareMetalInstance, found %d: %v", len(names), names)
+				}
+				instanceName = names[0]
 				return nil
 			}, time.Minute, 2*time.Second).Should(Succeed())
 
