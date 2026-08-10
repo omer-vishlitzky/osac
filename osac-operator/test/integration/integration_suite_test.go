@@ -56,8 +56,12 @@ var _ = BeforeSuite(func() {
 				Status struct {
 					Phase             string `json:"phase"`
 					ContainerStatuses []struct {
-						Ready        bool  `json:"ready"`
-						RestartCount int64 `json:"restartCount"`
+						Ready bool `json:"ready"`
+						State struct {
+							Waiting *struct {
+								Reason string `json:"reason"`
+							} `json:"waiting"`
+						} `json:"state"`
 					} `json:"containerStatuses"`
 				} `json:"status"`
 			} `json:"items"`
@@ -75,11 +79,14 @@ var _ = BeforeSuite(func() {
 				return fmt.Errorf("pod %s in %s phase", pod.Metadata.Name, pod.Status.Phase)
 			}
 			for _, cs := range pod.Status.ContainerStatuses {
+				// Checks the kubelet's own crash-loop signal rather than a raw restart
+				// count, which never resets and would fail the suite on a single early,
+				// non-recurring restart that has nothing to do with an actual crash loop.
+				if cs.State.Waiting != nil && cs.State.Waiting.Reason == "CrashLoopBackOff" {
+					return fmt.Errorf("pod %s is crash-looping", pod.Metadata.Name)
+				}
 				if !cs.Ready {
 					return fmt.Errorf("pod %s has unready container", pod.Metadata.Name)
-				}
-				if cs.RestartCount > 0 {
-					return fmt.Errorf("pod %s has %d restarts (crash-looping)", pod.Metadata.Name, cs.RestartCount)
 				}
 			}
 			running++
