@@ -61,6 +61,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.should-run == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 75  # ginkgo --timeout 1h (Makefile) + ~15m for dev-env/setup/log-collection
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       with:
@@ -112,7 +113,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.should-run == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45  # ginkgo --timeout 30m (Makefile) + ~15m for dev-env/setup/log-collection
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -141,7 +142,6 @@ jobs:
         run: make dev-env
 
       - name: Run integration tests
-        timeout-minutes: 15
         env:
           CONTAINER_TOOL: docker
         run: make integration-test-operator
@@ -164,7 +164,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.should-run == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45  # ginkgo --timeout 30m (Makefile) + ~15m for dev-env/setup/log-collection
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -193,7 +193,6 @@ jobs:
         run: make dev-env
 
       - name: Run integration tests
-        timeout-minutes: 15
         env:
           CONTAINER_TOOL: docker
         run: make integration-test-bmf
