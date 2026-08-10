@@ -10,7 +10,7 @@ jobs:
   enable-auto-merge:
     runs-on: ubuntu-latest
     steps:
-      - name: Check org membership
+      - name: Check repo collaborator
         id: org-check
         env:
           GH_TOKEN: ${{ secrets.MERGE_QUEUE_TOKEN }}
@@ -18,7 +18,7 @@ jobs:
           author="${{ github.event.pull_request.user.login }}"
           echo "author=$author"
           echo "draft=${{ github.event.pull_request.draft }}"
-          if gh api "orgs/osac-project/members/$author"; then
+          if gh api "repos/${{ github.repository }}/collaborators/$author"; then
             echo "org_member=true"
             echo "org_member=true" >> "$GITHUB_OUTPUT"
           else
