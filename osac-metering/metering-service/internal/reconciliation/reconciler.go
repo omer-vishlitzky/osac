@@ -225,6 +225,7 @@ func (r *Reconciler) reconcileFulfillmentResources(ctx context.Context, fulfillm
 			ps.CurrentState = fs.state
 			wasBillable := ps.IsBillable
 			ps.IsBillable = isBillable
+			ps.EverBillable = ps.EverBillable || isBillable
 			ps.FulfillmentVersion = fs.version
 			ps.TransitionTime = now
 			if isBillable && !wasBillable {

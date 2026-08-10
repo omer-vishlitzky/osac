@@ -97,7 +97,7 @@ func (s *PostgresStore) Upsert(ctx context.Context, state ResourceState) error {
 			current_state = EXCLUDED.current_state,
 			previous_state = EXCLUDED.previous_state,
 			is_billable = EXCLUDED.is_billable,
-			ever_billable = EXCLUDED.ever_billable,
+			ever_billable = metering_resource_state.ever_billable OR EXCLUDED.ever_billable,
 			billable_since = EXCLUDED.billable_since,
 			last_heartbeat_at = EXCLUDED.last_heartbeat_at,
 			transition_time = EXCLUDED.transition_time,

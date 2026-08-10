@@ -985,12 +985,19 @@ var _ = Describe("Consumer", func() {
 			Expect(store.states["vm-new"].BillableSince).ToNot(BeNil())
 		})
 
-		It("emits started.v1 (not resumed.v1) for a brand-new resource's real first-boot sequence", func() {
+		It("emits started.v1 then resumed.v1 across a real first-boot and resume cycle", func() {
 			// Real lifecycle shape: CREATE observes the resource before it's
 			// running (STARTING -- matching what the controller reports at
 			// creation), then a separate UPDATE reports RUNNING. No pre-seeded
 			// store state. makeComputeInstance/makeEvent hardcode RUNNING even
 			// at CREATE, which hides this path -- build the events by hand here.
+			//
+			// Continues through a stop + restart so the same consumer/store
+			// also proves the seam a first-boot-only test can't: that
+			// buildProjectionState actually persists EverBillable=true after
+			// the first activation, and a later reactivation reads that back
+			// as resumed.v1 -- not just that a hand-seeded EverBillable:true
+			// fixture produces resumed.v1 in isolation.
 			store := newMockStore()
 
 			createCI := makeComputeInstance("vm-fresh", "tenant-1")
@@ -1010,15 +1017,35 @@ var _ = Describe("Consumer", func() {
 				Payload: &privatev1.Event_ComputeInstance{ComputeInstance: runningCI},
 			}
 
+			stoppedCI := makeComputeInstance("vm-fresh", "tenant-1")
+			stoppedCI.Status.State = privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_STOPPED
+			stoppedCI.Metadata.Version = 3
+			stoppedEvent := &privatev1.Event{
+				Id:      "evt-stopped",
+				Type:    privatev1.EventType_EVENT_TYPE_OBJECT_UPDATED,
+				Payload: &privatev1.Event_ComputeInstance{ComputeInstance: stoppedCI},
+			}
+
+			restartedCI := makeComputeInstance("vm-fresh", "tenant-1")
+			restartedCI.Status.State = privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_RUNNING
+			restartedCI.Metadata.Version = 4
+			restartedEvent := &privatev1.Event{
+				Id:      "evt-restarted",
+				Type:    privatev1.EventType_EVENT_TYPE_OBJECT_UPDATED,
+				Payload: &privatev1.Event_ComputeInstance{ComputeInstance: restartedCI},
+			}
+
 			stream := &mockWatchStream{
 				responses: []*privatev1.EventsWatchResponse{
 					makeResponse(createEvent),
 					makeResponse(runningEvent),
+					makeResponse(stoppedEvent),
+					makeResponse(restartedEvent),
 				},
 			}
 			client.results = []mockStreamResult{{stream: stream}}
 
-			pub := &mockPublisher{published: make([]cloudevents.Event, 0, 2), cancelFunc: cancel}
+			pub := &mockPublisher{published: make([]cloudevents.Event, 0, 4), cancelFunc: cancel}
 			consumer := newConsumerWithStore(pub, store)
 
 			err := consumer.Run(ctx)
@@ -1026,10 +1053,13 @@ var _ = Describe("Consumer", func() {
 
 			pub.mu.Lock()
 			defer pub.mu.Unlock()
-			Expect(pub.published).To(HaveLen(2))
+			Expect(pub.published).To(HaveLen(4))
 			Expect(pub.published[0].Type()).To(Equal(events.EventCreated))
 			Expect(pub.published[1].Type()).To(Equal(events.EventStarted),
 				"first-ever activation of a brand-new resource must be started.v1, not resumed.v1")
+			Expect(pub.published[2].Type()).To(Equal(events.EventSuspended))
+			Expect(pub.published[3].Type()).To(Equal(events.EventResumed),
+				"reactivation must be resumed.v1 once the consumer has recorded EverBillable itself")
 		})
 	})
 

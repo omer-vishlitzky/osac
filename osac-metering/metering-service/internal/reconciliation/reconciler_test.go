@@ -289,6 +289,36 @@ var _ = Describe("Reconciler", func() {
 			Expect(updated.CurrentState).To(Equal("RUNNING"))
 		})
 
+		It("sets EverBillable when a never-billable resource drifts into a billable state", func() {
+			client := &mockComputeClient{
+				items: []*privatev1.ComputeInstance{
+					makeCI("res-drift-first", "tenant-1", "RUNNING", 2),
+				},
+			}
+			store := newMockStore()
+			store.states["res-drift-first"] = projection.ResourceState{
+				ResourceID:         "res-drift-first",
+				ResourceType:       events.ResourceTypeComputeInstance,
+				TenantID:           "tenant-1",
+				CurrentState:       "STOPPED",
+				IsBillable:         false,
+				EverBillable:       false, // never actually billed before this drift
+				FulfillmentVersion: 1,
+			}
+			pub := &mockPublisher{}
+			recon := reconciliation.NewReconciler(client, nil, store, pub, logr.Discard(), 60*time.Second)
+
+			Expect(recon.Reconcile(ctx)).To(Succeed())
+
+			store.mu.Lock()
+			defer store.mu.Unlock()
+			updated := store.states["res-drift-first"]
+			Expect(updated.IsBillable).To(BeTrue())
+			Expect(updated.EverBillable).To(BeTrue(),
+				"a resource that just drifted into a billable state must be marked EverBillable, "+
+					"or its next real resume will wrongly emit started.v1 again")
+		})
+
 		It("emits synthetic heartbeat for stale billable resources", func() {
 			staleTime := time.Now().Add(-5 * time.Minute)
 			client := &mockComputeClient{
