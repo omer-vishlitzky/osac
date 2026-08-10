@@ -190,8 +190,9 @@ service by deploying it to that cluster and exercising the APIs.
 
 The cluster itself is not created or torn down by the tests -- from the `osac-workspace/osac` repo
 root, run `make dev-env` once (creates the Kind cluster and installs prerequisites + the `osac` chart),
-then `ginkgo run it` here to build/load the fulfillment-service image, deploy it, and run the suite.
-The cluster is reused across runs; tear it down when done with `make teardown` from the repo root.
+then `make integration-test-fulfillment` (also from the repo root) to build/load the fulfillment-service
+image, deploy it, and run the suite. The cluster is reused across runs; tear it down when done with
+`make teardown` from the repo root.
 
 The integration tests use TLS with SNI (_Server Name Indication_) routing through the Envoy Gateway.
 This means that the services are accessed using their Kubernetes internal host names, but routed
@@ -211,31 +212,22 @@ Add the following entries to your `/etc/hosts` file:
 127.0.0.1 fulfillment-internal-api.osac.svc.cluster.local
 ```
 
-To run the integration tests:
+To build/load/deploy the service and run the integration tests in one step, from the repo root:
+
+```bash
+$ make integration-test-fulfillment
+```
+
+Or, against a cluster where the fulfillment-service image is already deployed (for example, one you
+just ran the command above against), run `ginkgo` directly -- it only connects and exercises the
+suite, it does not build, load, or deploy anything itself:
 
 ```bash
 $ ginkgo run it
 ```
 
-Each run will:
-
-1. Connect to the pre-existing Kind cluster (fails if `make dev-env` hasn't been run yet).
-2. Build and load the fulfillment-service container image.
-3. Deploy the fulfillment service.
-4. Run all test cases.
-
-The cluster is left running afterwards either way -- there is no "preserve vs. clean up" choice to
-make per run, unlike the old per-run-cluster model. `IT_KEEP_KIND` still exists but only controls
-whether cluster diagnostic logs are dumped on failure; it no longer affects cluster lifetime.
-
-The `setup` label gets you a deployed environment without running any actual test, useful for manual
-poking:
-
-```bash
-$ ginkgo run --label-filter setup it
-```
-
-To tear down the cluster when you're done, from the `osac-workspace/osac` repo root:
+Either way, the cluster is left running afterwards. Tear it down when you're done, from the repo
+root:
 
 ```bash
 $ make teardown
@@ -249,7 +241,7 @@ you want to use a known value, for example to log in with the CLI afterwards, yo
 `IT_SECRET` environment variable:
 
 ```bash
-$ IT_KEEP_KIND=true IT_SECRET=my-secret ginkgo run --label-filter setup it
+$ IT_SECRET=my-secret ginkgo run it
 ```
 
 The secret used to run the integration tests is saved to the `random` secret inside the `default`
@@ -258,54 +250,6 @@ want to use the secret. You can get it like this:
 
 ```bash
 $ kubectl get secret -n default random -o json | jq -r '.data["secret"] | @base64d'
-```
-
-### Custom CA certificate
-
-By default, each integration test run generates a fresh CA private key and certificate. This means
-that the CA changes every time the cluster is recreated, which forces you to either re-extract the
-CA bundle and pass it to `osac login --ca-file`, or use `--insecure` to skip verification.
-
-To avoid this, you can provide your own pre-generated CA files via the `IT_CA_KEY` and `IT_CA_CRT`
-environment variables. Both must be set together and must point to PEM-encoded files. When provided,
-the integration tests will use them instead of generating a new CA. This allows you to configure the
-CA once in your browser or pass it to `osac login --ca-file` without having to update it after every
-run.
-
-To generate a CA key and certificate with `openssl`:
-
-```bash
-openssl req \
--x509 \
--newkey rsa:2048 \
--nodes \
--keyout ca.key \
--out ca.crt \
--days 365 \
--subj "/CN=Default CA" \
--addext "keyUsage=critical,keyCertSign,cRLSign" \
--addext "basicConstraints=critical,CA:TRUE"
-```
-
-Then run the integration tests pointing to those files:
-
-```bash
-export IT_KEEP_KIND=true
-export IT_CA_KEY=ca.key
-export IT_CA_CRT=ca.crt
-ginkgo run -v it
-```
-
-Note that `-nodes` flag in the `openssl` command above means `ca.key` (referenced by `IT_CA_KEY`) is
-not passphrase-protected. This is fine for local development, but as a good habit consider setting
-restrictive permissions (`chmod 600 ca.key`) and avoiding committing it to version control. If the
-key is ever shared accidentally, simply regenerate both files and recreate the cluster.
-
-As long as you reuse the same files across runs, the CA will remain stable and you can use the
-certificate directly with the CLI:
-
-```bash
-osac login --ca-file ca.crt ...
 ```
 
 ### Login to the integration tests environment
@@ -324,44 +268,9 @@ https://fulfillment-internal-api.osac.svc.cluster.local:8000
 
 The same secret is shared by all service accounts and users.
 
-The `--ca-file` flag should point to a file containing the trusted CA certificates. If you used the
-`IT_CA_CRT` environment variable, you can point directly to that file. Otherwise, the CA bundle is
-stored in the `ca-bundle` ConfigMap created by _trust-manager_. You can extract it with:
+The `--ca-file` flag should point to a file containing the trusted CA certificates, extracted from
+the `ca-bundle` ConfigMap created by _trust-manager_:
 
 ```bash
 kubectl get configmap ca-bundle -n osac -o json | jq -r '.data["bundle.pem"]' > ca.crt
-```
-
-### Debugging in the integration tests environment
-
-In the integration tests environment you can use the usual Kubernetes tools and logs for
-debugging, but you can also set the `IT_DEBUG` environment variable to `true`. That will add the
-`dlv` debugger to the container image, use it to run the binaries of the gRPC server, the REST
-gateway and the controller, and expose the debugger on the following ports:
-
-| Component    | Port  |
-|--------------|-------|
-| gRPC server  | 30001 |
-| REST gateway | 30002 |
-| Controller   | 30003 |
-
-For example, to connect to the gRPC server debugger from Visual Studio Code, add the following
-configuration to your `.vscode/launch.json` file:
-
-```json
-{
-        "name": "attach grpc-server",
-        "type": "go",
-        "request": "attach",
-        "mode": "remote",
-        "host": "127.0.0.1",
-        "port": 30001
-}
-```
-
-If you use a different development environment, you can connect directly with `dlv` from the
-command line:
-
-```bash
-$ dlv connect 127.0.0.1:30001
 ```
