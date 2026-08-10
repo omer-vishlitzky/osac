@@ -136,6 +136,33 @@ var _ = Describe("PostgresStore", func() {
 			Expect(got.FulfillmentVersion).To(Equal(int32(2)))
 		})
 
+		It("derives is_billable from billable_since regardless of the caller's value", func() {
+			ctx := context.Background()
+			state := makeState("vm-generated", 1)
+			state.IsBillable = false // wrong on purpose -- column ignores this
+			Expect(store.Upsert(ctx, state)).To(Succeed())
+
+			got, err := store.Get(ctx, "vm-generated")
+			Expect(err).ToNot(HaveOccurred())
+			Expect(got.IsBillable).To(BeTrue(),
+				"is_billable is GENERATED from billable_since, not from the caller's IsBillable field")
+		})
+
+		It("self-heals ever_billable from billable_since even when the caller computes it wrong", func() {
+			ctx := context.Background()
+			state := makeState("vm-selfheal", 1)
+			state.EverBillable = false // wrong on purpose -- this is the exact bug fixed in 60dc25a2
+			Expect(store.Upsert(ctx, state)).To(Succeed())
+
+			got, err := store.Get(ctx, "vm-selfheal")
+			Expect(err).ToNot(HaveOccurred())
+			Expect(got.EverBillable).To(BeTrue(),
+				"ever_billable must derive from billable_since IS NOT NULL, not trust the caller's "+
+					"already-OR'd value -- a caller that gets EverBillable wrong on a first write "+
+					"(as the pre-fix reconciler state_drift branch did) must not need a second, "+
+					"correct write to self-correct")
+		})
+
 		It("Returns nil for a non-existent resource", func() {
 			ctx := context.Background()
 			got, err := store.Get(ctx, "nonexistent")

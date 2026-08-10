@@ -86,18 +86,17 @@ func (s *PostgresStore) Upsert(ctx context.Context, state ResourceState) error {
 	_, err = tx.Exec(ctx, `
 		INSERT INTO metering_resource_state (
 			resource_id, resource_type, tenant_id, project_id,
-			current_state, previous_state, is_billable, ever_billable, billable_since,
+			current_state, previous_state, ever_billable, billable_since,
 			last_heartbeat_at, transition_time, fulfillment_version,
 			billing_dimensions, component_billable_since, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NOW())
+		) VALUES ($1, $2, $3, $4, $5, $6, ($7::timestamptz IS NOT NULL), $7, $8, $9, $10, $11, $12, NOW())
 		ON CONFLICT (resource_id) DO UPDATE SET
 			resource_type = EXCLUDED.resource_type,
 			tenant_id = EXCLUDED.tenant_id,
 			project_id = EXCLUDED.project_id,
 			current_state = EXCLUDED.current_state,
 			previous_state = EXCLUDED.previous_state,
-			is_billable = EXCLUDED.is_billable,
-			ever_billable = metering_resource_state.ever_billable OR EXCLUDED.ever_billable,
+			ever_billable = metering_resource_state.ever_billable OR (EXCLUDED.billable_since IS NOT NULL),
 			billable_since = EXCLUDED.billable_since,
 			last_heartbeat_at = EXCLUDED.last_heartbeat_at,
 			transition_time = EXCLUDED.transition_time,
@@ -112,8 +111,6 @@ func (s *PostgresStore) Upsert(ctx context.Context, state ResourceState) error {
 		nullIfEmpty(state.ProjectID),
 		state.CurrentState,
 		nullIfEmpty(state.PreviousState),
-		state.IsBillable,
-		state.EverBillable,
 		state.BillableSince,
 		state.LastHeartbeatAt,
 		state.TransitionTime,
