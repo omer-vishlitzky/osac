@@ -8,12 +8,27 @@ on:
 
 jobs:
   enable-auto-merge:
-    if: >-
-      github.event.pull_request.draft == false
-      && contains(fromJSON('["MEMBER","COLLABORATOR","OWNER"]'), github.event.pull_request.author_association)
     runs-on: ubuntu-latest
     steps:
+      # Every run of this workflow has reported "skipped" since it was
+      # introduced (0/35+ runs actually reached the merge step) -- the old
+      # job-level `if:` below skipped the whole job before any step ran, so
+      # there was never a log line showing what the gate actually saw.
+      # This step is unconditional so we get that visibility on every event.
+      - name: Debug event payload
+        run: |
+          echo "event_name=${{ github.event_name }}"
+          echo "action=${{ github.event.action }}"
+          echo "pr_number=${{ github.event.pull_request.number }}"
+          echo "draft=${{ github.event.pull_request.draft }}"
+          echo "author=${{ github.event.pull_request.user.login }}"
+          echo "author_association=${{ github.event.pull_request.author_association }}"
+          echo "head_repo_fork=${{ github.event.pull_request.head.repo.fork }}"
+          echo "gate_would_pass=${{ github.event.pull_request.draft == false && contains(fromJSON('["MEMBER","COLLABORATOR","OWNER"]'), github.event.pull_request.author_association) }}"
       - name: Enable auto-merge
+        if: >-
+          github.event.pull_request.draft == false
+          && contains(fromJSON('["MEMBER","COLLABORATOR","OWNER"]'), github.event.pull_request.author_association)
         env:
           GH_TOKEN: ${{ secrets.MERGE_QUEUE_TOKEN }}
         run: gh pr merge ${{ github.event.pull_request.number }} --repo ${{ github.repository }} --auto --rebase
