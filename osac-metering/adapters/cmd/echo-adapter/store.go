@@ -12,6 +12,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"strconv"
 	"sync"
@@ -22,17 +23,18 @@ import (
 
 const defaultMaxEvents = 1000
 
-// storedEvent holds the metadata for a received metering event.
+// storedEvent holds the full CloudEvent plus Kafka metadata.
 type storedEvent struct {
-	ID         string    `json:"id"`
-	Type       string    `json:"type"`
-	Source     string    `json:"source"`
-	Time       string    `json:"time,omitempty"`
-	ResourceID string    `json:"resource_id,omitempty"`
-	Topic      string    `json:"topic"`
-	Partition  int32     `json:"partition"`
-	Offset     int64     `json:"offset"`
-	ReceivedAt time.Time `json:"received_at"`
+	// Raw is the full CloudEvent serialized as JSON. Returned to callers
+	// so E2E tests can assert on extensions (osacresourceid, osactenant, …)
+	// and the data payload (billing_dimensions, transition_time, …).
+	Raw json.RawMessage `json:"-"`
+
+	// Indexed fields for server-side filtering.
+	id         string
+	eventType  string
+	resourceID string
+	receivedAt time.Time
 }
 
 // eventStore is a bounded, thread-safe ring buffer of received events.
@@ -60,22 +62,31 @@ func (s *eventStore) clear() {
 	s.events = s.events[:0]
 }
 
-// getByID returns the event with the given CloudEvent ID, or nil if not found.
-func (s *eventStore) getByID(id string) *storedEvent {
+// getByID returns the enriched JSON for the event with the given CloudEvent ID.
+func (s *eventStore) getByID(id string) json.RawMessage {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	for i := range s.events {
-		if s.events[i].ID == id {
-			e := s.events[i]
-			return &e
+		if s.events[i].id == id {
+			return s.events[i].Raw
 		}
 	}
 	return nil
 }
 
-// add records a metering event in the ring buffer.
+// add records a metering event in the ring buffer, storing the full
+// CloudEvent JSON as-is. Kafka metadata (topic, partition, offset) is
+// kept in indexed fields for filtering but not merged into the JSON
+// to avoid overwriting CloudEvent attributes or introducing invalid
+// extension names.
 func (s *eventStore) add(event adapters.MeteringEvent) {
 	ce := event.CloudEvent
+
+	raw, err := json.Marshal(ce)
+	if err != nil {
+		log.Printf("failed to marshal CloudEvent id=%s: %v", ce.ID(), err)
+		return
+	}
 
 	var resourceID string
 	if v, ok := ce.Extensions()["osacresourceid"]; ok {
@@ -83,22 +94,17 @@ func (s *eventStore) add(event adapters.MeteringEvent) {
 	}
 
 	entry := storedEvent{
-		ID:         ce.ID(),
-		Type:       ce.Type(),
-		Source:     ce.Source(),
-		Time:       ce.Time().Format(time.RFC3339),
-		ResourceID: resourceID,
-		Topic:      event.Topic,
-		Partition:  event.Partition,
-		Offset:     event.Offset,
-		ReceivedAt: time.Now(),
+		Raw:        raw,
+		id:         ce.ID(),
+		eventType:  ce.Type(),
+		resourceID: resourceID,
+		receivedAt: time.Now(),
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if len(s.events) >= s.max {
-		// Shift left by 1, dropping the oldest entry.
 		copy(s.events, s.events[1:])
 		s.events[len(s.events)-1] = entry
 	} else {
@@ -107,22 +113,22 @@ func (s *eventStore) add(event adapters.MeteringEvent) {
 }
 
 // query returns events matching the given filters.
-func (s *eventStore) query(eventType, resourceID string, since time.Time, limit int) []storedEvent {
+func (s *eventStore) query(eventType, resourceID string, since time.Time, limit int) []json.RawMessage {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	var result []storedEvent
+	var result []json.RawMessage
 	for _, e := range s.events {
-		if eventType != "" && e.Type != eventType {
+		if eventType != "" && e.eventType != eventType {
 			continue
 		}
-		if resourceID != "" && e.ResourceID != resourceID {
+		if resourceID != "" && e.resourceID != resourceID {
 			continue
 		}
-		if !since.IsZero() && e.ReceivedAt.Before(since) {
+		if !since.IsZero() && e.receivedAt.Before(since) {
 			continue
 		}
-		result = append(result, e)
+		result = append(result, e.Raw)
 		if limit > 0 && len(result) >= limit {
 			break
 		}
@@ -137,13 +143,13 @@ func (s *eventStore) count(eventType, resourceID string, since time.Time) int {
 
 	n := 0
 	for _, e := range s.events {
-		if eventType != "" && e.Type != eventType {
+		if eventType != "" && e.eventType != eventType {
 			continue
 		}
-		if resourceID != "" && e.ResourceID != resourceID {
+		if resourceID != "" && e.resourceID != resourceID {
 			continue
 		}
-		if !since.IsZero() && e.ReceivedAt.Before(since) {
+		if !since.IsZero() && e.receivedAt.Before(since) {
 			continue
 		}
 		n++
@@ -153,7 +159,7 @@ func (s *eventStore) count(eventType, resourceID string, since time.Time) int {
 
 // handleEvents serves GET /events with optional query parameters:
 //   - type:        filter by CloudEvent type
-//   - resource_id: filter by resource ID
+//   - resource_id: filter by resource ID (osacresourceid extension)
 //   - since:       RFC3339 timestamp, only events received after this time
 //   - limit:       max number of results
 func (s *eventStore) handleEvents(w http.ResponseWriter, r *http.Request) {
@@ -183,7 +189,7 @@ func (s *eventStore) handleEvents(w http.ResponseWriter, r *http.Request) {
 
 	events := s.query(eventType, resourceID, since, limit)
 	if events == nil {
-		events = []storedEvent{}
+		events = []json.RawMessage{}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -198,14 +204,14 @@ func (s *eventStore) handleEventByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	event := s.getByID(id)
-	if event == nil {
+	raw := s.getByID(id)
+	if raw == nil {
 		http.Error(w, "event not found", http.StatusNotFound)
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(event) //nolint:errcheck
+	w.Write(raw) //nolint:errcheck
 }
 
 // handleDeleteEvents serves DELETE /events — clears all stored events.
