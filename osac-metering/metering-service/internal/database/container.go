@@ -194,13 +194,6 @@ func (i *Instance) init(ctx context.Context) error {
 	return nil
 }
 
-func (i *Instance) URL(ctx context.Context) (string, error) {
-	if err := i.init(ctx); err != nil {
-		return "", err
-	}
-	return i.url, nil
-}
-
 func (i *Instance) Pool(ctx context.Context) (*pgxpool.Pool, error) {
 	if err := i.init(ctx); err != nil {
 		return nil, err

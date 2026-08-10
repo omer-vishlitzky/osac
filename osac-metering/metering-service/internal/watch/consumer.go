@@ -307,7 +307,6 @@ func (c *Consumer) handleScalingEvent(ctx context.Context, event *privatev1.Even
 			for _, comp := range changed {
 				scalingCtx := &events.StateContext{
 					PreviousState: stateCtx.PreviousState,
-					WasBillable:   stateCtx.WasBillable,
 				}
 				if !comp.IsNew {
 					scalingCtx.DurationSeconds = c.componentDurationSeconds(existing, comp.NodeSet, transitionTime)
@@ -422,6 +421,7 @@ func (c *Consumer) buildProjectionState(mapper events.ResourceMapper, existing *
 		TenantID:           mapper.TenantID(),
 		CurrentState:       currentState,
 		IsBillable:         isBillable,
+		EverBillable:       isBillable || (existing != nil && existing.EverBillable),
 		TransitionTime:     tt,
 		FulfillmentVersion: version,
 		BillingDimensions:  dims,
@@ -478,7 +478,7 @@ func (c *Consumer) buildStateContext(existing *projection.ResourceState, nowBill
 
 	sc := &events.StateContext{
 		PreviousState: existing.CurrentState,
-		WasBillable:   existing.IsBillable,
+		EverBillable:  existing.EverBillable,
 	}
 
 	if existing.IsBillable && existing.BillableSince != nil {

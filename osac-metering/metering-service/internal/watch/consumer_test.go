@@ -565,7 +565,11 @@ var _ = Describe("Consumer", func() {
 			pub.mu.Lock()
 			defer pub.mu.Unlock()
 			Expect(pub.published).To(HaveLen(1))
-			Expect(pub.published[0].Type()).To(Equal("osac.resource.resumed.v1"))
+			// Fixture has no recorded billing history (EverBillable defaults
+			// false) -- this is genuinely vm-meta's first activation, so
+			// started.v1 is correct. The type isn't this test's focus (see
+			// name), but it should still be right.
+			Expect(pub.published[0].Type()).To(Equal("osac.resource.started.v1"))
 		})
 
 		It("fails fast on data quality error when state actually changed", func() {
@@ -655,6 +659,7 @@ var _ = Describe("Consumer", func() {
 				TenantID:           "tenant-1",
 				CurrentState:       "STOPPED",
 				IsBillable:         false,
+				EverBillable:       true, // was RUNNING before this stop -- a genuine resume
 				FulfillmentVersion: 1,
 				BillingDimensions:  map[string]any{},
 				TransitionTime:     now,
@@ -979,6 +984,53 @@ var _ = Describe("Consumer", func() {
 			Expect(store.states["vm-new"].IsBillable).To(BeTrue())
 			Expect(store.states["vm-new"].BillableSince).ToNot(BeNil())
 		})
+
+		It("emits started.v1 (not resumed.v1) for a brand-new resource's real first-boot sequence", func() {
+			// Real lifecycle shape: CREATE observes the resource before it's
+			// running (STARTING -- matching what the controller reports at
+			// creation), then a separate UPDATE reports RUNNING. No pre-seeded
+			// store state. makeComputeInstance/makeEvent hardcode RUNNING even
+			// at CREATE, which hides this path -- build the events by hand here.
+			store := newMockStore()
+
+			createCI := makeComputeInstance("vm-fresh", "tenant-1")
+			createCI.Status.State = privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_STARTING
+			createEvent := &privatev1.Event{
+				Id:      "evt-create",
+				Type:    privatev1.EventType_EVENT_TYPE_OBJECT_CREATED,
+				Payload: &privatev1.Event_ComputeInstance{ComputeInstance: createCI},
+			}
+
+			runningCI := makeComputeInstance("vm-fresh", "tenant-1")
+			runningCI.Status.State = privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_RUNNING
+			runningCI.Metadata.Version = 2
+			runningEvent := &privatev1.Event{
+				Id:      "evt-running",
+				Type:    privatev1.EventType_EVENT_TYPE_OBJECT_UPDATED,
+				Payload: &privatev1.Event_ComputeInstance{ComputeInstance: runningCI},
+			}
+
+			stream := &mockWatchStream{
+				responses: []*privatev1.EventsWatchResponse{
+					makeResponse(createEvent),
+					makeResponse(runningEvent),
+				},
+			}
+			client.results = []mockStreamResult{{stream: stream}}
+
+			pub := &mockPublisher{published: make([]cloudevents.Event, 0, 2), cancelFunc: cancel}
+			consumer := newConsumerWithStore(pub, store)
+
+			err := consumer.Run(ctx)
+			Expect(err).ToNot(HaveOccurred())
+
+			pub.mu.Lock()
+			defer pub.mu.Unlock()
+			Expect(pub.published).To(HaveLen(2))
+			Expect(pub.published[0].Type()).To(Equal(events.EventCreated))
+			Expect(pub.published[1].Type()).To(Equal(events.EventStarted),
+				"first-ever activation of a brand-new resource must be started.v1, not resumed.v1")
+		})
 	})
 
 	Describe("CaaS Cluster events", func() {
@@ -1148,6 +1200,55 @@ var _ = Describe("Consumer", func() {
 			Expect(pub.published).To(HaveLen(3))
 			for _, e := range pub.published {
 				Expect(e.Type()).To(Equal(events.EventStarted))
+			}
+		})
+
+		It("emits started.v1 (not resumed.v1) for a brand-new cluster's real first-progress sequence", func() {
+			// Companion to the test above, which unrealistically feeds a bare
+			// UPDATE into an empty store (existing==nil gives PreviousState=""
+			// for free). Real clusters get a CREATE first, same as ComputeInstance
+			// -- CREATE seeds a real (non-empty) CurrentState before PROGRESSING
+			// is ever observed, so PreviousState is never "" again. No pre-seeded
+			// store state here; build both events by hand.
+			store := newMockStore()
+
+			createCluster := makeCluster("cl-fresh", "tenant-1", privatev1.ClusterState_CLUSTER_STATE_UNSPECIFIED, defaultNodeSets())
+			createEvent := &privatev1.Event{
+				Id:      "evt-create",
+				Type:    privatev1.EventType_EVENT_TYPE_OBJECT_CREATED,
+				Payload: &privatev1.Event_Cluster{Cluster: createCluster},
+			}
+
+			progressingCluster := makeCluster("cl-fresh", "tenant-1", privatev1.ClusterState_CLUSTER_STATE_PROGRESSING, defaultNodeSets())
+			progressingCluster.Metadata.Version = 3
+			progressingEvent := &privatev1.Event{
+				Id:      "evt-progressing",
+				Type:    privatev1.EventType_EVENT_TYPE_OBJECT_UPDATED,
+				Payload: &privatev1.Event_Cluster{Cluster: progressingCluster},
+			}
+
+			stream := &mockWatchStream{
+				responses: []*privatev1.EventsWatchResponse{
+					makeResponse(createEvent),
+					makeResponse(progressingEvent),
+				},
+			}
+			client.results = []mockStreamResult{{stream: stream}}
+
+			// 1 created.v1 + 3 started.v1 (control_plane + 2 workers)
+			pub := &mockPublisher{published: make([]cloudevents.Event, 0, 4), cancelFunc: cancel}
+			consumer := newConsumerWithStore(pub, store)
+
+			err := consumer.Run(ctx)
+			Expect(err).ToNot(HaveOccurred())
+
+			pub.mu.Lock()
+			defer pub.mu.Unlock()
+			Expect(pub.published).To(HaveLen(4))
+			Expect(pub.published[0].Type()).To(Equal(events.EventCreated))
+			for _, e := range pub.published[1:] {
+				Expect(e.Type()).To(Equal(events.EventStarted),
+					"first-ever activation of a brand-new cluster must be started.v1, not resumed.v1")
 			}
 		})
 

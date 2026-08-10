@@ -32,8 +32,16 @@ type ResourceMapper interface {
 // StateContext carries previous state from the State Projection for enriching
 // lifecycle events with duration and state-derived type resolution.
 type StateContext struct {
-	PreviousState   string
-	WasBillable     bool
+	PreviousState string
+	// EverBillable is true once this resource has been billable at least once,
+	// ever, and stays true from then on (see projection.ResourceState.EverBillable).
+	// Distinguishes a resource's first-ever activation (started.v1) from every
+	// later billable->non-billable->billable cycle (resumed.v1) -- a distinction
+	// the (previousState, currentState) transition table cannot make on its own,
+	// since previousState is never the empty/never-seen sentinel by the time a
+	// real transition into a billable state is observed (CREATE always seeds a
+	// concrete state first).
+	EverBillable    bool
 	BillableSince   *time.Time
 	DurationSeconds *float64
 }
@@ -48,6 +56,13 @@ func MapWatchEvent(event *privatev1.Event, mapper ResourceMapper, stateCtx *Stat
 	ceType, err := mapper.CloudEventType(event.GetType(), previousState)
 	if err != nil {
 		return nil, err
+	}
+	if ceType == eventBillableStart {
+		if stateCtx.EverBillable {
+			ceType = EventResumed
+		} else {
+			ceType = EventStarted
+		}
 	}
 
 	if mapper.ResourceID() == "" {

@@ -38,6 +38,16 @@ const (
 	EventCorrection = "osac.resource.correction.v1"
 )
 
+// eventBillableStart is an internal marker, never emitted as a real CloudEvent
+// type. Transition tables use it for every "crossed into billable" row instead
+// of picking EventStarted or EventResumed themselves -- that choice depends on
+// whether the resource has EVER been billable before, which is historical
+// information a (previousState, currentState) table lookup cannot see (by the
+// time a real transition into a billable state is observed, previousState is
+// never the empty/never-seen sentinel; CREATE always seeds a concrete state
+// first). MapWatchEvent resolves this marker via StateContext.EverBillable.
+const eventBillableStart = "internal.billable-boundary-crossed"
+
 // Resource type constants.
 const (
 	ResourceTypeComputeInstance = "compute_instance"

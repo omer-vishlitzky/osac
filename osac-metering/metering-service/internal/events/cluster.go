@@ -103,9 +103,11 @@ func (m *clusterMapper) BillingDimensionsMap() map[string]any {
 // the Watch Consumer via DimensionsEqual; the hourly reconciler catches
 // any missed dimension drift.
 var clusterTransitions = TransitionTable{
-	// Started: first billable state (no previous)
-	{StateEmpty, ClusterStateProgressing}: {EventType: EventStarted},
-	{StateEmpty, ClusterStateReady}:       {EventType: EventStarted},
+	// Crossed into billable: label (started.v1 vs resumed.v1) is resolved by
+	// MapWatchEvent from StateContext.EverBillable, not by which previous
+	// state this row matched -- see eventBillableStart's doc comment.
+	{StateEmpty, ClusterStateProgressing}: {EventType: eventBillableStart},
+	{StateEmpty, ClusterStateReady}:       {EventType: eventBillableStart},
 
 	// Skip: first observed in non-billable state (bootstrap, reconnect after failure)
 	{StateEmpty, ClusterStateFailed}:       {Skip: true},
@@ -113,15 +115,14 @@ var clusterTransitions = TransitionTable{
 	{StateEmpty, ClusterStateDeleteFailed}: {Skip: true},
 	{StateEmpty, ClusterStateUnspecified}:  {Skip: true},
 
-	// Resumed: non-billable to billable
-	{ClusterStateFailed, ClusterStateProgressing}:       {EventType: EventResumed},
-	{ClusterStateFailed, ClusterStateReady}:             {EventType: EventResumed},
-	{ClusterStateDeleting, ClusterStateProgressing}:     {EventType: EventResumed},
-	{ClusterStateDeleting, ClusterStateReady}:           {EventType: EventResumed},
-	{ClusterStateDeleteFailed, ClusterStateProgressing}: {EventType: EventResumed},
-	{ClusterStateDeleteFailed, ClusterStateReady}:       {EventType: EventResumed},
-	{ClusterStateUnspecified, ClusterStateProgressing}:  {EventType: EventResumed},
-	{ClusterStateUnspecified, ClusterStateReady}:        {EventType: EventResumed},
+	{ClusterStateFailed, ClusterStateProgressing}:       {EventType: eventBillableStart},
+	{ClusterStateFailed, ClusterStateReady}:             {EventType: eventBillableStart},
+	{ClusterStateDeleting, ClusterStateProgressing}:     {EventType: eventBillableStart},
+	{ClusterStateDeleting, ClusterStateReady}:           {EventType: eventBillableStart},
+	{ClusterStateDeleteFailed, ClusterStateProgressing}: {EventType: eventBillableStart},
+	{ClusterStateDeleteFailed, ClusterStateReady}:       {EventType: eventBillableStart},
+	{ClusterStateUnspecified, ClusterStateProgressing}:  {EventType: eventBillableStart},
+	{ClusterStateUnspecified, ClusterStateReady}:        {EventType: eventBillableStart},
 
 	// Suspended: billable to non-billable
 	{ClusterStateProgressing, ClusterStateFailed}:       {EventType: EventSuspended},

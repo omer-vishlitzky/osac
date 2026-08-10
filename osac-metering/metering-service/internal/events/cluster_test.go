@@ -44,7 +44,7 @@ var _ = Describe("CaaS Cluster Mapper", func() {
 
 	Context("state machine — full transition matrix", func() {
 		DescribeTable("resolves correct CloudEvent type for state transitions",
-			func(currentState privatev1.ClusterState, previousState string, expectedType string, expectSkip bool) {
+			func(currentState privatev1.ClusterState, previousState string, everBillable bool, expectedType string, expectSkip bool) {
 				cl.Status.State = currentState
 
 				event := &privatev1.Event{
@@ -53,7 +53,7 @@ var _ = Describe("CaaS Cluster Mapper", func() {
 					Payload: &privatev1.Event_Cluster{Cluster: cl},
 				}
 
-				stateCtx := &events.StateContext{PreviousState: previousState}
+				stateCtx := &events.StateContext{PreviousState: previousState, EverBillable: everBillable}
 				ce, err := mapEvent(event, stateCtx)
 
 				if expectSkip {
@@ -64,103 +64,123 @@ var _ = Describe("CaaS Cluster Mapper", func() {
 					Expect(ce.Type()).To(Equal(expectedType))
 				}
 			},
-			// --- Started: first billable state (no previous) ---
-			Entry("initial PROGRESSING (prev=empty) -> started.v1",
-				privatev1.ClusterState_CLUSTER_STATE_PROGRESSING, events.StateEmpty, events.EventStarted, false),
-			Entry("initial READY (prev=empty) -> started.v1",
-				privatev1.ClusterState_CLUSTER_STATE_READY, events.StateEmpty, events.EventStarted, false),
+			// --- Crossed into billable, from "" (existing==nil, so EverBillable
+			// is necessarily false -- only fires on missed-CREATE recovery) ---
+			Entry("initial PROGRESSING (prev=empty), never billable before -> started.v1",
+				privatev1.ClusterState_CLUSTER_STATE_PROGRESSING, events.StateEmpty, false, events.EventStarted, false),
+			Entry("initial READY (prev=empty), never billable before -> started.v1",
+				privatev1.ClusterState_CLUSTER_STATE_READY, events.StateEmpty, false, events.EventStarted, false),
 
 			// --- Skip: first observed in non-billable state ---
 			Entry("initial FAILED (prev=empty) -> skip",
-				privatev1.ClusterState_CLUSTER_STATE_FAILED, events.StateEmpty, "", true),
+				privatev1.ClusterState_CLUSTER_STATE_FAILED, events.StateEmpty, false, "", true),
 			Entry("initial DELETING (prev=empty) -> skip",
-				privatev1.ClusterState_CLUSTER_STATE_DELETING, events.StateEmpty, "", true),
+				privatev1.ClusterState_CLUSTER_STATE_DELETING, events.StateEmpty, false, "", true),
 			Entry("initial DELETE_FAILED (prev=empty) -> skip",
-				privatev1.ClusterState_CLUSTER_STATE_DELETE_FAILED, events.StateEmpty, "", true),
+				privatev1.ClusterState_CLUSTER_STATE_DELETE_FAILED, events.StateEmpty, false, "", true),
 			Entry("initial UNSPECIFIED (prev=empty) -> skip",
-				privatev1.ClusterState_CLUSTER_STATE_UNSPECIFIED, events.StateEmpty, "", true),
+				privatev1.ClusterState_CLUSTER_STATE_UNSPECIFIED, events.StateEmpty, false, "", true),
 
-			// --- Resumed: non-billable to billable ---
-			Entry("FAILED -> PROGRESSING -> resumed.v1",
-				privatev1.ClusterState_CLUSTER_STATE_PROGRESSING, events.ClusterStateFailed, events.EventResumed, false),
-			Entry("FAILED -> READY -> resumed.v1",
-				privatev1.ClusterState_CLUSTER_STATE_READY, events.ClusterStateFailed, events.EventResumed, false),
-			Entry("DELETING -> PROGRESSING -> resumed.v1",
-				privatev1.ClusterState_CLUSTER_STATE_PROGRESSING, events.ClusterStateDeleting, events.EventResumed, false),
-			Entry("DELETING -> READY -> resumed.v1",
-				privatev1.ClusterState_CLUSTER_STATE_READY, events.ClusterStateDeleting, events.EventResumed, false),
-			Entry("DELETE_FAILED -> PROGRESSING -> resumed.v1",
-				privatev1.ClusterState_CLUSTER_STATE_PROGRESSING, events.ClusterStateDeleteFailed, events.EventResumed, false),
-			Entry("DELETE_FAILED -> READY -> resumed.v1",
-				privatev1.ClusterState_CLUSTER_STATE_READY, events.ClusterStateDeleteFailed, events.EventResumed, false),
-			Entry("UNSPECIFIED -> PROGRESSING -> resumed.v1",
-				privatev1.ClusterState_CLUSTER_STATE_PROGRESSING, events.ClusterStateUnspecified, events.EventResumed, false),
-			Entry("UNSPECIFIED -> READY -> resumed.v1",
-				privatev1.ClusterState_CLUSTER_STATE_READY, events.ClusterStateUnspecified, events.EventResumed, false),
+			// --- Crossed into billable, from a real prior state: label depends on
+			// EverBillable, not on which state matched -- both variants proven for
+			// each reachable previousState (UNSPECIFIED is the real-world case: a
+			// fresh cluster whose CREATE is observed before status is populated) ---
+			Entry("FAILED -> PROGRESSING, billable before -> resumed.v1",
+				privatev1.ClusterState_CLUSTER_STATE_PROGRESSING, events.ClusterStateFailed, true, events.EventResumed, false),
+			Entry("FAILED -> PROGRESSING, never billable before -> started.v1",
+				privatev1.ClusterState_CLUSTER_STATE_PROGRESSING, events.ClusterStateFailed, false, events.EventStarted, false),
+			Entry("FAILED -> READY, billable before -> resumed.v1",
+				privatev1.ClusterState_CLUSTER_STATE_READY, events.ClusterStateFailed, true, events.EventResumed, false),
+			Entry("FAILED -> READY, never billable before -> started.v1",
+				privatev1.ClusterState_CLUSTER_STATE_READY, events.ClusterStateFailed, false, events.EventStarted, false),
+			Entry("DELETING -> PROGRESSING, billable before -> resumed.v1",
+				privatev1.ClusterState_CLUSTER_STATE_PROGRESSING, events.ClusterStateDeleting, true, events.EventResumed, false),
+			Entry("DELETING -> PROGRESSING, never billable before -> started.v1",
+				privatev1.ClusterState_CLUSTER_STATE_PROGRESSING, events.ClusterStateDeleting, false, events.EventStarted, false),
+			Entry("DELETING -> READY, billable before -> resumed.v1",
+				privatev1.ClusterState_CLUSTER_STATE_READY, events.ClusterStateDeleting, true, events.EventResumed, false),
+			Entry("DELETING -> READY, never billable before -> started.v1",
+				privatev1.ClusterState_CLUSTER_STATE_READY, events.ClusterStateDeleting, false, events.EventStarted, false),
+			Entry("DELETE_FAILED -> PROGRESSING, billable before -> resumed.v1",
+				privatev1.ClusterState_CLUSTER_STATE_PROGRESSING, events.ClusterStateDeleteFailed, true, events.EventResumed, false),
+			Entry("DELETE_FAILED -> PROGRESSING, never billable before -> started.v1",
+				privatev1.ClusterState_CLUSTER_STATE_PROGRESSING, events.ClusterStateDeleteFailed, false, events.EventStarted, false),
+			Entry("DELETE_FAILED -> READY, billable before -> resumed.v1",
+				privatev1.ClusterState_CLUSTER_STATE_READY, events.ClusterStateDeleteFailed, true, events.EventResumed, false),
+			Entry("DELETE_FAILED -> READY, never billable before -> started.v1",
+				privatev1.ClusterState_CLUSTER_STATE_READY, events.ClusterStateDeleteFailed, false, events.EventStarted, false),
+			Entry("UNSPECIFIED -> PROGRESSING, billable before -> resumed.v1",
+				privatev1.ClusterState_CLUSTER_STATE_PROGRESSING, events.ClusterStateUnspecified, true, events.EventResumed, false),
+			Entry("UNSPECIFIED -> PROGRESSING, never billable before -> started.v1",
+				privatev1.ClusterState_CLUSTER_STATE_PROGRESSING, events.ClusterStateUnspecified, false, events.EventStarted, false),
+			Entry("UNSPECIFIED -> READY, billable before -> resumed.v1",
+				privatev1.ClusterState_CLUSTER_STATE_READY, events.ClusterStateUnspecified, true, events.EventResumed, false),
+			Entry("UNSPECIFIED -> READY, never billable before -> started.v1",
+				privatev1.ClusterState_CLUSTER_STATE_READY, events.ClusterStateUnspecified, false, events.EventStarted, false),
 
-			// --- Suspended: billable to non-billable ---
+			// --- Suspended: billable to non-billable (EverBillable irrelevant) ---
 			Entry("PROGRESSING -> FAILED -> suspended.v1",
-				privatev1.ClusterState_CLUSTER_STATE_FAILED, events.ClusterStateProgressing, events.EventSuspended, false),
+				privatev1.ClusterState_CLUSTER_STATE_FAILED, events.ClusterStateProgressing, false, events.EventSuspended, false),
 			Entry("PROGRESSING -> DELETING -> suspended.v1",
-				privatev1.ClusterState_CLUSTER_STATE_DELETING, events.ClusterStateProgressing, events.EventSuspended, false),
+				privatev1.ClusterState_CLUSTER_STATE_DELETING, events.ClusterStateProgressing, false, events.EventSuspended, false),
 			Entry("READY -> FAILED -> suspended.v1",
-				privatev1.ClusterState_CLUSTER_STATE_FAILED, events.ClusterStateReady, events.EventSuspended, false),
+				privatev1.ClusterState_CLUSTER_STATE_FAILED, events.ClusterStateReady, false, events.EventSuspended, false),
 			Entry("READY -> DELETING -> suspended.v1",
-				privatev1.ClusterState_CLUSTER_STATE_DELETING, events.ClusterStateReady, events.EventSuspended, false),
+				privatev1.ClusterState_CLUSTER_STATE_DELETING, events.ClusterStateReady, false, events.EventSuspended, false),
 			Entry("PROGRESSING -> UNSPECIFIED -> suspended.v1",
-				privatev1.ClusterState_CLUSTER_STATE_UNSPECIFIED, events.ClusterStateProgressing, events.EventSuspended, false),
+				privatev1.ClusterState_CLUSTER_STATE_UNSPECIFIED, events.ClusterStateProgressing, false, events.EventSuspended, false),
 			Entry("READY -> UNSPECIFIED -> suspended.v1",
-				privatev1.ClusterState_CLUSTER_STATE_UNSPECIFIED, events.ClusterStateReady, events.EventSuspended, false),
+				privatev1.ClusterState_CLUSTER_STATE_UNSPECIFIED, events.ClusterStateReady, false, events.EventSuspended, false),
 			Entry("READY -> DELETE_FAILED -> suspended.v1",
-				privatev1.ClusterState_CLUSTER_STATE_DELETE_FAILED, events.ClusterStateReady, events.EventSuspended, false),
+				privatev1.ClusterState_CLUSTER_STATE_DELETE_FAILED, events.ClusterStateReady, false, events.EventSuspended, false),
 			Entry("PROGRESSING -> DELETE_FAILED -> suspended.v1",
-				privatev1.ClusterState_CLUSTER_STATE_DELETE_FAILED, events.ClusterStateProgressing, events.EventSuspended, false),
+				privatev1.ClusterState_CLUSTER_STATE_DELETE_FAILED, events.ClusterStateProgressing, false, events.EventSuspended, false),
 
 			// --- Skip: billable to billable (no billing boundary) ---
 			Entry("PROGRESSING -> READY -> skip",
-				privatev1.ClusterState_CLUSTER_STATE_READY, events.ClusterStateProgressing, "", true),
+				privatev1.ClusterState_CLUSTER_STATE_READY, events.ClusterStateProgressing, false, "", true),
 			Entry("READY -> PROGRESSING -> skip",
-				privatev1.ClusterState_CLUSTER_STATE_PROGRESSING, events.ClusterStateReady, "", true),
+				privatev1.ClusterState_CLUSTER_STATE_PROGRESSING, events.ClusterStateReady, false, "", true),
 			Entry("PROGRESSING -> PROGRESSING -> skip (same-state)",
-				privatev1.ClusterState_CLUSTER_STATE_PROGRESSING, events.ClusterStateProgressing, "", true),
+				privatev1.ClusterState_CLUSTER_STATE_PROGRESSING, events.ClusterStateProgressing, false, "", true),
 			Entry("READY -> READY -> skip (same-state, scaling)",
-				privatev1.ClusterState_CLUSTER_STATE_READY, events.ClusterStateReady, "", true),
+				privatev1.ClusterState_CLUSTER_STATE_READY, events.ClusterStateReady, false, "", true),
 
 			// --- Skip: non-billable same-state ---
 			Entry("FAILED -> FAILED -> skip (same-state)",
-				privatev1.ClusterState_CLUSTER_STATE_FAILED, events.ClusterStateFailed, "", true),
+				privatev1.ClusterState_CLUSTER_STATE_FAILED, events.ClusterStateFailed, false, "", true),
 			Entry("DELETING -> DELETING -> skip (same-state)",
-				privatev1.ClusterState_CLUSTER_STATE_DELETING, events.ClusterStateDeleting, "", true),
+				privatev1.ClusterState_CLUSTER_STATE_DELETING, events.ClusterStateDeleting, false, "", true),
 			Entry("DELETE_FAILED -> DELETE_FAILED -> skip (same-state)",
-				privatev1.ClusterState_CLUSTER_STATE_DELETE_FAILED, events.ClusterStateDeleteFailed, "", true),
+				privatev1.ClusterState_CLUSTER_STATE_DELETE_FAILED, events.ClusterStateDeleteFailed, false, "", true),
 			Entry("UNSPECIFIED -> UNSPECIFIED -> skip (same-state)",
-				privatev1.ClusterState_CLUSTER_STATE_UNSPECIFIED, events.ClusterStateUnspecified, "", true),
+				privatev1.ClusterState_CLUSTER_STATE_UNSPECIFIED, events.ClusterStateUnspecified, false, "", true),
 
 			// --- Skip: non-billable to non-billable (cross-state) ---
 			Entry("FAILED -> DELETING -> skip",
-				privatev1.ClusterState_CLUSTER_STATE_DELETING, events.ClusterStateFailed, "", true),
+				privatev1.ClusterState_CLUSTER_STATE_DELETING, events.ClusterStateFailed, false, "", true),
 			Entry("FAILED -> DELETE_FAILED -> skip",
-				privatev1.ClusterState_CLUSTER_STATE_DELETE_FAILED, events.ClusterStateFailed, "", true),
+				privatev1.ClusterState_CLUSTER_STATE_DELETE_FAILED, events.ClusterStateFailed, false, "", true),
 			Entry("DELETING -> DELETE_FAILED -> skip",
-				privatev1.ClusterState_CLUSTER_STATE_DELETE_FAILED, events.ClusterStateDeleting, "", true),
+				privatev1.ClusterState_CLUSTER_STATE_DELETE_FAILED, events.ClusterStateDeleting, false, "", true),
 			Entry("DELETE_FAILED -> DELETING -> skip",
-				privatev1.ClusterState_CLUSTER_STATE_DELETING, events.ClusterStateDeleteFailed, "", true),
+				privatev1.ClusterState_CLUSTER_STATE_DELETING, events.ClusterStateDeleteFailed, false, "", true),
 			Entry("DELETING -> FAILED -> skip",
-				privatev1.ClusterState_CLUSTER_STATE_FAILED, events.ClusterStateDeleting, "", true),
+				privatev1.ClusterState_CLUSTER_STATE_FAILED, events.ClusterStateDeleting, false, "", true),
 			Entry("DELETE_FAILED -> FAILED -> skip",
-				privatev1.ClusterState_CLUSTER_STATE_FAILED, events.ClusterStateDeleteFailed, "", true),
+				privatev1.ClusterState_CLUSTER_STATE_FAILED, events.ClusterStateDeleteFailed, false, "", true),
 			Entry("UNSPECIFIED -> FAILED -> skip",
-				privatev1.ClusterState_CLUSTER_STATE_FAILED, events.ClusterStateUnspecified, "", true),
+				privatev1.ClusterState_CLUSTER_STATE_FAILED, events.ClusterStateUnspecified, false, "", true),
 			Entry("UNSPECIFIED -> DELETING -> skip",
-				privatev1.ClusterState_CLUSTER_STATE_DELETING, events.ClusterStateUnspecified, "", true),
+				privatev1.ClusterState_CLUSTER_STATE_DELETING, events.ClusterStateUnspecified, false, "", true),
 			Entry("UNSPECIFIED -> DELETE_FAILED -> skip",
-				privatev1.ClusterState_CLUSTER_STATE_DELETE_FAILED, events.ClusterStateUnspecified, "", true),
+				privatev1.ClusterState_CLUSTER_STATE_DELETE_FAILED, events.ClusterStateUnspecified, false, "", true),
 			Entry("FAILED -> UNSPECIFIED -> skip",
-				privatev1.ClusterState_CLUSTER_STATE_UNSPECIFIED, events.ClusterStateFailed, "", true),
+				privatev1.ClusterState_CLUSTER_STATE_UNSPECIFIED, events.ClusterStateFailed, false, "", true),
 			Entry("DELETING -> UNSPECIFIED -> skip",
-				privatev1.ClusterState_CLUSTER_STATE_UNSPECIFIED, events.ClusterStateDeleting, "", true),
+				privatev1.ClusterState_CLUSTER_STATE_UNSPECIFIED, events.ClusterStateDeleting, false, "", true),
 			Entry("DELETE_FAILED -> UNSPECIFIED -> skip",
-				privatev1.ClusterState_CLUSTER_STATE_UNSPECIFIED, events.ClusterStateDeleteFailed, "", true),
+				privatev1.ClusterState_CLUSTER_STATE_UNSPECIFIED, events.ClusterStateDeleteFailed, false, "", true),
 		)
 
 		It("returns error for unknown state (missing table entry)", func() {

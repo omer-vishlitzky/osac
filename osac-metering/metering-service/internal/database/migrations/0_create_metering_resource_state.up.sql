@@ -13,6 +13,7 @@ CREATE TABLE metering_resource_state (
     current_state     TEXT        NOT NULL,
     previous_state    TEXT,
     is_billable       BOOLEAN     NOT NULL DEFAULT FALSE,
+    ever_billable     BOOLEAN     NOT NULL DEFAULT FALSE,
     billable_since    TIMESTAMPTZ,
     last_heartbeat_at TIMESTAMPTZ,
     transition_time   TIMESTAMPTZ NOT NULL DEFAULT NOW(),

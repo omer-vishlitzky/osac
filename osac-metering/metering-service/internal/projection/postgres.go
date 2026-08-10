@@ -31,7 +31,7 @@ func NewPostgresStore(pool *pgxpool.Pool) *PostgresStore {
 func (s *PostgresStore) Get(ctx context.Context, resourceID string) (*ResourceState, error) {
 	row := s.pool.QueryRow(ctx, `
 		SELECT resource_id, resource_type, tenant_id, project_id,
-		       current_state, previous_state, is_billable, billable_since,
+		       current_state, previous_state, is_billable, ever_billable, billable_since,
 		       last_heartbeat_at, transition_time, fulfillment_version,
 		       billing_dimensions, component_billable_since
 		FROM metering_resource_state
@@ -86,10 +86,10 @@ func (s *PostgresStore) Upsert(ctx context.Context, state ResourceState) error {
 	_, err = tx.Exec(ctx, `
 		INSERT INTO metering_resource_state (
 			resource_id, resource_type, tenant_id, project_id,
-			current_state, previous_state, is_billable, billable_since,
+			current_state, previous_state, is_billable, ever_billable, billable_since,
 			last_heartbeat_at, transition_time, fulfillment_version,
 			billing_dimensions, component_billable_since, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW())
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NOW())
 		ON CONFLICT (resource_id) DO UPDATE SET
 			resource_type = EXCLUDED.resource_type,
 			tenant_id = EXCLUDED.tenant_id,
@@ -97,6 +97,7 @@ func (s *PostgresStore) Upsert(ctx context.Context, state ResourceState) error {
 			current_state = EXCLUDED.current_state,
 			previous_state = EXCLUDED.previous_state,
 			is_billable = EXCLUDED.is_billable,
+			ever_billable = EXCLUDED.ever_billable,
 			billable_since = EXCLUDED.billable_since,
 			last_heartbeat_at = EXCLUDED.last_heartbeat_at,
 			transition_time = EXCLUDED.transition_time,
@@ -112,6 +113,7 @@ func (s *PostgresStore) Upsert(ctx context.Context, state ResourceState) error {
 		state.CurrentState,
 		nullIfEmpty(state.PreviousState),
 		state.IsBillable,
+		state.EverBillable,
 		state.BillableSince,
 		state.LastHeartbeatAt,
 		state.TransitionTime,
@@ -139,7 +141,7 @@ func (s *PostgresStore) Delete(ctx context.Context, resourceID string) error {
 func (s *PostgresStore) ListBillable(ctx context.Context) ([]ResourceState, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT resource_id, resource_type, tenant_id, project_id,
-		       current_state, previous_state, is_billable, billable_since,
+		       current_state, previous_state, is_billable, ever_billable, billable_since,
 		       last_heartbeat_at, transition_time, fulfillment_version,
 		       billing_dimensions, component_billable_since
 		FROM metering_resource_state
@@ -154,7 +156,7 @@ func (s *PostgresStore) ListBillable(ctx context.Context) ([]ResourceState, erro
 func (s *PostgresStore) ListAll(ctx context.Context) ([]ResourceState, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT resource_id, resource_type, tenant_id, project_id,
-		       current_state, previous_state, is_billable, billable_since,
+		       current_state, previous_state, is_billable, ever_billable, billable_since,
 		       last_heartbeat_at, transition_time, fulfillment_version,
 		       billing_dimensions, component_billable_since
 		FROM metering_resource_state`)
@@ -199,6 +201,7 @@ func scanResourceState(row pgx.Row) (*ResourceState, error) {
 		&state.CurrentState,
 		&previousState,
 		&state.IsBillable,
+		&state.EverBillable,
 		&billableSince,
 		&lastHeartbeat,
 		&state.TransitionTime,

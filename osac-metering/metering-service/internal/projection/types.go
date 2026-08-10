@@ -21,6 +21,10 @@ type ResourceState struct {
 	CurrentState  string
 	PreviousState string
 	IsBillable    bool
+	// EverBillable is true once this resource has been billable at least once,
+	// ever, and stays true from then on -- distinguishes first-ever activation
+	// (started.v1) from every later resume (resumed.v1). See StateContext.EverBillable.
+	EverBillable  bool
 	BillableSince *time.Time
 	// ComponentBillableSince tracks, per node_set, when that component's
 	// billing dimensions last changed. N+1 decomposed resources (ClusterOrder)

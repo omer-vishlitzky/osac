@@ -173,6 +173,7 @@ func (r *Reconciler) reconcileFulfillmentResources(ctx context.Context, fulfillm
 				ProjectID:          fs.projectID,
 				CurrentState:       fs.state,
 				IsBillable:         isBillable,
+				EverBillable:       isBillable,
 				TransitionTime:     now,
 				FulfillmentVersion: fs.version,
 				BillingDimensions:  fs.billingDimensions,
