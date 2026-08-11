@@ -5,9 +5,12 @@ on:
   pull_request_target:
     types: [opened, reopened, ready_for_review, synchronize, labeled, unlabeled]
     branches: [main]
+  schedule:
+    - cron: "*/10 * * * *"
 
 jobs:
   enable-auto-merge:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - name: Check repo collaborator
@@ -59,3 +62,25 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.MERGE_QUEUE_TOKEN }}
         run: gh pr merge ${{ github.event.pull_request.number }} --repo ${{ github.repository }} --disable-auto
+
+  requeue-eligible-prs:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Re-enable auto-merge on eligible PRs
+        env:
+          GH_TOKEN: ${{ secrets.MERGE_QUEUE_TOKEN }}
+        run: |
+          echo "Scanning for eligible PRs without auto-merge..."
+          gh pr list --repo "${{ github.repository }}" --state open --json number,isDraft,labels,autoMergeRequest --jq '
+            .[] | select(
+              .isDraft == false
+              and .autoMergeRequest == null
+              and ([.labels[].name] | contains(["lgtm","approved","jira/valid-reference"]))
+              and ([.labels[].name] | any(. == "do-not-merge/hold" or . == "needs-rebase") | not)
+            ) | .number
+          ' | while read -r pr; do
+            echo "Re-enabling auto-merge on PR #$pr"
+            gh pr merge "$pr" --repo "${{ github.repository }}" --auto --rebase || echo "Failed to enable auto-merge on PR #$pr"
+          done
+          echo "Scan complete."
