@@ -150,6 +150,36 @@ aap:
 validation:
   enabled: true
 
+# --- Kafka (metering infrastructure) ---
+kafka:
+  enabled: true
+
+# --- Metering ---
+metering:
+  enabled: true
+  echoAdapter:
+    enabled: true
+    image:
+      repository: ghcr.io/osac-project/metering-echo-adapter
+      tag: latest
+      pullPolicy: Always
+  database:
+    connection:
+    - secret:
+        name: metering-db
+        items:
+        - key: url
+          param: url
+    - secret:
+        name: postgres-client-cert-metering
+        items:
+        - key: tls.crt
+          param: sslcert
+        - key: tls.key
+          param: sslkey
+        - key: ca.crt
+          param: sslrootcert
+
 # --- Bare Metal Fulfillment Operator ---
 bmf:
   enabled: false
