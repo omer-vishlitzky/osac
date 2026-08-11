@@ -7,10 +7,11 @@ on:
     branches: [main]
   schedule:
     - cron: "*/10 * * * *"
+  workflow_dispatch:
 
 jobs:
   enable-auto-merge:
-    if: github.event_name != 'schedule'
+    if: github.event_name == 'pull_request_target'
     runs-on: ubuntu-latest
     steps:
       - name: Check repo collaborator
@@ -37,7 +38,7 @@ jobs:
         run: |
           echo "labels=$LABELS"
           blocked=false
-          for label in "do-not-merge/hold" "needs-rebase"; do
+          for label in "do-not-merge/hold" "do-not-merge/work-in-progress" "do-not-merge/invalid-owners-file" "needs-rebase"; do
             if echo "$LABELS" | jq -e "index(\"$label\")" > /dev/null; then
               echo "Blocking label found: $label"
               blocked=true
@@ -64,7 +65,7 @@ jobs:
         run: gh pr merge ${{ github.event.pull_request.number }} --repo ${{ github.repository }} --disable-auto
 
   requeue-eligible-prs:
-    if: github.event_name == 'schedule'
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - name: Re-enable auto-merge on eligible PRs
@@ -78,7 +79,7 @@ jobs:
               .isDraft == false
               and .autoMergeRequest == null
               and ([.labels[].name] | contains(["lgtm","approved","jira/valid-reference"]))
-              and ([.labels[].name] | any(. == "do-not-merge/hold" or . == "needs-rebase") | not)
+              and ([.labels[].name] | any(. == "do-not-merge/hold" or . == "do-not-merge/work-in-progress" or . == "do-not-merge/invalid-owners-file" or . == "needs-rebase") | not)
             ) | .number]')
           echo "Eligible PRs: $prs"
           for pr in $(echo "$prs" | jq -r '.[]'); do
