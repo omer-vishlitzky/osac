@@ -196,6 +196,7 @@ func (s *PrivateClustersServer) Create(ctx context.Context,
 		if hostType != nil {
 			hostTypeRef := &privatev1.HostTypeReference{}
 			hostTypeRef.SetId(hostType.GetId())
+			hostTypeRef.SetName(hostType.GetMetadata().GetName())
 			nodeSet.SetHostType(hostTypeRef)
 		}
 	}
@@ -755,16 +756,19 @@ func (s *PrivateClustersServer) validateAndTransformCluster(ctx context.Context,
 	)
 	cluster.GetSpec().SetTemplateParameters(actualClusterParameters)
 
-	// Make sure that the template and the host types of the node sets are referenced by their identifiers, as
-	// that is what we want to save to the database.
+	// Make sure that the template and the host types of the node sets are referenced by their identifiers and
+	// names, as that is what we want to save to the database. Both fields are needed: id for lookups, name for
+	// display and billing dimensions (metering reads the name).
 	resolvedTemplateRef := &privatev1.ClusterTemplateReference{}
 	resolvedTemplateRef.SetId(template.GetId())
+	resolvedTemplateRef.SetName(template.GetMetadata().GetName())
 	cluster.GetSpec().SetTemplate(resolvedTemplateRef)
 	for _, clusterNodeSet := range cluster.GetSpec().GetNodeSets() {
 		hostType := hostTypes[refKey(clusterNodeSet.GetHostType())]
 		if hostType != nil {
 			resolvedHostTypeRef := &privatev1.HostTypeReference{}
 			resolvedHostTypeRef.SetId(hostType.GetId())
+			resolvedHostTypeRef.SetName(hostType.GetMetadata().GetName())
 			clusterNodeSet.SetHostType(resolvedHostTypeRef)
 		}
 	}
@@ -982,6 +986,7 @@ func (s *PrivateClustersServer) validateAndTransformCatalogItem(ctx context.Cont
 		if hostType != nil {
 			resolvedHostTypeRef := &privatev1.HostTypeReference{}
 			resolvedHostTypeRef.SetId(hostType.GetId())
+			resolvedHostTypeRef.SetName(hostType.GetMetadata().GetName())
 			clusterNodeSet.SetHostType(resolvedHostTypeRef)
 		}
 	}
