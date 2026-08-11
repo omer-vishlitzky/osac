@@ -71,15 +71,17 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.MERGE_QUEUE_TOKEN }}
         run: |
+          set -euo pipefail
           echo "Scanning for eligible PRs without auto-merge..."
-          gh pr list --repo "${{ github.repository }}" --state open --json number,isDraft,labels,autoMergeRequest --jq '
-            .[] | select(
+          prs=$(gh pr list --repo "${{ github.repository }}" --state open --limit 200 --json number,isDraft,labels,autoMergeRequest --jq '
+            [.[] | select(
               .isDraft == false
               and .autoMergeRequest == null
               and ([.labels[].name] | contains(["lgtm","approved","jira/valid-reference"]))
               and ([.labels[].name] | any(. == "do-not-merge/hold" or . == "needs-rebase") | not)
-            ) | .number
-          ' | while read -r pr; do
+            ) | .number]')
+          echo "Eligible PRs: $prs"
+          for pr in $(echo "$prs" | jq -r '.[]'); do
             echo "Re-enabling auto-merge on PR #$pr"
             gh pr merge "$pr" --repo "${{ github.repository }}" --auto --rebase || echo "Failed to enable auto-merge on PR #$pr"
           done
