@@ -83,6 +83,6 @@ jobs:
           echo "Eligible PRs: $prs"
           for pr in $(echo "$prs" | jq -r '.[]'); do
             echo "Re-enabling auto-merge on PR #$pr"
-            gh pr merge "$pr" --repo "${{ github.repository }}" --auto --rebase || echo "Failed to enable auto-merge on PR #$pr"
+            gh pr merge "$pr" --repo "${{ github.repository }}" --auto --rebase
           done
           echo "Scan complete."
