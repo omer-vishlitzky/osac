@@ -5,13 +5,15 @@ on:
   pull_request_target:
     types: [opened, reopened, ready_for_review, synchronize, labeled, unlabeled]
     branches: [main]
+  pull_request_review:
+    types: [submitted]
   schedule:
     - cron: "*/10 * * * *"
   workflow_dispatch:
 
 jobs:
   enable-auto-merge:
-    if: github.event_name == 'pull_request_target'
+    if: github.event_name == 'pull_request_target' || github.event_name == 'pull_request_review'
     runs-on: ubuntu-latest
     steps:
       - name: Remove lgtm on new push
