@@ -944,6 +944,11 @@ func (s *PrivateClustersServer) validateAndTransformCatalogItem(ctx context.Cont
 		return grpcstatus.Errorf(grpccodes.InvalidArgument, "template '%s' has been deleted", templateRefStr)
 	}
 
+	resolvedTemplateRef := &privatev1.ClusterTemplateReference{}
+	resolvedTemplateRef.SetId(template.GetId())
+	resolvedTemplateRef.SetName(template.GetMetadata().GetName())
+	cluster.GetSpec().SetTemplate(resolvedTemplateRef)
+
 	// Apply spec defaults from the template (user and field_definition values take precedence):
 	utils.ApplyClusterSpecDefaults(cluster.GetSpec(), template.GetSpecDefaults())
 
