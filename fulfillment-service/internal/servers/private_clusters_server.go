@@ -596,8 +596,7 @@ func (s *PrivateClustersServer) validateTemplateImmutability(ctx context.Context
 	}
 
 	// Check if template has changed. Compare by refKey (Id) rather than proto.Equal because
-	// validateAndTransformCluster normalizes the stored reference to Id-only, while the
-	// reference validator interceptor may backfill Name on incoming requests.
+	// the reference validator interceptor may backfill additional fields on incoming requests.
 	if updatingTemplate && refKey(existingSpec.GetTemplate()) != refKey(newSpec.GetTemplate()) {
 		return grpcstatus.Errorf(
 			grpccodes.InvalidArgument,
