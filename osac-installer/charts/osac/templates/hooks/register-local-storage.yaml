@@ -11,7 +11,7 @@ metadata:
     "helm.sh/hook-weight": "31"
     "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
 spec:
-  backoffLimit: 5
+  backoffLimit: 10
   # waitForFulfillment polls up to 60 × (30s curl + 10s sleep) = 2400s worst case.
   # This deadline must exceed that to avoid premature termination.
   activeDeadlineSeconds: 3000
@@ -38,7 +38,7 @@ spec:
             # Step 1: Create the local StorageBackend. Capture the ID whether
             # this is the first install (2xx) or a re-install (409 = already exists).
             BACKEND_RESP=$(mktemp)
-            BACKEND_CODE=$(curl -skS \
+            BACKEND_CODE=$(curl -skS --retry 5 --retry-delay 5 --retry-all-errors \
               --connect-timeout 5 --max-time 30 \
               -o "${BACKEND_RESP}" -w '%{http_code}' \
               -X POST "${API}/storage_backends" \
@@ -53,7 +53,8 @@ spec:
                 ;;
               409)
                 echo "StorageBackend 'local' already exists, verifying spec..."
-                EXISTING=$(curl -skS --connect-timeout 5 --max-time 30 \
+                EXISTING=$(curl -skS --retry 5 --retry-delay 5 --retry-all-errors \
+                  --connect-timeout 5 --max-time 30 \
                   "${API}/storage_backends" \
                   -H "Authorization: Bearer ${AUTH_TOKEN}")
                 BACKEND_ID=$(echo "${EXISTING}" | python3 -c "import sys,json; items=json.load(sys.stdin).get('items',[]); m=next((i for i in items if i.get('metadata',{}).get('name')=='local'),None); p=m.get('spec',{}).get('provider','') if m else ''; sys.stderr.write('ERROR: backend not found or wrong provider: '+p+'\n') or sys.exit(1) if not m or p!='lvms' else print(m['id'])")
@@ -72,7 +73,7 @@ spec:
             # Protocol 2 = STORAGE_PROTOCOL_BLOCK (LVMS provides block volumes).
             TIER_BODY=$(printf '{"metadata":{"name":"local"},"spec":{"backends":[{"backend_id":"%s","protocol":2}]}}' "${BACKEND_ID}")
             TIER_RESP=$(mktemp)
-            TIER_CODE=$(curl -skS \
+            TIER_CODE=$(curl -skS --retry 5 --retry-delay 5 --retry-all-errors \
               --connect-timeout 5 --max-time 30 \
               -o "${TIER_RESP}" -w '%{http_code}' \
               -X POST "${API}/storage_tiers" \
@@ -84,7 +85,8 @@ spec:
               2??) echo "StorageTier 'local' created." ;;
               409)
                 echo "StorageTier 'local' already exists, verifying backend reference..."
-                EXISTING_TIER=$(curl -skS --connect-timeout 5 --max-time 30 \
+                EXISTING_TIER=$(curl -skS --retry 5 --retry-delay 5 --retry-all-errors \
+                  --connect-timeout 5 --max-time 30 \
                   "${API}/storage_tiers" -H "Authorization: Bearer ${AUTH_TOKEN}")
                 echo "${EXISTING_TIER}" | python3 -c "import sys,json; items=json.load(sys.stdin).get('items',[]); m=next((t for t in items if t.get('metadata',{}).get('name')=='local'),None); sys.exit(1) if not m else None; ok=next((b for b in m.get('spec',{}).get('backends',[]) if b.get('backend_id')=='${BACKEND_ID}' and b.get('protocol')==2),None); sys.stderr.write('ERROR: tier does not reference backend ${BACKEND_ID}\n') or sys.exit(1) if not ok else print('ok')"
                 ;;

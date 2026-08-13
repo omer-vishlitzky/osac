@@ -11,7 +11,7 @@ metadata:
     "helm.sh/hook-weight": "30"
     "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
 spec:
-  backoffLimit: 5
+  backoffLimit: 10
   activeDeadlineSeconds: 900
   template:
     metadata:
@@ -39,7 +39,7 @@ spec:
               local response="/tmp/cv-response.json"
               local code
 
-              code=$(curl -skS \
+              code=$(curl -skS --retry 5 --retry-delay 5 --retry-all-errors \
                 --connect-timeout 5 \
                 --max-time 30 \
                 -o "${response}" \
