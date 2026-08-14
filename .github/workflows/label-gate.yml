@@ -19,7 +19,7 @@ jobs:
         if: inputs.caller-event == 'merge_group'
         run: echo "Labels already validated on PR"
       - name: Check required Prow labels
-        if: inputs.caller-event == 'pull_request'
+        if: inputs.caller-event != 'merge_group'
         env:
           LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
         run: |

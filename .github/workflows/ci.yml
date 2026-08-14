@@ -187,6 +187,7 @@ jobs:
   check:
     if: always()
     needs:
+      - changes
       - pre-commit
       - check-pr
       - check-generated-code
@@ -204,7 +205,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Verify all checks passed or were skipped
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
         run: |
-          echo '${{ toJSON(needs) }}' | jq -e '
+          echo "$NEEDS_JSON" | jq -e '
             to_entries | map(select(.value.result == "failure" or .value.result == "cancelled")) | length == 0
           '
