@@ -31,9 +31,40 @@ jobs:
   helm-lint:
     uses: ./.github/workflows/helm-lint.yaml
 
+  ansible-lint:
+    uses: ./.github/workflows/ansible-lint.yml
+
+  codeql:
+    uses: ./.github/workflows/codeql.yml
+    permissions:
+      contents: read
+      security-events: write
+      packages: read
+      actions: read
+
+  dependency-review:
+    uses: ./.github/workflows/dependency-review.yml
+
+  label-gate:
+    uses: ./.github/workflows/label-gate.yml
+    with:
+      caller-event: ${{ github.event_name }}
+
+  e2e-vmaas:
+    uses: ./.github/workflows/e2e-vmaas-full-install.yml
+    secrets: inherit
+
+  e2e-bmaas:
+    uses: ./.github/workflows/e2e-bmaas-full-install.yml
+    secrets: inherit
+
+  e2e-caas:
+    uses: ./.github/workflows/e2e-caas-full-install.yml
+    secrets: inherit
+
   check:
     if: always()
-    needs: [pre-commit, check-pr, check-generated-code, check-floating-tags, unit-tests, integration-tests, helm-lint]
+    needs: [pre-commit, check-pr, check-generated-code, check-floating-tags, unit-tests, integration-tests, helm-lint, ansible-lint, codeql, dependency-review, label-gate, e2e-vmaas, e2e-bmaas, e2e-caas]
     runs-on: ubuntu-latest
     steps:
       - name: Verify all checks passed or were skipped
