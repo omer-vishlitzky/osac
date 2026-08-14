@@ -3,6 +3,7 @@ name: CI
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
     branches: [main]
   merge_group:
 
@@ -46,12 +47,14 @@ jobs:
               - '!fulfillment-service/LICENSE'
               - '!fulfillment-service/**/*.md'
               - '!fulfillment-service/docs/**'
+              - '!fulfillment-service/.claude/**'
             osac-operator:
               - 'osac-operator/**'
               - '!osac-operator/OWNERS'
               - '!osac-operator/LICENSE'
               - '!osac-operator/**/*.md'
               - '!osac-operator/docs/**'
+              - '!osac-operator/.claude/**'
             osac-aap:
               - 'osac-aap/**'
               - '!osac-aap/OWNERS'
@@ -62,14 +65,21 @@ jobs:
               - 'osac-operator/api/**'
               - 'osac-operator/charts/**'
               - 'osac-operator/config/crd/bases/**'
+              - 'osac-operator/hack/sync-helm-crds.py'
+              - 'osac-operator/Makefile'
               - 'bare-metal-fulfillment-operator/api/**'
               - 'bare-metal-fulfillment-operator/charts/**'
               - 'bare-metal-fulfillment-operator/config/crd/bases/**'
+              - 'bare-metal-fulfillment-operator/hack/sync-helm-crds.py'
+              - 'bare-metal-fulfillment-operator/Makefile'
               - 'fulfillment-service/charts/**'
               - 'osac-aap/charts/**'
               - 'osac-csi-driver/charts/**'
               - 'osac-metering/charts/**'
               - 'osac-installer/**'
+              - '.github/scripts/check-floating-tags.sh'
+              - '.github/workflows/helm-lint.yaml'
+              - '.github/workflows/check-floating-tags.yaml'
 
   pre-commit:
     uses: ./.github/workflows/pre-commit.yaml
