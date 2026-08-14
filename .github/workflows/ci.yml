@@ -9,10 +9,31 @@ on:
 jobs:
   pre-commit:
     uses: ./.github/workflows/pre-commit.yaml
+    permissions:
+      contents: read
+      issues: write
+
+  check-pr:
+    uses: ./.github/workflows/check-pull-request.yaml
+
+  check-generated-code:
+    uses: ./.github/workflows/check-generated-code.yaml
+
+  check-floating-tags:
+    uses: ./.github/workflows/check-floating-tags.yaml
+
+  unit-tests:
+    uses: ./.github/workflows/unit-tests.yml
+
+  integration-tests:
+    uses: ./.github/workflows/integration-tests.yml
+
+  helm-lint:
+    uses: ./.github/workflows/helm-lint.yaml
 
   check:
     if: always()
-    needs: [pre-commit]
+    needs: [pre-commit, check-pr, check-generated-code, check-floating-tags, unit-tests, integration-tests, helm-lint]
     runs-on: ubuntu-latest
     steps:
       - name: Verify all checks passed or were skipped
