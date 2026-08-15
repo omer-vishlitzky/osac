@@ -198,7 +198,7 @@ make deploy IMG=<some-registry>/bare-metal-fulfillment-operator:tag
 You can apply the samples (examples) from the config/sample:
 
 ``` sh
-kubectl apply -k config/samples/
+kubectl apply -f config/samples/
 ```
 
 > **NOTE**: Ensure that the samples has default values to test it out.
@@ -235,7 +235,7 @@ make build-installer IMG=<some-registry>/bare-metal-fulfillment-operator:tag
 ```
 
 NOTE: The makefile target mentioned above generates an 'install.yaml' file in
-the dist directory. This file contains all the resources built with Kustomize,
+the dist directory. This file contains all the resources built with Helm,
 which are necessary to install this project without its dependencies.
 
 2.  Using the installer

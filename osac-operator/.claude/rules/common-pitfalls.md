@@ -30,7 +30,7 @@ Operator uses Go modules, not vendoring. Delete `vendor/` if it exists. Use `go 
 ## 8. Integration test failures
 - Update `kustomization.yaml` after renaming/deleting manifests
 - Clean up test clusters: `kind delete cluster --name osac`
-- Run `make test-kustomize` before committing manifest changes
+- Run `make helm-validate` before committing chart changes
 
 ## 9. gRPC client version mismatches
 Update module version in `buf.gen.yaml`, never edit proto files directly.

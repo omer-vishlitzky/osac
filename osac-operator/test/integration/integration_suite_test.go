@@ -19,7 +19,6 @@ package integration
 import (
 	"fmt"
 	"os/exec"
-	"strings"
 	"testing"
 	"time"
 
@@ -38,8 +37,8 @@ var _ = BeforeSuite(func() {
 	By("installing cert-manager")
 	Expect(utils.InstallCertManager()).To(Succeed())
 
-	By("installing CRDs")
-	cmd := exec.Command("make", "install")
+	By("installing CRDs via Helm")
+	cmd := exec.Command("helm", "upgrade", "--install", "osac-operator-crds", "charts/operator-crds")
 	_, err := utils.Run(cmd)
 	Expect(err).NotTo(HaveOccurred())
 
@@ -55,15 +54,13 @@ var _ = BeforeSuite(func() {
 	err = utils.LoadImageToKindClusterWithName(operatorImage)
 	Expect(err).NotTo(HaveOccurred())
 
-	By("creating manager namespace")
-	cmd = exec.Command("kubectl", "create", "ns", operatorNamespace)
-	_, err = utils.Run(cmd)
-	if err != nil && !strings.Contains(err.Error(), "AlreadyExists") {
-		Fail(fmt.Sprintf("failed to create namespace %s: %v", operatorNamespace, err))
-	}
-
-	By("deploying the controller-manager")
-	cmd = exec.Command("kubectl", "apply", "-k", "config/testing/default")
+	By("deploying the controller-manager via Helm")
+	cmd = exec.Command("helm", "upgrade", "--install", "osac-operator", "charts/operator",
+		"--namespace", operatorNamespace, "--create-namespace",
+		"--set", "image.repository=localhost/osac-operator",
+		"--set", "image.tag=latest",
+		"--set", "image.pullPolicy=Never",
+	)
 	_, err = utils.Run(cmd)
 	Expect(err).NotTo(HaveOccurred())
 
@@ -104,7 +101,11 @@ var _ = BeforeSuite(func() {
 
 var _ = AfterSuite(func() {
 	By("undeploying the controller-manager")
-	cmd := exec.Command("kubectl", "delete", "-k", "config/testing/default", "--ignore-not-found")
+	cmd := exec.Command("helm", "uninstall", "osac-operator", "--namespace", operatorNamespace)
+	_, _ = utils.Run(cmd)
+
+	By("uninstalling CRDs")
+	cmd = exec.Command("helm", "uninstall", "osac-operator-crds")
 	_, _ = utils.Run(cmd)
 
 	By("removing manager namespace")

@@ -31,7 +31,7 @@ make helm-crds                 # Sync CRDs to operator-crds chart + operator man
 make check-helm-crds           # Runs helm-crds then verifies no drift (may modify generated files)
 
 make run                       # Run controller locally
-make install                   # Install CRDs via kustomize
+make install                   # Install CRDs via Helm
 make deploy IMG=<registry>/bare-metal-fulfillment-operator:tag
 make undeploy                  # Remove operator from cluster
 make uninstall                 # Remove CRDs from cluster
