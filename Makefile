@@ -80,7 +80,7 @@ install-osac-kind: ## Install OSAC umbrella chart on Kind
 install-fake-crds: ## Install fake CRDs for HyperShift, KubeVirt, OVN-K
 	@for f in osac-operator/config/crd/fakes/*.yaml; do \
 		case "$$(basename "$$f")" in \
-			kustomization.yaml|*osac.openshift.io*) continue ;; \
+			*osac.openshift.io*) continue ;; \
 		esac; \
 		kubectl apply --server-side --force-conflicts -f "$$f"; \
 	done
