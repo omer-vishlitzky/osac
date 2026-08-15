@@ -110,9 +110,7 @@ config/
   crd/                     # Generated CRD manifests (DO NOT EDIT)
   rbac/                    # Generated RBAC rules
   samples/                 # Example CRs and config Secret
-  testing/                 # Testing configurations
-    default/               # Default testing kustomization
-    console-proxy/         # Console proxy testing kustomization
+  testing/                 # Testing configurations (Helm values overlays)
 charts/
   operator/                # Helm chart for operator
   operator-crds/           # Helm chart for CRDs
