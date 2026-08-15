@@ -106,6 +106,10 @@ spec:
             value: {{ .Values.controllers.bareMetalInstance | quote }}
           - name: OSAC_ENABLE_STORAGE_CONTROLLER
             value: {{ .Values.controllers.storage | quote }}
+          {{- if .Values.remoteCluster.enabled }}
+          - name: OSAC_REMOTE_CLUSTER_KUBECONFIG
+            value: /etc/remote-cluster/kubeconfig
+          {{- end }}
         securityContext:
           allowPrivilegeEscalation: false
           readOnlyRootFilesystem: true
@@ -124,7 +128,19 @@ spec:
             port: 8081
           initialDelaySeconds: 5
           periodSeconds: 10
+        {{- if .Values.remoteCluster.enabled }}
+        volumeMounts:
+          - name: remote-cluster
+            mountPath: /etc/remote-cluster
+            readOnly: true
+        {{- end }}
         resources:
           {{- toYaml .Values.resources | nindent 10 }}
+      {{- if .Values.remoteCluster.enabled }}
+      volumes:
+      - name: remote-cluster
+        secret:
+          secretName: {{ .Values.remoteCluster.secretName }}
+      {{- end }}
       serviceAccountName: {{ include "osac-operator.serviceAccountName" . }}
       terminationGracePeriodSeconds: 10

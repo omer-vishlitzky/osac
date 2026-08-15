@@ -38,6 +38,9 @@ service:
 
 sharedPostgres:
   enabled: true
+  host: ""
+  adminUser: osac_admin
+  adminCertSecret: postgres-admin-client-cert
 
 bmf:
   enabled: false

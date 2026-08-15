@@ -1,5 +1,6 @@
 {{- if .Values.sharedPostgres.enabled }}
 {{- $prefix := include "osac-workload.dbPrefix" . }}
+{{- $pgHost := .Values.sharedPostgres.host | default (printf "postgres.%s.svc.cluster.local" .Values.baseNamespace) }}
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -20,14 +21,20 @@ spec:
         {{- include "osac-workload.labels" . | nindent 8 }}
     spec:
       restartPolicy: OnFailure
-      serviceAccountName: {{ include "osac-workload.fullname" . }}-db-init
-      automountServiceAccountToken: true
+      automountServiceAccountToken: false
       volumes:
+      - name: admin-cert
+        secret:
+          secretName: {{ .Values.sharedPostgres.adminCertSecret }}
+          defaultMode: 0440
+      - name: ca-bundle
+        configMap:
+          name: ca-bundle
       - name: tmp
         emptyDir: {}
       containers:
       - name: init-db
-        image: {{ .Values.cliImage }}
+        image: {{ .Values.sharedPostgres.image | default "quay.io/sclorg/postgresql-18-c10s@sha256:6be2c9d855f06fb665257a6b0911676a38d740be7022cc61acee1c99a832b1b2" }}
         securityContext:
           allowPrivilegeEscalation: false
           readOnlyRootFilesystem: true
@@ -36,8 +43,22 @@ spec:
         env:
         - name: HOME
           value: /tmp
-        - name: BASE_NAMESPACE
-          value: {{ .Values.baseNamespace }}
+        - name: PGHOST
+          value: {{ $pgHost | quote }}
+        - name: PGPORT
+          value: "5432"
+        - name: PGUSER
+          value: {{ .Values.sharedPostgres.adminUser | quote }}
+        - name: PGDATABASE
+          value: "default_db"
+        - name: PGSSLMODE
+          value: "verify-full"
+        - name: PGSSLCERT
+          value: /certs/tls.crt
+        - name: PGSSLKEY
+          value: /certs/tls.key
+        - name: PGSSLROOTCERT
+          value: /ca/bundle.pem
         - name: DB_PREFIX
           value: {{ $prefix }}
         command:
@@ -48,35 +69,29 @@ spec:
         - |
           echo "Creating databases for namespace {{ .Release.Namespace }}..."
           echo "Using prefix: ${DB_PREFIX}"
+          echo "Connecting to: ${PGHOST}:${PGPORT} as ${PGUSER}"
 
           create_db_and_user() {
             local name="$1"
             echo "  Creating user and database: ${name}"
 
-            # CREATE USER/DATABASE return error if already exists — check first
             local user_exists
-            user_exists=$(oc exec deploy/postgres -n "${BASE_NAMESPACE}" -- \
-              psql -U postgres -tc "SELECT 1 FROM pg_roles WHERE rolname='${name}'")
+            user_exists=$(psql -tc "SELECT 1 FROM pg_roles WHERE rolname='${name}'")
             if echo "${user_exists}" | grep -q 1; then
               echo "  User ${name} already exists"
             else
-              oc exec deploy/postgres -n "${BASE_NAMESPACE}" -- \
-                psql -U postgres -c "CREATE USER ${name};"
+              psql -c "CREATE USER ${name};"
             fi
 
             local db_exists
-            db_exists=$(oc exec deploy/postgres -n "${BASE_NAMESPACE}" -- \
-              psql -U postgres -tc "SELECT 1 FROM pg_database WHERE datname='${name}'")
+            db_exists=$(psql -tc "SELECT 1 FROM pg_database WHERE datname='${name}'")
             if echo "${db_exists}" | grep -q 1; then
               echo "  Database ${name} already exists"
             else
-              oc exec deploy/postgres -n "${BASE_NAMESPACE}" -- \
-                psql -U postgres -c "CREATE DATABASE ${name} OWNER ${name};"
+              psql -c "CREATE DATABASE ${name} OWNER ${name};"
             fi
 
-            # Verify
-            oc exec deploy/postgres -n "${BASE_NAMESPACE}" -- \
-              psql -U postgres -tc "SELECT 1 FROM pg_database WHERE datname='${name}'" | grep -q 1
+            psql -tc "SELECT 1 FROM pg_database WHERE datname='${name}'" | grep -q 1
             echo "  Verified: ${name}"
           }
 
@@ -84,6 +99,12 @@ spec:
           create_db_and_user "${DB_PREFIX}_metering"
           echo "Databases created: ${DB_PREFIX}_service, ${DB_PREFIX}_metering"
         volumeMounts:
+        - name: admin-cert
+          mountPath: /certs
+          readOnly: true
+        - name: ca-bundle
+          mountPath: /ca
+          readOnly: true
         - name: tmp
           mountPath: /tmp
         resources:

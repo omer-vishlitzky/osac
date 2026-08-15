@@ -5,6 +5,8 @@ VALUES_FILE ?= values/development/values.yaml
 WORKLOAD_VALUES_FILE ?= $(dir $(VALUES_FILE))workload-values.yaml
 EXTRA_HELM_ARGS ?=
 AAP_LICENSE_FILE ?= $(dir $(VALUES_FILE))license.zip
+VCLUSTER ?=
+VCLUSTER_KUBECONFIG ?= /tmp/vcluster-$(NAMESPACE).kubeconfig
 
 .PHONY: help
 help: ## Display this help
@@ -87,10 +89,30 @@ install-secrets-base:
 		-n $(BASE_NAMESPACE) --overwrite
 
 .PHONY: install-workload
-install-workload: helm-deps-workload copy-base-secrets ## Phase 4: Install workload in NAMESPACE (repeatable)
-	$(eval DOMAIN := $(shell oc get ingresses.config/cluster -o jsonpath='{.spec.domain}'))
+install-workload: helm-deps-workload ## Phase 4: Install workload in NAMESPACE (repeatable). Set VCLUSTER=true for vcluster isolation.
 	@[[ -n "$(NAMESPACE)" ]] || { echo "ERROR: NAMESPACE is required. Usage: make install-workload NAMESPACE=pool-abc123"; exit 1; }
+	$(eval DOMAIN := $(shell oc get ingresses.config/cluster -o jsonpath='{.spec.domain}'))
 	@[[ -n "$(DOMAIN)" ]] || { echo "ERROR: Could not determine cluster domain. Is oc logged in?"; exit 1; }
+ifeq ($(VCLUSTER),true)
+	HOST_KUBECONFIG=$(KUBECONFIG) BASE_NAMESPACE=$(BASE_NAMESPACE) \
+		VCLUSTER_KUBECONFIG=$(VCLUSTER_KUBECONFIG) \
+		scripts/vcluster.sh create $(NAMESPACE)
+	KUBECONFIG=$(VCLUSTER_KUBECONFIG) helm upgrade --install osac-$(NAMESPACE) charts/osac-workload/ \
+		--namespace osac --create-namespace \
+		--values $(WORKLOAD_VALUES_FILE) \
+		--set baseNamespace=$(BASE_NAMESPACE) \
+		--set service.externalHostname=fulfillment-api-$(NAMESPACE).$(DOMAIN) \
+		--set service.internalHostname=fulfillment-internal-api-$(NAMESPACE).$(DOMAIN) \
+		--set service.auth.issuerUrl=https://keycloak-keycloak.$(DOMAIN)/realms/osac \
+		--set service.variant=kind \
+		--set operator.consoleProxy.disabled=true \
+		--set operator.remoteCluster.enabled=true \
+		--set operator.aap.url=https://osac-aap-$(BASE_NAMESPACE).$(DOMAIN)/api/controller \
+		--set metering.topicPrefix=$(NAMESPACE) \
+		$(EXTRA_HELM_ARGS) \
+		--timeout 20m --wait
+else
+	$(MAKE) copy-base-secrets NAMESPACE=$(NAMESPACE)
 	helm upgrade --install osac-$(NAMESPACE) charts/osac-workload/ \
 		--namespace $(NAMESPACE) --create-namespace \
 		--values $(WORKLOAD_VALUES_FILE) \
@@ -103,6 +125,7 @@ install-workload: helm-deps-workload copy-base-secrets ## Phase 4: Install workl
 		--set metering.topicPrefix=$(NAMESPACE) \
 		$(EXTRA_HELM_ARGS) \
 		--timeout 20m --wait
+endif
 
 ##@ Uninstall
 
@@ -114,9 +137,15 @@ uninstall: ## Full uninstall (workload + base + prereqs + operators)
 	-helm uninstall osac-operators --namespace osac-operators
 
 .PHONY: uninstall-workload
-uninstall-workload: ## Uninstall workload from NAMESPACE
+uninstall-workload: ## Uninstall workload from NAMESPACE. Set VCLUSTER=true if installed as vcluster.
 	@[[ -n "$(NAMESPACE)" ]] || { echo "ERROR: NAMESPACE is required."; exit 1; }
+ifeq ($(VCLUSTER),true)
+	-KUBECONFIG=$(VCLUSTER_KUBECONFIG) helm uninstall osac-$(NAMESPACE) --namespace osac --wait --timeout 10m
+	HOST_KUBECONFIG=$(KUBECONFIG) VCLUSTER_KUBECONFIG=$(VCLUSTER_KUBECONFIG) \
+		scripts/vcluster.sh delete $(NAMESPACE)
+else
 	-helm uninstall osac-$(NAMESPACE) --namespace $(NAMESPACE) --wait --timeout 10m
+endif
 
 .PHONY: uninstall-base
 uninstall-base: ## Uninstall shared base layer
@@ -127,7 +156,7 @@ copy-base-secrets:
 	@[[ -n "$(NAMESPACE)" ]] || { echo "ERROR: NAMESPACE is required."; exit 1; }
 	@oc create namespace $(NAMESPACE) --dry-run=client -o yaml | oc apply -f -
 	@oc label namespace $(NAMESPACE) osac.openshift.io/managed=true --overwrite
-	@for secret in osac-aap-api-token fulfillment-controller-credentials; do \
+	@for secret in osac-aap-api-token fulfillment-controller-credentials postgres-admin-client-cert; do \
 		echo "Copying secret $$secret from $(BASE_NAMESPACE) to $(NAMESPACE)..."; \
 		oc get secret $$secret -n $(BASE_NAMESPACE) -o json \
 			| jq 'del(.metadata.resourceVersion,.metadata.uid,.metadata.creationTimestamp,.metadata.ownerReferences,.metadata.labels,.metadata.annotations) | .metadata.namespace = "$(NAMESPACE)"' \

@@ -17,6 +17,8 @@ heartbeat:
 reconciliation:
   interval: "60m"
 
+kafka: {}
+
 certs:
   caBundle:
     configMap: ca-bundle

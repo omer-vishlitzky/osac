@@ -7,9 +7,7 @@ metadata:
     {{- include "osac-base.labels" . | nindent 4 }}
 rules:
 - apiGroups: [""]
-  resources: ["pods", "pods/exec"]
-  verbs: ["get", "list", "create"]
-- apiGroups: ["apps"]
-  resources: ["deployments"]
+  resources: ["secrets"]
+  resourceNames: ["postgres-admin-client-cert"]
   verbs: ["get"]
 {{- end }}

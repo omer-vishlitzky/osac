@@ -9,22 +9,4 @@ metadata:
   annotations:
     "helm.sh/hook": pre-install,pre-upgrade
     "helm.sh/hook-weight": "-6"
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: {{ include "osac-workload.fullname" . }}-db-init
-  labels:
-    {{- include "osac-workload.labels" . | nindent 4 }}
-  annotations:
-    "helm.sh/hook": pre-install,pre-upgrade
-    "helm.sh/hook-weight": "-6"
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
-  name: osac-shared-postgres-manager
-subjects:
-- kind: ServiceAccount
-  name: {{ include "osac-workload.fullname" . }}-db-init
-  namespace: {{ .Release.Namespace }}
 {{- end }}

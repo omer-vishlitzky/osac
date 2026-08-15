@@ -86,3 +86,7 @@ networkManagers:
         bridge into — used as the platform default NetworkClass.
       capabilities: "ipv4,ipv6,dualStack"
   k8sManagers: {}
+
+remoteCluster:
+  enabled: false
+  secretName: remote-cluster-kubeconfig
