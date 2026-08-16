@@ -33,26 +33,24 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 
 {{/*
 Per-instance database name for the fulfillment service.
-When instancePrefix is set: {prefix}_service; otherwise: service.
+instancePrefix is required — every deployment is an instance.
 */}}
 {{- define "osac.dbNameService" -}}
-{{- if .Values.instancePrefix }}{{ .Values.instancePrefix }}_service{{ else }}service{{ end }}
+{{ required "instancePrefix is required" .Values.instancePrefix }}_service
 {{- end }}
 
 {{/*
 Per-instance database name for metering.
-When instancePrefix is set: {prefix}_metering; otherwise: metering.
 */}}
 {{- define "osac.dbNameMetering" -}}
-{{- if .Values.instancePrefix }}{{ .Values.instancePrefix }}_metering{{ else }}metering{{ end }}
+{{ required "instancePrefix is required" .Values.instancePrefix }}_metering
 {{- end }}
 
 {{/*
-Per-instance Kafka topic prefix.
-When instancePrefix is set: {prefix}. (with trailing dot); otherwise: empty.
+Per-instance Kafka topic prefix (with trailing dot).
 */}}
 {{- define "osac.topicPrefix" -}}
-{{- if .Values.instancePrefix }}{{ .Values.instancePrefix }}.{{ end }}
+{{ required "instancePrefix is required" .Values.instancePrefix }}.
 {{- end }}
 
 {{/*

@@ -72,12 +72,12 @@ service:
   database:
     connection:
     - secret:
-        name: fulfillment-db
+        name: osac-db-config
         items:
         - key: url
           param: url
     - secret:
-        name: postgres-client-cert-service
+        name: osac-db-client-cert
         items:
         - key: tls.crt
           param: sslcert

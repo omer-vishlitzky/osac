@@ -74,14 +74,14 @@ service:
   database:
     connection:
       - configMap:
-          name: fulfillment-database-config
+          name: osac-db-config
           items:
             - key: url
               param: url
             - key: sslmode
               param: sslmode
       - secret:
-          name: fulfillment-database-client-cert
+          name: osac-db-client-cert
           items:
             - key: tls.crt
               param: sslcert
