@@ -7,8 +7,8 @@
 #   make install         PLATFORM=kind|openshift  PROFILE=dev|vmaas-ci|bmaas-ci|caas-ci
 #   make uninstall       PLATFORM=kind|openshift  PROFILE=dev|vmaas-ci|bmaas-ci|caas-ci
 #   make install-infra   PLATFORM=kind|openshift  PROFILE=dev|vmaas-ci|bmaas-ci|caas-ci
-#   make install-osac    PROFILE=dev|vmaas-ci|bmaas-ci|caas-ci  [NS=osac]
-#   make uninstall-osac  [NS=osac]
+#   make install-osac    PROFILE=dev|vmaas-ci|bmaas-ci|caas-ci  [NS=osac] [VCLUSTER=true]
+#   make uninstall-osac  [NS=osac] [VCLUSTER=true]
 #   make uninstall-infra PLATFORM=kind|openshift  PROFILE=dev|vmaas-ci|bmaas-ci|caas-ci
 #   make test            SUITE=all|fulfillment|operator|bmf
 
@@ -65,6 +65,10 @@ OSAC_CHART     := $(CHARTS)/osac
 NS ?=
 OSAC_NS := $(or $(NS),osac)
 EXTRA_HELM_ARGS ?=
+VCLUSTER ?=
+
+# vcluster lifecycle script.
+VCLUSTER_SH := $(OSAC_INSTALLER)/scripts/vcluster.sh
 
 # Per-instance isolation: when NS differs from the default, derive an
 # instancePrefix from the namespace (hyphens → underscores for PostgreSQL
@@ -76,7 +80,7 @@ MULTI_INSTANCE_ARGS := $(if $(INSTANCE_PREFIX),\
   --set operator.consoleProxy.disabled=true \
   --set metering.topicPrefix=$(INSTANCE_PREFIX),)
 
-# Values file selection: kind uses kind-specific files.
+# Values file selection: kind uses kind-specific files, vcluster adds an overlay.
 ifeq ($(PLATFORM),kind)
 INFRA_VALUES    := $(OSAC_INSTALLER)/values/dev/kind-infra.yaml
 INSTANCE_VALUES := $(OSAC_INSTALLER)/values/dev/kind-instance.yaml
@@ -84,6 +88,11 @@ else ifdef PROFILE
 INFRA_VALUES    := $(OSAC_INSTALLER)/values/$(PROFILE)/infra.yaml
 INSTANCE_VALUES := $(OSAC_INSTALLER)/values/$(PROFILE)/instance.yaml
 endif
+
+# vcluster overlay: layer vcluster-instance.yaml on top of the profile's instance values.
+VCLUSTER_INSTANCE_VALUES := $(OSAC_INSTALLER)/values/$(PROFILE)/vcluster-instance.yaml
+VCLUSTER_HELM_ARGS := $(if $(filter true,$(VCLUSTER)),\
+  $(if $(wildcard $(VCLUSTER_INSTANCE_VALUES)),-f $(VCLUSTER_INSTANCE_VALUES)),)
 
 # Container tool and Kind cluster config.
 CONTAINER_TOOL ?= $(shell command -v podman >/dev/null 2>&1 && echo podman || echo docker)
@@ -167,15 +176,22 @@ endif
 ##@ Entity: Osac
 
 .PHONY: install-osac
-install-osac: ## Install OSAC instance (PROFILE= required, NS= optional)
+install-osac: ## Install OSAC instance (PROFILE= required, NS= optional, VCLUSTER=true for vcluster)
 	cd $(OSAC_INSTALLER) && helm dependency build $(subst $(OSAC_INSTALLER)/,,$(OSAC_CHART))
+ifeq ($(VCLUSTER),true)
+	VCLUSTER_NAME=$(OSAC_NS) VCLUSTER_NS=$(OSAC_NS) $(VCLUSTER_SH) create
+	VCLUSTER_NAME=$(OSAC_NS) VCLUSTER_NS=$(OSAC_NS) OSAC_NS=$(OSAC_NS) $(VCLUSTER_SH) setup
+	$(eval VCLUSTER_KC := /tmp/vcluster-$(OSAC_NS).kubeconfig)
+endif
 ifneq ($(PLATFORM),kind)
 	$(eval DOMAIN := $(shell oc get ingresses.config/cluster -o jsonpath='{.spec.domain}'))
 	@[ -n "$(DOMAIN)" ] || { echo "ERROR: Could not determine cluster domain. Is oc logged in?" >&2; exit 1; }
 endif
 	helm upgrade --install osac $(OSAC_CHART) \
 		-f $(INSTANCE_VALUES) \
+		$(VCLUSTER_HELM_ARGS) \
 		--namespace $(OSAC_NS) --create-namespace \
+		$(if $(VCLUSTER_KC),--kubeconfig $(VCLUSTER_KC)) \
 		$(if $(DOMAIN),--set service.externalHostname=fulfillment-api-$(OSAC_NS).$(DOMAIN)) \
 		$(if $(DOMAIN),--set service.internalHostname=fulfillment-internal-api-$(OSAC_NS).$(DOMAIN)) \
 		$(if $(DOMAIN),--set service.auth.issuerUrl=https://keycloak-keycloak.$(DOMAIN)/realms/osac) \
@@ -184,8 +200,12 @@ endif
 		--wait --timeout 40m
 
 .PHONY: uninstall-osac
-uninstall-osac: ## Uninstall OSAC instance (NS= optional)
+uninstall-osac: ## Uninstall OSAC instance (NS= optional, VCLUSTER=true for vcluster)
+ifeq ($(VCLUSTER),true)
+	VCLUSTER_NAME=$(OSAC_NS) VCLUSTER_NS=$(OSAC_NS) $(VCLUSTER_SH) teardown
+else
 	helm uninstall osac --namespace $(OSAC_NS) --ignore-not-found
+endif
 
 ##@ Composite
 

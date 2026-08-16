@@ -1,0 +1,29 @@
+# CaaS CI vcluster overlay -- layered on top of instance.yaml when VCLUSTER=true.
+
+# --- Kafka overrides ---
+kafka:
+  clusterName: osac-kafka
+  clusterNamespace: osac-kafka
+  bootstrapOverride: "osac-kafka-kafka-bootstrap.osac-kafka.svc.cluster.local:9093"
+
+# --- Cert overrides ---
+service:
+  certs:
+    issuerRef:
+      kind: ClusterIssuer
+      name: default-ca
+    caBundle:
+      configMap: ca-bundle
+
+# --- AAP overrides ---
+aap:
+  aap:
+    instance:
+      enabled: false
+  bootstrap:
+    enabled: false
+
+# --- Operator overrides ---
+operator:
+  hubAccess:
+    enabled: false
