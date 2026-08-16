@@ -32,6 +32,8 @@ operator:
 # --- Fulfillment Service ---
 service:
   variant: kind
+  consoleProxy:
+    disabled: true
   externalHostname: fulfillment-api.osac.svc.cluster.local
   internalHostname: fulfillment-internal-api.osac.svc.cluster.local
   images:
@@ -44,8 +46,7 @@ service:
       configMap: ca-bundle
   # Disable console-proxy readiness probe in kind (TLS verification issue with self-signed certs)
   consoleProxy:
-    readinessProbe:
-      enabled: false
+    disabled: true
   auth:
     issuerUrl: https://keycloak.osac.localhost:8443/realms/osac
     emergencyServiceAccounts:

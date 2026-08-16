@@ -224,3 +224,6 @@ vault:
 
   # Volume sources for the Keycloak client secret used for Vault authentication.
   credentials: []
+
+consoleProxy:
+  disabled: false
