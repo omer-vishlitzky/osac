@@ -10,14 +10,14 @@
 #   make install-osac    PROFILE=dev|vmaas-ci|bmaas-ci|caas-ci|full-ci  NS=osac  [VCLUSTER=true]
 #   make uninstall-osac  NS=osac  [VCLUSTER=true]
 #   make uninstall-infra PLATFORM=kind|openshift  PROFILE=dev|vmaas-ci|bmaas-ci|caas-ci|full-ci
-#   make test            SUITE=all|fulfillment|operator|bmf
+#   make test            SUITE=all|fulfillment|operator|bmf  NS=osac
 
 # -- Fail-fast parameter validation ------------------------------------
 # Guards fire at parse time, gated by MAKECMDGOALS so `make help` works.
 
 PLATFORM_TARGETS := install uninstall install-infra uninstall-infra
 PROFILE_TARGETS  := install uninstall install-infra uninstall-infra install-osac
-NS_TARGETS       := install install-osac uninstall-osac uninstall
+NS_TARGETS       := install install-osac uninstall-osac uninstall test
 SUITE_TARGETS    := test
 
 ifneq ($(filter $(PLATFORM_TARGETS),$(MAKECMDGOALS)),)
@@ -278,7 +278,7 @@ kind-create: ## Create Kind cluster (idempotent)
 
 .PHONY: dev-env
 dev-env: kind-create ## Create Kind dev environment with OSAC
-	$(MAKE) install PLATFORM=kind PROFILE=dev
+	$(MAKE) install PLATFORM=kind PROFILE=dev NS=osac
 	$(MAKE) install-fake-crds
 
 .PHONY: dev-env-full
