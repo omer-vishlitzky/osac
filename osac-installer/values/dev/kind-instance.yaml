@@ -1,3 +1,4 @@
+instancePrefix: osac
 # Kind dev environment -- instance values for osac chart.
 
 # --- Operator ---

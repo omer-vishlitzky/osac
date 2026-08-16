@@ -10,9 +10,9 @@
     },
     "instancePrefix": {
       "type": "string",
-      "description": "Per-instance isolation prefix. When set, creates namespace-prefixed databases, Kafka topics, and AAP templates. Derive from the namespace (e.g. pr_101 for NS=pr-101). Leave empty for single-instance mode.",
-      "pattern": "^$|^[a-zA-Z_][a-zA-Z0-9_]*$",
-      "default": ""
+      "description": "Per-instance isolation prefix. Creates namespace-prefixed databases, Kafka topics, and AAP templates. Derive from the namespace (e.g. osac for NS=osac, pr_101 for NS=pr-101).",
+      "pattern": "^[a-zA-Z_][a-zA-Z0-9_]*$",
+      "minLength": 1
     },
     "dbInit": {
       "type": "object",
@@ -1377,5 +1377,8 @@
         }
       }
     }
-  }
+  },
+  "required": [
+    "instancePrefix"
+  ]
 }
