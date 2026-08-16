@@ -88,8 +88,8 @@ helm-lint: ## Lint Helm charts.
 
 .PHONY: helm-validate
 helm-validate: helm-lint ## Lint and template-render Helm charts.
-	helm template bmf-operator-crds charts/operator-crds/ > /dev/null
-	helm template bmf-operator charts/operator/ > /dev/null
+	helm template bmf-operator-crds charts/operator-crds/
+	helm template bmf-operator charts/operator/
 
 .PHONY: helm-crds
 helm-crds: manifests ## Copy generated CRDs into the operator-crds Helm chart.
@@ -236,4 +236,3 @@ mv $(1) $(1)-$(3) ;\
 } ;\
 ln -sf $(1)-$(3) $(1)
 endef
-
