@@ -27,6 +27,10 @@ envoygateway:
   httpNodePort: 30080
   httpsNodePort: 30443
 
+# --- Bundled PostgreSQL ---
+bundledPostgres:
+  enabled: true
+
 # --- CA issuer ---
 caIssuer:
   enabled: true
