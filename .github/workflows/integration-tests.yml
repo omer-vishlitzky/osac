@@ -86,7 +86,7 @@ jobs:
         echo '127.0.0.1 fulfillment-api.osac.svc.cluster.local' | sudo tee -a /etc/hosts
         echo '127.0.0.1 fulfillment-internal-api.osac.svc.cluster.local' | sudo tee -a /etc/hosts
         echo '127.0.0.1 keycloak.keycloak.svc.cluster.local' | sudo tee -a /etc/hosts
-        make test SUITE=fulfillment
+        make test SUITE=fulfillment NS=osac
     - name: Collect diagnostic logs
       if: always()
       run: |
@@ -144,7 +144,7 @@ jobs:
       - name: Run integration tests
         env:
           CONTAINER_TOOL: docker
-        run: make test SUITE=operator
+        run: make test SUITE=operator NS=osac
 
       - name: Collect diagnostic logs
         if: always()
@@ -195,7 +195,7 @@ jobs:
       - name: Run integration tests
         env:
           CONTAINER_TOOL: docker
-        run: make test SUITE=bmf
+        run: make test SUITE=bmf NS=osac
 
       - name: Collect diagnostic logs
         if: always()
