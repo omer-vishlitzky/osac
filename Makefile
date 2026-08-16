@@ -143,8 +143,10 @@ ifeq ($(PLATFORM),kind)
 		--version v1.6.5 --namespace envoy-gateway --create-namespace \
 		--wait --timeout 5m
 	helm upgrade --install osac-infra $(INFRA_CHART) \
+		--namespace osac-infra --create-namespace \
 		-f $(INFRA_VALUES) \
-		--wait --timeout 10m
+		--set osacNamespace=$(NS) \
+		--wait-for-jobs --timeout 30m
 	@for f in osac-operator/config/crd/fakes/*.yaml; do \
 		case "$$(basename "$$f")" in \
 			*osac.openshift.io*) continue ;; \
@@ -178,7 +180,7 @@ endif
 .PHONY: uninstall-infra
 uninstall-infra: ## Uninstall infrastructure (PLATFORM= PROFILE= required)
 ifeq ($(PLATFORM),kind)
-	helm uninstall osac-infra --ignore-not-found
+	helm uninstall osac-infra --namespace osac-infra --ignore-not-found
 	helm uninstall envoy-gateway --namespace envoy-gateway --ignore-not-found
 	helm uninstall trust-manager --namespace cert-manager --ignore-not-found
 	helm uninstall cert-manager --namespace cert-manager --ignore-not-found
