@@ -1,5 +1,4 @@
-# Umbrella chart values for kind development environment
-# Usage: helm install osac osac/osac-installer/charts/osac/ --values kind-dev/values-kind.yaml --namespace osac
+# Kind dev environment -- instance values for osac chart.
 
 # --- Operator ---
 operator:
@@ -128,9 +127,6 @@ bmf:
     metal3:
       enabled: true
 
-# --- Bundled PostgreSQL ---
-# NOTE: bundledPostgres has moved to the osac-infra chart.
-
 # --- Hub Access ---
 hubAccess:
   enabled: true
@@ -155,7 +151,7 @@ networkFulfillment:
 storageFulfillment:
   enabled: false
 
-# --- UI (disabled — uses OpenShift Route, run via pnpm dev instead) ---
+# --- UI (disabled -- uses OpenShift Route, run via pnpm dev instead) ---
 ui:
   enabled: false
 

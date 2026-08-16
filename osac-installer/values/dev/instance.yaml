@@ -1,25 +1,4 @@
-# --- Prerequisites ---
-certManager:
-  enabled: true
-trustManager:
-  enabled: true
-caIssuer:
-  enabled: true
-keycloak:
-  enabled: true
-aapOperator:
-  enabled: true
-lvms:
-  enabled: false
-metallb:
-  enabled: false
-cnv:
-  enabled: false
-mce:
-  enabled: false
-
-# OSAC Development Environment Values
-# Development values
+# OpenShift dev environment -- instance values for osac chart.
 
 # --- Operator ---
 operator:
@@ -46,8 +25,8 @@ operator:
 # --- Fulfillment Service ---
 service:
   variant: openshift
-  externalHostname: ""  # Set to fulfillment-api-<namespace>.apps.<cluster>.<domain>
-  internalHostname: ""  # Set to fulfillment-internal-api-<namespace>.apps.<cluster>.<domain>
+  externalHostname: ""  # Set dynamically by make install-osac
+  internalHostname: ""  # Set dynamically by make install-osac
   images:
     service: ghcr.io/osac-project/fulfillment-service:latest
     envoy: ghcr.io/osac-project/envoy:v1.33.0
@@ -153,7 +132,7 @@ aap:
 validation:
   enabled: true
 
-# --- ClusterVersion Seeding ---
+# --- Cluster Versions ---
 clusterVersions:
   enabled: true
   versions:
