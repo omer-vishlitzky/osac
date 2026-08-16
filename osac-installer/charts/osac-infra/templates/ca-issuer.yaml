@@ -57,5 +57,6 @@ spec:
       - key: kubernetes.io/metadata.name
         operator: In
         values:
+        - {{ .Release.Namespace }}
         - {{ .Values.osacNamespace }}
 {{- end }}

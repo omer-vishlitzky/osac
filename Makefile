@@ -4,41 +4,36 @@
 # Parameters are REQUIRED -- missing params produce hard errors.
 #
 # Usage:
+# Every target requires PLATFORM, PROFILE, and NS. No exceptions.
 #   make install         PLATFORM=kind|openshift  PROFILE=dev|vmaas-ci|bmaas-ci|caas-ci|full-ci  NS=osac
 #   make uninstall       PLATFORM=kind|openshift  PROFILE=dev|vmaas-ci|bmaas-ci|caas-ci|full-ci  NS=osac
-#   make install-infra   PLATFORM=kind|openshift  PROFILE=dev|vmaas-ci|bmaas-ci|caas-ci|full-ci
-#   make install-osac    PROFILE=dev|vmaas-ci|bmaas-ci|caas-ci|full-ci  NS=osac  [VCLUSTER=true]
-#   make uninstall-osac  NS=osac  [VCLUSTER=true]
-#   make uninstall-infra PLATFORM=kind|openshift  PROFILE=dev|vmaas-ci|bmaas-ci|caas-ci|full-ci
-#   make test            SUITE=all|fulfillment|operator|bmf  NS=osac
+#   make install-infra   PLATFORM=kind|openshift  PROFILE=dev|vmaas-ci|bmaas-ci|caas-ci|full-ci  NS=osac
+#   make install-osac    PLATFORM=kind|openshift  PROFILE=dev|vmaas-ci|bmaas-ci|caas-ci|full-ci  NS=osac  [VCLUSTER=true]
+#   make uninstall-osac  PLATFORM=kind|openshift  PROFILE=dev|vmaas-ci|bmaas-ci|caas-ci|full-ci  NS=osac  [VCLUSTER=true]
+#   make uninstall-infra PLATFORM=kind|openshift  PROFILE=dev|vmaas-ci|bmaas-ci|caas-ci|full-ci  NS=osac
+#   make test            PLATFORM=kind|openshift  PROFILE=dev|vmaas-ci|bmaas-ci|caas-ci|full-ci  NS=osac  SUITE=all|fulfillment|operator|bmf
 
 # -- Fail-fast parameter validation ------------------------------------
 # Guards fire at parse time, gated by MAKECMDGOALS so `make help` works.
 
-PLATFORM_TARGETS := install uninstall install-infra uninstall-infra
-PROFILE_TARGETS  := install uninstall install-infra uninstall-infra install-osac
-NS_TARGETS       := install install-osac uninstall-osac uninstall test
-SUITE_TARGETS    := test
+ALL_TARGETS := install uninstall install-infra uninstall-infra install-osac uninstall-osac test
 
-ifneq ($(filter $(PLATFORM_TARGETS),$(MAKECMDGOALS)),)
+ifneq ($(filter $(ALL_TARGETS),$(MAKECMDGOALS)),)
 ifndef PLATFORM
 $(error PLATFORM is required (kind|openshift))
 endif
 ifeq ($(filter $(PLATFORM),kind openshift),)
 $(error PLATFORM=$(PLATFORM) is invalid; must be kind or openshift)
 endif
-endif
-
-ifneq ($(filter $(PROFILE_TARGETS),$(MAKECMDGOALS)),)
 ifndef PROFILE
 $(error PROFILE is required (dev|vmaas-ci|bmaas-ci|caas-ci|full-ci))
 endif
 ifeq ($(filter $(PROFILE),dev vmaas-ci bmaas-ci caas-ci full-ci),)
 $(error PROFILE=$(PROFILE) is invalid; must be dev, vmaas-ci, bmaas-ci, caas-ci, or full-ci)
 endif
+ifndef NS
+$(error NS is required (namespace for OSAC instance, e.g. NS=osac))
 endif
-
-ifneq ($(filter $(PLATFORM_TARGETS),$(MAKECMDGOALS)),)
 ifeq ($(PLATFORM),kind)
 ifneq ($(PROFILE),dev)
 $(error PLATFORM=kind only supports PROFILE=dev)
@@ -46,12 +41,7 @@ endif
 endif
 endif
 
-ifneq ($(filter $(NS_TARGETS),$(MAKECMDGOALS)),)
-ifndef NS
-$(error NS is required (namespace for OSAC instance, e.g. NS=osac))
-endif
-endif
-
+SUITE_TARGETS := test
 ifneq ($(filter $(SUITE_TARGETS),$(MAKECMDGOALS)),)
 ifndef SUITE
 $(error SUITE is required (all|fulfillment|operator|bmf))
