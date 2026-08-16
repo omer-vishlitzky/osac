@@ -58,21 +58,18 @@ check-postgres: ## Verify in-cluster PostgreSQL is reachable before installing O
 
 ##@ Helm Chart Management
 
-##@ Backward-Compatible Targets (used by osac-test-infra E2E workflows)
-# These map old target names to new chart names. Remove once osac-test-infra
-# is updated to use the root Makefile's entity-based API.
-
-VALUES_FILE ?=
+##@ OpenShift Deployment (called by osac-test-infra E2E workflows)
+# INFRA_VALUES and INSTANCE_VALUES are required. No defaults.
 
 .PHONY: install
-install: install-operators install-prereqs install-osac ## Full install (operators + prereqs + OSAC) — backward compat
+install: install-operators install-prereqs install-osac ## Full install (operators + prereqs + OSAC)
 
 .PHONY: install-operators
 install-operators: wait-for-api wait-for-operators-namespaces ## Phase 1: Install OLM operators via osac-deps chart
 	$(eval OCP_VERSION := $(shell oc get clusterversion version -o jsonpath='{.status.desired.version}' | cut -d. -f1,2))
 	helm upgrade --install osac-deps charts/osac-deps/ \
 		--namespace osac-deps --create-namespace \
-		--values $(VALUES_FILE) \
+		--values $(INFRA_VALUES) \
 		--set lvms.channel=stable-$(OCP_VERSION) \
 		$(EXTRA_HELM_ARGS) \
 		--timeout 30m --wait
@@ -84,7 +81,7 @@ install-prereqs: wait-for-prereqs-namespaces ## Phase 2: Configure prerequisites
 	@[ -n "$(DOMAIN)" ] || { echo "ERROR: could not determine cluster domain" >&2; exit 1; }
 	helm upgrade --install osac-infra charts/osac-infra/ \
 		--namespace osac-infra --create-namespace \
-		--values $(VALUES_FILE) \
+		--values $(INFRA_VALUES) \
 		--set osacNamespace=$(INSTALLER_NAMESPACE) \
 		--set lvms.channel=stable-$(OCP_VERSION) \
 		--set keycloak.hostname=https://keycloak-keycloak.$(DOMAIN) \
@@ -98,7 +95,7 @@ install-osac: helm-deps install-secrets check-postgres ## Phase 3: Install OSAC 
 	@[ -n "$(DOMAIN)" ] || { echo "ERROR: could not determine cluster domain" >&2; exit 1; }
 	helm upgrade --install osac charts/osac/ \
 		--namespace $(INSTALLER_NAMESPACE) --create-namespace \
-		--values $(VALUES_FILE) \
+		--values $(INSTANCE_VALUES) \
 		--set service.externalHostname=fulfillment-api-$(INSTALLER_NAMESPACE).$(DOMAIN) \
 		--set service.internalHostname=fulfillment-internal-api-$(INSTALLER_NAMESPACE).$(DOMAIN) \
 		--set service.auth.issuerUrl=https://keycloak-keycloak.$(DOMAIN)/realms/osac \
