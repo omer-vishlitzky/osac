@@ -28,31 +28,41 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end -}}
 
 {{- define "osac-metering.kafkaClusterName" -}}
-osac-kafka
+{{- .Values.kafka.clusterName | default "osac-kafka" }}
 {{- end -}}
 
 {{- define "osac-metering.kafkaClusterNamespace" -}}
-osac-kafka
+{{- .Values.kafka.clusterNamespace | default "osac-kafka" }}
 {{- end -}}
 
 {{- define "osac-metering.kafkaBrokers" -}}
-osac-kafka-kafka-bootstrap.osac-kafka.svc.cluster.local:9093
-{{- end -}}
-
-{{- define "osac-metering.kafkaTopic" -}}
-osac.metering.lifecycle
+{{- .Values.kafka.brokers | default "osac-kafka-kafka-bootstrap.osac-kafka.svc.cluster.local:9093" }}
 {{- end -}}
 
 {{- define "osac-metering.kafkaCaSecret" -}}
-osac-kafka-cluster-ca-cert
+{{- .Values.kafka.caSecret | default "osac-kafka-cluster-ca-cert" }}
+{{- end -}}
+
+{{/*
+Topic prefix: when set, prepended to all topic names with a dot separator.
+*/}}
+{{- define "osac-metering.topicPrefix" -}}
+{{- .Values.topicPrefix | default "" }}
+{{- end -}}
+
+{{- define "osac-metering.kafkaTopic" -}}
+{{- $prefix := include "osac-metering.topicPrefix" . -}}
+{{- if $prefix }}{{ $prefix }}.{{ end }}osac.metering.lifecycle
 {{- end -}}
 
 {{- define "osac-metering.kafkaSaslUsername" -}}
-osac-metering
+{{- $prefix := include "osac-metering.topicPrefix" . -}}
+{{- if $prefix }}{{ $prefix }}-{{ end }}osac-metering
 {{- end -}}
 
 {{- define "osac-metering.kafkaSaslSecretName" -}}
-osac-metering
+{{- $prefix := include "osac-metering.topicPrefix" . -}}
+{{- if $prefix }}{{ $prefix }}-{{ end }}osac-metering
 {{- end -}}
 
 {{- define "osac-metering.kafkaReplicas" -}}

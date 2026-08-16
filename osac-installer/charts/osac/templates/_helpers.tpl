@@ -32,6 +32,30 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- end }}
 
 {{/*
+Per-instance database name for the fulfillment service.
+When instancePrefix is set: {prefix}_service; otherwise: service.
+*/}}
+{{- define "osac.dbNameService" -}}
+{{- if .Values.instancePrefix }}{{ .Values.instancePrefix }}_service{{ else }}service{{ end }}
+{{- end }}
+
+{{/*
+Per-instance database name for metering.
+When instancePrefix is set: {prefix}_metering; otherwise: metering.
+*/}}
+{{- define "osac.dbNameMetering" -}}
+{{- if .Values.instancePrefix }}{{ .Values.instancePrefix }}_metering{{ else }}metering{{ end }}
+{{- end }}
+
+{{/*
+Per-instance Kafka topic prefix.
+When instancePrefix is set: {prefix}. (with trailing dot); otherwise: empty.
+*/}}
+{{- define "osac.topicPrefix" -}}
+{{- if .Values.instancePrefix }}{{ .Values.instancePrefix }}.{{ end }}
+{{- end }}
+
+{{/*
 Wait-for-fulfillment init container.
 Uses .Values.cliImage for the container image.
 */}}
