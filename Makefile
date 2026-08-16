@@ -4,12 +4,12 @@
 # Parameters are REQUIRED -- missing params produce hard errors.
 #
 # Usage:
-#   make install         PLATFORM=kind|openshift  PROFILE=dev|vmaas-ci|bmaas-ci|caas-ci
-#   make uninstall       PLATFORM=kind|openshift  PROFILE=dev|vmaas-ci|bmaas-ci|caas-ci
-#   make install-infra   PLATFORM=kind|openshift  PROFILE=dev|vmaas-ci|bmaas-ci|caas-ci
-#   make install-osac    PROFILE=dev|vmaas-ci|bmaas-ci|caas-ci  [NS=osac] [VCLUSTER=true]
+#   make install         PLATFORM=kind|openshift  PROFILE=dev|vmaas-ci|bmaas-ci|caas-ci|full-ci
+#   make uninstall       PLATFORM=kind|openshift  PROFILE=dev|vmaas-ci|bmaas-ci|caas-ci|full-ci
+#   make install-infra   PLATFORM=kind|openshift  PROFILE=dev|vmaas-ci|bmaas-ci|caas-ci|full-ci
+#   make install-osac    PROFILE=dev|vmaas-ci|bmaas-ci|caas-ci|full-ci  [NS=osac] [VCLUSTER=true]
 #   make uninstall-osac  [NS=osac] [VCLUSTER=true]
-#   make uninstall-infra PLATFORM=kind|openshift  PROFILE=dev|vmaas-ci|bmaas-ci|caas-ci
+#   make uninstall-infra PLATFORM=kind|openshift  PROFILE=dev|vmaas-ci|bmaas-ci|caas-ci|full-ci
 #   make test            SUITE=all|fulfillment|operator|bmf
 
 # -- Fail-fast parameter validation ------------------------------------
@@ -30,10 +30,10 @@ endif
 
 ifneq ($(filter $(PROFILE_TARGETS),$(MAKECMDGOALS)),)
 ifndef PROFILE
-$(error PROFILE is required (dev|vmaas-ci|bmaas-ci|caas-ci))
+$(error PROFILE is required (dev|vmaas-ci|bmaas-ci|caas-ci|full-ci))
 endif
-ifeq ($(filter $(PROFILE),dev vmaas-ci bmaas-ci caas-ci),)
-$(error PROFILE=$(PROFILE) is invalid; must be dev, vmaas-ci, bmaas-ci, or caas-ci)
+ifeq ($(filter $(PROFILE),dev vmaas-ci bmaas-ci caas-ci full-ci),)
+$(error PROFILE=$(PROFILE) is invalid; must be dev, vmaas-ci, bmaas-ci, caas-ci, or full-ci)
 endif
 endif
 

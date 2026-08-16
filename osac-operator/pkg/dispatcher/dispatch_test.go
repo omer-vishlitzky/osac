@@ -25,6 +25,7 @@ import (
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	privatev1 "github.com/osac-project/osac/osac-operator/internal/api/osac/private/v1"
@@ -157,7 +158,7 @@ var _ = Describe("Dispatcher", func() {
 		Expect(corev1.AddToScheme(scheme)).To(Succeed())
 	})
 
-	newStubWithManagers := func(fabricName string, k8sName *string) *stubNetworkClassesClient {
+	newStubWithManagers := func(fabricName *string, k8sName *string) *stubNetworkClassesClient {
 		return &stubNetworkClassesClient{
 			getFunc: func(_ context.Context, _ *privatev1.NetworkClassesGetRequest, _ ...grpc.CallOption) (*privatev1.NetworkClassesGetResponse, error) {
 				return &privatev1.NetworkClassesGetResponse{
@@ -172,7 +173,7 @@ var _ = Describe("Dispatcher", func() {
 	}
 
 	It("dispatches VirtualNetwork to fabric only", func() {
-		stub := newStubWithManagers("netris", nil)
+		stub := newStubWithManagers(ptr.To("netris"), nil)
 		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
 			newFabricManagerConfigMap("fm-netris", "netris", "ipv4"),
 		).Build()
@@ -191,7 +192,7 @@ var _ = Describe("Dispatcher", func() {
 
 	It("dispatches Subnet to fabric + k8s when both configured", func() {
 		k8sName := "cudn_localnet"
-		stub := newStubWithManagers("neutron", &k8sName)
+		stub := newStubWithManagers(ptr.To("neutron"), &k8sName)
 		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
 			newFabricManagerConfigMap("fm-neutron", "neutron", "ipv4,ipv6,dualStack"),
 			newK8sManagerConfigMap("km-cudn", "cudn_localnet", "ipv4,ipv6,dualStack"),
@@ -212,7 +213,7 @@ var _ = Describe("Dispatcher", func() {
 	})
 
 	It("dispatches Subnet to fabric only when k8sManager is nil", func() {
-		stub := newStubWithManagers("netris", nil)
+		stub := newStubWithManagers(ptr.To("netris"), nil)
 		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
 			newFabricManagerConfigMap("fm-netris", "netris", "ipv4"),
 		).Build()
@@ -230,7 +231,7 @@ var _ = Describe("Dispatcher", func() {
 	})
 
 	It("dispatches SecurityGroup to fabric only", func() {
-		stub := newStubWithManagers("netris", nil)
+		stub := newStubWithManagers(ptr.To("netris"), nil)
 		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
 			newFabricManagerConfigMap("fm-netris", "netris", "ipv4"),
 		).Build()
@@ -247,7 +248,7 @@ var _ = Describe("Dispatcher", func() {
 	})
 
 	It("dispatches NATGateway to fabric only", func() {
-		stub := newStubWithManagers("netris", nil)
+		stub := newStubWithManagers(ptr.To("netris"), nil)
 		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
 			newFabricManagerConfigMap("fm-netris", "netris", "ipv4"),
 		).Build()
@@ -264,7 +265,7 @@ var _ = Describe("Dispatcher", func() {
 	})
 
 	It("returns error for unknown resource kind", func() {
-		stub := newStubWithManagers("netris", nil)
+		stub := newStubWithManagers(ptr.To("netris"), nil)
 		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
 			newFabricManagerConfigMap("fm-netris", "netris", "ipv4"),
 		).Build()
@@ -282,7 +283,7 @@ var _ = Describe("Dispatcher", func() {
 
 	It("dispatches VirtualNetwork to k8s manager when no fabric manager is set (fallback)", func() {
 		k8sName := "cudn_localnet"
-		stub := newStubWithManagers("", &k8sName)
+		stub := newStubWithManagers(nil, &k8sName)
 		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
 			newK8sManagerConfigMap("km-cudn", "cudn_localnet", "ipv4,ipv6,dualStack"),
 		).Build()
@@ -302,7 +303,7 @@ var _ = Describe("Dispatcher", func() {
 	DescribeTable("dispatches fallback-eligible kinds to the k8s manager when no fabric manager is set",
 		func(kind string) {
 			k8sName := "cudn_localnet"
-			stub := newStubWithManagers("", &k8sName)
+			stub := newStubWithManagers(nil, &k8sName)
 			cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
 				newK8sManagerConfigMap("km-cudn", "cudn_localnet", "ipv4,ipv6,dualStack"),
 			).Build()
@@ -325,7 +326,7 @@ var _ = Describe("Dispatcher", func() {
 
 	It("dispatches Subnet to exactly one k8s target when no fabric manager is set (dedupe)", func() {
 		k8sName := "cudn_localnet"
-		stub := newStubWithManagers("", &k8sName)
+		stub := newStubWithManagers(nil, &k8sName)
 		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
 			newK8sManagerConfigMap("km-cudn", "cudn_localnet", "ipv4,ipv6,dualStack"),
 		).Build()
@@ -344,7 +345,7 @@ var _ = Describe("Dispatcher", func() {
 
 	It("returns an error dispatching NATGateway when no fabric manager is set (no fallback)", func() {
 		k8sName := "cudn_localnet"
-		stub := newStubWithManagers("", &k8sName)
+		stub := newStubWithManagers(nil, &k8sName)
 		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
 			newK8sManagerConfigMap("km-cudn", "cudn_localnet", "ipv4,ipv6,dualStack"),
 		).Build()
@@ -360,7 +361,7 @@ var _ = Describe("Dispatcher", func() {
 	})
 
 	It("returns an error dispatching a fallback-eligible kind when neither manager is set", func() {
-		stub := newStubWithManagers("", nil)
+		stub := newStubWithManagers(nil, nil)
 		cl := fake.NewClientBuilder().WithScheme(scheme).Build()
 
 		disc, err := networkmanager.NewDiscovery(cl, "osac")

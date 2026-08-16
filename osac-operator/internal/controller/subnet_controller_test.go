@@ -36,7 +36,6 @@ import (
 
 	osacv1alpha1 "github.com/osac-project/osac/osac-operator/api/v1alpha1"
 	privatev1 "github.com/osac-project/osac/osac-operator/internal/api/osac/private/v1"
-	"github.com/osac-project/osac/osac-operator/internal/dispatcheradapter"
 	"github.com/osac-project/osac/osac-operator/pkg/dispatcher"
 	"github.com/osac-project/osac/osac-operator/pkg/networkmanager"
 	"github.com/osac-project/osac/osac-operator/pkg/provisioning"
@@ -393,9 +392,9 @@ var _ = Describe("SubnetReconciler", func() {
 		It("uses the resolved fabric manager name from the parent VirtualNetwork's NetworkClass", func() {
 			disc, err := networkmanager.NewDiscovery(fakeDiscoveryClient, "osac")
 			Expect(err).NotTo(HaveOccurred())
-			reconciler.Resolver = dispatcher.NewResolver(dispatcheradapter.NewNetworkClassAdapter(newListingNetworkClassClient(
+			reconciler.Resolver = dispatcher.NewResolver(newListingNetworkClassClient(
 				[]*privatev1.NetworkClass{{Id: "nc-dispatch", FabricManager: ptr.To("netris")}}, &[]*privatev1.NetworkClass{},
-			)), disc)
+			), disc)
 
 			dispatchVnet := &osacv1alpha1.VirtualNetwork{
 				ObjectMeta: metav1.ObjectMeta{
@@ -433,9 +432,9 @@ var _ = Describe("SubnetReconciler", func() {
 		It("falls back to the parent VirtualNetwork's legacy implementation strategy when fabricManager is not set", func() {
 			disc, err := networkmanager.NewDiscovery(fakeDiscoveryClient, "osac")
 			Expect(err).NotTo(HaveOccurred())
-			reconciler.Resolver = dispatcher.NewResolver(dispatcheradapter.NewNetworkClassAdapter(newListingNetworkClassClient(
+			reconciler.Resolver = dispatcher.NewResolver(newListingNetworkClassClient(
 				[]*privatev1.NetworkClass{{Id: "nc-legacy"}}, &[]*privatev1.NetworkClass{},
-			)), disc)
+			), disc)
 
 			dispatchVnet := &osacv1alpha1.VirtualNetwork{
 				ObjectMeta: metav1.ObjectMeta{
@@ -473,9 +472,9 @@ var _ = Describe("SubnetReconciler", func() {
 		It("returns a reconcile error when the NetworkClass references an unregistered manager", func() {
 			disc, err := networkmanager.NewDiscovery(fakeDiscoveryClient, "osac")
 			Expect(err).NotTo(HaveOccurred())
-			reconciler.Resolver = dispatcher.NewResolver(dispatcheradapter.NewNetworkClassAdapter(newListingNetworkClassClient(
+			reconciler.Resolver = dispatcher.NewResolver(newListingNetworkClassClient(
 				[]*privatev1.NetworkClass{{Id: "nc-broken", FabricManager: ptr.To("does-not-exist")}}, &[]*privatev1.NetworkClass{},
-			)), disc)
+			), disc)
 
 			dispatchVnet := &osacv1alpha1.VirtualNetwork{
 				ObjectMeta: metav1.ObjectMeta{

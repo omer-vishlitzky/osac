@@ -63,7 +63,7 @@ import (
 	"github.com/osac-project/osac/osac-operator/helpers"
 	privatev1 "github.com/osac-project/osac/osac-operator/internal/api/osac/private/v1"
 	"github.com/osac-project/osac/osac-operator/internal/controller"
-	"github.com/osac-project/osac/osac-operator/internal/dispatcheradapter"
+
 	"github.com/osac-project/osac/osac-operator/internal/migrations"
 	"github.com/osac-project/osac/osac-operator/pkg/aap"
 	"github.com/osac-project/osac/osac-operator/pkg/dispatcher"
@@ -525,8 +525,7 @@ func setupNetworkingControllers(
 		if err != nil {
 			return fmt.Errorf("network manager discovery: %w", err)
 		}
-		networkClassAdapter := dispatcheradapter.NewNetworkClassAdapter(networkClassesClient)
-		resolver = dispatcher.NewResolver(networkClassAdapter, disc)
+		resolver = dispatcher.NewResolver(networkClassesClient, disc)
 
 		if err := setupNetworkClassCapabilitiesController(
 			mgr, localMgr, grpcConn, networkingNamespace, resolver,
