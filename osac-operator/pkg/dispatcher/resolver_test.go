@@ -25,6 +25,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	privatev1 "github.com/osac-project/osac/osac-operator/internal/api/osac/private/v1"
@@ -91,7 +92,7 @@ var _ = Describe("Resolver", func() {
 				return &privatev1.NetworkClassesGetResponse{
 					Object: &privatev1.NetworkClass{
 						Id:            "nc-1",
-						FabricManager: "netris",
+						FabricManager: ptr.To("netris"),
 						K8SManager:    &k8sManagerStr,
 					},
 				}, nil
@@ -119,7 +120,7 @@ var _ = Describe("Resolver", func() {
 				return &privatev1.NetworkClassesGetResponse{
 					Object: &privatev1.NetworkClass{
 						Id:            "nc-2",
-						FabricManager: "neutron",
+						FabricManager: ptr.To("neutron"),
 						K8SManager:    &k8sManagerName,
 					},
 				}, nil
@@ -168,7 +169,7 @@ var _ = Describe("Resolver", func() {
 				return &privatev1.NetworkClassesGetResponse{
 					Object: &privatev1.NetworkClass{
 						Id:            "nc-k8s-only",
-						FabricManager: "",
+						FabricManager: nil,
 						K8SManager:    &k8sManagerName,
 					},
 				}, nil
@@ -195,7 +196,7 @@ var _ = Describe("Resolver", func() {
 				return &privatev1.NetworkClassesGetResponse{
 					Object: &privatev1.NetworkClass{
 						Id:            "nc-no-manager",
-						FabricManager: "",
+						FabricManager: nil,
 					},
 				}, nil
 			},
@@ -217,7 +218,7 @@ var _ = Describe("Resolver", func() {
 				return &privatev1.NetworkClassesGetResponse{
 					Object: &privatev1.NetworkClass{
 						Id:            "nc-bad-fabric",
-						FabricManager: "unknown-fabric",
+						FabricManager: ptr.To("unknown-fabric"),
 					},
 				}, nil
 			},
@@ -241,7 +242,7 @@ var _ = Describe("Resolver", func() {
 				return &privatev1.NetworkClassesGetResponse{
 					Object: &privatev1.NetworkClass{
 						Id:            "nc-bad-k8s",
-						FabricManager: "netris",
+						FabricManager: ptr.To("netris"),
 						K8SManager:    &k8sManagerName,
 					},
 				}, nil
