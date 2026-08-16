@@ -85,8 +85,8 @@ helm-validate: helm-lint ## Validate all charts (lint + template)
 	@for d in values/*/; do \
 		infra="$${d}infra.yaml"; \
 		[ -f "$$infra" ] && echo "Validating $$infra..." && \
-			helm template osac-deps charts/osac-deps/ --values "$$infra" > /dev/null && \
-			helm template osac-infra charts/osac-infra/ --values "$$infra" > /dev/null; \
+			helm template osac-deps charts/osac-deps/ --values "$$infra" && \
+			helm template osac-infra charts/osac-infra/ --values "$$infra"; \
 	done
 	./scripts/validate-keycloak-credentials.sh
 	@echo "Validation passed."

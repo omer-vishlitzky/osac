@@ -83,8 +83,8 @@ helm-lint: ## Lint Helm charts.
 
 .PHONY: helm-validate
 helm-validate: helm-lint ## Lint and template-render Helm charts.
-	helm template osac-operator-crds charts/operator-crds/ > /dev/null
-	helm template osac-operator charts/operator/ > /dev/null
+	helm template osac-operator-crds charts/operator-crds/
+	helm template osac-operator charts/operator/
 
 # Run integration tests against a pre-existing Kind cluster deployed via
 # the root Makefile's `make dev-env` + `make integration-test-operator`.
@@ -269,4 +269,3 @@ mv $(1) $(1)-$(3) ;\
 } ;\
 ln -sf $(1)-$(3) $(1)
 endef
-
