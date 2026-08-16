@@ -11,6 +11,7 @@ Unless required by applicable law or agreed to in writing, software distributed 
 specific language governing permissions and limitations under the License.
 */}}
 
+{{- if not .Values.consoleProxy.disabled }}
 {{- $caBundleConfigMap := required "certs.caBundle.configMap is required" .Values.certs.caBundle.configMap }}
 
 apiVersion: apps/v1
@@ -111,3 +112,4 @@ spec:
           periodSeconds: 10
           timeoutSeconds: 5
           failureThreshold: 5
+{{- end }}
