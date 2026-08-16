@@ -1,33 +1,4 @@
-# --- Prerequisites ---
-certManager:
-  enabled: true
-trustManager:
-  enabled: true
-caIssuer:
-  enabled: true
-keycloak:
-  enabled: true
-  # Seed known passwords for the realm's built-in test users -- the e2e
-  # suite logs in as these accounts by password.
-  devFixtures:
-    enabled: true
-aapOperator:
-  enabled: true
-lvms:
-  enabled: true
-metallb:
-  enabled: true
-cnv:
-  enabled: true
-mce:
-  enabled: false
-
-# OSAC VMaaS (VM-as-a-Service) CI Environment Values
-# VMaaS CI values
-
-# --- CSI Driver ---
-csiDriver:
-  enabled: true
+# CaaS CI environment -- instance values for osac chart.
 
 # --- Operator ---
 operator:
@@ -46,8 +17,8 @@ operator:
     serverAddress: "fulfillment-internal-api:8001"
     tokenFile: "/var/run/secrets/kubernetes.io/serviceaccount/token"
   controllers:
-    clusterOrder: false
-    computeInstance: true
+    clusterOrder: true
+    computeInstance: false
     tenant: true
     networking: true
     storage: true
@@ -59,9 +30,9 @@ operator:
 
 # --- Fulfillment Service ---
 service:
-  externalHostname: ""  # Set to fulfillment-api-<namespace>.apps.<cluster>.<domain>
-  internalHostname: ""  # Set to fulfillment-internal-api-<namespace>.apps.<cluster>.<domain>
   variant: openshift
+  externalHostname: ""  # Set dynamically by make install-osac
+  internalHostname: ""  # Set dynamically by make install-osac
   images:
     service: ghcr.io/osac-project/fulfillment-service:main
     envoy: ghcr.io/osac-project/envoy:v1.33.0
@@ -117,21 +88,6 @@ service:
   log:
     level: debug
 
-# --- UI ---
-ui:
-  enabled: true
-  images:
-    ui: ghcr.io/osac-project/osac-ui:v0.0.5
-  api:
-    fulfillment:
-      certs:
-        caBundle:
-          configMap: ca-bundle
-  auth:
-    certs:
-      caBundle:
-        configMap: ca-bundle
-
 # --- AAP ---
 aap:
   aap:
@@ -155,7 +111,13 @@ aap:
     projectGitUri: "https://github.com/osac-project/osac"
     projectGitBranch: "main"
   instanceGroups:
-    storageFulfillment:
+    clusterFulfillment:
+      enabled: true
+      config:
+        NETWORK_STEPS_COLLECTION: "ci.steps"
+        HOSTED_CLUSTER_CONTROLLER_AVAILABILITY_POLICY: "SingleReplica"
+        HOSTED_CLUSTER_INFRASTRUCTURE_AVAILABILITY_POLICY: "SingleReplica"
+    networkFulfillment:
       enabled: true
 
 # --- Validation ---
@@ -165,23 +127,23 @@ validation:
 # --- Bare Metal Fulfillment Operator ---
 bmf:
   enabled: false
+  image:
+    repository: ghcr.io/osac-project/bare-metal-fulfillment-operator
+    tag: latest
+    pullPolicy: Always
 
-# --- CI/dev only ---
-# Hub access: registers local cluster as a hub. Only for environments
-# where the fulfillment service and hub cluster are the same.
+# --- Cluster Versions ---
+clusterVersions:
+  enabled: true
+  versions:
+  - version: "4.20.0"
+    image: "quay.io/openshift-release-dev/ocp-release:4.20.0-multi"
+  - version: "4.22.0"
+    image: "quay.io/openshift-release-dev/ocp-release:4.22.0-multi"
+    default: true
+
+# --- Hub Access ---
 hubAccess:
-  enabled: true
-
-# Bundled PostgreSQL: single-pod ephemeral database for testing.
-# Uses fsync=off — data is lost on restart. Not for production.
-bundledPostgres:
-  enabled: true
-  database:
-    name: service
-    user: service
-
-# --- Kafka (metering infrastructure) ---
-kafka:
   enabled: true
 
 # --- Metering ---
@@ -189,8 +151,6 @@ metering:
   enabled: true
   reconciliation:
     interval: "5m"
-  # Echo adapter — test/development tool only. Consumes metering events from
-  # Kafka and exposes them via HTTP for E2E test assertions.
   echoAdapter:
     enabled: true
     image:
@@ -213,3 +173,7 @@ metering:
           param: sslkey
         - key: ca.crt
           param: sslrootcert
+
+# --- LVMS StorageBackend registration ---
+lvms:
+  enabled: true

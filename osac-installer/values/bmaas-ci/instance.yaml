@@ -1,26 +1,4 @@
-# --- Prerequisites ---
-certManager:
-  enabled: true
-trustManager:
-  enabled: true
-caIssuer:
-  enabled: true
-keycloak:
-  enabled: true
-  # Seed known passwords for the realm's built-in test users -- the e2e
-  # suite logs in as these accounts by password.
-  devFixtures:
-    enabled: true
-aapOperator:
-  enabled: true
-lvms:
-  enabled: true
-metallb:
-  enabled: false
-cnv:
-  enabled: false
-mce:
-  enabled: false
+# BMaaS CI environment -- instance values for osac chart.
 
 # --- Operator ---
 operator:
@@ -53,8 +31,8 @@ operator:
 
 # --- Fulfillment Service ---
 service:
-  externalHostname: ""  # Set to fulfillment-api-<namespace>.apps.<cluster>.<domain>
-  internalHostname: ""  # Set to fulfillment-internal-api-<namespace>.apps.<cluster>.<domain>
+  externalHostname: ""  # Set dynamically by make install-osac
+  internalHostname: ""  # Set dynamically by make install-osac
   variant: openshift
   images:
     service: ghcr.io/osac-project/fulfillment-service:main
@@ -164,17 +142,10 @@ bmf:
     aapUrl: "http://osac-aap/api/controller"
     aapInsecureSkipVerify: "true"
 
-
-# --- CI/dev only ---
-# Hub access: registers local cluster as a hub. Only for environments
-# where the fulfillment service and hub cluster are the same.
+# --- Hub Access ---
 hubAccess:
   enabled: true
 
-# Bundled PostgreSQL: single-pod ephemeral database for testing.
-# Uses fsync=off — data is lost on restart. Not for production.
-bundledPostgres:
+# --- LVMS StorageBackend registration ---
+lvms:
   enabled: true
-  database:
-    name: service
-    user: service

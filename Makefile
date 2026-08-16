@@ -1,21 +1,87 @@
-# OSAC Monorepo Makefile
-# Single deployment path via osac-installer Helm charts.
+# OSAC Monorepo Makefile -- entity-based deployment API.
+#
+# Entities:  Infra (osac-deps + osac-infra), Osac (osac chart), Test
+# Parameters are REQUIRED -- missing params produce hard errors.
+#
+# Usage:
+#   make install         PLATFORM=kind|openshift  PROFILE=dev|vmaas-ci|bmaas-ci|caas-ci
+#   make uninstall       PLATFORM=kind|openshift  PROFILE=dev|vmaas-ci|bmaas-ci|caas-ci
+#   make install-infra   PLATFORM=kind|openshift  PROFILE=dev|vmaas-ci|bmaas-ci|caas-ci
+#   make install-osac    PROFILE=dev|vmaas-ci|bmaas-ci|caas-ci  [NS=osac]
+#   make uninstall-osac  [NS=osac]
+#   make uninstall-infra PLATFORM=kind|openshift  PROFILE=dev|vmaas-ci|bmaas-ci|caas-ci
+#   make test            SUITE=all|fulfillment|operator|bmf
 
-KIND_CLUSTER_NAME ?= osac-dev
-OSAC_NAMESPACE ?= osac
+# -- Fail-fast parameter validation ------------------------------------
+# Guards fire at parse time, gated by MAKECMDGOALS so `make help` works.
+
+PLATFORM_TARGETS := install uninstall install-infra uninstall-infra
+PROFILE_TARGETS  := install uninstall install-infra uninstall-infra install-osac
+SUITE_TARGETS    := test
+
+ifneq ($(filter $(PLATFORM_TARGETS),$(MAKECMDGOALS)),)
+ifndef PLATFORM
+$(error PLATFORM is required (kind|openshift))
+endif
+ifeq ($(filter $(PLATFORM),kind openshift),)
+$(error PLATFORM=$(PLATFORM) is invalid; must be kind or openshift)
+endif
+endif
+
+ifneq ($(filter $(PROFILE_TARGETS),$(MAKECMDGOALS)),)
+ifndef PROFILE
+$(error PROFILE is required (dev|vmaas-ci|bmaas-ci|caas-ci))
+endif
+ifeq ($(filter $(PROFILE),dev vmaas-ci bmaas-ci caas-ci),)
+$(error PROFILE=$(PROFILE) is invalid; must be dev, vmaas-ci, bmaas-ci, or caas-ci)
+endif
+endif
+
+ifneq ($(filter $(PLATFORM_TARGETS),$(MAKECMDGOALS)),)
+ifeq ($(PLATFORM),kind)
+ifneq ($(PROFILE),dev)
+$(error PLATFORM=kind only supports PROFILE=dev)
+endif
+endif
+endif
+
+ifneq ($(filter $(SUITE_TARGETS),$(MAKECMDGOALS)),)
+ifndef SUITE
+$(error SUITE is required (all|fulfillment|operator|bmf))
+endif
+ifeq ($(filter $(SUITE),all fulfillment operator bmf),)
+$(error SUITE=$(SUITE) is invalid; must be all, fulfillment, operator, or bmf)
+endif
+endif
+
+# -- Paths and constants -----------------------------------------------
+
+OSAC_INSTALLER := osac-installer
+CHARTS         := $(OSAC_INSTALLER)/charts
+DEPS_CHART     := $(CHARTS)/osac-deps
+INFRA_CHART    := $(CHARTS)/osac-infra
+OSAC_CHART     := $(CHARTS)/osac
+
+NS ?=
+OSAC_NS := $(or $(NS),osac)
+EXTRA_HELM_ARGS ?=
+
+# Values file selection: kind uses kind-specific files.
+ifeq ($(PLATFORM),kind)
+INFRA_VALUES    := $(OSAC_INSTALLER)/values/dev/kind-infra.yaml
+INSTANCE_VALUES := $(OSAC_INSTALLER)/values/dev/kind-instance.yaml
+else ifdef PROFILE
+INFRA_VALUES    := $(OSAC_INSTALLER)/values/$(PROFILE)/infra.yaml
+INSTANCE_VALUES := $(OSAC_INSTALLER)/values/$(PROFILE)/instance.yaml
+endif
+
+# Container tool and Kind cluster config.
 CONTAINER_TOOL ?= $(shell command -v podman >/dev/null 2>&1 && echo podman || echo docker)
-
-INFRA_CHART = osac-installer/charts/osac-infra
-OSAC_CHART = osac-installer/charts/osac
-KIND_INFRA_VALUES = osac-installer/values/kind/prereqs.yaml
-KIND_OSAC_VALUES = osac-installer/values/kind/osac.yaml
-KIND_CONFIG = kind-dev/kind-config.yaml
-KIND_KUBECONFIG = $(HOME)/.kube/$(KIND_CLUSTER_NAME)-kind.kubeconfig
+KIND_CLUSTER_NAME ?= osac-dev
+KIND_CONFIG := kind-dev/kind-config.yaml
+KIND_KUBECONFIG := $(HOME)/.kube/$(KIND_CLUSTER_NAME)-kind.kubeconfig
 export KUBECONFIG ?= $(KIND_KUBECONFIG)
 
-# kind-load-image loads a container image into the Kind cluster.
-# With podman, `kind load docker-image` fails because it uses the docker
-# socket; fall back to save-then-load-archive instead.
 define kind-load-image
 	@if [ "$(CONTAINER_TOOL)" = "podman" ]; then \
 		tmpfile=$$(mktemp /tmp/kind-image-XXXXXX.tar); \
@@ -27,31 +93,17 @@ define kind-load-image
 	fi
 endef
 
+# -- Help --------------------------------------------------------------
+
 .PHONY: help
-help: ## Display this help.
+help: ## Display this help
 	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage:\n  make \033[36m<target>\033[0m\n"} /^[a-zA-Z_0-9-]+:.*?##/ { printf "  \033[36m%-30s\033[0m %s\n", $$1, $$2 } /^##@/ { printf "\n\033[1m%s\033[0m\n", substr($$0, 5) } ' $(MAKEFILE_LIST)
 
-##@ Development Environment
+##@ Entity: Infra
 
-.PHONY: dev-env
-dev-env: kind-create install-infra-kind install-fake-crds install-osac-kind ## Create Kind dev environment with OSAC (lightweight, ~8 min)
-
-.PHONY: dev-env-full
-dev-env-full: dev-env install-kubevirt install-awx seed-catalog ## Full dev environment with KubeVirt + AWX + catalog (~25 min)
-
-.PHONY: kind-create
-kind-create: ## Create Kind cluster (idempotent)
-	@if kind get clusters | grep -q "^$(KIND_CLUSTER_NAME)$$"; then \
-		echo "Kind cluster '$(KIND_CLUSTER_NAME)' already exists"; \
-	else \
-		echo "Creating Kind cluster '$(KIND_CLUSTER_NAME)'..."; \
-		kind create cluster --name $(KIND_CLUSTER_NAME) --config $(KIND_CONFIG) --wait 60s; \
-	fi
-	@kind export kubeconfig --name $(KIND_CLUSTER_NAME) --kubeconfig $(HOME)/.kube/$(KIND_CLUSTER_NAME)-kind.kubeconfig
-	@echo "KUBECONFIG=$(HOME)/.kube/$(KIND_CLUSTER_NAME)-kind.kubeconfig"
-
-.PHONY: install-infra-kind
-install-infra-kind: ## Install shared infrastructure (cert-manager, keycloak, envoy gateway) on Kind
+.PHONY: install-infra
+install-infra: ## Install infrastructure (PLATFORM= PROFILE= required)
+ifeq ($(PLATFORM),kind)
 	@echo "Installing cert-manager..."
 	helm upgrade --install cert-manager oci://quay.io/jetstack/charts/cert-manager \
 		--version v1.20.0 --namespace cert-manager --create-namespace \
@@ -65,16 +117,137 @@ install-infra-kind: ## Install shared infrastructure (cert-manager, keycloak, en
 		--version v1.6.5 --namespace envoy-gateway --create-namespace \
 		--wait --timeout 5m
 	helm upgrade --install osac-infra $(INFRA_CHART) \
-		-f $(KIND_INFRA_VALUES) \
+		-f $(INFRA_VALUES) \
 		--wait --timeout 10m
+else
+	$(eval OCP_VERSION := $(shell oc get clusterversion version -o jsonpath='{.status.desired.version}' | cut -d. -f1,2))
+	@bash -c 'source $(OSAC_INSTALLER)/scripts/lib.sh && \
+		for ns in ansible-aap cert-manager-operator cert-manager openshift-storage metallb-system multicluster-engine openshift-cnv; do \
+			wait_for_namespace_cleanup "$$ns"; \
+		done'
+	helm upgrade --install osac-deps $(DEPS_CHART) \
+		--namespace osac-deps --create-namespace \
+		--values $(INFRA_VALUES) \
+		--set lvms.channel=stable-$(OCP_VERSION) \
+		--timeout 30m --wait
+	@bash -c 'source $(OSAC_INSTALLER)/scripts/lib.sh && wait_for_namespace_cleanup keycloak'
+	$(eval DOMAIN := $(shell oc get ingresses.config/cluster -o jsonpath='{.spec.domain}'))
+	helm upgrade --install osac-infra $(INFRA_CHART) \
+		--namespace osac-infra --create-namespace \
+		--values $(INFRA_VALUES) \
+		--set osacNamespace=$(OSAC_NS) \
+		--set lvms.channel=stable-$(OCP_VERSION) \
+		$(if $(DOMAIN),--set keycloak.hostname=https://keycloak-keycloak.$(DOMAIN)) \
+		$(if $(DOMAIN),--set keycloak.route.hostname=keycloak-keycloak.$(DOMAIN)) \
+		--timeout 30m --wait-for-jobs
+endif
 
-.PHONY: install-osac-kind
-install-osac-kind: ## Install OSAC umbrella chart on Kind
-	cd osac-installer && helm dependency build $(subst osac-installer/,,$(OSAC_CHART))
+.PHONY: uninstall-infra
+uninstall-infra: ## Uninstall infrastructure (PLATFORM= PROFILE= required)
+ifeq ($(PLATFORM),kind)
+	-helm uninstall osac-infra
+	-helm uninstall envoy-gateway --namespace envoy-gateway
+	-helm uninstall trust-manager --namespace cert-manager
+	-helm uninstall cert-manager --namespace cert-manager
+else
+	-helm uninstall osac-infra --namespace osac-infra --wait --timeout 10m
+	-helm uninstall osac-deps --namespace osac-deps
+endif
+
+##@ Entity: Osac
+
+.PHONY: install-osac
+install-osac: ## Install OSAC instance (PROFILE= required, NS= optional)
+	cd $(OSAC_INSTALLER) && helm dependency build $(subst $(OSAC_INSTALLER)/,,$(OSAC_CHART))
+ifneq ($(PLATFORM),kind)
+	$(eval DOMAIN := $(shell oc get ingresses.config/cluster -o jsonpath='{.spec.domain}'))
+	@[ -n "$(DOMAIN)" ] || { echo "ERROR: Could not determine cluster domain. Is oc logged in?" >&2; exit 1; }
+endif
 	helm upgrade --install osac $(OSAC_CHART) \
-		-f $(KIND_OSAC_VALUES) \
-		--namespace $(OSAC_NAMESPACE) --create-namespace \
-		--wait --timeout 10m
+		-f $(INSTANCE_VALUES) \
+		--namespace $(OSAC_NS) --create-namespace \
+		$(if $(DOMAIN),--set service.externalHostname=fulfillment-api-$(OSAC_NS).$(DOMAIN)) \
+		$(if $(DOMAIN),--set service.internalHostname=fulfillment-internal-api-$(OSAC_NS).$(DOMAIN)) \
+		$(if $(DOMAIN),--set service.auth.issuerUrl=https://keycloak-keycloak.$(DOMAIN)/realms/osac) \
+		$(EXTRA_HELM_ARGS) \
+		--wait --timeout 40m
+
+.PHONY: uninstall-osac
+uninstall-osac: ## Uninstall OSAC instance (NS= optional)
+	helm uninstall osac --namespace $(OSAC_NS) --ignore-not-found
+
+##@ Composite
+
+.PHONY: install
+install: install-infra install-osac ## Full install: infra + osac (PLATFORM= PROFILE= required)
+
+.PHONY: uninstall
+uninstall: uninstall-osac uninstall-infra ## Full uninstall: osac + infra (PLATFORM= PROFILE= required)
+
+##@ Entity: Test
+
+.PHONY: test
+test: ## Run integration tests (SUITE= required: all|fulfillment|operator|bmf)
+ifeq ($(SUITE),all)
+	$(MAKE) test SUITE=fulfillment
+	$(MAKE) test SUITE=operator
+	$(MAKE) test SUITE=bmf
+endif
+ifeq ($(SUITE),fulfillment)
+	$(CONTAINER_TOOL) build -t localhost/fulfillment-service:it -f fulfillment-service/Containerfile .
+	$(call kind-load-image,localhost/fulfillment-service:it)
+	helm upgrade --install osac $(OSAC_CHART) \
+		-f $(OSAC_INSTALLER)/values/dev/kind-instance.yaml \
+		--set service.images.service=localhost/fulfillment-service:it \
+		--namespace $(OSAC_NS) --wait --timeout 5m
+	@for f in fulfillment-service/it/crds/*.yaml; do kubectl apply --server-side --force-conflicts -f "$$f"; done
+	cd fulfillment-service && ginkgo run --timeout 1h -v it
+endif
+ifeq ($(SUITE),operator)
+	$(CONTAINER_TOOL) build -t localhost/osac-operator:it -f osac-operator/Containerfile .
+	$(call kind-load-image,localhost/osac-operator:it)
+	helm upgrade --install osac $(OSAC_CHART) \
+		-f $(OSAC_INSTALLER)/values/dev/kind-instance.yaml \
+		--set operator.image.repository=localhost/osac-operator \
+		--set operator.image.tag=it \
+		--set operator.image.pullPolicy=Never \
+		--namespace $(OSAC_NS) --wait --timeout 5m
+	cd osac-operator && ginkgo run --timeout 30m -v test/integration
+endif
+ifeq ($(SUITE),bmf)
+	$(CONTAINER_TOOL) build -t localhost/bmf-operator:it -f bare-metal-fulfillment-operator/Containerfile .
+	$(call kind-load-image,localhost/bmf-operator:it)
+	kubectl apply --server-side --force-conflicts -f bare-metal-fulfillment-operator/test/crds/
+	helm upgrade --install osac $(OSAC_CHART) \
+		-f $(OSAC_INSTALLER)/values/dev/kind-instance.yaml \
+		--set bmf.enabled=true \
+		--set bmf.image.repository=localhost/bmf-operator \
+		--set bmf.image.tag=it \
+		--set bmf.image.pullPolicy=Never \
+		--namespace $(OSAC_NS) --wait --timeout 5m
+	cd bare-metal-fulfillment-operator && ginkgo run --timeout 30m -v test/integration
+endif
+
+##@ Development Environment
+
+.PHONY: kind-create
+kind-create: ## Create Kind cluster (idempotent)
+	@if kind get clusters | grep -q "^$(KIND_CLUSTER_NAME)$$"; then \
+		echo "Kind cluster '$(KIND_CLUSTER_NAME)' already exists"; \
+	else \
+		echo "Creating Kind cluster '$(KIND_CLUSTER_NAME)'..."; \
+		kind create cluster --name $(KIND_CLUSTER_NAME) --config $(KIND_CONFIG) --wait 60s; \
+	fi
+	@kind export kubeconfig --name $(KIND_CLUSTER_NAME) --kubeconfig $(KIND_KUBECONFIG)
+	@echo "KUBECONFIG=$(KIND_KUBECONFIG)"
+
+.PHONY: dev-env
+dev-env: kind-create ## Create Kind dev environment with OSAC
+	$(MAKE) install PLATFORM=kind PROFILE=dev
+	$(MAKE) install-fake-crds
+
+.PHONY: dev-env-full
+dev-env-full: dev-env install-kubevirt install-awx seed-catalog ## Full dev environment with KubeVirt + AWX + catalog
 
 .PHONY: install-fake-crds
 install-fake-crds: ## Install fake CRDs for HyperShift, KubeVirt, OVN-K
@@ -85,52 +258,10 @@ install-fake-crds: ## Install fake CRDs for HyperShift, KubeVirt, OVN-K
 		kubectl apply --server-side --force-conflicts -f "$$f"; \
 	done
 
-##@ Integration Tests
-
-.PHONY: integration-test
-integration-test: integration-test-fulfillment integration-test-operator integration-test-bmf ## Run all integration tests
-
-.PHONY: integration-test-fulfillment
-integration-test-fulfillment: ## Run fulfillment-service integration tests
-	$(CONTAINER_TOOL) build -t localhost/fulfillment-service:it -f fulfillment-service/Containerfile .
-	$(call kind-load-image,localhost/fulfillment-service:it)
-	helm upgrade --install osac $(OSAC_CHART) \
-		-f $(KIND_OSAC_VALUES) \
-		--set service.images.service=localhost/fulfillment-service:it \
-		--namespace $(OSAC_NAMESPACE) --wait --timeout 5m
-	@for f in fulfillment-service/it/crds/*.yaml; do kubectl apply --server-side --force-conflicts -f "$$f"; done
-	cd fulfillment-service && ginkgo run --timeout 1h -v it
-
-.PHONY: integration-test-operator
-integration-test-operator: ## Run osac-operator integration tests
-	$(CONTAINER_TOOL) build -t localhost/osac-operator:it -f osac-operator/Containerfile .
-	$(call kind-load-image,localhost/osac-operator:it)
-	helm upgrade --install osac $(OSAC_CHART) \
-		-f $(KIND_OSAC_VALUES) \
-		--set operator.image.repository=localhost/osac-operator \
-		--set operator.image.tag=it \
-		--set operator.image.pullPolicy=Never \
-		--namespace $(OSAC_NAMESPACE) --wait --timeout 5m
-	cd osac-operator && ginkgo run --timeout 30m -v test/integration
-
-.PHONY: integration-test-bmf
-integration-test-bmf: ## Run bare-metal-fulfillment-operator integration tests
-	$(CONTAINER_TOOL) build -t localhost/bmf-operator:it -f bare-metal-fulfillment-operator/Containerfile .
-	$(call kind-load-image,localhost/bmf-operator:it)
-	kubectl apply --server-side --force-conflicts -f bare-metal-fulfillment-operator/test/crds/
-	helm upgrade --install osac $(OSAC_CHART) \
-		-f $(KIND_OSAC_VALUES) \
-		--set bmf.enabled=true \
-		--set bmf.image.repository=localhost/bmf-operator \
-		--set bmf.image.tag=it \
-		--set bmf.image.pullPolicy=Never \
-		--namespace $(OSAC_NAMESPACE) --wait --timeout 5m
-	cd bare-metal-fulfillment-operator && ginkgo run --timeout 30m -v test/integration
-
 ##@ Full Environment (opt-in)
 
 .PHONY: install-kubevirt
-install-kubevirt: ## Install KubeVirt + CDI + Multus (for compute instance testing)
+install-kubevirt: ## Install KubeVirt + CDI + Multus
 	@MULTUS_VERSION=$$(curl -sL "https://api.github.com/repos/k8snetworkplumbingwg/multus-cni/releases/latest" | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": "\(.*\)".*/\1/'); \
 	echo "Installing Multus $${MULTUS_VERSION}..."; \
 	kubectl apply -f "https://raw.githubusercontent.com/k8snetworkplumbingwg/multus-cni/$${MULTUS_VERSION}/deployments/multus-daemonset.yml"
@@ -146,12 +277,12 @@ install-kubevirt: ## Install KubeVirt + CDI + Multus (for compute instance testi
 .PHONY: install-awx
 install-awx: ## Install AWX operator and instance
 	helm upgrade --install osac-infra $(INFRA_CHART) \
-		-f $(KIND_INFRA_VALUES) \
+		-f $(OSAC_INSTALLER)/values/dev/kind-infra.yaml \
 		--set awx.enabled=true \
 		--wait --timeout 10m
 
 .PHONY: seed-catalog
-seed-catalog: ## Seed catalog data (templates, instance types, networking)
+seed-catalog: ## Seed catalog data
 	@echo "Catalog seeding via fulfillment-service API..."
 	@echo "TODO: implement catalog seeding via helm hooks or script"
 
@@ -163,4 +294,4 @@ teardown: ## Delete Kind cluster and all resources
 
 .PHONY: teardown-osac
 teardown-osac: ## Uninstall OSAC (keep cluster and infra)
-	helm uninstall osac --namespace $(OSAC_NAMESPACE) --ignore-not-found
+	helm uninstall osac --namespace $(OSAC_NS) --ignore-not-found

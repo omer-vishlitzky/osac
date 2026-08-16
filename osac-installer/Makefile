@@ -1,18 +1,15 @@
+# osac-installer helper targets.
+# Deployment targets (install, uninstall) live in the root Makefile.
+
 INSTALLER_NAMESPACE ?= osac
-VALUES_FILE ?= values/development/values.yaml
-# Extra helm --set/--set-string args appended to install-osac's install command
-# (e.g. e2e passing component image overrides), so the FIRST install already
-# uses them instead of a separate patch applied after the fact.
+# Extra helm --set/--set-string args appended to install commands.
 EXTRA_HELM_ARGS ?=
 
 .PHONY: help
 help: ## Display this help
 	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage:\n  make \033[36m<target>\033[0m\n\nTargets:\n"} /^[a-zA-Z_-]+:.*?##/ { printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
 
-##@ Installation
-
-.PHONY: install
-install: install-deps install-infra install-osac ## Full install (deps + infra + OSAC)
+##@ Pre-install Helpers
 
 .PHONY: wait-for-api
 wait-for-api: ## Wait for the Kubernetes API server to be consistently reachable
@@ -37,41 +34,17 @@ wait-for-deps-namespaces: ## Wait for operator namespaces left Terminating by a 
 			wait_for_namespace_cleanup "$$ns"; \
 		done'
 
-.PHONY: install-deps
-install-deps: wait-for-api wait-for-deps-namespaces ## Phase 1: Install CRD providers (OLM operators on OpenShift, upstream Helm on Kind)
-	$(eval OCP_VERSION := $(shell oc get clusterversion version -o jsonpath='{.status.desired.version}' | cut -d. -f1,2))
-	helm upgrade --install osac-deps charts/osac-deps/ \
-		--namespace osac-deps --create-namespace \
-		--values $(VALUES_FILE) \
-		--set lvms.channel=stable-$(OCP_VERSION) \
-		--timeout 30m --wait
-
 .PHONY: wait-for-infra-namespaces
 wait-for-infra-namespaces: ## Wait for the keycloak namespace left Terminating by a prior uninstall
 	@bash -c 'source scripts/lib.sh && wait_for_namespace_cleanup keycloak'
 
-.PHONY: install-infra
-install-infra: wait-for-infra-namespaces ## Phase 2: Install shared infrastructure (CA, Keycloak, Gateway, shared PostgreSQL)
-	$(eval OCP_VERSION := $(shell oc get clusterversion version -o jsonpath='{.status.desired.version}' | cut -d. -f1,2))
-	$(eval DOMAIN := $(shell oc get ingresses.config/cluster -o jsonpath='{.spec.domain}'))
-	helm upgrade --install osac-infra charts/osac-infra/ \
-		--namespace osac-infra --create-namespace \
-		--values $(VALUES_FILE) \
-		--set osacNamespace=$(INSTALLER_NAMESPACE) \
-		--set lvms.channel=stable-$(OCP_VERSION) \
-		$(if $(DOMAIN),--set keycloak.hostname=https://keycloak-keycloak.$(DOMAIN)) \
-		$(if $(DOMAIN),--set keycloak.route.hostname=keycloak-keycloak.$(DOMAIN)) \
-		--timeout 30m --wait-for-jobs
-
-AAP_LICENSE_FILE ?= $(dir $(VALUES_FILE))license.zip
+AAP_LICENSE_FILE ?= license.zip
 
 .PHONY: install-secrets
 install-secrets: ## Create pre-install secrets (AAP license)
 	@[[ -f "$(AAP_LICENSE_FILE)" ]] || { echo "ERROR: AAP license not found at $(AAP_LICENSE_FILE)"; exit 1; }
 	@bash -c 'source scripts/lib.sh && wait_for_namespace_cleanup "$(INSTALLER_NAMESPACE)"'
 	oc create namespace $(INSTALLER_NAMESPACE) --dry-run=client -o yaml | oc apply -f -
-	# Server-side apply avoids last-applied-configuration (256KiB limit on large
-	# license.zip) while remaining idempotent when the license file changes.
 	oc create secret generic config-as-code-manifest-ig \
 		--from-file=license.zip="$(AAP_LICENSE_FILE)" \
 		-n $(INSTALLER_NAMESPACE) --dry-run=client -o yaml | oc apply --server-side -f -
@@ -82,25 +55,6 @@ install-secrets: ## Create pre-install secrets (AAP license)
 .PHONY: check-postgres
 check-postgres: ## Verify in-cluster PostgreSQL is reachable before installing OSAC
 	@bash -c 'source scripts/lib.sh && check_postgres_prerequisites "$(INSTALLER_NAMESPACE)" "$(VALUES_FILE)"'
-
-.PHONY: install-osac
-install-osac: helm-deps install-secrets check-postgres ## Phase 3: Install OSAC
-	$(eval DOMAIN := $(shell oc get ingresses.config/cluster -o jsonpath='{.spec.domain}'))
-	@[[ -n "$(DOMAIN)" ]] || { echo "ERROR: Could not determine cluster domain. Is oc logged in?"; exit 1; }
-	helm upgrade --install osac charts/osac/ \
-		--namespace $(INSTALLER_NAMESPACE) --create-namespace \
-		--values $(VALUES_FILE) \
-		--set service.externalHostname=fulfillment-api-$(INSTALLER_NAMESPACE).$(DOMAIN) \
-		--set service.internalHostname=fulfillment-internal-api-$(INSTALLER_NAMESPACE).$(DOMAIN) \
-		--set service.auth.issuerUrl=https://keycloak-keycloak.$(DOMAIN)/realms/osac \
-		$(EXTRA_HELM_ARGS) \
-		--timeout 40m --wait
-
-.PHONY: uninstall
-uninstall: ## Full uninstall (OSAC + infra + deps)
-	-helm uninstall osac --namespace $(INSTALLER_NAMESPACE) --wait --timeout 20m
-	-helm uninstall osac-infra --namespace osac-infra --wait --timeout 10m
-	-helm uninstall osac-deps --namespace osac-deps
 
 ##@ Helm Chart Management
 
@@ -122,19 +76,17 @@ helm-lint: ## Lint all charts
 
 .PHONY: helm-template
 helm-template: ## Dry-run render all templates
-	helm template osac-deps charts/osac-deps/ --values $(VALUES_FILE)
-	helm template osac-infra charts/osac-infra/ --values $(VALUES_FILE)
-	helm dependency build charts/osac/
-	helm template osac charts/osac/ --values $(VALUES_FILE)
-
-##@ Validation
+	helm template osac-deps charts/osac-deps/
+	helm template osac-infra charts/osac-infra/
+	helm template osac charts/osac/
 
 .PHONY: helm-validate
 helm-validate: helm-lint ## Validate all charts (lint + template)
-	@for f in values/*/values.yaml; do \
-		echo "Validating $$f..."; \
-		helm template osac-deps charts/osac-deps/ --values "$$f" > /dev/null; \
-		helm template osac-infra charts/osac-infra/ --values "$$f" > /dev/null; \
+	@for d in values/*/; do \
+		infra="$${d}infra.yaml"; \
+		[ -f "$$infra" ] && echo "Validating $$infra..." && \
+			helm template osac-deps charts/osac-deps/ --values "$$infra" > /dev/null && \
+			helm template osac-infra charts/osac-infra/ --values "$$infra" > /dev/null; \
 	done
 	./scripts/validate-keycloak-credentials.sh
 	@echo "Validation passed."
