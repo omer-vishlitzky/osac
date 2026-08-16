@@ -58,6 +58,61 @@ check-postgres: ## Verify in-cluster PostgreSQL is reachable before installing O
 
 ##@ Helm Chart Management
 
+##@ Backward-Compatible Targets (used by osac-test-infra E2E workflows)
+# These map old target names to new chart names. Remove once osac-test-infra
+# is updated to use the root Makefile's entity-based API.
+
+VALUES_FILE ?=
+
+.PHONY: install
+install: install-operators install-prereqs install-osac ## Full install (operators + prereqs + OSAC) — backward compat
+
+.PHONY: install-operators
+install-operators: wait-for-api wait-for-operators-namespaces ## Phase 1: Install OLM operators via osac-deps chart
+	$(eval OCP_VERSION := $(shell oc get clusterversion version -o jsonpath='{.status.desired.version}' | cut -d. -f1,2))
+	helm upgrade --install osac-deps charts/osac-deps/ \
+		--namespace osac-deps --create-namespace \
+		--values $(VALUES_FILE) \
+		--set lvms.channel=stable-$(OCP_VERSION) \
+		$(EXTRA_HELM_ARGS) \
+		--timeout 30m --wait
+
+.PHONY: install-prereqs
+install-prereqs: wait-for-prereqs-namespaces ## Phase 2: Configure prerequisites via osac-infra chart
+	$(eval OCP_VERSION := $(shell oc get clusterversion version -o jsonpath='{.status.desired.version}' | cut -d. -f1,2))
+	$(eval DOMAIN := $(shell oc get ingresses.config/cluster -o jsonpath='{.spec.domain}'))
+	@[ -n "$(DOMAIN)" ] || { echo "ERROR: could not determine cluster domain" >&2; exit 1; }
+	helm upgrade --install osac-infra charts/osac-infra/ \
+		--namespace osac-infra --create-namespace \
+		--values $(VALUES_FILE) \
+		--set osacNamespace=$(INSTALLER_NAMESPACE) \
+		--set lvms.channel=stable-$(OCP_VERSION) \
+		--set keycloak.hostname=https://keycloak-keycloak.$(DOMAIN) \
+		--set keycloak.route.hostname=keycloak-keycloak.$(DOMAIN) \
+		$(EXTRA_HELM_ARGS) \
+		--timeout 30m --wait-for-jobs
+
+.PHONY: install-osac
+install-osac: helm-deps install-secrets check-postgres ## Phase 3: Install OSAC via osac chart
+	$(eval DOMAIN := $(shell oc get ingresses.config/cluster -o jsonpath='{.spec.domain}'))
+	@[ -n "$(DOMAIN)" ] || { echo "ERROR: could not determine cluster domain" >&2; exit 1; }
+	helm upgrade --install osac charts/osac/ \
+		--namespace $(INSTALLER_NAMESPACE) --create-namespace \
+		--values $(VALUES_FILE) \
+		--set service.externalHostname=fulfillment-api-$(INSTALLER_NAMESPACE).$(DOMAIN) \
+		--set service.internalHostname=fulfillment-internal-api-$(INSTALLER_NAMESPACE).$(DOMAIN) \
+		--set service.auth.issuerUrl=https://keycloak-keycloak.$(DOMAIN)/realms/osac \
+		$(EXTRA_HELM_ARGS) \
+		--wait --timeout 40m
+
+.PHONY: uninstall
+uninstall: ## Full uninstall (OSAC + prereqs + operators)
+	helm uninstall osac --namespace $(INSTALLER_NAMESPACE) --ignore-not-found
+	helm uninstall osac-infra --namespace osac-infra --ignore-not-found --wait --timeout 10m
+	helm uninstall osac-deps --namespace osac-deps --ignore-not-found
+
+##@ Charts
+
 .PHONY: sync-charts
 sync-charts: ## Update submodules and rebuild chart dependencies
 	git submodule update --init --recursive
