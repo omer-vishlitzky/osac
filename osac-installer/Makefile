@@ -12,7 +12,7 @@ help: ## Display this help
 ##@ Installation
 
 .PHONY: install
-install: install-operators install-prereqs install-osac ## Full install (operators + prereqs + OSAC)
+install: install-deps install-infra install-osac ## Full install (deps + infra + OSAC)
 
 .PHONY: wait-for-api
 wait-for-api: ## Wait for the Kubernetes API server to be consistently reachable
@@ -30,32 +30,32 @@ wait-for-api: ## Wait for the Kubernetes API server to be consistently reachable
 		sleep 10; \
 	done
 
-.PHONY: wait-for-operators-namespaces
-wait-for-operators-namespaces: ## Wait for operator namespaces left Terminating by a prior uninstall
+.PHONY: wait-for-deps-namespaces
+wait-for-deps-namespaces: ## Wait for operator namespaces left Terminating by a prior uninstall
 	@bash -c 'source scripts/lib.sh && \
 		for ns in ansible-aap cert-manager-operator cert-manager openshift-storage metallb-system multicluster-engine openshift-cnv; do \
 			wait_for_namespace_cleanup "$$ns"; \
 		done'
 
-.PHONY: install-operators
-install-operators: wait-for-api wait-for-operators-namespaces ## Phase 1: Install OLM operators (cert-manager, AAP, LVMS, etc.)
+.PHONY: install-deps
+install-deps: wait-for-api wait-for-deps-namespaces ## Phase 1: Install CRD providers (OLM operators on OpenShift, upstream Helm on Kind)
 	$(eval OCP_VERSION := $(shell oc get clusterversion version -o jsonpath='{.status.desired.version}' | cut -d. -f1,2))
-	helm upgrade --install osac-operators charts/osac-operators/ \
-		--namespace osac-operators --create-namespace \
+	helm upgrade --install osac-deps charts/osac-deps/ \
+		--namespace osac-deps --create-namespace \
 		--values $(VALUES_FILE) \
 		--set lvms.channel=stable-$(OCP_VERSION) \
 		--timeout 30m --wait
 
-.PHONY: wait-for-prereqs-namespaces
-wait-for-prereqs-namespaces: ## Wait for the keycloak namespace left Terminating by a prior uninstall
+.PHONY: wait-for-infra-namespaces
+wait-for-infra-namespaces: ## Wait for the keycloak namespace left Terminating by a prior uninstall
 	@bash -c 'source scripts/lib.sh && wait_for_namespace_cleanup keycloak'
 
-.PHONY: install-prereqs
-install-prereqs: wait-for-prereqs-namespaces ## Phase 2: Configure prerequisites (certificates, keycloak, operator CRs)
+.PHONY: install-infra
+install-infra: wait-for-infra-namespaces ## Phase 2: Install shared infrastructure (CA, Keycloak, Gateway, shared PostgreSQL)
 	$(eval OCP_VERSION := $(shell oc get clusterversion version -o jsonpath='{.status.desired.version}' | cut -d. -f1,2))
 	$(eval DOMAIN := $(shell oc get ingresses.config/cluster -o jsonpath='{.spec.domain}'))
-	helm upgrade --install osac-prereqs charts/osac-prereqs/ \
-		--namespace osac-prereqs --create-namespace \
+	helm upgrade --install osac-infra charts/osac-infra/ \
+		--namespace osac-infra --create-namespace \
 		--values $(VALUES_FILE) \
 		--set osacNamespace=$(INSTALLER_NAMESPACE) \
 		--set lvms.channel=stable-$(OCP_VERSION) \
@@ -97,10 +97,10 @@ install-osac: helm-deps install-secrets check-postgres ## Phase 3: Install OSAC
 		--timeout 40m --wait
 
 .PHONY: uninstall
-uninstall: ## Full uninstall (OSAC + prereqs + operators)
+uninstall: ## Full uninstall (OSAC + infra + deps)
 	-helm uninstall osac --namespace $(INSTALLER_NAMESPACE) --wait --timeout 20m
-	-helm uninstall osac-prereqs --namespace osac-prereqs --wait --timeout 10m
-	-helm uninstall osac-operators --namespace osac-operators
+	-helm uninstall osac-infra --namespace osac-infra --wait --timeout 10m
+	-helm uninstall osac-deps --namespace osac-deps
 
 ##@ Helm Chart Management
 
@@ -115,15 +115,15 @@ helm-deps: ## Build Helm chart dependencies
 
 .PHONY: helm-lint
 helm-lint: ## Lint all charts
-	helm lint charts/osac-operators/
-	helm lint charts/osac-prereqs/
+	helm lint charts/osac-deps/
+	helm lint charts/osac-infra/
 	helm dependency build charts/osac/
 	helm lint charts/osac/
 
 .PHONY: helm-template
 helm-template: ## Dry-run render all templates
-	helm template osac-operators charts/osac-operators/ --values $(VALUES_FILE)
-	helm template osac-prereqs charts/osac-prereqs/ --values $(VALUES_FILE)
+	helm template osac-deps charts/osac-deps/ --values $(VALUES_FILE)
+	helm template osac-infra charts/osac-infra/ --values $(VALUES_FILE)
 	helm dependency build charts/osac/
 	helm template osac charts/osac/ --values $(VALUES_FILE)
 
@@ -133,8 +133,8 @@ helm-template: ## Dry-run render all templates
 helm-validate: helm-lint ## Validate all charts (lint + template)
 	@for f in values/*/values.yaml; do \
 		echo "Validating $$f..."; \
-		helm template osac-operators charts/osac-operators/ --values "$$f" > /dev/null; \
-		helm template osac-prereqs charts/osac-prereqs/ --values "$$f" > /dev/null; \
+		helm template osac-deps charts/osac-deps/ --values "$$f" > /dev/null; \
+		helm template osac-infra charts/osac-infra/ --values "$$f" > /dev/null; \
 	done
 	./scripts/validate-keycloak-credentials.sh
 	@echo "Validation passed."

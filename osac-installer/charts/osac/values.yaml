@@ -277,19 +277,6 @@ metallb:
 hubAccess:
   enabled: false
 
-bundledPostgres:
-  enabled: false
-  database:
-    name: service
-    user: service
-  resources:
-    limits:
-      cpu: 500m
-      memory: 512Mi
-    requests:
-      cpu: 50m
-      memory: 128Mi
-
 clusterVersions:
   enabled: false
   versions: []

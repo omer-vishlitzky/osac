@@ -1290,61 +1290,6 @@
         }
       }
     },
-    "bundledPostgres": {
-      "type": "object",
-      "description": "Bundled PostgreSQL for CI/dev (ephemeral, not for production)",
-      "properties": {
-        "enabled": {
-          "type": "boolean",
-          "default": false
-        },
-        "database": {
-          "type": "object",
-          "properties": {
-            "name": {
-              "type": "string",
-              "default": "service"
-            },
-            "user": {
-              "type": "string",
-              "default": "service"
-            }
-          }
-        },
-        "resources": {
-          "type": "object",
-          "description": "Container resource requests and limits",
-          "properties": {
-            "limits": {
-              "type": "object",
-              "properties": {
-                "cpu": {
-                  "type": "string",
-                  "description": "CPU limit"
-                },
-                "memory": {
-                  "type": "string",
-                  "description": "Memory limit"
-                }
-              }
-            },
-            "requests": {
-              "type": "object",
-              "properties": {
-                "cpu": {
-                  "type": "string",
-                  "description": "CPU request"
-                },
-                "memory": {
-                  "type": "string",
-                  "description": "Memory request"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
     "clusterVersions": {
       "type": "object",
       "description": "Seed ClusterVersion records in the fulfillment-service after install",
