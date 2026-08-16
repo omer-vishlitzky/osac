@@ -4,11 +4,11 @@
 # Parameters are REQUIRED -- missing params produce hard errors.
 #
 # Usage:
-#   make install         PLATFORM=kind|openshift  PROFILE=dev|vmaas-ci|bmaas-ci|caas-ci|full-ci
-#   make uninstall       PLATFORM=kind|openshift  PROFILE=dev|vmaas-ci|bmaas-ci|caas-ci|full-ci
+#   make install         PLATFORM=kind|openshift  PROFILE=dev|vmaas-ci|bmaas-ci|caas-ci|full-ci  NS=osac
+#   make uninstall       PLATFORM=kind|openshift  PROFILE=dev|vmaas-ci|bmaas-ci|caas-ci|full-ci  NS=osac
 #   make install-infra   PLATFORM=kind|openshift  PROFILE=dev|vmaas-ci|bmaas-ci|caas-ci|full-ci
-#   make install-osac    PROFILE=dev|vmaas-ci|bmaas-ci|caas-ci|full-ci  [NS=osac] [VCLUSTER=true]
-#   make uninstall-osac  [NS=osac] [VCLUSTER=true]
+#   make install-osac    PROFILE=dev|vmaas-ci|bmaas-ci|caas-ci|full-ci  NS=osac  [VCLUSTER=true]
+#   make uninstall-osac  NS=osac  [VCLUSTER=true]
 #   make uninstall-infra PLATFORM=kind|openshift  PROFILE=dev|vmaas-ci|bmaas-ci|caas-ci|full-ci
 #   make test            SUITE=all|fulfillment|operator|bmf
 
@@ -17,6 +17,7 @@
 
 PLATFORM_TARGETS := install uninstall install-infra uninstall-infra
 PROFILE_TARGETS  := install uninstall install-infra uninstall-infra install-osac
+NS_TARGETS       := install install-osac uninstall-osac uninstall
 SUITE_TARGETS    := test
 
 ifneq ($(filter $(PLATFORM_TARGETS),$(MAKECMDGOALS)),)
@@ -45,6 +46,12 @@ endif
 endif
 endif
 
+ifneq ($(filter $(NS_TARGETS),$(MAKECMDGOALS)),)
+ifndef NS
+$(error NS is required (namespace for OSAC instance, e.g. NS=osac))
+endif
+endif
+
 ifneq ($(filter $(SUITE_TARGETS),$(MAKECMDGOALS)),)
 ifndef SUITE
 $(error SUITE is required (all|fulfillment|operator|bmf))
@@ -62,8 +69,6 @@ DEPS_CHART     := $(CHARTS)/osac-deps
 INFRA_CHART    := $(CHARTS)/osac-infra
 OSAC_CHART     := $(CHARTS)/osac
 
-NS ?=
-OSAC_NS := $(or $(NS),osac)
 EXTRA_HELM_ARGS ?=
 VCLUSTER ?=
 
@@ -73,7 +78,7 @@ VCLUSTER_SH := $(OSAC_INSTALLER)/scripts/vcluster.sh
 # Per-instance isolation: when NS differs from the default, derive an
 # instancePrefix from the namespace (hyphens → underscores for PostgreSQL
 # identifier compatibility) and inject the multi-instance --set flags.
-INSTANCE_PREFIX := $(if $(filter-out osac,$(OSAC_NS)),$(subst -,_,$(OSAC_NS)),)
+INSTANCE_PREFIX := $(if $(filter-out osac,$(NS)),$(subst -,_,$(NS)),)
 MULTI_INSTANCE_ARGS := $(if $(INSTANCE_PREFIX),\
   --set instancePrefix=$(INSTANCE_PREFIX) \
   --set operator.aap.templatePrefix=$(INSTANCE_PREFIX)-osac \
@@ -95,7 +100,7 @@ VCLUSTER_HELM_ARGS := $(if $(filter true,$(VCLUSTER)),\
   $(if $(wildcard $(VCLUSTER_INSTANCE_VALUES)),-f $(VCLUSTER_INSTANCE_VALUES)),)
 
 # Container tool and Kind cluster config.
-CONTAINER_TOOL ?= $(shell command -v podman >/dev/null 2>&1 && echo podman || echo docker)
+CONTAINER_TOOL ?= $(or $(shell command -v podman 2>/dev/null),$(shell command -v docker 2>/dev/null),$(error neither podman nor docker found in PATH))
 KIND_CLUSTER_NAME ?= osac-dev
 KIND_CONFIG := kind-dev/kind-config.yaml
 KIND_KUBECONFIG := $(HOME)/.kube/$(KIND_CLUSTER_NAME)-kind.kubeconfig
@@ -151,37 +156,38 @@ else
 		--timeout 30m --wait
 	@bash -c 'source $(OSAC_INSTALLER)/scripts/lib.sh && wait_for_namespace_cleanup keycloak'
 	$(eval DOMAIN := $(shell oc get ingresses.config/cluster -o jsonpath='{.spec.domain}'))
+	@[ -n "$(DOMAIN)" ] || { echo "ERROR: could not determine cluster domain" >&2; exit 1; }
 	helm upgrade --install osac-infra $(INFRA_CHART) \
 		--namespace osac-infra --create-namespace \
 		--values $(INFRA_VALUES) \
-		--set osacNamespace=$(OSAC_NS) \
+		--set osacNamespace=$(NS) \
 		--set lvms.channel=stable-$(OCP_VERSION) \
-		$(if $(DOMAIN),--set keycloak.hostname=https://keycloak-keycloak.$(DOMAIN)) \
-		$(if $(DOMAIN),--set keycloak.route.hostname=keycloak-keycloak.$(DOMAIN)) \
+		--set keycloak.hostname=https://keycloak-keycloak.$(DOMAIN) \
+		--set keycloak.route.hostname=keycloak-keycloak.$(DOMAIN) \
 		--timeout 30m --wait-for-jobs
 endif
 
 .PHONY: uninstall-infra
 uninstall-infra: ## Uninstall infrastructure (PLATFORM= PROFILE= required)
 ifeq ($(PLATFORM),kind)
-	-helm uninstall osac-infra
-	-helm uninstall envoy-gateway --namespace envoy-gateway
-	-helm uninstall trust-manager --namespace cert-manager
-	-helm uninstall cert-manager --namespace cert-manager
+	helm uninstall osac-infra --ignore-not-found
+	helm uninstall envoy-gateway --namespace envoy-gateway --ignore-not-found
+	helm uninstall trust-manager --namespace cert-manager --ignore-not-found
+	helm uninstall cert-manager --namespace cert-manager --ignore-not-found
 else
-	-helm uninstall osac-infra --namespace osac-infra --wait --timeout 10m
-	-helm uninstall osac-deps --namespace osac-deps
+	helm uninstall osac-infra --namespace osac-infra --ignore-not-found --wait --timeout 10m
+	helm uninstall osac-deps --namespace osac-deps --ignore-not-found
 endif
 
 ##@ Entity: Osac
 
 .PHONY: install-osac
-install-osac: ## Install OSAC instance (PROFILE= required, NS= optional, VCLUSTER=true for vcluster)
+install-osac: ## Install OSAC instance (PROFILE= NS= required, VCLUSTER=true for vcluster)
 	cd $(OSAC_INSTALLER) && helm dependency build $(subst $(OSAC_INSTALLER)/,,$(OSAC_CHART))
 ifeq ($(VCLUSTER),true)
-	VCLUSTER_NAME=$(OSAC_NS) VCLUSTER_NS=$(OSAC_NS) $(VCLUSTER_SH) create
-	VCLUSTER_NAME=$(OSAC_NS) VCLUSTER_NS=$(OSAC_NS) OSAC_NS=$(OSAC_NS) $(VCLUSTER_SH) setup
-	$(eval VCLUSTER_KC := /tmp/vcluster-$(OSAC_NS).kubeconfig)
+	VCLUSTER_NAME=$(NS) VCLUSTER_NS=$(NS) $(VCLUSTER_SH) create
+	VCLUSTER_NAME=$(NS) VCLUSTER_NS=$(NS) OSAC_NS=$(NS) $(VCLUSTER_SH) setup
+	$(eval VCLUSTER_KC := /tmp/vcluster-$(NS).kubeconfig)
 endif
 ifneq ($(PLATFORM),kind)
 	$(eval DOMAIN := $(shell oc get ingresses.config/cluster -o jsonpath='{.spec.domain}'))
@@ -190,21 +196,19 @@ endif
 	helm upgrade --install osac $(OSAC_CHART) \
 		-f $(INSTANCE_VALUES) \
 		$(VCLUSTER_HELM_ARGS) \
-		--namespace $(OSAC_NS) --create-namespace \
+		--namespace $(NS) --create-namespace \
 		$(if $(VCLUSTER_KC),--kubeconfig $(VCLUSTER_KC)) \
-		$(if $(DOMAIN),--set service.externalHostname=fulfillment-api-$(OSAC_NS).$(DOMAIN)) \
-		$(if $(DOMAIN),--set service.internalHostname=fulfillment-internal-api-$(OSAC_NS).$(DOMAIN)) \
-		$(if $(DOMAIN),--set service.auth.issuerUrl=https://keycloak-keycloak.$(DOMAIN)/realms/osac) \
+		$(if $(DOMAIN),--set service.externalHostname=fulfillment-api-$(NS).$(DOMAIN) --set service.internalHostname=fulfillment-internal-api-$(NS).$(DOMAIN) --set service.auth.issuerUrl=https://keycloak-keycloak.$(DOMAIN)/realms/osac) \
 		$(MULTI_INSTANCE_ARGS) \
 		$(EXTRA_HELM_ARGS) \
 		--wait --timeout 40m
 
 .PHONY: uninstall-osac
-uninstall-osac: ## Uninstall OSAC instance (NS= optional, VCLUSTER=true for vcluster)
+uninstall-osac: ## Uninstall OSAC instance (NS= required, VCLUSTER=true for vcluster)
 ifeq ($(VCLUSTER),true)
-	VCLUSTER_NAME=$(OSAC_NS) VCLUSTER_NS=$(OSAC_NS) $(VCLUSTER_SH) teardown
+	VCLUSTER_NAME=$(NS) VCLUSTER_NS=$(NS) $(VCLUSTER_SH) teardown
 else
-	helm uninstall osac --namespace $(OSAC_NS) --ignore-not-found
+	helm uninstall osac --namespace $(NS) --ignore-not-found
 endif
 
 ##@ Composite
@@ -230,7 +234,7 @@ ifeq ($(SUITE),fulfillment)
 	helm upgrade --install osac $(OSAC_CHART) \
 		-f $(OSAC_INSTALLER)/values/dev/kind-instance.yaml \
 		--set service.images.service=localhost/fulfillment-service:it \
-		--namespace $(OSAC_NS) --wait --timeout 5m
+		--namespace $(NS) --wait --timeout 5m
 	@for f in fulfillment-service/it/crds/*.yaml; do kubectl apply --server-side --force-conflicts -f "$$f"; done
 	cd fulfillment-service && ginkgo run --timeout 1h -v it
 endif
@@ -242,7 +246,7 @@ ifeq ($(SUITE),operator)
 		--set operator.image.repository=localhost/osac-operator \
 		--set operator.image.tag=it \
 		--set operator.image.pullPolicy=Never \
-		--namespace $(OSAC_NS) --wait --timeout 5m
+		--namespace $(NS) --wait --timeout 5m
 	cd osac-operator && ginkgo run --timeout 30m -v test/integration
 endif
 ifeq ($(SUITE),bmf)
@@ -255,7 +259,7 @@ ifeq ($(SUITE),bmf)
 		--set bmf.image.repository=localhost/bmf-operator \
 		--set bmf.image.tag=it \
 		--set bmf.image.pullPolicy=Never \
-		--namespace $(OSAC_NS) --wait --timeout 5m
+		--namespace $(NS) --wait --timeout 5m
 	cd bare-metal-fulfillment-operator && ginkgo run --timeout 30m -v test/integration
 endif
 
@@ -325,4 +329,4 @@ teardown: ## Delete Kind cluster and all resources
 
 .PHONY: teardown-osac
 teardown-osac: ## Uninstall OSAC (keep cluster and infra)
-	helm uninstall osac --namespace $(OSAC_NS) --ignore-not-found
+	helm uninstall osac --namespace $(NS) --ignore-not-found

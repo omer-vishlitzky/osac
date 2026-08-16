@@ -166,7 +166,7 @@ install: manifests helm-crds ## Install CRDs into the K8s cluster specified in ~
 
 .PHONY: uninstall
 uninstall: ## Uninstall CRDs from the K8s cluster specified in ~/.kube/config.
-	helm uninstall bmf-operator-crds --ignore-not-found || true
+	helm uninstall bmf-operator-crds --ignore-not-found
 
 .PHONY: deploy
 deploy: manifests helm-crds ## Deploy controller to the K8s cluster specified in ~/.kube/config.
@@ -174,7 +174,7 @@ deploy: manifests helm-crds ## Deploy controller to the K8s cluster specified in
 
 .PHONY: undeploy
 undeploy: ## Undeploy controller from the K8s cluster specified in ~/.kube/config.
-	helm uninstall bmf-operator --ignore-not-found || true
+	helm uninstall bmf-operator --ignore-not-found
 
 ##@ Dependencies
 
@@ -230,7 +230,7 @@ define go-install-tool
 set -e; \
 package=$(2)@$(3) ;\
 echo "Downloading $${package}" ;\
-rm -f $(1) || true ;\
+rm -f $(1) ;\
 GOBIN=$(LOCALBIN) go install $${package} ;\
 mv $(1) $(1)-$(3) ;\
 } ;\

@@ -299,29 +299,37 @@ jobs:
       working-directory: osac-installer
       run: helm dependency build charts/osac/
 
-    - name: Lint chart
+    - name: Lint charts
       working-directory: osac-installer
       run: |
-        helm lint charts/osac/ --values values/development/values.yaml \
+        helm lint charts/osac-deps/
+        helm lint charts/osac-infra/ --values values/dev/infra.yaml
+        helm lint charts/osac/ --values values/dev/instance.yaml \
           --set service.externalHostname=fulfillment-api.osac.svc.cluster.local \
           --set service.internalHostname=fulfillment-internal-api.osac.svc.cluster.local
 
-    - name: Template chart (dry-run validation)
+    - name: Template charts (dry-run validation)
       working-directory: osac-installer
       run: |
-        helm template osac charts/osac/ --values values/development/values.yaml \
+        helm template osac-deps charts/osac-deps/ --values values/dev/infra.yaml
+        helm template osac-infra charts/osac-infra/ --values values/dev/infra.yaml
+        helm template osac charts/osac/ --values values/dev/instance.yaml \
           --set service.externalHostname=fulfillment-api.osac.svc.cluster.local \
-          --set service.internalHostname=fulfillment-internal-api.osac.svc.cluster.local \
-          > /dev/null
+          --set service.internalHostname=fulfillment-internal-api.osac.svc.cluster.local
 
-    - name: Deploy umbrella chart
+    - name: Deploy charts
       continue-on-error: true
       working-directory: osac-installer
       run: |
-        helm install osac charts/osac/ \
+        helm install osac-infra charts/osac-infra/ \
           --namespace osac \
           --create-namespace \
-          --values values/development/values.yaml \
+          --values values/dev/infra.yaml \
+          --timeout 5m \
+          --wait
+        helm install osac charts/osac/ \
+          --namespace osac \
+          --values values/dev/instance.yaml \
           --set service.externalHostname=fulfillment-api.osac.svc.cluster.local \
           --set service.internalHostname=fulfillment-internal-api.osac.svc.cluster.local \
           --set validation.enabled=false \
@@ -335,13 +343,13 @@ jobs:
       if: always()
       run: |
         echo "=== Pods ==="
-        kubectl get pods -n osac 2>/dev/null || true
+        kubectl get pods -n osac
         echo "=== Deployments ==="
-        kubectl get deployments -n osac 2>/dev/null || true
+        kubectl get deployments -n osac
         echo "=== Services ==="
-        kubectl get services -n osac 2>/dev/null || true
-        echo "=== Helm status ==="
-        helm status osac -n osac 2>/dev/null || true
+        kubectl get services -n osac
+        echo "=== Helm releases ==="
+        helm list -n osac
 
     - name: Test idempotency (helm upgrade with no changes)
       continue-on-error: true
@@ -349,7 +357,7 @@ jobs:
       run: |
         helm upgrade osac charts/osac/ \
           --namespace osac \
-          --values values/development/values.yaml \
+          --values values/dev/instance.yaml \
           --set service.externalHostname=fulfillment-api.osac.svc.cluster.local \
           --set service.internalHostname=fulfillment-internal-api.osac.svc.cluster.local \
           --set validation.enabled=false \
