@@ -13,6 +13,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/IBM/sarama"
@@ -45,11 +46,13 @@ type EventPublisher interface {
 	Publish(ctx context.Context, event cloudevents.Event) error
 }
 
-const (
-	TopicLifecycle   = "osac.metering.lifecycle"
-	TopicHeartbeat   = "osac.metering.heartbeat"
-	TopicCorrections = "osac.metering.corrections"
-	TopicInference   = "osac.metering.inference"
+var TopicPrefix = os.Getenv("KAFKA_TOPIC_PREFIX")
+
+var (
+	TopicLifecycle   = TopicPrefix + "osac.metering.lifecycle"
+	TopicHeartbeat   = TopicPrefix + "osac.metering.heartbeat"
+	TopicCorrections = TopicPrefix + "osac.metering.corrections"
+	TopicInference   = TopicPrefix + "osac.metering.inference"
 )
 
 var Topics = []string{TopicLifecycle, TopicHeartbeat, TopicCorrections}

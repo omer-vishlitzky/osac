@@ -75,15 +75,13 @@ VCLUSTER ?=
 # vcluster lifecycle script.
 VCLUSTER_SH := $(OSAC_INSTALLER)/scripts/vcluster.sh
 
-# Per-instance isolation: when NS differs from the default, derive an
-# instancePrefix from the namespace (hyphens → underscores for PostgreSQL
-# identifier compatibility) and inject the multi-instance --set flags.
-INSTANCE_PREFIX := $(if $(filter-out osac,$(NS)),$(subst -,_,$(NS)),)
-MULTI_INSTANCE_ARGS := $(if $(INSTANCE_PREFIX),\
+# Every deployment is an instance. Derive instancePrefix from NS
+# (hyphens to underscores for PostgreSQL identifier compatibility).
+INSTANCE_PREFIX := $(subst -,_,$(NS))
+INSTANCE_ARGS := \
   --set instancePrefix=$(INSTANCE_PREFIX) \
   --set operator.aap.templatePrefix=$(INSTANCE_PREFIX)-osac \
-  --set operator.consoleProxy.disabled=true \
-  --set metering.topicPrefix=$(INSTANCE_PREFIX),)
+  --set metering.topicPrefix=$(INSTANCE_PREFIX)
 
 # Values file selection: kind uses kind-specific files, vcluster adds an overlay.
 ifeq ($(PLATFORM),kind)
@@ -199,7 +197,7 @@ endif
 		--namespace $(NS) --create-namespace \
 		$(if $(VCLUSTER_KC),--kubeconfig $(VCLUSTER_KC)) \
 		$(if $(DOMAIN),--set service.externalHostname=fulfillment-api-$(NS).$(DOMAIN) --set service.internalHostname=fulfillment-internal-api-$(NS).$(DOMAIN) --set service.auth.issuerUrl=https://keycloak-keycloak.$(DOMAIN)/realms/osac) \
-		$(MULTI_INSTANCE_ARGS) \
+		$(INSTANCE_ARGS) \
 		$(EXTRA_HELM_ARGS) \
 		--wait --timeout 40m
 

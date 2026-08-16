@@ -96,6 +96,7 @@ install-osac: helm-deps install-secrets check-postgres ## Phase 3: Install OSAC 
 	helm upgrade --install osac charts/osac/ \
 		--namespace $(INSTALLER_NAMESPACE) --create-namespace \
 		--values $(INSTANCE_VALUES) \
+		--set instancePrefix=$(subst -,_,$(INSTALLER_NAMESPACE)) \
 		--set service.externalHostname=fulfillment-api-$(INSTALLER_NAMESPACE).$(DOMAIN) \
 		--set service.internalHostname=fulfillment-internal-api-$(INSTALLER_NAMESPACE).$(DOMAIN) \
 		--set service.auth.issuerUrl=https://keycloak-keycloak.$(DOMAIN)/realms/osac \
