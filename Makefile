@@ -126,21 +126,31 @@ help: ## Display this help
 .PHONY: install-infra
 install-infra: ## Install infrastructure (PLATFORM= PROFILE= required)
 ifeq ($(PLATFORM),kind)
-	@echo "Installing cert-manager..."
+	@if kind get clusters | grep -q "^$(KIND_CLUSTER_NAME)$$"; then \
+		echo "Kind cluster '$(KIND_CLUSTER_NAME)' already exists"; \
+	else \
+		echo "Creating Kind cluster '$(KIND_CLUSTER_NAME)'..."; \
+		kind create cluster --name $(KIND_CLUSTER_NAME) --config $(KIND_CONFIG) --wait 60s; \
+	fi
+	@kind export kubeconfig --name $(KIND_CLUSTER_NAME) --kubeconfig $(KIND_KUBECONFIG)
 	helm upgrade --install cert-manager oci://quay.io/jetstack/charts/cert-manager \
 		--version v1.20.0 --namespace cert-manager --create-namespace \
 		--set crds.enabled=true --wait --timeout 5m
-	@echo "Installing trust-manager..."
 	helm upgrade --install trust-manager oci://quay.io/jetstack/charts/trust-manager \
 		--version v0.22.0 --namespace cert-manager \
 		--set defaultPackage.enabled=false --wait --timeout 5m
-	@echo "Installing Envoy Gateway..."
 	helm upgrade --install envoy-gateway oci://docker.io/envoyproxy/gateway-helm \
 		--version v1.6.5 --namespace envoy-gateway --create-namespace \
 		--wait --timeout 5m
 	helm upgrade --install osac-infra $(INFRA_CHART) \
 		-f $(INFRA_VALUES) \
 		--wait --timeout 10m
+	@for f in osac-operator/config/crd/fakes/*.yaml; do \
+		case "$$(basename "$$f")" in \
+			*osac.openshift.io*) continue ;; \
+		esac; \
+		kubectl apply --server-side --force-conflicts -f "$$f"; \
+	done
 else
 	$(eval OCP_VERSION := $(shell oc get clusterversion version -o jsonpath='{.status.desired.version}' | cut -d. -f1,2))
 	@bash -c 'source $(OSAC_INSTALLER)/scripts/lib.sh && \
@@ -172,6 +182,7 @@ ifeq ($(PLATFORM),kind)
 	helm uninstall envoy-gateway --namespace envoy-gateway --ignore-not-found
 	helm uninstall trust-manager --namespace cert-manager --ignore-not-found
 	helm uninstall cert-manager --namespace cert-manager --ignore-not-found
+	kind delete cluster --name $(KIND_CLUSTER_NAME)
 else
 	helm uninstall osac-infra --namespace osac-infra --ignore-not-found --wait --timeout 10m
 	helm uninstall osac-deps --namespace osac-deps --ignore-not-found
@@ -261,70 +272,3 @@ ifeq ($(SUITE),bmf)
 	cd bare-metal-fulfillment-operator && ginkgo run --timeout 30m -v test/integration
 endif
 
-##@ Development Environment
-
-.PHONY: kind-create
-kind-create: ## Create Kind cluster (idempotent)
-	@if kind get clusters | grep -q "^$(KIND_CLUSTER_NAME)$$"; then \
-		echo "Kind cluster '$(KIND_CLUSTER_NAME)' already exists"; \
-	else \
-		echo "Creating Kind cluster '$(KIND_CLUSTER_NAME)'..."; \
-		kind create cluster --name $(KIND_CLUSTER_NAME) --config $(KIND_CONFIG) --wait 60s; \
-	fi
-	@kind export kubeconfig --name $(KIND_CLUSTER_NAME) --kubeconfig $(KIND_KUBECONFIG)
-	@echo "KUBECONFIG=$(KIND_KUBECONFIG)"
-
-.PHONY: dev-env
-dev-env: kind-create ## Create Kind dev environment with OSAC
-	$(MAKE) install PLATFORM=kind PROFILE=dev NS=osac
-	$(MAKE) install-fake-crds
-
-.PHONY: dev-env-full
-dev-env-full: dev-env install-kubevirt install-awx seed-catalog ## Full dev environment with KubeVirt + AWX + catalog
-
-.PHONY: install-fake-crds
-install-fake-crds: ## Install fake CRDs for HyperShift, KubeVirt, OVN-K
-	@for f in osac-operator/config/crd/fakes/*.yaml; do \
-		case "$$(basename "$$f")" in \
-			*osac.openshift.io*) continue ;; \
-		esac; \
-		kubectl apply --server-side --force-conflicts -f "$$f"; \
-	done
-
-##@ Full Environment (opt-in)
-
-.PHONY: install-kubevirt
-install-kubevirt: ## Install KubeVirt + CDI + Multus
-	@MULTUS_VERSION=$$(curl -sL "https://api.github.com/repos/k8snetworkplumbingwg/multus-cni/releases/latest" | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": "\(.*\)".*/\1/'); \
-	echo "Installing Multus $${MULTUS_VERSION}..."; \
-	kubectl apply -f "https://raw.githubusercontent.com/k8snetworkplumbingwg/multus-cni/$${MULTUS_VERSION}/deployments/multus-daemonset.yml"
-	@KUBEVIRT_VERSION=$$(curl -sL https://storage.googleapis.com/kubevirt-prow/release/kubevirt/kubevirt/stable.txt); \
-	echo "Installing KubeVirt $${KUBEVIRT_VERSION}..."; \
-	kubectl apply -f "https://github.com/kubevirt/kubevirt/releases/download/$${KUBEVIRT_VERSION}/kubevirt-operator.yaml"; \
-	kubectl apply -f "https://github.com/kubevirt/kubevirt/releases/download/$${KUBEVIRT_VERSION}/kubevirt-cr.yaml"
-	@CDI_VERSION=$$(curl -sL "https://api.github.com/repos/kubevirt/containerized-data-importer/releases/latest" | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": "\(.*\)".*/\1/'); \
-	echo "Installing CDI $${CDI_VERSION}..."; \
-	kubectl apply -f "https://github.com/kubevirt/containerized-data-importer/releases/download/$${CDI_VERSION}/cdi-operator.yaml"; \
-	kubectl apply -f "https://github.com/kubevirt/containerized-data-importer/releases/download/$${CDI_VERSION}/cdi-cr.yaml"
-
-.PHONY: install-awx
-install-awx: ## Install AWX operator and instance
-	helm upgrade --install osac-infra $(INFRA_CHART) \
-		-f $(OSAC_INSTALLER)/values/dev/kind-infra.yaml \
-		--set awx.enabled=true \
-		--wait --timeout 10m
-
-.PHONY: seed-catalog
-seed-catalog: ## Seed catalog data
-	@echo "Catalog seeding via fulfillment-service API..."
-	@echo "TODO: implement catalog seeding via helm hooks or script"
-
-##@ Teardown
-
-.PHONY: teardown
-teardown: ## Delete Kind cluster and all resources
-	kind delete cluster --name $(KIND_CLUSTER_NAME)
-
-.PHONY: teardown-osac
-teardown-osac: ## Uninstall OSAC (keep cluster and infra)
-	helm uninstall osac --namespace $(NS) --ignore-not-found
