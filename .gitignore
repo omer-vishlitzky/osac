@@ -199,3 +199,4 @@ cython_debug/
 **/osac-aap-secrets.env
 **/server-ssh-key
 **/server-ssh-bastion-key
+osac-installer/charts/osac/tmpcharts*/
