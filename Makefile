@@ -95,7 +95,7 @@ KIND_KUBECONFIG := $(HOME)/.kube/$(KIND_CLUSTER_NAME)-kind.kubeconfig
 export KUBECONFIG ?= $(KIND_KUBECONFIG)
 
 define kind-load-image
-	@if [ "$(CONTAINER_TOOL)" = "podman" ]; then \
+	@if [ "$$(basename $(CONTAINER_TOOL))" = "podman" ]; then \
 		tmpfile=$$(mktemp /tmp/kind-image-XXXXXX.tar); \
 		$(CONTAINER_TOOL) save $(1) -o "$$tmpfile"; \
 		kind load image-archive "$$tmpfile" --name $(KIND_CLUSTER_NAME); \

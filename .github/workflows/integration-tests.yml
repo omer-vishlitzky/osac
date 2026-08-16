@@ -82,6 +82,8 @@ jobs:
         CONTAINER_TOOL: docker
       run: make install PLATFORM=kind PROFILE=dev NS=osac
     - name: Run integration tests
+      env:
+        CONTAINER_TOOL: docker
       run: |
         echo '127.0.0.1 fulfillment-api.osac.svc.cluster.local' | sudo tee -a /etc/hosts
         echo '127.0.0.1 fulfillment-internal-api.osac.svc.cluster.local' | sudo tee -a /etc/hosts

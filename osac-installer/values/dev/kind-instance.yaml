@@ -3,8 +3,6 @@ instancePrefix: osac
 
 # --- Operator ---
 operator:
-  consoleProxy:
-    disabled: true
   image:
     repository: ghcr.io/osac-project/osac-operator
     tag: latest
@@ -124,6 +122,9 @@ aap:
 # --- Bare Metal Fulfillment (disabled) ---
 bmf:
   enabled: false
+  secrets:
+    inventoryConfig: osac-inventory-config-metal3-test
+    managementConfig: osac-management-config-metal3-test
   testBackend:
     metal3:
       enabled: true
