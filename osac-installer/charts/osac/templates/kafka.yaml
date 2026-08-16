@@ -1,4 +1,4 @@
-{{- if .Values.instancePrefix }}
+{{- if and .Values.instancePrefix .Values.kafka.enabled }}
 {{- $prefix := .Values.instancePrefix }}
 {{- $ns := .Values.kafka.clusterNamespace }}
 {{- $cluster := .Values.kafka.clusterName }}
