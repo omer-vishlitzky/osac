@@ -65,7 +65,7 @@ check-postgres: ## Verify in-cluster PostgreSQL is reachable before installing O
 install: install-operators install-prereqs install-osac ## Full install (operators + prereqs + OSAC)
 
 .PHONY: install-operators
-install-operators: wait-for-api wait-for-operators-namespaces ## Phase 1: Install OLM operators via osac-deps chart
+install-operators: wait-for-api wait-for-deps-namespaces ## Phase 1: Install OLM operators via osac-deps chart
 	$(eval OCP_VERSION := $(shell oc get clusterversion version -o jsonpath='{.status.desired.version}' | cut -d. -f1,2))
 	helm upgrade --install osac-deps charts/osac-deps/ \
 		--namespace osac-deps --create-namespace \
@@ -75,7 +75,7 @@ install-operators: wait-for-api wait-for-operators-namespaces ## Phase 1: Instal
 		--timeout 30m --wait
 
 .PHONY: install-prereqs
-install-prereqs: wait-for-prereqs-namespaces ## Phase 2: Configure prerequisites via osac-infra chart
+install-prereqs: wait-for-infra-namespaces ## Phase 2: Configure prerequisites via osac-infra chart
 	$(eval OCP_VERSION := $(shell oc get clusterversion version -o jsonpath='{.status.desired.version}' | cut -d. -f1,2))
 	$(eval DOMAIN := $(shell oc get ingresses.config/cluster -o jsonpath='{.spec.domain}'))
 	@[ -n "$(DOMAIN)" ] || { echo "ERROR: could not determine cluster domain" >&2; exit 1; }
