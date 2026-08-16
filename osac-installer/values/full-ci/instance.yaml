@@ -1,3 +1,4 @@
+instancePrefix: full_ci
 # Full CI environment -- instance values for osac chart.
 
 # --- Operator ---
