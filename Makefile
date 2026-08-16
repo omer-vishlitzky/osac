@@ -5,9 +5,9 @@ KIND_CLUSTER_NAME ?= osac-dev
 OSAC_NAMESPACE ?= osac
 CONTAINER_TOOL ?= $(shell command -v podman >/dev/null 2>&1 && echo podman || echo docker)
 
-PREREQS_CHART = osac-installer/charts/osac-prereqs
+INFRA_CHART = osac-installer/charts/osac-infra
 OSAC_CHART = osac-installer/charts/osac
-KIND_PREREQS_VALUES = osac-installer/values/kind/prereqs.yaml
+KIND_INFRA_VALUES = osac-installer/values/kind/prereqs.yaml
 KIND_OSAC_VALUES = osac-installer/values/kind/osac.yaml
 KIND_CONFIG = kind-dev/kind-config.yaml
 KIND_KUBECONFIG = $(HOME)/.kube/$(KIND_CLUSTER_NAME)-kind.kubeconfig
@@ -34,7 +34,7 @@ help: ## Display this help.
 ##@ Development Environment
 
 .PHONY: dev-env
-dev-env: kind-create install-prereqs-kind install-fake-crds install-osac-kind ## Create Kind dev environment with OSAC (lightweight, ~8 min)
+dev-env: kind-create install-infra-kind install-fake-crds install-osac-kind ## Create Kind dev environment with OSAC (lightweight, ~8 min)
 
 .PHONY: dev-env-full
 dev-env-full: dev-env install-kubevirt install-awx seed-catalog ## Full dev environment with KubeVirt + AWX + catalog (~25 min)
@@ -50,8 +50,8 @@ kind-create: ## Create Kind cluster (idempotent)
 	@kind export kubeconfig --name $(KIND_CLUSTER_NAME) --kubeconfig $(HOME)/.kube/$(KIND_CLUSTER_NAME)-kind.kubeconfig
 	@echo "KUBECONFIG=$(HOME)/.kube/$(KIND_CLUSTER_NAME)-kind.kubeconfig"
 
-.PHONY: install-prereqs-kind
-install-prereqs-kind: ## Install prerequisites (cert-manager, keycloak, envoy gateway) on Kind
+.PHONY: install-infra-kind
+install-infra-kind: ## Install shared infrastructure (cert-manager, keycloak, envoy gateway) on Kind
 	@echo "Installing cert-manager..."
 	helm upgrade --install cert-manager oci://quay.io/jetstack/charts/cert-manager \
 		--version v1.20.0 --namespace cert-manager --create-namespace \
@@ -64,8 +64,8 @@ install-prereqs-kind: ## Install prerequisites (cert-manager, keycloak, envoy ga
 	helm upgrade --install envoy-gateway oci://docker.io/envoyproxy/gateway-helm \
 		--version v1.6.5 --namespace envoy-gateway --create-namespace \
 		--wait --timeout 5m
-	helm upgrade --install osac-prereqs $(PREREQS_CHART) \
-		-f $(KIND_PREREQS_VALUES) \
+	helm upgrade --install osac-infra $(INFRA_CHART) \
+		-f $(KIND_INFRA_VALUES) \
 		--wait --timeout 10m
 
 .PHONY: install-osac-kind
@@ -145,8 +145,8 @@ install-kubevirt: ## Install KubeVirt + CDI + Multus (for compute instance testi
 
 .PHONY: install-awx
 install-awx: ## Install AWX operator and instance
-	helm upgrade --install osac-prereqs $(PREREQS_CHART) \
-		-f $(KIND_PREREQS_VALUES) \
+	helm upgrade --install osac-infra $(INFRA_CHART) \
+		-f $(KIND_INFRA_VALUES) \
 		--set awx.enabled=true \
 		--wait --timeout 10m
 
@@ -162,5 +162,5 @@ teardown: ## Delete Kind cluster and all resources
 	kind delete cluster --name $(KIND_CLUSTER_NAME)
 
 .PHONY: teardown-osac
-teardown-osac: ## Uninstall OSAC (keep cluster and prereqs)
+teardown-osac: ## Uninstall OSAC (keep cluster and infra)
 	helm uninstall osac --namespace $(OSAC_NAMESPACE) --ignore-not-found

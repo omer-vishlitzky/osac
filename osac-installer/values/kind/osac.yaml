@@ -129,11 +129,7 @@ bmf:
       enabled: true
 
 # --- Bundled PostgreSQL ---
-bundledPostgres:
-  enabled: false
-  database:
-    name: service
-    user: service
+# NOTE: bundledPostgres has moved to the osac-infra chart.
 
 # --- Hub Access ---
 hubAccess:

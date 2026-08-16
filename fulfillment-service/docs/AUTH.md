@@ -228,7 +228,7 @@ If you need to export the realm configuration for backup or modification:
 4. (Optional) Update the chart's realm file (in the `osac-installer` repo, not here):
 
    ```bash
-   cp realm.json osac-installer/charts/osac-prereqs/files/realm.json
+   cp realm.json osac-installer/charts/osac-infra/files/realm.json
    ```
 
 ## Fulfillment Service Configuration

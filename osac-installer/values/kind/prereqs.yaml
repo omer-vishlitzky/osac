@@ -1,7 +1,7 @@
-# Kind-specific values for osac-prereqs chart.
+# Kind-specific values for osac-infra chart.
 # cert-manager, trust-manager, and envoy gateway are installed as
-# separate Helm releases by the root Makefile (install-prereqs-kind).
-# This values file configures the prereqs chart templates only.
+# separate Helm releases by the root Makefile (install-infra-kind).
+# This values file configures the infra chart templates only.
 
 # --- Disable OLM subscription templates (not available in Kind) ---
 certManager:
