@@ -271,4 +271,3 @@ ifeq ($(SUITE),bmf)
 		--namespace $(NS) --wait --timeout 5m
 	cd bare-metal-fulfillment-operator && ginkgo run --timeout 30m -v test/integration
 endif
-

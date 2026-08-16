@@ -163,3 +163,6 @@ metallb:
 # --- CAPI Provider (disabled) ---
 capiProvider:
   enabled: false
+
+kafka:
+  enabled: false

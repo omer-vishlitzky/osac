@@ -15,6 +15,7 @@ dbInit:
 
 # Kafka cluster coordinates for per-instance topic/user creation.
 kafka:
+  enabled: true
   clusterName: osac-kafka
   clusterNamespace: osac-kafka
   replicas: 3
