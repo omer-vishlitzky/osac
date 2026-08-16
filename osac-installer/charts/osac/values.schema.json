@@ -8,6 +8,45 @@
       "type": "string",
       "description": "Default OpenShift CLI image used by hook jobs"
     },
+    "instancePrefix": {
+      "type": "string",
+      "description": "Per-instance isolation prefix. When set, creates namespace-prefixed databases, Kafka topics, and AAP templates. Derive from the namespace (e.g. pr_101 for NS=pr-101). Leave empty for single-instance mode.",
+      "pattern": "^$|^[a-zA-Z_][a-zA-Z0-9_]*$",
+      "default": ""
+    },
+    "dbInit": {
+      "type": "object",
+      "description": "Shared PostgreSQL host for the db-init hook (only used when instancePrefix is set)",
+      "properties": {
+        "host": {
+          "type": "string",
+          "description": "PostgreSQL host for db-init hook",
+          "default": "postgres.osac-infra.svc.cluster.local"
+        }
+      }
+    },
+    "kafka": {
+      "type": "object",
+      "description": "Kafka cluster coordinates for per-instance topic/user creation",
+      "properties": {
+        "clusterName": {
+          "type": "string",
+          "description": "Strimzi Kafka cluster name",
+          "default": "osac-kafka"
+        },
+        "clusterNamespace": {
+          "type": "string",
+          "description": "Namespace of the Kafka cluster",
+          "default": "osac-kafka"
+        },
+        "replicas": {
+          "type": "integer",
+          "description": "Kafka broker replica count (drives topic replication factor)",
+          "default": 3,
+          "minimum": 1
+        }
+      }
+    },
     "operatorCrds": {
       "type": "object",
       "description": "OSAC Operator CRDs configuration",

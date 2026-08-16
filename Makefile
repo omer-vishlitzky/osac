@@ -66,6 +66,16 @@ NS ?=
 OSAC_NS := $(or $(NS),osac)
 EXTRA_HELM_ARGS ?=
 
+# Per-instance isolation: when NS differs from the default, derive an
+# instancePrefix from the namespace (hyphens → underscores for PostgreSQL
+# identifier compatibility) and inject the multi-instance --set flags.
+INSTANCE_PREFIX := $(if $(filter-out osac,$(OSAC_NS)),$(subst -,_,$(OSAC_NS)),)
+MULTI_INSTANCE_ARGS := $(if $(INSTANCE_PREFIX),\
+  --set instancePrefix=$(INSTANCE_PREFIX) \
+  --set operator.aap.templatePrefix=$(INSTANCE_PREFIX)-osac \
+  --set operator.consoleProxy.disabled=true \
+  --set metering.topicPrefix=$(INSTANCE_PREFIX),)
+
 # Values file selection: kind uses kind-specific files.
 ifeq ($(PLATFORM),kind)
 INFRA_VALUES    := $(OSAC_INSTALLER)/values/dev/kind-infra.yaml
@@ -169,6 +179,7 @@ endif
 		$(if $(DOMAIN),--set service.externalHostname=fulfillment-api-$(OSAC_NS).$(DOMAIN)) \
 		$(if $(DOMAIN),--set service.internalHostname=fulfillment-internal-api-$(OSAC_NS).$(DOMAIN)) \
 		$(if $(DOMAIN),--set service.auth.issuerUrl=https://keycloak-keycloak.$(DOMAIN)/realms/osac) \
+		$(MULTI_INSTANCE_ARGS) \
 		$(EXTRA_HELM_ARGS) \
 		--wait --timeout 40m
 

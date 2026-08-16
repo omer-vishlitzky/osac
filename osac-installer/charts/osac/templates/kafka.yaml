@@ -1,0 +1,58 @@
+{{- if .Values.instancePrefix }}
+{{- $prefix := .Values.instancePrefix }}
+{{- $ns := .Values.kafka.clusterNamespace }}
+{{- $cluster := .Values.kafka.clusterName }}
+{{- $replicas := .Values.kafka.replicas | int }}
+{{- $minIsr := min $replicas 2 }}
+{{- range list
+  (dict "suffix" "lifecycle"    "partitions" 3 "retentionDays" 30)
+  (dict "suffix" "heartbeat"    "partitions" 3 "retentionDays" 30)
+  (dict "suffix" "inference"    "partitions" 3 "retentionDays" 30)
+  (dict "suffix" "corrections"  "partitions" 3 "retentionDays" 30)
+  (dict "suffix" "dlq"          "partitions" 1 "retentionDays" 90)
+}}
+apiVersion: kafka.strimzi.io/v1
+kind: KafkaTopic
+metadata:
+  name: {{ $prefix }}.osac.metering.{{ .suffix }}
+  namespace: {{ $ns }}
+  labels:
+    strimzi.io/cluster: {{ $cluster }}
+spec:
+  partitions: {{ .partitions }}
+  replicas: {{ $replicas }}
+  config:
+    retention.ms: "{{ mul .retentionDays 86400000 }}"
+    min.insync.replicas: "{{ $minIsr }}"
+    cleanup.policy: delete
+---
+{{- end }}
+apiVersion: kafka.strimzi.io/v1
+kind: KafkaUser
+metadata:
+  name: {{ $prefix }}-osac-metering
+  namespace: {{ $ns }}
+  labels:
+    strimzi.io/cluster: {{ $cluster }}
+spec:
+  authentication:
+    type: scram-sha-512
+  authorization:
+    type: simple
+    acls:
+      - resource:
+          type: topic
+          name: {{ $prefix }}.osac.metering.
+          patternType: prefix
+        operations:
+          - Write
+          - Describe
+        host: "*"
+      - resource:
+          type: cluster
+          name: kafka-cluster
+          patternType: literal
+        operations:
+          - IdempotentWrite
+        host: "*"
+{{- end }}

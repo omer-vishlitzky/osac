@@ -3,6 +3,22 @@
 
 cliImage: quay.io/openshift/origin-cli:4.20.0
 
+# --- Multi-instance isolation ---
+# When set, enables per-instance isolation: prefixed databases, Kafka topics,
+# and AAP templates. Derive from the namespace (e.g. "pr_101" for NS=pr-101).
+# Leave empty for single-instance mode (default).
+instancePrefix: ""
+
+# Shared PostgreSQL host for db-init hook (only used when instancePrefix is set).
+dbInit:
+  host: "postgres.osac-infra.svc.cluster.local"
+
+# Kafka cluster coordinates for per-instance topic/user creation.
+kafka:
+  clusterName: osac-kafka
+  clusterNamespace: osac-kafka
+  replicas: 3
+
 # --- Operator CRDs ---
 operatorCrds:
   install: true
