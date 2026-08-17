@@ -18,6 +18,7 @@ package dispatcher_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -210,6 +211,26 @@ var _ = Describe("Resolver", func() {
 		_, err = resolver.Resolve(ctx, "nc-no-manager")
 		Expect(err).To(HaveOccurred())
 		Expect(err.Error()).To(ContainSubstring("neither fabricManager nor k8sManager is set"))
+		Expect(errors.Is(err, dispatcher.ErrNoManagerConfigured)).To(BeTrue())
+	})
+
+	It("returns error when the client returns no object", func() {
+		stub := &stubNetworkClassesClient{
+			getFunc: func(_ context.Context, _ *privatev1.NetworkClassesGetRequest, _ ...grpc.CallOption) (*privatev1.NetworkClassesGetResponse, error) {
+				return &privatev1.NetworkClassesGetResponse{
+					Object: nil,
+				}, nil
+			},
+		}
+
+		cl := fake.NewClientBuilder().WithScheme(scheme).Build()
+		disc, err := networkmanager.NewDiscovery(cl, "osac")
+		Expect(err).NotTo(HaveOccurred())
+		resolver := dispatcher.NewResolver(stub, disc)
+
+		_, err = resolver.Resolve(ctx, "nc-no-object")
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("response contains no object"))
 	})
 
 	It("returns error when fabric manager is not registered", func() {
