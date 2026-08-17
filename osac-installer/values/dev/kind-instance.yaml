@@ -91,20 +91,7 @@ service:
   log:
     level: debug
   vault:
-    endpoint: "http://openbao.openbao.svc.cluster.local:8200"
-    namespace: osac
-    kvMountPath: secret
-    lifecycleRole: "lifecycle"
-    lifecycleMountPath: "jwt"
-    keycloakClientId: "osac-controller"
-    keycloakIssuerUrl: "https://keycloak.keycloak.svc.cluster.local:8000/realms/osac"
-    keycloakAudience: "osac-api"
-    credentials:
-    - secret:
-        name: fulfillment-controller-credentials
-        items:
-        - key: client-secret
-          param: client-secret
+    endpoint: ""
 
 # --- AAP (disabled for kind) ---
 aap:
