@@ -232,34 +232,23 @@ endif
 ifeq ($(SUITE),fulfillment)
 	$(CONTAINER_TOOL) build -t localhost/fulfillment-service:it -f fulfillment-service/Containerfile .
 	$(call kind-load-image,localhost/fulfillment-service:it)
-	helm upgrade --install osac $(OSAC_CHART) \
-		-f $(OSAC_INSTALLER)/values/dev/kind-instance.yaml \
-		--set service.images.service=localhost/fulfillment-service:it \
-		--namespace $(NS) --wait --timeout 5m
+	$(MAKE) install-osac PLATFORM=$(PLATFORM) PROFILE=$(PROFILE) NS=$(NS) \
+		EXTRA_HELM_ARGS="--set service.images.service=localhost/fulfillment-service:it"
 	@for f in fulfillment-service/it/crds/*.yaml; do kubectl apply --server-side --force-conflicts -f "$$f"; done
 	cd fulfillment-service && ginkgo run --timeout 1h -v it
 endif
 ifeq ($(SUITE),operator)
 	$(CONTAINER_TOOL) build -t localhost/osac-operator:it -f osac-operator/Containerfile .
 	$(call kind-load-image,localhost/osac-operator:it)
-	helm upgrade --install osac $(OSAC_CHART) \
-		-f $(OSAC_INSTALLER)/values/dev/kind-instance.yaml \
-		--set operator.image.repository=localhost/osac-operator \
-		--set operator.image.tag=it \
-		--set operator.image.pullPolicy=Never \
-		--namespace $(NS) --wait --timeout 5m
+	$(MAKE) install-osac PLATFORM=$(PLATFORM) PROFILE=$(PROFILE) NS=$(NS) \
+		EXTRA_HELM_ARGS="--set operator.image.repository=localhost/osac-operator --set operator.image.tag=it --set operator.image.pullPolicy=Never"
 	cd osac-operator && ginkgo run --timeout 30m -v test/integration
 endif
 ifeq ($(SUITE),bmf)
 	$(CONTAINER_TOOL) build -t localhost/bmf-operator:it -f bare-metal-fulfillment-operator/Containerfile .
 	$(call kind-load-image,localhost/bmf-operator:it)
 	kubectl apply --server-side --force-conflicts -f bare-metal-fulfillment-operator/test/crds/
-	helm upgrade --install osac $(OSAC_CHART) \
-		-f $(OSAC_INSTALLER)/values/dev/kind-instance.yaml \
-		--set bmf.enabled=true \
-		--set bmf.image.repository=localhost/bmf-operator \
-		--set bmf.image.tag=it \
-		--set bmf.image.pullPolicy=Never \
-		--namespace $(NS) --wait --timeout 5m
+	$(MAKE) install-osac PLATFORM=$(PLATFORM) PROFILE=$(PROFILE) NS=$(NS) \
+		EXTRA_HELM_ARGS="--set bmf.enabled=true --set bmf.image.repository=localhost/bmf-operator --set bmf.image.tag=it --set bmf.image.pullPolicy=Never"
 	cd bare-metal-fulfillment-operator && ginkgo run --timeout 30m -v test/integration
 endif
