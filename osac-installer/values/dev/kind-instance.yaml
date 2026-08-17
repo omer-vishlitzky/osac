@@ -73,14 +73,14 @@ service:
   database:
     connection:
       - configMap:
-          name: fulfillment-db
+          name: osac-db-config
           items:
             - key: url
               param: url
             - key: sslmode
               param: sslmode
       - secret:
-          name: postgres-client-cert-service
+          name: osac-db-client-cert
           items:
             - key: tls.crt
               param: sslcert
