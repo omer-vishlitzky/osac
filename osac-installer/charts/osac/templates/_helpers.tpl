@@ -32,18 +32,19 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- end }}
 
 {{/*
-Per-instance database name for the fulfillment service.
-instancePrefix is enforced by values.schema.json.
+PostgreSQL-safe instance prefix: hyphens converted to underscores.
+All database identifiers derive from this single template.
 */}}
-{{- define "osac.dbNameService" -}}
-{{ .Values.instancePrefix }}_service
+{{- define "osac.pgPrefix" -}}
+{{ replace "-" "_" .Values.instancePrefix }}
 {{- end }}
 
-{{/*
-Per-instance database name for metering.
-*/}}
+{{- define "osac.dbNameService" -}}
+{{ include "osac.pgPrefix" . }}_service
+{{- end }}
+
 {{- define "osac.dbNameMetering" -}}
-{{ .Values.instancePrefix }}_metering
+{{ include "osac.pgPrefix" . }}_metering
 {{- end }}
 
 {{/*

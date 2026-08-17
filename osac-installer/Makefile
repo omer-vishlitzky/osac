@@ -1,73 +1,279 @@
-# osac-installer helper targets.
-# Deployment targets (install, uninstall) live in the root Makefile.
+# OSAC Installer -- single deployment API.
+#
+# Entities:  Infra (osac-deps + osac-infra), Osac (osac chart), Test
+# Parameters are REQUIRED -- missing params produce hard errors.
+#
+# Usage:
+# Every deployment target requires PLATFORM, PROFILE, and NS. No exceptions.
+#   make install         PLATFORM=kind|openshift  PROFILE=dev|vmaas-ci|bmaas-ci|caas-ci|full-ci  NS=osac
+#   make uninstall       PLATFORM=kind|openshift  PROFILE=dev|vmaas-ci|bmaas-ci|caas-ci|full-ci  NS=osac
+#   make install-infra   PLATFORM=kind|openshift  PROFILE=dev|vmaas-ci|bmaas-ci|caas-ci|full-ci  NS=osac
+#   make install-osac    PLATFORM=kind|openshift  PROFILE=dev|vmaas-ci|bmaas-ci|caas-ci|full-ci  NS=osac  [VCLUSTER=true]
+#   make uninstall-osac  PLATFORM=kind|openshift  PROFILE=dev|vmaas-ci|bmaas-ci|caas-ci|full-ci  NS=osac  [VCLUSTER=true]
+#   make uninstall-infra PLATFORM=kind|openshift  PROFILE=dev|vmaas-ci|bmaas-ci|caas-ci|full-ci  NS=osac
+#   make test            PLATFORM=kind|openshift  PROFILE=dev|vmaas-ci|bmaas-ci|caas-ci|full-ci  NS=osac  SUITE=all|fulfillment|operator|bmf
+#
+# Helm chart management (no parameters required):
+#   make helm-lint
+#   make helm-validate
 
-INSTALLER_NAMESPACE ?= osac
+SHELL := /usr/bin/env bash -o pipefail
+.SHELLFLAGS := -ec
+
 # Extra helm --set/--set-string args appended to install commands.
 EXTRA_HELM_ARGS ?=
 
+# -- Fail-fast parameter validation ------------------------------------
+# Guards fire at parse time, gated by MAKECMDGOALS so `make help` works.
+
+ALL_TARGETS := install uninstall install-infra uninstall-infra install-osac uninstall-osac test
+
+ifneq ($(filter $(ALL_TARGETS),$(MAKECMDGOALS)),)
+ifndef PLATFORM
+$(error PLATFORM is required (kind|openshift))
+endif
+ifeq ($(filter $(PLATFORM),kind openshift),)
+$(error PLATFORM=$(PLATFORM) is invalid; must be kind or openshift)
+endif
+ifndef PROFILE
+$(error PROFILE is required (dev|vmaas-ci|bmaas-ci|caas-ci|full-ci))
+endif
+ifeq ($(filter $(PROFILE),dev vmaas-ci bmaas-ci caas-ci full-ci),)
+$(error PROFILE=$(PROFILE) is invalid; must be dev, vmaas-ci, bmaas-ci, caas-ci, or full-ci)
+endif
+ifndef NS
+$(error NS is required (namespace for OSAC instance, e.g. NS=osac))
+endif
+ifeq ($(PLATFORM),kind)
+ifneq ($(PROFILE),dev)
+$(error PLATFORM=kind only supports PROFILE=dev)
+endif
+endif
+endif
+
+SUITE_TARGETS := test
+ifneq ($(filter $(SUITE_TARGETS),$(MAKECMDGOALS)),)
+ifndef SUITE
+$(error SUITE is required (all|fulfillment|operator|bmf))
+endif
+ifeq ($(filter $(SUITE),all fulfillment operator bmf),)
+$(error SUITE=$(SUITE) is invalid; must be all, fulfillment, operator, or bmf)
+endif
+endif
+
+# -- Paths and constants -----------------------------------------------
+
+CHARTS         := charts
+DEPS_CHART     := $(CHARTS)/osac-deps
+INFRA_CHART    := $(CHARTS)/osac-infra
+OSAC_CHART     := $(CHARTS)/osac
+
+VCLUSTER ?=
+VCLUSTER_SH := scripts/vcluster.sh
+
+# instancePrefix = namespace as-is.
+# Templates that need PostgreSQL-safe identifiers convert internally.
+INSTANCE_PREFIX := $(NS)
+INSTANCE_ARGS := \
+  --set instancePrefix=$(INSTANCE_PREFIX) \
+  --set operator.aap.templatePrefix=$(INSTANCE_PREFIX)-osac \
+  --set metering.topicPrefix=$(INSTANCE_PREFIX)
+
+# Values file selection: kind uses kind-specific files, OpenShift uses profile files.
+ifeq ($(PLATFORM),kind)
+INFRA_VALUES    := values/dev/kind-infra.yaml
+INSTANCE_VALUES := values/dev/kind-instance.yaml
+else ifdef PROFILE
+INFRA_VALUES    := values/$(PROFILE)/infra.yaml
+INSTANCE_VALUES := values/$(PROFILE)/instance.yaml
+endif
+
+# vcluster overlay: layer vcluster-instance.yaml on top of the profile's instance values.
+VCLUSTER_INSTANCE_VALUES := values/$(PROFILE)/vcluster-instance.yaml
+VCLUSTER_HELM_ARGS := $(if $(filter true,$(VCLUSTER)),\
+  $(if $(wildcard $(VCLUSTER_INSTANCE_VALUES)),-f $(VCLUSTER_INSTANCE_VALUES)),)
+
+# Container tool and Kind cluster config.
+CONTAINER_TOOL ?= $(or $(shell command -v podman 2>/dev/null),$(shell command -v docker 2>/dev/null),$(error neither podman nor docker found in PATH))
+KIND_CLUSTER_NAME ?= osac-dev
+KIND_CONFIG := ../kind-dev/kind-config.yaml
+KIND_KUBECONFIG := $(HOME)/.kube/$(KIND_CLUSTER_NAME)-kind.kubeconfig
+export KUBECONFIG ?= $(KIND_KUBECONFIG)
+
+define kind-load-image
+	@if [ "$$(basename $(CONTAINER_TOOL))" = "podman" ]; then \
+		tmpfile=$$(mktemp /tmp/kind-image-XXXXXX.tar); \
+		$(CONTAINER_TOOL) save $(1) -o "$$tmpfile"; \
+		kind load image-archive "$$tmpfile" --name $(KIND_CLUSTER_NAME); \
+		rm -f "$$tmpfile"; \
+	else \
+		kind load docker-image $(1) --name $(KIND_CLUSTER_NAME); \
+	fi
+endef
+
+# -- Help --------------------------------------------------------------
+
 .PHONY: help
 help: ## Display this help
-	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage:\n  make \033[36m<target>\033[0m\n\nTargets:\n"} /^[a-zA-Z_-]+:.*?##/ { printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
+	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage:\n  make \033[36m<target>\033[0m\n"} /^[a-zA-Z_0-9-]+:.*?##/ { printf "  \033[36m%-30s\033[0m %s\n", $$1, $$2 } /^##@/ { printf "\n\033[1m%s\033[0m\n", substr($$0, 5) } ' $(MAKEFILE_LIST)
 
-##@ Pre-install Helpers
+##@ Entity: Infra
 
-.PHONY: wait-for-api
-wait-for-api: ## Wait for the Kubernetes API server to be consistently reachable
-	@echo "Waiting for API server to be reachable..."
-	@for i in $$(seq 1 30); do \
-		if oc get --raw /version >/dev/null 2>&1; then \
-			echo "API server is reachable."; \
-			exit 0; \
-		fi; \
-		if [ "$$i" -eq 30 ]; then \
-			echo "ERROR: API server still unreachable after 5 minutes." >&2; \
-			exit 1; \
-		fi; \
-		echo "  Not yet reachable (attempt $$i/30), retrying in 10s..."; \
-		sleep 10; \
+.PHONY: install-infra
+install-infra: ## Install infrastructure (PLATFORM= PROFILE= required)
+ifeq ($(PLATFORM),kind)
+	@if kind get clusters | grep -q "^$(KIND_CLUSTER_NAME)$$"; then \
+		echo "Kind cluster '$(KIND_CLUSTER_NAME)' already exists"; \
+	else \
+		echo "Creating Kind cluster '$(KIND_CLUSTER_NAME)'..."; \
+		kind create cluster --name $(KIND_CLUSTER_NAME) --config $(KIND_CONFIG) --wait 60s; \
+	fi
+	@kind export kubeconfig --name $(KIND_CLUSTER_NAME) --kubeconfig $(KIND_KUBECONFIG)
+	helm upgrade --install cert-manager oci://quay.io/jetstack/charts/cert-manager \
+		--version v1.20.0 --namespace cert-manager --create-namespace \
+		--set crds.enabled=true --wait --timeout 5m
+	helm upgrade --install trust-manager oci://quay.io/jetstack/charts/trust-manager \
+		--version v0.22.0 --namespace cert-manager \
+		--set defaultPackage.enabled=false --wait --timeout 5m
+	helm upgrade --install envoy-gateway oci://docker.io/envoyproxy/gateway-helm \
+		--version v1.6.5 --namespace envoy-gateway --create-namespace \
+		--wait --timeout 5m
+	helm upgrade --install osac-infra $(INFRA_CHART) \
+		--namespace osac-infra --create-namespace \
+		-f $(INFRA_VALUES) \
+		--set osacNamespace=$(NS) \
+		--wait-for-jobs --timeout 30m
+	@for f in ../osac-operator/config/crd/fakes/*.yaml; do \
+		case "$$(basename "$$f")" in \
+			*osac.openshift.io*) continue ;; \
+		esac; \
+		kubectl apply --server-side --force-conflicts -f "$$f"; \
 	done
-
-.PHONY: wait-for-deps-namespaces
-wait-for-deps-namespaces: ## Wait for operator namespaces left Terminating by a prior uninstall
+else
+	$(eval OCP_VERSION := $(shell oc get clusterversion version -o jsonpath='{.status.desired.version}' | cut -d. -f1,2))
 	@bash -c 'source scripts/lib.sh && \
 		for ns in ansible-aap cert-manager-operator cert-manager openshift-storage metallb-system multicluster-engine openshift-cnv; do \
 			wait_for_namespace_cleanup "$$ns"; \
 		done'
-
-.PHONY: wait-for-infra-namespaces
-wait-for-infra-namespaces: ## Wait for the keycloak namespace left Terminating by a prior uninstall
+	helm upgrade --install osac-deps $(DEPS_CHART) \
+		--namespace osac-deps --create-namespace \
+		--values $(INFRA_VALUES) \
+		--set lvms.channel=stable-$(OCP_VERSION) \
+		--timeout 30m --wait
 	@bash -c 'source scripts/lib.sh && wait_for_namespace_cleanup keycloak'
+	$(eval DOMAIN := $(shell oc get ingresses.config/cluster -o jsonpath='{.spec.domain}'))
+	@[ -n "$(DOMAIN)" ] || { echo "ERROR: could not determine cluster domain" >&2; exit 1; }
+	helm upgrade --install osac-infra $(INFRA_CHART) \
+		--namespace osac-infra --create-namespace \
+		--values $(INFRA_VALUES) \
+		--set osacNamespace=$(NS) \
+		--set lvms.channel=stable-$(OCP_VERSION) \
+		--set keycloak.hostname=https://keycloak-keycloak.$(DOMAIN) \
+		--set keycloak.route.hostname=keycloak-keycloak.$(DOMAIN) \
+		--timeout 30m --wait-for-jobs
+endif
 
-AAP_LICENSE_FILE ?= license.zip
+.PHONY: uninstall-infra
+uninstall-infra: ## Uninstall infrastructure (PLATFORM= PROFILE= required)
+ifeq ($(PLATFORM),kind)
+	helm uninstall osac-infra --namespace osac-infra --ignore-not-found
+	helm uninstall envoy-gateway --namespace envoy-gateway --ignore-not-found
+	helm uninstall trust-manager --namespace cert-manager --ignore-not-found
+	helm uninstall cert-manager --namespace cert-manager --ignore-not-found
+	kind delete cluster --name $(KIND_CLUSTER_NAME)
+else
+	helm uninstall osac-infra --namespace osac-infra --ignore-not-found --wait --timeout 10m
+	helm uninstall osac-deps --namespace osac-deps --ignore-not-found
+endif
 
-.PHONY: install-secrets
-install-secrets: ## Create pre-install secrets (AAP license)
-	@[[ -f "$(AAP_LICENSE_FILE)" ]] || { echo "ERROR: AAP license not found at $(AAP_LICENSE_FILE)"; exit 1; }
-	@bash -c 'source scripts/lib.sh && wait_for_namespace_cleanup "$(INSTALLER_NAMESPACE)"'
-	oc create namespace $(INSTALLER_NAMESPACE) --dry-run=client -o yaml | oc apply -f -
-	oc create secret generic config-as-code-manifest-ig \
-		--from-file=license.zip="$(AAP_LICENSE_FILE)" \
-		-n $(INSTALLER_NAMESPACE) --dry-run=client -o yaml | oc apply --server-side -f -
-	oc label secret config-as-code-manifest-ig \
-		osac.openshift.io/project=osac-aap \
-		-n $(INSTALLER_NAMESPACE) --overwrite
+##@ Entity: Osac
 
-.PHONY: check-postgres
-check-postgres: ## Verify in-cluster PostgreSQL is reachable before installing OSAC
-	@bash -c 'source scripts/lib.sh && check_postgres_prerequisites "$(INSTALLER_NAMESPACE)" "$(INFRA_VALUES)"'
+.PHONY: install-osac
+install-osac: ## Install OSAC instance (PROFILE= NS= required, VCLUSTER=true for vcluster)
+	helm dependency build $(OSAC_CHART)
+ifeq ($(VCLUSTER),true)
+	VCLUSTER_NAME=$(NS) VCLUSTER_NS=$(NS) $(VCLUSTER_SH) create
+	VCLUSTER_NAME=$(NS) VCLUSTER_NS=$(NS) OSAC_NS=$(NS) $(VCLUSTER_SH) setup
+	$(eval VCLUSTER_KC := /tmp/vcluster-$(NS).kubeconfig)
+endif
+ifneq ($(PLATFORM),kind)
+	$(eval DOMAIN := $(shell oc get ingresses.config/cluster -o jsonpath='{.spec.domain}'))
+	@[ -n "$(DOMAIN)" ] || { echo "ERROR: Could not determine cluster domain. Is oc logged in?" >&2; exit 1; }
+endif
+	helm upgrade --install osac $(OSAC_CHART) \
+		-f $(INSTANCE_VALUES) \
+		$(VCLUSTER_HELM_ARGS) \
+		--namespace $(NS) --create-namespace \
+		$(if $(VCLUSTER_KC),--kubeconfig $(VCLUSTER_KC)) \
+		$(if $(DOMAIN),--set service.externalHostname=fulfillment-api-$(NS).$(DOMAIN) --set service.internalHostname=fulfillment-internal-api-$(NS).$(DOMAIN) --set service.auth.issuerUrl=https://keycloak-keycloak.$(DOMAIN)/realms/osac) \
+		$(INSTANCE_ARGS) \
+		$(EXTRA_HELM_ARGS) \
+		--wait --timeout 40m
 
-##@ Helm Chart Management
+.PHONY: uninstall-osac
+uninstall-osac: ## Uninstall OSAC instance (NS= required, VCLUSTER=true for vcluster)
+ifeq ($(VCLUSTER),true)
+	VCLUSTER_NAME=$(NS) VCLUSTER_NS=$(NS) $(VCLUSTER_SH) teardown
+else
+	helm uninstall osac --namespace $(NS) --ignore-not-found
+endif
 
-##@ OpenShift Deployment (called by osac-test-infra E2E workflows)
-# INFRA_VALUES and INSTANCE_VALUES are required. No defaults.
+##@ Composite
 
 .PHONY: install
-install: install-operators install-prereqs install-osac ## Full install (operators + prereqs + OSAC)
+install: install-infra install-osac ## Full install: infra + osac (PLATFORM= PROFILE= required)
+
+.PHONY: uninstall
+uninstall: uninstall-osac uninstall-infra ## Full uninstall: osac + infra (PLATFORM= PROFILE= required)
+
+##@ Entity: Test
+
+.PHONY: test
+test: ## Run integration tests (SUITE= required: all|fulfillment|operator|bmf)
+ifeq ($(SUITE),all)
+	$(MAKE) test SUITE=fulfillment
+	$(MAKE) test SUITE=operator
+	$(MAKE) test SUITE=bmf
+endif
+ifeq ($(SUITE),fulfillment)
+	$(CONTAINER_TOOL) build -t localhost/fulfillment-service:it -f ../fulfillment-service/Containerfile ..
+	$(call kind-load-image,localhost/fulfillment-service:it)
+	$(MAKE) install-osac PLATFORM=$(PLATFORM) PROFILE=$(PROFILE) NS=$(NS) \
+		EXTRA_HELM_ARGS="--set service.images.service=localhost/fulfillment-service:it --set operator.enabled=false"
+	@for f in ../fulfillment-service/it/crds/*.yaml; do kubectl apply --server-side --force-conflicts -f "$$f"; done
+	cd ../fulfillment-service && ginkgo run --timeout 1h -v it
+endif
+ifeq ($(SUITE),operator)
+	$(CONTAINER_TOOL) build -t localhost/osac-operator:it -f ../osac-operator/Containerfile ..
+	$(call kind-load-image,localhost/osac-operator:it)
+	$(MAKE) install-osac PLATFORM=$(PLATFORM) PROFILE=$(PROFILE) NS=$(NS) \
+		EXTRA_HELM_ARGS="--set operator.image.repository=localhost/osac-operator --set operator.image.tag=it --set operator.image.pullPolicy=Never --set service.enabled=false --set hubAccess.enabled=false --set validation.enabled=false"
+	cd ../osac-operator && ginkgo run --timeout 30m -v test/integration
+endif
+ifeq ($(SUITE),bmf)
+	$(CONTAINER_TOOL) build -t localhost/bmf-operator:it -f ../bare-metal-fulfillment-operator/Containerfile ..
+	$(call kind-load-image,localhost/bmf-operator:it)
+	kubectl apply --server-side --force-conflicts -f ../bare-metal-fulfillment-operator/test/crds/
+	$(MAKE) install-osac PLATFORM=$(PLATFORM) PROFILE=$(PROFILE) NS=$(NS) \
+		EXTRA_HELM_ARGS="--set bmf.enabled=true --set bmf.image.repository=localhost/bmf-operator --set bmf.image.tag=it --set bmf.image.pullPolicy=Never --set operator.enabled=false --set service.enabled=false --set hubAccess.enabled=false --set validation.enabled=false"
+	cd ../bare-metal-fulfillment-operator && ginkgo run --timeout 30m -v test/integration
+endif
+
+##@ Backward-compatible targets (used by osac-test-infra E2E workflows)
+# These wrap the new API for OpenShift E2E workflows that call the old target names.
+# INFRA_VALUES and INSTANCE_VALUES must be passed by the caller.
+
+AAP_LICENSE_FILE ?= license.zip
+INSTALLER_NAMESPACE ?= $(NS)
 
 .PHONY: install-operators
-install-operators: wait-for-api wait-for-deps-namespaces ## Phase 1: Install OLM operators via osac-deps chart
+install-operators: ## [compat] Phase 1: Install OLM operators via osac-deps chart
 	$(eval OCP_VERSION := $(shell oc get clusterversion version -o jsonpath='{.status.desired.version}' | cut -d. -f1,2))
-	helm upgrade --install osac-deps charts/osac-deps/ \
+	@bash -c 'source scripts/lib.sh && \
+		for ns in ansible-aap cert-manager-operator cert-manager openshift-storage metallb-system multicluster-engine openshift-cnv; do \
+			wait_for_namespace_cleanup "$$ns"; \
+		done'
+	helm upgrade --install osac-deps $(DEPS_CHART) \
 		--namespace osac-deps --create-namespace \
 		--values $(INFRA_VALUES) \
 		--set lvms.channel=stable-$(OCP_VERSION) \
@@ -75,71 +281,67 @@ install-operators: wait-for-api wait-for-deps-namespaces ## Phase 1: Install OLM
 		--timeout 30m --wait
 
 .PHONY: install-prereqs
-install-prereqs: wait-for-infra-namespaces ## Phase 2: Configure prerequisites via osac-infra chart
+install-prereqs: ## [compat] Phase 2: Configure prerequisites via osac-infra chart
 	$(eval OCP_VERSION := $(shell oc get clusterversion version -o jsonpath='{.status.desired.version}' | cut -d. -f1,2))
 	$(eval DOMAIN := $(shell oc get ingresses.config/cluster -o jsonpath='{.spec.domain}'))
 	@[ -n "$(DOMAIN)" ] || { echo "ERROR: could not determine cluster domain" >&2; exit 1; }
-	helm upgrade --install osac-infra charts/osac-infra/ \
+	helm upgrade --install osac-infra $(INFRA_CHART) \
 		--namespace osac-infra --create-namespace \
 		--values $(INFRA_VALUES) \
-		--set osacNamespace=$(INSTALLER_NAMESPACE) \
+		--set osacNamespace=$(or $(INSTALLER_NAMESPACE),$(NS)) \
 		--set lvms.channel=stable-$(OCP_VERSION) \
 		--set keycloak.hostname=https://keycloak-keycloak.$(DOMAIN) \
 		--set keycloak.route.hostname=keycloak-keycloak.$(DOMAIN) \
 		$(EXTRA_HELM_ARGS) \
 		--timeout 30m --wait-for-jobs
 
-.PHONY: install-osac
-install-osac: helm-deps install-secrets check-postgres ## Phase 3: Install OSAC via osac chart
-	$(eval DOMAIN := $(shell oc get ingresses.config/cluster -o jsonpath='{.spec.domain}'))
-	@[ -n "$(DOMAIN)" ] || { echo "ERROR: could not determine cluster domain" >&2; exit 1; }
-	helm upgrade --install osac charts/osac/ \
-		--namespace $(INSTALLER_NAMESPACE) --create-namespace \
-		--values $(INSTANCE_VALUES) \
-		--set instancePrefix=$(subst -,_,$(INSTALLER_NAMESPACE)) \
-		--set service.externalHostname=fulfillment-api-$(INSTALLER_NAMESPACE).$(DOMAIN) \
-		--set service.internalHostname=fulfillment-internal-api-$(INSTALLER_NAMESPACE).$(DOMAIN) \
-		--set service.auth.issuerUrl=https://keycloak-keycloak.$(DOMAIN)/realms/osac \
-		$(EXTRA_HELM_ARGS) \
-		--wait --timeout 40m
+.PHONY: install-secrets
+install-secrets: ## [compat] Create pre-install secrets (AAP license)
+	@[[ -f "$(AAP_LICENSE_FILE)" ]] || { echo "ERROR: AAP license not found at $(AAP_LICENSE_FILE)"; exit 1; }
+	@bash -c 'source scripts/lib.sh && wait_for_namespace_cleanup "$(or $(INSTALLER_NAMESPACE),$(NS))"'
+	oc create namespace $(or $(INSTALLER_NAMESPACE),$(NS)) --dry-run=client -o yaml | oc apply -f -
+	oc create secret generic config-as-code-manifest-ig \
+		--from-file=license.zip="$(AAP_LICENSE_FILE)" \
+		-n $(or $(INSTALLER_NAMESPACE),$(NS)) --dry-run=client -o yaml | oc apply --server-side -f -
+	oc label secret config-as-code-manifest-ig \
+		osac.openshift.io/project=osac-aap \
+		-n $(or $(INSTALLER_NAMESPACE),$(NS)) --overwrite
 
-.PHONY: uninstall
-uninstall: ## Full uninstall (OSAC + prereqs + operators)
-	helm uninstall osac --namespace $(INSTALLER_NAMESPACE) --ignore-not-found
-	helm uninstall osac-infra --namespace osac-infra --ignore-not-found --wait --timeout 10m
-	helm uninstall osac-deps --namespace osac-deps --ignore-not-found
+.PHONY: check-postgres
+check-postgres: ## [compat] Verify in-cluster PostgreSQL is reachable before installing OSAC
+	@bash -c 'source scripts/lib.sh && check_postgres_prerequisites "$(or $(INSTALLER_NAMESPACE),$(NS))" "$(INFRA_VALUES)"'
 
 ##@ Charts
 
 .PHONY: sync-charts
 sync-charts: ## Update submodules and rebuild chart dependencies
 	git submodule update --init --recursive
-	helm dependency build charts/osac/
+	helm dependency build $(OSAC_CHART)
 
 .PHONY: helm-deps
 helm-deps: ## Build Helm chart dependencies
-	helm dependency build charts/osac/
+	helm dependency build $(OSAC_CHART)
 
 .PHONY: helm-lint
 helm-lint: ## Lint all charts
-	helm lint charts/osac-deps/
-	helm lint charts/osac-infra/
-	helm dependency build charts/osac/
-	helm lint charts/osac/
+	helm lint $(DEPS_CHART)
+	helm lint $(INFRA_CHART)
+	helm dependency build $(OSAC_CHART)
+	helm lint $(OSAC_CHART)
 
 .PHONY: helm-template
 helm-template: ## Dry-run render all templates
-	helm template osac-deps charts/osac-deps/
-	helm template osac-infra charts/osac-infra/
-	helm template osac charts/osac/
+	helm template osac-deps $(DEPS_CHART)
+	helm template osac-infra $(INFRA_CHART)
+	helm template osac $(OSAC_CHART)
 
 .PHONY: helm-validate
 helm-validate: helm-lint ## Validate all charts (lint + template)
 	@for d in values/*/; do \
 		infra="$${d}infra.yaml"; \
 		[ -f "$$infra" ] && echo "Validating $$infra..." && \
-			helm template osac-deps charts/osac-deps/ --values "$$infra" && \
-			helm template osac-infra charts/osac-infra/ --values "$$infra"; \
+			helm template osac-deps $(DEPS_CHART) --values "$$infra" && \
+			helm template osac-infra $(INFRA_CHART) --values "$$infra"; \
 	done
 	./scripts/validate-keycloak-credentials.sh
 	@echo "Validation passed."

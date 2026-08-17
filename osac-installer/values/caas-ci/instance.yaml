@@ -1,4 +1,4 @@
-instancePrefix: caas_ci
+instancePrefix: caas-ci
 # CaaS CI environment -- instance values for osac chart.
 
 # --- Operator ---

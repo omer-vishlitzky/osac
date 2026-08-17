@@ -1645,7 +1645,7 @@ const kubectlCmd = "kubectl"
 
 // Name and namespace of the hub:
 const hubId = "local"
-const hubNamespace = "osac-operator-system"
+const hubNamespace = "osac"
 
 // userAgent is the user agent string for the integration test tool.
 const userAgent = "fulfillment-it-tool"

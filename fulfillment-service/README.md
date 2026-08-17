@@ -188,17 +188,15 @@ The project includes integration tests that run against a real Kubernetes cluste
 [kind](https://kind.sigs.k8s.io). These tests verify the end-to-end functionality of the fulfillment
 service by deploying it to that cluster and exercising the APIs.
 
-From the repo root:
-
 ```bash
 # Create Kind cluster + deploy infrastructure
-$ make install-infra PLATFORM=kind PROFILE=dev NS=osac
+$ make -C ../osac-installer install-infra PLATFORM=kind PROFILE=dev NS=osac
 
 # Build image, deploy fulfillment-service via osac chart, run tests
-$ make test PLATFORM=kind PROFILE=dev NS=osac SUITE=fulfillment
+$ make -C ../osac-installer test PLATFORM=kind PROFILE=dev NS=osac SUITE=fulfillment
 
 # Clean up
-$ make uninstall PLATFORM=kind PROFILE=dev NS=osac
+$ make -C ../osac-installer uninstall PLATFORM=kind PROFILE=dev NS=osac
 ```
 
 The integration tests use TLS with SNI (_Server Name Indication_) routing through the Envoy Gateway.
