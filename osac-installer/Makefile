@@ -90,13 +90,16 @@ endif
 
 # vcluster overlay: layer vcluster-instance.yaml on top of the profile's instance values.
 VCLUSTER_INSTANCE_VALUES := values/$(PROFILE)/vcluster-instance.yaml
-VCLUSTER_HELM_ARGS := $(if $(filter true,$(VCLUSTER)),\
-  $(if $(wildcard $(VCLUSTER_INSTANCE_VALUES)),-f $(VCLUSTER_INSTANCE_VALUES)),)
+ifeq ($(VCLUSTER),true)
+VCLUSTER_HELM_ARGS := -f $(VCLUSTER_INSTANCE_VALUES)
+else
+VCLUSTER_HELM_ARGS :=
+endif
 
 # Container tool and Kind cluster config.
 CONTAINER_TOOL ?= $(or $(shell command -v podman 2>/dev/null),$(shell command -v docker 2>/dev/null),$(error neither podman nor docker found in PATH))
 KIND_CLUSTER_NAME ?= osac-dev
-KIND_CONFIG := ../kind-dev/kind-config.yaml
+KIND_CONFIG := kind-config.yaml
 KIND_KUBECONFIG := $(HOME)/.kube/$(KIND_CLUSTER_NAME)-kind.kubeconfig
 export KUBECONFIG ?= $(KIND_KUBECONFIG)
 
