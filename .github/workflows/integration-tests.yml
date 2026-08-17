@@ -77,10 +77,10 @@ jobs:
       uses: azure/setup-helm@v4
     - name: Install ginkgo
       run: go install github.com/onsi/ginkgo/v2/ginkgo@v2.32.0  # keep in sync with go.mod's github.com/onsi/ginkgo/v2 version
-    - name: Install OSAC on Kind
+    - name: Install infrastructure on Kind
       env:
         CONTAINER_TOOL: docker
-      run: make install PLATFORM=kind PROFILE=dev NS=osac
+      run: make install-infra PLATFORM=kind PROFILE=dev NS=osac
     - name: Run integration tests
       env:
         CONTAINER_TOOL: docker
@@ -138,10 +138,10 @@ jobs:
       - name: Install ginkgo
         run: go install github.com/onsi/ginkgo/v2/ginkgo@v2.32.0  # keep in sync with go.mod's github.com/onsi/ginkgo/v2 version
 
-      - name: Install OSAC on Kind
+      - name: Install infrastructure on Kind
         env:
           CONTAINER_TOOL: docker
-        run: make install PLATFORM=kind PROFILE=dev NS=osac
+        run: make install-infra PLATFORM=kind PROFILE=dev NS=osac
 
       - name: Run integration tests
         env:
@@ -189,10 +189,10 @@ jobs:
       - name: Install ginkgo
         run: go install github.com/onsi/ginkgo/v2/ginkgo@v2.32.0  # keep in sync with go.mod's github.com/onsi/ginkgo/v2 version
 
-      - name: Install OSAC on Kind
+      - name: Install infrastructure on Kind
         env:
           CONTAINER_TOOL: docker
-        run: make install PLATFORM=kind PROFILE=dev NS=osac
+        run: make install-infra PLATFORM=kind PROFILE=dev NS=osac
 
       - name: Run integration tests
         env:
