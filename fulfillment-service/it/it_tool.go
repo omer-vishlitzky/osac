@@ -315,6 +315,14 @@ func (t *Tool) Setup(ctx context.Context) error {
 		return err
 	}
 
+	// The controller's initial sync loop processes tenants asynchronously —
+	// IDP org creation and break-glass credential setup must complete before
+	// tests can create their own tenants with a 60s timeout.
+	err = t.waitForTenantsSynced(ctx)
+	if err != nil {
+		return err
+	}
+
 	// Add users to Keycloak Organizations (tenant orgs created by the controller):
 	err = t.addUsersToKeycloakOrganizations(ctx)
 	if err != nil {
@@ -588,6 +596,46 @@ func (t *Tool) createTenants(ctx context.Context) error {
 			return err
 		}
 	}
+	return nil
+}
+
+func (t *Tool) waitForTenantsSynced(ctx context.Context) error {
+	t.logger.InfoContext(ctx, "Waiting for setup tenants to reach SYNCED")
+
+	uniqueTenants := make(map[string]bool)
+	uniqueTenants[usersGroup] = true
+	for _, tenants := range OIDCTenants {
+		for _, tenant := range tenants {
+			uniqueTenants[tenant] = true
+		}
+	}
+
+	tenantsClient := privatev1.NewTenantsClient(t.internalView.adminConn)
+	for tenant := range uniqueTenants {
+		bo := backoff.NewExponentialBackOff()
+		bo.InitialInterval = 1 * time.Second
+		bo.MaxInterval = 5 * time.Second
+		bo.MaxElapsedTime = 120 * time.Second
+		tenantName := tenant
+		err := backoff.Retry(func() error {
+			resp, getErr := tenantsClient.Get(ctx, privatev1.TenantsGetRequest_builder{
+				Id: tenantName,
+			}.Build())
+			if getErr != nil {
+				return fmt.Errorf("failed to get tenant %q: %w", tenantName, getErr)
+			}
+			if resp.GetObject().GetStatus().GetState() != privatev1.TenantState_TENANT_STATE_SYNCED {
+				return fmt.Errorf("tenant %q not yet synced", tenantName)
+			}
+			return nil
+		}, backoff.WithContext(bo, ctx))
+		if err != nil {
+			return fmt.Errorf("timed out waiting for tenant %q to reach SYNCED: %w", tenant, err)
+		}
+		t.logger.DebugContext(ctx, "Tenant synced", slog.String("tenant", tenant))
+	}
+
+	t.logger.InfoContext(ctx, "All setup tenants synced")
 	return nil
 }
 
