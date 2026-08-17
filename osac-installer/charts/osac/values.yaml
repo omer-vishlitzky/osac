@@ -3,10 +3,7 @@
 
 cliImage: quay.io/openshift/origin-cli:4.20.0
 
-# --- Multi-instance isolation ---
-# When set, enables per-instance isolation: prefixed databases, Kafka topics,
-# and AAP templates. Derive from the namespace (e.g. "pr_101" for NS=pr-101).
-# Leave empty for single-instance mode (default).
+# The namespace name. Always set via --set instancePrefix=<NS> by the Makefile.
 instancePrefix: ""
 
 # Shared PostgreSQL host for db-init hook (only used when instancePrefix is set).

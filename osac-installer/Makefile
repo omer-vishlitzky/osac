@@ -123,7 +123,7 @@ help: ## Display this help
 ##@ Entity: Infra
 
 .PHONY: install-infra
-install-infra: ## Install infrastructure (PLATFORM= PROFILE= required)
+install-infra: ## Install infrastructure (PLATFORM= PROFILE= NS= required)
 ifeq ($(PLATFORM),kind)
 	@if kind get clusters | grep -q "^$(KIND_CLUSTER_NAME)$$"; then \
 		echo "Kind cluster '$(KIND_CLUSTER_NAME)' already exists"; \
@@ -177,7 +177,7 @@ else
 endif
 
 .PHONY: uninstall-infra
-uninstall-infra: ## Uninstall infrastructure (PLATFORM= PROFILE= required)
+uninstall-infra: ## Uninstall infrastructure (PLATFORM= PROFILE= NS= required)
 ifeq ($(PLATFORM),kind)
 	helm uninstall osac-infra --namespace osac-infra --ignore-not-found
 	helm uninstall envoy-gateway --namespace envoy-gateway --ignore-not-found
@@ -192,7 +192,7 @@ endif
 ##@ Entity: Osac
 
 .PHONY: install-osac
-install-osac: ## Install OSAC instance (PROFILE= NS= required, VCLUSTER=true for vcluster)
+install-osac: ## Install OSAC instance (PLATFORM= PROFILE= NS= required, VCLUSTER=true for vcluster)
 	helm dependency build $(OSAC_CHART)
 ifeq ($(VCLUSTER),true)
 	VCLUSTER_NAME=$(NS) VCLUSTER_NS=$(NS) $(VCLUSTER_SH) create
@@ -214,7 +214,7 @@ endif
 		--wait --timeout 40m
 
 .PHONY: uninstall-osac
-uninstall-osac: ## Uninstall OSAC instance (NS= required, VCLUSTER=true for vcluster)
+uninstall-osac: ## Uninstall OSAC instance (PLATFORM= PROFILE= NS= required, VCLUSTER=true for vcluster)
 ifeq ($(VCLUSTER),true)
 	VCLUSTER_NAME=$(NS) VCLUSTER_NS=$(NS) $(VCLUSTER_SH) teardown
 else
@@ -266,53 +266,6 @@ endif
 # These wrap the new API for OpenShift E2E workflows that call the old target names.
 # INFRA_VALUES and INSTANCE_VALUES must be passed by the caller.
 
-AAP_LICENSE_FILE ?= license.zip
-INSTALLER_NAMESPACE ?= $(NS)
-
-.PHONY: install-operators
-install-operators: ## [compat] Phase 1: Install OLM operators via osac-deps chart
-	$(eval OCP_VERSION := $(shell oc get clusterversion version -o jsonpath='{.status.desired.version}' | cut -d. -f1,2))
-	@bash -c 'source scripts/lib.sh && \
-		for ns in ansible-aap cert-manager-operator cert-manager openshift-storage metallb-system multicluster-engine openshift-cnv; do \
-			wait_for_namespace_cleanup "$$ns"; \
-		done'
-	helm upgrade --install osac-deps $(DEPS_CHART) \
-		--namespace osac-deps --create-namespace \
-		--values $(INFRA_VALUES) \
-		--set lvms.channel=stable-$(OCP_VERSION) \
-		$(EXTRA_HELM_ARGS) \
-		--timeout 30m --wait
-
-.PHONY: install-prereqs
-install-prereqs: ## [compat] Phase 2: Configure prerequisites via osac-infra chart
-	$(eval OCP_VERSION := $(shell oc get clusterversion version -o jsonpath='{.status.desired.version}' | cut -d. -f1,2))
-	$(eval DOMAIN := $(shell oc get ingresses.config/cluster -o jsonpath='{.spec.domain}'))
-	@[ -n "$(DOMAIN)" ] || { echo "ERROR: could not determine cluster domain" >&2; exit 1; }
-	helm upgrade --install osac-infra $(INFRA_CHART) \
-		--namespace osac-infra --create-namespace \
-		--values $(INFRA_VALUES) \
-		--set osacNamespace=$(or $(INSTALLER_NAMESPACE),$(NS)) \
-		--set lvms.channel=stable-$(OCP_VERSION) \
-		--set keycloak.hostname=https://keycloak-keycloak.$(DOMAIN) \
-		--set keycloak.route.hostname=keycloak-keycloak.$(DOMAIN) \
-		$(EXTRA_HELM_ARGS) \
-		--timeout 30m --wait-for-jobs
-
-.PHONY: install-secrets
-install-secrets: ## [compat] Create pre-install secrets (AAP license)
-	@[[ -f "$(AAP_LICENSE_FILE)" ]] || { echo "ERROR: AAP license not found at $(AAP_LICENSE_FILE)"; exit 1; }
-	@bash -c 'source scripts/lib.sh && wait_for_namespace_cleanup "$(or $(INSTALLER_NAMESPACE),$(NS))"'
-	oc create namespace $(or $(INSTALLER_NAMESPACE),$(NS)) --dry-run=client -o yaml | oc apply -f -
-	oc create secret generic config-as-code-manifest-ig \
-		--from-file=license.zip="$(AAP_LICENSE_FILE)" \
-		-n $(or $(INSTALLER_NAMESPACE),$(NS)) --dry-run=client -o yaml | oc apply --server-side -f -
-	oc label secret config-as-code-manifest-ig \
-		osac.openshift.io/project=osac-aap \
-		-n $(or $(INSTALLER_NAMESPACE),$(NS)) --overwrite
-
-.PHONY: check-postgres
-check-postgres: ## [compat] Verify in-cluster PostgreSQL is reachable before installing OSAC
-	@bash -c 'source scripts/lib.sh && check_postgres_prerequisites "$(or $(INSTALLER_NAMESPACE),$(NS))" "$(INFRA_VALUES)"'
 
 ##@ Charts
 
