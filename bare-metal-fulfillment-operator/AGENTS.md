@@ -17,8 +17,7 @@ Kubernetes operator for managing bare-metal host pools in the OSAC project. Defi
 ```bash
 make build                     # Build manager binary
 make test                      # Unit tests (uses envtest for K8s API simulation)
-make integration-tests         # Integration tests against a pre-existing Kind cluster
-                                # (create one first via the root Makefile's `make dev-env`)
+make test PLATFORM=kind PROFILE=dev NS=osac SUITE=bmf  # Integration tests (from repo root)
 make lint                      # golangci-lint
 make lint-fix                  # golangci-lint run --fix
 make lint-config               # Verify golangci-lint config
@@ -127,7 +126,7 @@ CRDs must stay in sync: after `make manifests`, run `make helm-crds` (uses `hack
 
 - **golangci-lint** (see `Makefile`) with dupl, errcheck, ginkgolinter, goconst, gocyclo, govet, ineffassign, lll, misspell, prealloc, revive, staticcheck, unconvert, unused (see `.golangci.yml`)
 - **Pre-commit hooks**: trailing-whitespace, check-merge-conflict, end-of-file-fixer, check-added-large-files, check-case-conflict, check-json, check-symlinks, detect-private-key, yamllint --strict (excludes `config/`), golangci-lint run --fix
-- **Tests**: Ginkgo v2 + Gomega with envtest for unit tests; integration tests in `test/integration/` run against a pre-existing, persistent Kind cluster (`osac-dev`, created via the root Makefile's `make dev-env`)
+- **Tests**: Ginkgo v2 + Gomega with envtest for unit tests; integration tests in `test/integration/` run via `make test PLATFORM=kind PROFILE=dev NS=osac SUITE=bmf` from the repo root
 - **Test coverage**: Unit tests generate `cover.out`
 
 ## Container Security

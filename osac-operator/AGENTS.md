@@ -72,7 +72,7 @@ Each resource has a **resource controller** (provisions via AAP, manages finaliz
 
 ### Provisioning
 
-ClusterOrder and ComputeInstance controllers use direct AAP REST API integration via the `ProvisioningProvider` interface (`pkg/provisioning/provider.go` and `pkg/aap/client.go`). Networking controllers (VirtualNetwork, Subnet, SecurityGroup) and the ExternalIP family of controllers also use this pattern. `pkg/provisioning`, `pkg/aap`, and `pkg/dispatcher` are public packages consumed outside this repo (e.g., `bare-metal-fulfillment-operator`) — changes to their interfaces can impact those consumers. `pkg/dispatcher.NetworkClassClient` is the seam other operators implement to resolve a NetworkClass's fabric/k8s managers without depending on this repo's `internal/api` gRPC client; `internal/dispatcheradapter` is this repo's own implementation, wrapping the generated `privatev1.NetworkClassesClient`. Management-state annotation (`osac.openshift.io/management-state = Unmanaged`) is checked by every resource controller except `tenant_controller.go` to skip reconciliation.
+ClusterOrder and ComputeInstance controllers use direct AAP REST API integration via the `ProvisioningProvider` interface (`pkg/provisioning/provider.go` and `pkg/aap/client.go`). Networking controllers (VirtualNetwork, Subnet, SecurityGroup) and the ExternalIP family of controllers also use this pattern. `pkg/provisioning`, `pkg/aap`, and `pkg/dispatcher` are public packages consumed outside this repo (e.g., `bare-metal-fulfillment-operator`) — changes to their interfaces can impact those consumers. `pkg/dispatcher.Resolver` resolves a NetworkClass's fabric/k8s managers using the generated `privatev1.NetworkClassesClient` directly. Management-state annotation (`osac.openshift.io/management-state = Unmanaged`) is checked by every resource controller except `tenant_controller.go` to skip reconciliation.
 
 ### Multi-cluster
 
@@ -103,7 +103,6 @@ internal/
     {resource}_controller.go           # Provisioning controller
     {resource}_feedback_controller.go  # Feedback controller
   consoleproxy/            # Console proxy server implementation (auth, config, handlers)
-  dispatcheradapter/       # Adapts internal/api's gRPC client to pkg/dispatcher.NetworkClassClient
   migrations/              # Data migrations (e.g., migrate_subnetrefs.go)
 helpers/                   # Utility functions (at project root, not under internal/)
 config/
@@ -121,7 +120,7 @@ hack/sync-helm-crds.py     # Script invoked by `make helm-crds` to sync CRDs to 
 ## Testing
 
 - **Unit tests**: Ginkgo + Gomega with `envtest` (real etcd + kube-apiserver)
-- **Integration**: `make integration-tests` runs Ginkgo tests in `test/integration/` against a pre-existing Kind cluster deployed via root `make dev-env`
+- **Integration**: `make test PLATFORM=kind PROFILE=dev NS=osac SUITE=operator` from the repo root
 - **E2E tests**: pytest-based, live in the separate `osac-test-infra` repo; triggered by the root-level `.github/workflows/e2e-vmaas-full-install.yml`
 - Kind cluster defaults to `osac-dev` (`KIND_CLUSTER_NAME` in Makefile)
 - Clean up: `kind delete cluster --name osac-dev`

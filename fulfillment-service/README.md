@@ -188,11 +188,18 @@ The project includes integration tests that run against a real Kubernetes cluste
 [kind](https://kind.sigs.k8s.io). These tests verify the end-to-end functionality of the fulfillment
 service by deploying it to that cluster and exercising the APIs.
 
-The cluster itself is not created or torn down by the tests -- from the `osac-workspace/osac` repo
-root, run `make dev-env` once (creates the Kind cluster and installs prerequisites + the `osac` chart),
-then `make integration-test-fulfillment` (also from the repo root) to build/load the fulfillment-service
-image, deploy it, and run the suite. The cluster is reused across runs; tear it down when done with
-`make teardown` from the repo root.
+From the repo root:
+
+```bash
+# Create Kind cluster + deploy infrastructure
+$ make install-infra PLATFORM=kind PROFILE=dev NS=osac
+
+# Build image, deploy fulfillment-service via osac chart, run tests
+$ make test PLATFORM=kind PROFILE=dev NS=osac SUITE=fulfillment
+
+# Clean up
+$ make uninstall PLATFORM=kind PROFILE=dev NS=osac
+```
 
 The integration tests use TLS with SNI (_Server Name Indication_) routing through the Envoy Gateway.
 This means that the services are accessed using their Kubernetes internal host names, but routed
@@ -212,25 +219,11 @@ Add the following entries to your `/etc/hosts` file:
 127.0.0.1 fulfillment-internal-api.osac.svc.cluster.local
 ```
 
-To build/load/deploy the service and run the integration tests in one step, from the repo root:
+Or, against a cluster where the fulfillment-service image is already deployed, run `ginkgo`
+directly -- it only connects and exercises the suite, it does not build, load, or deploy anything:
 
 ```bash
-$ make integration-test-fulfillment
-```
-
-Or, against a cluster where the fulfillment-service image is already deployed (for example, one you
-just ran the command above against), run `ginkgo` directly -- it only connects and exercises the
-suite, it does not build, load, or deploy anything itself:
-
-```bash
-$ ginkgo run it
-```
-
-Either way, the cluster is left running afterwards. Tear it down when you're done, from the repo
-root:
-
-```bash
-$ make teardown
+$ cd fulfillment-service && ginkgo run it
 ```
 
 ### Secret for passwords and credentials
