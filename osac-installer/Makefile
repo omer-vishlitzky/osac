@@ -54,7 +54,7 @@ install-secrets: ## Create pre-install secrets (AAP license)
 
 .PHONY: check-postgres
 check-postgres: ## Verify in-cluster PostgreSQL is reachable before installing OSAC
-	@bash -c 'source scripts/lib.sh && check_postgres_prerequisites "$(INSTALLER_NAMESPACE)" "$(VALUES_FILE)"'
+	@bash -c 'source scripts/lib.sh && check_postgres_prerequisites "$(INSTALLER_NAMESPACE)" "$(INSTANCE_VALUES)"'
 
 ##@ Helm Chart Management
 
