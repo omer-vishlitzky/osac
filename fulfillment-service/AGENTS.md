@@ -72,17 +72,15 @@ ginkgo run -r
 
 ### Integration Tests
 
-From the repo root:
-
 ```bash
 # Create Kind cluster + deploy infrastructure
-make install-infra PLATFORM=kind PROFILE=dev NS=osac
+make -C ../osac-installer install-infra PLATFORM=kind PROFILE=dev NS=osac
 
 # Build image, deploy fulfillment-service via osac chart, run tests
-make test PLATFORM=kind PROFILE=dev NS=osac SUITE=fulfillment
+make -C ../osac-installer test PLATFORM=kind PROFILE=dev NS=osac SUITE=fulfillment
 
 # Clean up
-make uninstall PLATFORM=kind PROFILE=dev NS=osac
+make -C ../osac-installer uninstall PLATFORM=kind PROFILE=dev NS=osac
 ```
 
 Requires `/etc/hosts` entries:

@@ -80,7 +80,7 @@ jobs:
     - name: Install infrastructure on Kind
       env:
         CONTAINER_TOOL: docker
-      run: make install-infra PLATFORM=kind PROFILE=dev NS=osac
+      run: make -C osac-installer install-infra PLATFORM=kind PROFILE=dev NS=osac
     - name: Run integration tests
       env:
         CONTAINER_TOOL: docker
@@ -88,7 +88,7 @@ jobs:
         echo '127.0.0.1 fulfillment-api.osac.svc.cluster.local' | sudo tee -a /etc/hosts
         echo '127.0.0.1 fulfillment-internal-api.osac.svc.cluster.local' | sudo tee -a /etc/hosts
         echo '127.0.0.1 keycloak.keycloak.svc.cluster.local' | sudo tee -a /etc/hosts
-        make test PLATFORM=kind PROFILE=dev NS=osac SUITE=fulfillment
+        make -C osac-installer test PLATFORM=kind PROFILE=dev NS=osac SUITE=fulfillment
     - name: Collect diagnostic logs
       if: always()
       run: |
@@ -141,12 +141,12 @@ jobs:
       - name: Install infrastructure on Kind
         env:
           CONTAINER_TOOL: docker
-        run: make install-infra PLATFORM=kind PROFILE=dev NS=osac
+        run: make -C osac-installer install-infra PLATFORM=kind PROFILE=dev NS=osac
 
       - name: Run integration tests
         env:
           CONTAINER_TOOL: docker
-        run: make test PLATFORM=kind PROFILE=dev NS=osac SUITE=operator
+        run: make -C osac-installer test PLATFORM=kind PROFILE=dev NS=osac SUITE=operator
 
       - name: Collect diagnostic logs
         if: always()
@@ -192,12 +192,12 @@ jobs:
       - name: Install infrastructure on Kind
         env:
           CONTAINER_TOOL: docker
-        run: make install-infra PLATFORM=kind PROFILE=dev NS=osac
+        run: make -C osac-installer install-infra PLATFORM=kind PROFILE=dev NS=osac
 
       - name: Run integration tests
         env:
           CONTAINER_TOOL: docker
-        run: make test PLATFORM=kind PROFILE=dev NS=osac SUITE=bmf
+        run: make -C osac-installer test PLATFORM=kind PROFILE=dev NS=osac SUITE=bmf
 
       - name: Collect diagnostic logs
         if: always()

@@ -92,7 +92,7 @@ spec:
         command: ["/bin/bash", "/scripts/db-init.sh"]
         env:
         - name: INSTANCE_PREFIX
-          value: {{ .Values.instancePrefix | quote }}
+          value: {{ include "osac.pgPrefix" . | quote }}
         - name: PGSSLMODE
           value: verify-full
         - name: PGSSLCERT
