@@ -26,6 +26,7 @@ operatorCrds:
 
 # --- Operator ---
 operator:
+  enabled: true
   image:
     repository: ghcr.io/osac-project/osac-operator
     tag: latest  # PLACEHOLDER -- overwritten at release time by publish-charts.yaml
@@ -62,6 +63,7 @@ operator:
 
 # --- Fulfillment Service ---
 service:
+  enabled: true
   variant: openshift
   # [REQUIRED] Hostname for the external API Route (e.g. fulfillment-api-osac.apps.mycluster.example.com)
   externalHostname: ""
