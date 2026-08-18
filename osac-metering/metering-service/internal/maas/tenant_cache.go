@@ -112,7 +112,7 @@ func (tc *TenantCache) Resolve(ctx context.Context, organizationID string) (stri
 	tc.mu.RUnlock()
 
 	if !found {
-		return "", fmt.Errorf("organization %q does not match any known tenant", organizationID)
+		return "", permanentError{fmt.Errorf("organization %q does not match any known tenant", organizationID)}
 	}
 	return organizationID, nil
 }
