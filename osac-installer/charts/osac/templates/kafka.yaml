@@ -27,32 +27,4 @@ spec:
     cleanup.policy: delete
 ---
 {{- end }}
-apiVersion: kafka.strimzi.io/v1
-kind: KafkaUser
-metadata:
-  name: {{ $prefix }}-osac-metering
-  namespace: {{ $ns }}
-  labels:
-    strimzi.io/cluster: {{ $cluster }}
-spec:
-  authentication:
-    type: scram-sha-512
-  authorization:
-    type: simple
-    acls:
-      - resource:
-          type: topic
-          name: {{ $prefix }}.osac.metering.
-          patternType: prefix
-        operations:
-          - Write
-          - Describe
-        host: "*"
-      - resource:
-          type: cluster
-          name: kafka-cluster
-          patternType: literal
-        operations:
-          - IdempotentWrite
-        host: "*"
 {{- end }}

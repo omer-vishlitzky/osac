@@ -152,6 +152,7 @@ jobs:
         # propagate normally: they fail before grep ever runs.
         helm template osac "osac-installer/osac-${VERSION}.tgz" \
           --values "${VALUES_FILE}" \
+          --set instancePrefix=nightly \
           --set service.externalHostname=placeholder.example.com \
           --set service.internalHostname=placeholder-internal.example.com \
         | (grep -oP 'image:\s*\K\S+' || true) \

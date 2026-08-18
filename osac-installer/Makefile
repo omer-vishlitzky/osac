@@ -273,11 +273,6 @@ ifeq ($(SUITE),bmf)
 	cd ../bare-metal-fulfillment-operator && ginkgo run --timeout 30m -v test/integration
 endif
 
-##@ Backward-compatible targets (used by osac-test-infra E2E workflows)
-# These wrap the new API for OpenShift E2E workflows that call the old target names.
-# INFRA_VALUES and INSTANCE_VALUES must be passed by the caller.
-
-
 ##@ Charts
 
 .PHONY: sync-charts
