@@ -72,7 +72,7 @@ service:
               param: client-secret
   database:
     connection:
-      - configMap:
+      - secret:
           name: osac-db-config
           items:
             - key: url
