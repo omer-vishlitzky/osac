@@ -16,6 +16,7 @@ import (
 
 	privatev1 "github.com/osac-project/osac-metering/internal/api/osac/private/v1"
 	"github.com/osac-project/osac-metering/internal/events"
+	"github.com/osac-project/osac-metering/schema"
 )
 
 type mockPublisher struct {
@@ -126,15 +127,15 @@ var _ = Describe("consumerHandler", func() {
 		Expect(ce.Extensions()["osactenant"]).To(Equal("acme-corp"))
 		Expect(ce.Time()).To(Equal(time.Date(2026, 8, 15, 12, 0, 0, 0, time.UTC)))
 
-		var data events.InferenceUsageData
+		var data schema.LifecycleData
 		Expect(json.Unmarshal(ce.Data(), &data)).To(Succeed())
 		Expect(data.TenantID).To(Equal("acme-corp"))
 		Expect(data.ResourceType).To(Equal(events.ResourceTypeMaaSInference))
-		Expect(data.BillingDimensions.Model).To(Equal("claude-sonnet-4-20250514"))
-		Expect(data.BillingDimensions.PromptTokens).To(Equal(1000))
-		Expect(data.BillingDimensions.CompletionTokens).To(Equal(500))
-		Expect(data.BillingDimensions.TotalTokens).To(Equal(1500))
-		Expect(data.BillingDimensions.OrganizationID).To(Equal("acme-corp"))
+		Expect(data.BillingDimensions["model"]).To(Equal("claude-sonnet-4-20250514"))
+		Expect(data.BillingDimensions["prompt_tokens"]).To(BeNumerically("==", 1000))
+		Expect(data.BillingDimensions["completion_tokens"]).To(BeNumerically("==", 500))
+		Expect(data.BillingDimensions["total_tokens"]).To(BeNumerically("==", 1500))
+		Expect(data.BillingDimensions["organization_id"]).To(Equal("acme-corp"))
 		Expect(data.SchemaVersion).To(Equal("v1"))
 	})
 
@@ -245,8 +246,8 @@ var _ = Describe("consumerHandler", func() {
 				"duration_ms":     1234.567,
 			},
 		}
-		data, _ := json.Marshal(event)
-		msg := &sarama.ConsumerMessage{Value: data}
+		raw, _ := json.Marshal(event)
+		msg := &sarama.ConsumerMessage{Value: raw}
 
 		err := handler.processMessage(context.Background(), msg)
 		Expect(err).NotTo(HaveOccurred())
@@ -254,9 +255,9 @@ var _ = Describe("consumerHandler", func() {
 		published := publisher.events()
 		Expect(published).To(HaveLen(1))
 
-		var usageData events.InferenceUsageData
-		Expect(json.Unmarshal(published[0].Data(), &usageData)).To(Succeed())
-		Expect(usageData.BillingDimensions.DurationMs).To(BeNumerically("~", 1234.567, 0.001))
+		var ld schema.LifecycleData
+		Expect(json.Unmarshal(published[0].Data(), &ld)).To(Succeed())
+		Expect(ld.BillingDimensions["duration_ms"]).To(BeNumerically("~", 1234.567, 0.001))
 	})
 })
 
