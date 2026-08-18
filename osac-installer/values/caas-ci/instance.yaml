@@ -161,12 +161,12 @@ metering:
   database:
     connection:
     - secret:
-        name: metering-db
+        name: osac-db-metering-config
         items:
         - key: url
           param: url
     - secret:
-        name: postgres-client-cert-metering
+        name: osac-db-metering-client-cert
         items:
         - key: tls.crt
           param: sslcert
