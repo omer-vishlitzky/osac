@@ -24,6 +24,7 @@ import (
 
 	"github.com/osac-project/osac-metering/internal/events"
 	kafkapub "github.com/osac-project/osac-metering/internal/kafka"
+	"github.com/osac-project/osac-metering/schema"
 )
 
 // permanentError wraps errors that will never succeed on retry (malformed
@@ -221,25 +222,25 @@ func buildInferenceEvent(rawEventID string, raw rawInferenceData, tenantID strin
 
 	events.SetOSACExtensions(&ce, rawEventID, events.ResourceTypeMaaSInference, tenantID, "")
 
-	data := events.InferenceUsageData{
+	data := schema.LifecycleData{
 		ResourceID:   rawEventID,
 		ResourceType: events.ResourceTypeMaaSInference,
 		TenantID:     tenantID,
-		BillingDimensions: events.InferenceBillingDimensions{
-			OrganizationID:      raw.OrganizationID,
-			CostCenter:          raw.CostCenter,
-			Subscription:        raw.Subscription,
-			Provider:            raw.Provider,
-			Model:               raw.Model,
-			PromptTokens:        raw.PromptTokens,
-			CompletionTokens:    raw.CompletionTokens,
-			TotalTokens:         raw.TotalTokens,
-			CachedInputTokens:   raw.CachedInputTokens,
-			CacheCreationTokens: raw.CacheCreationTokens,
-			ReasoningTokens:     raw.ReasoningTokens,
-			DurationMs:          raw.DurationMs,
+		BillingDimensions: map[string]any{
+			"organization_id":       raw.OrganizationID,
+			"cost_center":           raw.CostCenter,
+			"subscription":          raw.Subscription,
+			"provider":              raw.Provider,
+			"model":                 raw.Model,
+			"prompt_tokens":         raw.PromptTokens,
+			"completion_tokens":     raw.CompletionTokens,
+			"total_tokens":          raw.TotalTokens,
+			"cached_input_tokens":   raw.CachedInputTokens,
+			"cache_creation_tokens": raw.CacheCreationTokens,
+			"reasoning_tokens":      raw.ReasoningTokens,
+			"duration_ms":           raw.DurationMs,
 		},
-		SchemaVersion: events.SchemaVersion,
+		SchemaVersion: schema.SchemaVersion,
 	}
 
 	_ = ce.SetData(cloudevents.ApplicationJSON, data)
