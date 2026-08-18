@@ -30,8 +30,6 @@ const (
 	EventInferenceUsage = "osac.inference.usage.v1"
 )
 
-// ResourceTypeMaaSInference is local until the schema module adds it.
-const ResourceTypeMaaSInference = "maas_inference"
+const ResourceTypeMaaSInference = schema.ResourceTypeMaaSInference
 
-// SchemaVersion re-exported from the shared schema module.
 const SchemaVersion = schema.SchemaVersion

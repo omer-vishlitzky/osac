@@ -197,7 +197,7 @@ func (h *consumerHandler) processMessage(ctx context.Context, msg *sarama.Consum
 	tenantName, err := h.tenantCache.Resolve(ctx, raw.Data.OrganizationID)
 	if err != nil {
 		inferenceIngestErrors.WithLabelValues("tenant_resolution_failed").Inc()
-		return permanentError{fmt.Errorf("resolving tenant for organization %q: %w", raw.Data.OrganizationID, err)}
+		return fmt.Errorf("resolving tenant for organization %q: %w", raw.Data.OrganizationID, err)
 	}
 
 	enrichedEvent := buildInferenceEvent(raw.ID, raw.Data, tenantName, eventTime)
