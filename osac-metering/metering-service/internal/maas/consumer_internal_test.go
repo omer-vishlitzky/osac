@@ -3,10 +3,9 @@ package maas
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"sync"
 	"time"
-
-	"errors"
 
 	"github.com/IBM/sarama"
 	cloudevents "github.com/cloudevents/sdk-go/v2"
@@ -43,9 +42,13 @@ func (p *mockPublisher) events() []cloudevents.Event {
 
 type mockTenantsClient struct {
 	tenants []string
+	err     error
 }
 
 func (m *mockTenantsClient) List(_ context.Context, _ *privatev1.TenantsListRequest, _ ...grpc.CallOption) (*privatev1.TenantsListResponse, error) {
+	if m.err != nil {
+		return nil, m.err
+	}
 	items := make([]*privatev1.Tenant, len(m.tenants))
 	for i, name := range m.tenants {
 		items[i] = &privatev1.Tenant{
@@ -154,6 +157,24 @@ var _ = Describe("consumerHandler", func() {
 		Expect(err).To(HaveOccurred())
 		Expect(err.Error()).To(ContainSubstring("does not match any known tenant"))
 		Expect(errors.As(err, &permanentError{})).To(BeTrue())
+		Expect(publisher.events()).To(BeEmpty())
+	})
+
+	It("returns transient error when tenant API fails", func() {
+		failingClient := &mockTenantsClient{tenants: []string{}, err: errors.New("grpc unavailable")}
+		failingCache := NewTenantCache(failingClient, logr.Discard(), 5*time.Minute)
+		failingHandler := &consumerHandler{
+			publisher:   publisher,
+			tenantCache: failingCache,
+			logger:      logr.Discard(),
+		}
+		msg := &sarama.ConsumerMessage{
+			Value: makeRawEvent("some-org", "gpt-4o", 100, 50),
+		}
+		err := failingHandler.processMessage(context.Background(), msg)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("refreshing tenant cache"))
+		Expect(errors.As(err, &permanentError{})).To(BeFalse())
 		Expect(publisher.events()).To(BeEmpty())
 	})
 
