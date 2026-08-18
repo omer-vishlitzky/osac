@@ -77,8 +77,6 @@ service:
           items:
             - key: url
               param: url
-            - key: sslmode
-              param: sslmode
       - secret:
           name: osac-db-client-cert
           items:
