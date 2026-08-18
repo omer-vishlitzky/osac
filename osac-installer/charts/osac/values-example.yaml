@@ -176,13 +176,13 @@ service:
     # Production: external Postgres with mTLS.
     # Provide a secret with the connection URL and client certificates.
     - secret:
-        name: fulfillment-db
+        name: osac-db-config
         items:
         - key: url
           # Format: postgresql://<user>:<password>@<host>:5432/<dbname>?sslmode=verify-full
           param: url
     - secret:
-        name: postgres-client-cert-service
+        name: osac-db-client-cert
         items:
         - key: tls.crt
           param: sslcert
@@ -193,7 +193,7 @@ service:
   # Development: for non-TLS Postgres, replace the connection block above with:
   #   connection:
   #   - secret:
-  #       name: fulfillment-db
+  #       name: osac-db-config
   #       items:
   #       - key: url
   #         param: url
