@@ -76,7 +76,6 @@ VCLUSTER_SH := scripts/vcluster.sh
 INSTANCE_PREFIX := $(NS)
 INSTANCE_ARGS := \
   --set instancePrefix=$(INSTANCE_PREFIX) \
-  --set operator.aap.templatePrefix=$(INSTANCE_PREFIX)-osac \
   --set metering.topicPrefix=$(INSTANCE_PREFIX)
 
 # Values file selection: kind uses kind-specific files, OpenShift uses profile files.
