@@ -191,6 +191,8 @@ endif
 
 ##@ Entity: Osac
 
+AAP_LICENSE_FILE ?= values/$(PROFILE)/license.zip
+
 .PHONY: install-osac
 install-osac: ## Install OSAC instance (PLATFORM= PROFILE= NS= required, VCLUSTER=true for vcluster)
 	helm dependency build $(OSAC_CHART)
@@ -200,6 +202,16 @@ ifeq ($(VCLUSTER),true)
 	$(eval VCLUSTER_KC := /tmp/vcluster-$(NS).kubeconfig)
 endif
 ifneq ($(PLATFORM),kind)
+	@[ -n "$(AAP_LICENSE_FILE)" ] || { echo "ERROR: AAP_LICENSE_FILE is required for PLATFORM=openshift" >&2; exit 1; }
+	@[ -f "$(AAP_LICENSE_FILE)" ] || { echo "ERROR: AAP_LICENSE_FILE not found at $(AAP_LICENSE_FILE)" >&2; exit 1; }
+	oc create namespace $(NS) --dry-run=client -o yaml | oc apply -f -
+	oc create secret generic config-as-code-manifest-ig \
+		--from-file=license.zip="$(AAP_LICENSE_FILE)" \
+		-n $(NS) --dry-run=client -o yaml | oc apply --server-side -f -
+	oc label secret config-as-code-manifest-ig \
+		osac.openshift.io/project=osac-aap \
+		-n $(NS) --overwrite
+	@bash -c 'source scripts/lib.sh && check_postgres_prerequisites "$(NS)" "$(INFRA_VALUES)"'
 	$(eval DOMAIN := $(shell oc get ingresses.config/cluster -o jsonpath='{.spec.domain}'))
 	@[ -n "$(DOMAIN)" ] || { echo "ERROR: Could not determine cluster domain. Is oc logged in?" >&2; exit 1; }
 endif
