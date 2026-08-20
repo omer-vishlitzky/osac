@@ -2,6 +2,7 @@ filters:
   "[^.]":
   "[^.]":
   "[^.]":
+  "[^.]":
     approvers:
     - jhernand
     - adriengentil
