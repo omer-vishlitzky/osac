@@ -13,7 +13,7 @@ on:
 
 jobs:
   enable-auto-merge:
-    if: github.event_name == 'pull_request_target' || github.event_name == 'pull_request_review'
+    if: github.repository == 'osac-project/osac' && (github.event_name == 'pull_request_target' || github.event_name == 'pull_request_review')
     runs-on: ubuntu-latest
     steps:
       - name: Remove lgtm on new push
@@ -88,7 +88,7 @@ jobs:
         run: gh pr merge ${{ github.event.pull_request.number }} --repo ${{ github.repository }} --disable-auto
 
   requeue-eligible-prs:
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    if: github.repository == 'osac-project/osac' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     steps:
       - name: Re-enable auto-merge on eligible PRs

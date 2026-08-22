@@ -57,8 +57,12 @@ func createMetal3BMH(name string, labels map[string]string, opStatus metal3api.O
 
 	// Status is a subresource — Create does not persist it. Re-set and update
 	// separately so envtest stores the desired operational/provisioning state.
+	// HardwareDetails is required so FindFreeHost does not skip this host.
 	bmh.Status.OperationalStatus = opStatus
 	bmh.Status.Provisioning.State = provState
+	bmh.Status.HardwareDetails = &metal3api.HardwareDetails{
+		NIC: []metal3api.NIC{{MAC: "aa:bb:cc:dd:ee:01"}},
+	}
 	ExpectWithOffset(1, k8sClient.Status().Update(ctx, bmh)).To(Succeed())
 	return bmh
 }
@@ -410,6 +414,43 @@ var _ = Describe("BareMetalInstance Metal3 Integration", func() {
 				_, err = dc.ServerResourcesForGroupVersion("metal3.io/v1alpha1")
 				Expect(err).To(HaveOccurred(), "metal3.io/v1alpha1 should not be available without BMH CRD")
 			})
+		})
+	})
+
+	Describe("NIC metadata flow", func() {
+		const bmiName = "nic-test-bmi"
+		const bmhName = "nic-test-bmh"
+
+		AfterEach(func() {
+			cleanupBMI(bmiName)
+			cleanupBMH(bmhName)
+		})
+
+		It("should populate status.hardware.nics from BareMetalHost hardware inspection", func() {
+			bmh := createMetal3BMH(bmhName, map[string]string{
+				inventory.Metal3HostTypeLabel: "gpu-node",
+			}, metal3api.OperationalStatusOK, metal3api.StateAvailable)
+			_ = bmh
+
+			bmi := &v1alpha1.BareMetalInstance{
+				ObjectMeta: metav1.ObjectMeta{Name: bmiName, Namespace: metal3TestNS},
+				Spec: v1alpha1.BareMetalInstanceSpec{
+					HostType:   "gpu-node",
+					TemplateID: shared.OsacNoopTemplate,
+				},
+			}
+			Expect(k8sClient.Create(ctx, bmi)).To(Succeed())
+
+			reconciler := newMetal3Reconciler()
+
+			// 3 reconciles for allocation + 1 for management finalizer + 1 for Ready
+			reconcileN(reconciler, bmiName, 5)
+			bmi = getBMI(bmiName)
+
+			Expect(bmi.Status.Phase).To(Equal(v1alpha1.BareMetalInstancePhaseReady))
+			Expect(bmi.Status.Hardware).NotTo(BeNil())
+			Expect(bmi.Status.Hardware.NICs).To(HaveLen(1))
+			Expect(bmi.Status.Hardware.NICs[0].MAC).To(Equal("aa:bb:cc:dd:ee:01"))
 		})
 	})
 })

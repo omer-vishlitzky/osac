@@ -128,35 +128,25 @@ func (r *function) run(ctx context.Context, volume *privatev1.Volume) error {
 		r:      r,
 		volume: volume,
 	}
-	var reconcileErr error
+	var err error
 	if volume.HasMetadata() && volume.GetMetadata().HasDeletionTimestamp() {
-		reconcileErr = t.delete(ctx)
+		err = t.delete(ctx)
 	} else {
-		reconcileErr = t.update(ctx)
+		err = t.update(ctx)
 	}
-	if reconcileErr != nil {
-		t.setFailed(reconcileErr)
+	if err != nil {
+		return err
 	}
 	updateMask := r.maskCalculator.Calculate(oldVolume, volume)
-
-	var updateErr error
-	if len(updateMask.GetPaths()) > 0 {
-		_, updateErr = r.volumesClient.Update(ctx, privatev1.VolumesUpdateRequest_builder{
-			Object:     volume,
-			UpdateMask: updateMask,
-		}.Build())
+	if len(updateMask.GetPaths()) == 0 {
+		return nil
 	}
 
-	if reconcileErr != nil {
-		if updateErr != nil {
-			r.logger.WarnContext(ctx, "Failed to persist status after reconciliation error",
-				slog.String("reconcile_error", reconcileErr.Error()),
-				slog.String("update_error", updateErr.Error()),
-			)
-		}
-		return reconcileErr
-	}
-	return updateErr
+	_, err = r.volumesClient.Update(ctx, privatev1.VolumesUpdateRequest_builder{
+		Object:     volume,
+		UpdateMask: updateMask,
+	}.Build())
+	return err
 }
 
 // update handles the non-delete path: adds the controller finalizer, sets
@@ -170,7 +160,8 @@ func (t *task) update(ctx context.Context) error {
 	t.setDefaults()
 
 	if err := t.validateTenant(); err != nil {
-		return err
+		t.setFailed(err)
+		return nil
 	}
 
 	hubJustSelected := t.volume.GetStatus().GetHub() == ""
@@ -205,6 +196,15 @@ func (t *task) update(ctx context.Context) error {
 		}
 		err = t.hubClient.Create(ctx, newObject)
 		if err != nil {
+			return controllers.HandleK8sWriteError(ctx, t.r.logger, err, t.setFailed)
+		}
+		// Populate status.backend/protocol from the resolved private volume so the
+		// operator can select the vendor controller endpoint and protocol on the
+		// first provisioning reconcile, before any vendor round-trip. Status is a
+		// subresource, so it is set with a separate update after Create.
+		newObject.Status.Backend = t.volume.GetStatus().GetBackend()
+		newObject.Status.Protocol = protoProtocolToCRD(t.volume.GetStatus().GetProtocol())
+		if err = t.hubClient.Status().Update(ctx, newObject); err != nil {
 			return controllers.HandleK8sWriteError(ctx, t.r.logger, err, t.setFailed)
 		}
 		t.r.logger.DebugContext(
@@ -430,5 +430,19 @@ func protoAccessModeToCRD(mode privatev1.VolumeAccessMode) osacv1alpha1.VolumeAc
 		return osacv1alpha1.VolumeAccessModeReadWriteOncePod
 	default:
 		return osacv1alpha1.VolumeAccessModeReadWriteOnce
+	}
+}
+
+// protoProtocolToCRD maps the resolved storage protocol from the private Volume
+// status onto the CRD status protocol. An unspecified protocol maps to the empty
+// value, which the operator treats as not-yet-resolved.
+func protoProtocolToCRD(protocol privatev1.StorageProtocol) osacv1alpha1.VolumeProtocol {
+	switch protocol {
+	case privatev1.StorageProtocol_STORAGE_PROTOCOL_NFS:
+		return osacv1alpha1.VolumeProtocolNFS
+	case privatev1.StorageProtocol_STORAGE_PROTOCOL_BLOCK:
+		return osacv1alpha1.VolumeProtocolBlock
+	default:
+		return ""
 	}
 }

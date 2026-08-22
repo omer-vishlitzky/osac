@@ -15,18 +15,23 @@ package servers
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"go.uber.org/mock/gomock"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
 	"google.golang.org/protobuf/types/known/structpb"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
 	grpccodes "google.golang.org/grpc/codes"
 	grpcstatus "google.golang.org/grpc/status"
 
 	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
+	"github.com/osac-project/osac/fulfillment-service/internal/auth"
+	"github.com/osac-project/osac/fulfillment-service/internal/collections"
 	"github.com/osac-project/osac/fulfillment-service/internal/database/dao"
 )
 
@@ -987,6 +992,465 @@ var _ = Describe("Private compute instance catalog items server", func() {
 							Name: fmt.Sprintf("test-%s", uuid.NewString()[:8]),
 						}.Build(),
 						Title:    "Catalog item without instance type field",
+						Template: privatev1.ComputeInstanceTemplateReference_builder{Id: "my-ci-template-id"}.Build(),
+						FieldDefinitions: []*privatev1.FieldDefinition{
+							privatev1.FieldDefinition_builder{
+								Path:     "spec.ssh_public_key",
+								Editable: true,
+							}.Build(),
+						},
+					}.Build(),
+				}.Build())
+				Expect(err).ToNot(HaveOccurred())
+				Expect(response.GetWarnings()).To(BeEmpty())
+			})
+
+		})
+
+		Describe("Disk image validation in field_definitions", func() {
+			It("Returns warning when field_definitions default references a DEPRECATED disk image on Create", func() {
+				createDiskImageWithLifecycle("deprecated-di",
+					privatev1.DiskImageLifecycle_DISK_IMAGE_LIFECYCLE_DEPRECATED,
+					privatev1.DiskImageDeprecation_builder{
+						ObsolescenceTimestamp: timestamppb.New(
+							time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC)),
+					}.Build())
+
+				response, err := server.Create(ctx, privatev1.ComputeInstanceCatalogItemsCreateRequest_builder{
+					Object: privatev1.ComputeInstanceCatalogItem_builder{
+						Metadata: privatev1.Metadata_builder{
+							Name: fmt.Sprintf("test-%s", uuid.NewString()[:8]),
+						}.Build(),
+						Title:    "Catalog item with deprecated disk image default",
+						Template: privatev1.ComputeInstanceTemplateReference_builder{Id: "my-ci-template-id"}.Build(),
+						FieldDefinitions: []*privatev1.FieldDefinition{
+							privatev1.FieldDefinition_builder{
+								Path:     "disk_image",
+								Editable: true,
+								Default:  structpb.NewStringValue("deprecated-di"),
+							}.Build(),
+						},
+					}.Build(),
+				}.Build())
+				Expect(err).ToNot(HaveOccurred())
+				Expect(response.GetWarnings()).To(HaveLen(1))
+				Expect(response.GetWarnings()[0]).To(ContainSubstring("deprecated"))
+				Expect(response.GetWarnings()[0]).To(ContainSubstring("2027"))
+			})
+
+			It("Returns warning when field_definitions default references a DEPRECATED disk image on Update", func() {
+				// Create a catalog item without field_definitions first.
+				createResponse, err := server.Create(ctx, privatev1.ComputeInstanceCatalogItemsCreateRequest_builder{
+					Object: privatev1.ComputeInstanceCatalogItem_builder{
+						Metadata: privatev1.Metadata_builder{
+							Name: "test-ci-catalog-di-deprecated-upd",
+						}.Build(),
+						Title:    "Catalog item to update",
+						Template: privatev1.ComputeInstanceTemplateReference_builder{Id: "my-ci-template-id"}.Build(),
+					}.Build(),
+				}.Build())
+				Expect(err).ToNot(HaveOccurred())
+				catalogItemId := createResponse.GetObject().GetId()
+				name := createResponse.GetObject().GetMetadata().GetName()
+
+				createDiskImageWithLifecycle("deprecated-di-upd",
+					privatev1.DiskImageLifecycle_DISK_IMAGE_LIFECYCLE_DEPRECATED, nil)
+
+				updateResponse, err := server.Update(ctx, privatev1.ComputeInstanceCatalogItemsUpdateRequest_builder{
+					Object: privatev1.ComputeInstanceCatalogItem_builder{
+						Id:       catalogItemId,
+						Metadata: privatev1.Metadata_builder{Name: name}.Build(),
+						Title:    "Catalog item to update",
+						Template: privatev1.ComputeInstanceTemplateReference_builder{Id: "my-ci-template-id"}.Build(),
+						FieldDefinitions: []*privatev1.FieldDefinition{
+							privatev1.FieldDefinition_builder{
+								Path:     "disk_image",
+								Editable: true,
+								Default:  structpb.NewStringValue("deprecated-di-upd"),
+							}.Build(),
+						},
+					}.Build(),
+				}.Build())
+				Expect(err).ToNot(HaveOccurred())
+				Expect(updateResponse.GetWarnings()).To(HaveLen(1))
+				Expect(updateResponse.GetWarnings()[0]).To(ContainSubstring("deprecated"))
+			})
+
+			It("Rejects Create when field_definitions default references an OBSOLETE disk image", func() {
+				createDiskImageWithLifecycle("obsolete-di",
+					privatev1.DiskImageLifecycle_DISK_IMAGE_LIFECYCLE_OBSOLETE, nil)
+
+				_, err := server.Create(ctx, privatev1.ComputeInstanceCatalogItemsCreateRequest_builder{
+					Object: privatev1.ComputeInstanceCatalogItem_builder{
+						Metadata: privatev1.Metadata_builder{
+							Name: fmt.Sprintf("test-%s", uuid.NewString()[:8]),
+						}.Build(),
+						Title:    "Catalog item with obsolete disk image default",
+						Template: privatev1.ComputeInstanceTemplateReference_builder{Id: "my-ci-template-id"}.Build(),
+						FieldDefinitions: []*privatev1.FieldDefinition{
+							privatev1.FieldDefinition_builder{
+								Path:     "disk_image",
+								Editable: true,
+								Default:  structpb.NewStringValue("obsolete-di"),
+							}.Build(),
+						},
+					}.Build(),
+				}.Build())
+				Expect(err).To(HaveOccurred())
+				status, ok := grpcstatus.FromError(err)
+				Expect(ok).To(BeTrue())
+				Expect(status.Code()).To(Equal(grpccodes.FailedPrecondition))
+				Expect(status.Message()).To(ContainSubstring("obsolete"))
+			})
+
+			It("Rejects Update when field_definitions default references an OBSOLETE disk image", func() {
+				// Create a catalog item first.
+				createResponse, err := server.Create(ctx, privatev1.ComputeInstanceCatalogItemsCreateRequest_builder{
+					Object: privatev1.ComputeInstanceCatalogItem_builder{
+						Metadata: privatev1.Metadata_builder{
+							Name: "test-ci-catalog-di-obsolete-upd",
+						}.Build(),
+						Title:    "Catalog item for obsolete disk image update",
+						Template: privatev1.ComputeInstanceTemplateReference_builder{Id: "my-ci-template-id"}.Build(),
+					}.Build(),
+				}.Build())
+				Expect(err).ToNot(HaveOccurred())
+				catalogItemId := createResponse.GetObject().GetId()
+
+				createDiskImageWithLifecycle("obsolete-di-upd",
+					privatev1.DiskImageLifecycle_DISK_IMAGE_LIFECYCLE_OBSOLETE, nil)
+
+				_, err = server.Update(ctx, privatev1.ComputeInstanceCatalogItemsUpdateRequest_builder{
+					Object: privatev1.ComputeInstanceCatalogItem_builder{
+						Id:       catalogItemId,
+						Title:    "Catalog item for obsolete disk image update",
+						Template: privatev1.ComputeInstanceTemplateReference_builder{Id: "my-ci-template-id"}.Build(),
+						FieldDefinitions: []*privatev1.FieldDefinition{
+							privatev1.FieldDefinition_builder{
+								Path:     "disk_image",
+								Editable: true,
+								Default:  structpb.NewStringValue("obsolete-di-upd"),
+							}.Build(),
+						},
+					}.Build(),
+				}.Build())
+				Expect(err).To(HaveOccurred())
+				status, ok := grpcstatus.FromError(err)
+				Expect(ok).To(BeTrue())
+				Expect(status.Code()).To(Equal(grpccodes.FailedPrecondition))
+			})
+
+			It("Returns no warnings when field_definitions default references an AVAILABLE disk image", func() {
+				createDiskImageWithLifecycle("available-di",
+					privatev1.DiskImageLifecycle_DISK_IMAGE_LIFECYCLE_AVAILABLE, nil)
+
+				response, err := server.Create(ctx, privatev1.ComputeInstanceCatalogItemsCreateRequest_builder{
+					Object: privatev1.ComputeInstanceCatalogItem_builder{
+						Metadata: privatev1.Metadata_builder{
+							Name: fmt.Sprintf("test-%s", uuid.NewString()[:8]),
+						}.Build(),
+						Title:    "Catalog item with available disk image default",
+						Template: privatev1.ComputeInstanceTemplateReference_builder{Id: "my-ci-template-id"}.Build(),
+						FieldDefinitions: []*privatev1.FieldDefinition{
+							privatev1.FieldDefinition_builder{
+								Path:     "disk_image",
+								Editable: true,
+								Default:  structpb.NewStringValue("available-di"),
+							}.Build(),
+						},
+					}.Build(),
+				}.Build())
+				Expect(err).ToNot(HaveOccurred())
+				Expect(response.GetWarnings()).To(BeEmpty())
+
+				// The stored default must be normalized to an id-keyed {"id": ..., "name": ...}
+				// reference object so the deletion-protection trigger (migration 101) matches on the
+				// resolved id. A bare string was sent; validation resolves it and rewrites it in place
+				// before persist. createDiskImageWithLifecycle sets Id == Name, so both are "available-di".
+				var diskImageFd *privatev1.FieldDefinition
+				for _, fd := range response.GetObject().GetFieldDefinitions() {
+					if fd.GetPath() == "disk_image" {
+						diskImageFd = fd
+						break
+					}
+				}
+				Expect(diskImageFd).ToNot(BeNil())
+				normalized := diskImageFd.GetDefault().GetStructValue()
+				Expect(normalized).ToNot(BeNil())
+				Expect(normalized.GetFields()["id"].GetStringValue()).To(Equal("available-di"))
+				Expect(normalized.GetFields()["name"].GetStringValue()).To(Equal("available-di"))
+			})
+
+			It("Rejects Create when field_definitions default references a non-existent disk image", func() {
+				_, err := server.Create(ctx, privatev1.ComputeInstanceCatalogItemsCreateRequest_builder{
+					Object: privatev1.ComputeInstanceCatalogItem_builder{
+						Metadata: privatev1.Metadata_builder{
+							Name: fmt.Sprintf("test-%s", uuid.NewString()[:8]),
+						}.Build(),
+						Title:    "Catalog item with missing disk image",
+						Template: privatev1.ComputeInstanceTemplateReference_builder{Id: "my-ci-template-id"}.Build(),
+						FieldDefinitions: []*privatev1.FieldDefinition{
+							privatev1.FieldDefinition_builder{
+								Path:     "disk_image",
+								Editable: true,
+								Default:  structpb.NewStringValue("nonexistent-di"),
+							}.Build(),
+						},
+					}.Build(),
+				}.Build())
+				Expect(err).To(HaveOccurred())
+				status, ok := grpcstatus.FromError(err)
+				Expect(ok).To(BeTrue())
+				Expect(status.Code()).To(Equal(grpccodes.NotFound))
+			})
+
+			It("Rejects Create with NotFound when field_definitions default references a disk image in another tenant", func() {
+				// The generic List DAO now wraps the caller's CEL filter in parentheses
+				// (OSAC-4127), so a top-level OR ("this.id == k || this.metadata.name == k")
+				// stays scoped under the tenancy clause and a cross-tenant disk image cannot
+				// leak through by name — validation must reject the reference with NotFound.
+
+				// The disk image's tenant must exist first — the reverse-reference trigger
+				// rejects a disk image whose tenant is unknown.
+				tenantsDao, err := dao.NewGenericDAO[*privatev1.Tenant]().
+					SetLogger(logger).
+					SetTableName("tenants").
+					SetTenancyLogic(tenancy).
+					Build()
+				Expect(err).ToNot(HaveOccurred())
+				_, err = tenantsDao.Create().SetObject(
+					privatev1.Tenant_builder{
+						Id: "other-tenant",
+						Metadata: privatev1.Metadata_builder{
+							Name:   "other-tenant",
+							Tenant: "other-tenant",
+						}.Build(),
+					}.Build(),
+				).Do(ctx)
+				Expect(err).ToNot(HaveOccurred())
+
+				// Seed an AVAILABLE disk image owned by that third tenant, using the suite-default
+				// (universal) tenancy so the write itself is unfiltered.
+				diskImagesDao, err := dao.NewGenericDAO[*privatev1.DiskImage]().
+					SetLogger(logger).
+					SetTenancyLogic(tenancy).
+					Build()
+				Expect(err).ToNot(HaveOccurred())
+				_, err = diskImagesDao.Create().SetObject(
+					privatev1.DiskImage_builder{
+						Id: "other-tenant-di",
+						Metadata: privatev1.Metadata_builder{
+							Name:   "other-tenant-di",
+							Tenant: "other-tenant",
+						}.Build(),
+						Spec: privatev1.DiskImageSpec_builder{
+							Lifecycle: privatev1.DiskImageLifecycle_DISK_IMAGE_LIFECYCLE_AVAILABLE,
+						}.Build(),
+					}.Build(),
+				).Do(ctx)
+				Expect(err).ToNot(HaveOccurred())
+
+				// Build a catalog server whose caller can only see shared + "my-tenant", so the
+				// DAO's tenancy filter hides the "other-tenant" disk image (collapsing to
+				// zero rows -> NotFound, without leaking cross-tenant existence).
+				restrictedTenancy := auth.NewMockTenancyLogic(ctrl)
+				visible := auth.SharedTenants.Union(collections.NewSet("my-tenant"))
+				restrictedTenancy.EXPECT().DetermineVisibleTenants(gomock.Any()).
+					Return(visible, nil).AnyTimes()
+				restrictedTenancy.EXPECT().DetermineAssignableTenants(gomock.Any()).
+					Return(collections.NewSet("my-tenant"), nil).AnyTimes()
+				restrictedTenancy.EXPECT().DetermineDefaultTenant(gomock.Any()).
+					Return("my-tenant", nil).AnyTimes()
+
+				restrictedServer, err := NewPrivateComputeInstanceCatalogItemsServer().
+					SetLogger(logger).
+					SetAttributionLogic(attribution).
+					SetTenancyLogic(restrictedTenancy).
+					Build()
+				Expect(err).ToNot(HaveOccurred())
+
+				_, err = restrictedServer.Create(ctx, privatev1.ComputeInstanceCatalogItemsCreateRequest_builder{
+					Object: privatev1.ComputeInstanceCatalogItem_builder{
+						Metadata: privatev1.Metadata_builder{
+							Name: fmt.Sprintf("test-%s", uuid.NewString()[:8]),
+						}.Build(),
+						Title:    "Catalog item referencing a cross-tenant disk image",
+						Template: privatev1.ComputeInstanceTemplateReference_builder{Id: "my-ci-template-id"}.Build(),
+						FieldDefinitions: []*privatev1.FieldDefinition{
+							privatev1.FieldDefinition_builder{
+								Path:     "disk_image",
+								Editable: true,
+								Default:  structpb.NewStringValue("other-tenant-di"),
+							}.Build(),
+						},
+					}.Build(),
+				}.Build())
+				Expect(err).To(HaveOccurred())
+				status, ok := grpcstatus.FromError(err)
+				Expect(ok).To(BeTrue())
+				Expect(status.Code()).To(Equal(grpccodes.NotFound))
+			})
+
+			Context("disk_image name-collision precedence", func() {
+				// Disk image names are unique only per (name, tenant), so a shared image and one or
+				// more same-name tenant images can coexist. validateDiskImageState must break the tie
+				// deterministically: the caller's own tenant wins, then the shared tenant, otherwise
+				// the reference is a genuine ambiguity (InvalidArgument). These tests drive the server
+				// directly (the interceptor that id-pins typed refs is not in the unit chain), so the
+				// by-name resolution path is exercised as a real DB lookup.
+
+				// buildCatalogServer wires a catalog server whose caller has the given default tenant
+				// and can see the shared tenant plus the listed extra tenants.
+				buildCatalogServer := func(defaultTenant string, extraVisible ...string) *PrivateComputeInstanceCatalogItemsServer {
+					visible := auth.SharedTenants.Union(collections.NewSet(extraVisible...))
+					mockTenancy := auth.NewMockTenancyLogic(ctrl)
+					mockTenancy.EXPECT().DetermineVisibleTenants(gomock.Any()).
+						Return(visible, nil).AnyTimes()
+					mockTenancy.EXPECT().DetermineAssignableTenants(gomock.Any()).
+						Return(collections.NewSet(defaultTenant), nil).AnyTimes()
+					mockTenancy.EXPECT().DetermineDefaultTenant(gomock.Any()).
+						Return(defaultTenant, nil).AnyTimes()
+					s, err := NewPrivateComputeInstanceCatalogItemsServer().
+						SetLogger(logger).
+						SetAttributionLogic(attribution).
+						SetTenancyLogic(mockTenancy).
+						Build()
+					Expect(err).ToNot(HaveOccurred())
+					return s
+				}
+
+				// storedDiskImageDefault pulls the normalized disk_image field default off a created
+				// catalog item so its resolved id/name can be asserted.
+				storedDiskImageDefault := func(item *privatev1.ComputeInstanceCatalogItem) *structpb.Struct {
+					for _, fd := range item.GetFieldDefinitions() {
+						if fd.GetPath() == "disk_image" {
+							return fd.GetDefault().GetStructValue()
+						}
+					}
+					return nil
+				}
+
+				createCatalogItem := func(
+					s *PrivateComputeInstanceCatalogItemsServer,
+					def *structpb.Value,
+				) (*privatev1.ComputeInstanceCatalogItemsCreateResponse, error) {
+					return s.Create(ctx, privatev1.ComputeInstanceCatalogItemsCreateRequest_builder{
+						Object: privatev1.ComputeInstanceCatalogItem_builder{
+							Metadata: privatev1.Metadata_builder{
+								Name: fmt.Sprintf("test-%s", uuid.NewString()[:8]),
+							}.Build(),
+							Title:    "Catalog item for disk image precedence",
+							Template: privatev1.ComputeInstanceTemplateReference_builder{Id: "my-ci-template-id"}.Build(),
+							FieldDefinitions: []*privatev1.FieldDefinition{
+								privatev1.FieldDefinition_builder{
+									Path:     "disk_image",
+									Editable: true,
+									Default:  def,
+								}.Build(),
+							},
+						}.Build(),
+					}.Build())
+				}
+
+				It("Resolves a name collision to the caller's own-tenant disk image", func() {
+					createTenant("my-tenant")
+					createAvailableDiskImageInTenant("di-fedora-shared", "fedora", auth.SharedTenant)
+					createAvailableDiskImageInTenant("di-fedora-tenant", "fedora", "my-tenant")
+
+					s := buildCatalogServer("my-tenant", "my-tenant")
+					resp, err := createCatalogItem(s, structpb.NewStringValue("fedora"))
+					Expect(err).ToNot(HaveOccurred())
+					Expect(resp.GetWarnings()).To(BeEmpty())
+
+					def := storedDiskImageDefault(resp.GetObject())
+					Expect(def).ToNot(BeNil())
+					Expect(def.GetFields()["id"].GetStringValue()).To(Equal("di-fedora-tenant"))
+					Expect(def.GetFields()["name"].GetStringValue()).To(Equal("fedora"))
+				})
+
+				It("Falls back to the shared disk image when the caller's tenant has no same-name image", func() {
+					createTenant("my-tenant")
+					createTenant("other-tenant")
+					createAvailableDiskImageInTenant("di-ubuntu-shared", "ubuntu", auth.SharedTenant)
+					createAvailableDiskImageInTenant("di-ubuntu-other", "ubuntu", "other-tenant")
+
+					// The caller sees shared + other-tenant (so the name resolves to >1 row) but its own
+					// default tenant "my-tenant" owns no "ubuntu": the shared image must win the tie.
+					s := buildCatalogServer("my-tenant", "my-tenant", "other-tenant")
+					resp, err := createCatalogItem(s, structpb.NewStringValue("ubuntu"))
+					Expect(err).ToNot(HaveOccurred())
+
+					def := storedDiskImageDefault(resp.GetObject())
+					Expect(def).ToNot(BeNil())
+					Expect(def.GetFields()["id"].GetStringValue()).To(Equal("di-ubuntu-shared"))
+				})
+
+				It("Rejects an ambiguous name with InvalidArgument when multiple tenant images share it and none is shared", func() {
+					createTenant("tenant-a")
+					createTenant("tenant-b")
+					createAvailableDiskImageInTenant("di-fedora-a", "fedora", "tenant-a")
+					createAvailableDiskImageInTenant("di-fedora-b", "fedora", "tenant-b")
+
+					// A provider admin: default tenant is shared, but no shared "fedora" exists and two
+					// tenants own one — an irreducible ambiguity, which must be a deterministic error.
+					s := buildCatalogServer(auth.SharedTenant, "tenant-a", "tenant-b")
+					_, err := createCatalogItem(s, structpb.NewStringValue("fedora"))
+					Expect(err).To(HaveOccurred())
+					status, ok := grpcstatus.FromError(err)
+					Expect(ok).To(BeTrue())
+					Expect(status.Code()).To(Equal(grpccodes.InvalidArgument))
+				})
+
+				It("Uses the id and ignores the name when the default already carries an id", func() {
+					createTenant("my-tenant")
+					createAvailableDiskImageInTenant("di-fedora-shared", "fedora", auth.SharedTenant)
+					createAvailableDiskImageInTenant("di-fedora-tenant", "fedora", "my-tenant")
+
+					// The default pins the shared image by id even though the name "fedora" collides
+					// with the caller's own-tenant image: the by-id path must win, unambiguously.
+					s := buildCatalogServer("my-tenant", "my-tenant")
+					def := structpb.NewStructValue(&structpb.Struct{Fields: map[string]*structpb.Value{
+						"id":   structpb.NewStringValue("di-fedora-shared"),
+						"name": structpb.NewStringValue("fedora"),
+					}})
+					resp, err := createCatalogItem(s, def)
+					Expect(err).ToNot(HaveOccurred())
+
+					stored := storedDiskImageDefault(resp.GetObject())
+					Expect(stored).ToNot(BeNil())
+					Expect(stored.GetFields()["id"].GetStringValue()).To(Equal("di-fedora-shared"))
+					Expect(stored.GetFields()["name"].GetStringValue()).To(Equal("fedora"))
+				})
+
+				It("Is idempotent when re-validating an already-id-normalized default", func() {
+					createDiskImageWithLifecycle("stable-di",
+						privatev1.DiskImageLifecycle_DISK_IMAGE_LIFECYCLE_AVAILABLE, nil)
+
+					// Feed the already-normalized {"id","name"} form (what a prior Create persisted and
+					// migration 101 backfills). diskImageDefaultKey takes the by-id path, so it resolves
+					// to the same image and re-stores the same id-form default.
+					s := buildCatalogServer(auth.SharedTenant)
+					def := structpb.NewStructValue(&structpb.Struct{Fields: map[string]*structpb.Value{
+						"id":   structpb.NewStringValue("stable-di"),
+						"name": structpb.NewStringValue("stable-di"),
+					}})
+					resp, err := createCatalogItem(s, def)
+					Expect(err).ToNot(HaveOccurred())
+
+					stored := storedDiskImageDefault(resp.GetObject())
+					Expect(stored).ToNot(BeNil())
+					Expect(stored.GetFields()["id"].GetStringValue()).To(Equal("stable-di"))
+					Expect(stored.GetFields()["name"].GetStringValue()).To(Equal("stable-di"))
+				})
+			})
+
+			It("Skips validation when field_definitions has no disk_image path", func() {
+				response, err := server.Create(ctx, privatev1.ComputeInstanceCatalogItemsCreateRequest_builder{
+					Object: privatev1.ComputeInstanceCatalogItem_builder{
+						Metadata: privatev1.Metadata_builder{
+							Name: fmt.Sprintf("test-%s", uuid.NewString()[:8]),
+						}.Build(),
+						Title:    "Catalog item without disk image field",
 						Template: privatev1.ComputeInstanceTemplateReference_builder{Id: "my-ci-template-id"}.Build(),
 						FieldDefinitions: []*privatev1.FieldDefinition{
 							privatev1.FieldDefinition_builder{

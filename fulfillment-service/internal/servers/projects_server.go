@@ -120,6 +120,7 @@ func (b *ProjectsServerBuilder) Build() (result *ProjectsServer, err error) {
 		SetAttributionLogic(b.attributionLogic).
 		SetTenancyLogic(b.tenancyLogic).
 		SetMetricsRegisterer(b.metricsRegisterer).
+		SetFilterDesc((*publicv1.Project)(nil).ProtoReflect().Descriptor()).
 		Build()
 	if err != nil {
 		return
@@ -138,7 +139,9 @@ func (s *ProjectsServer) List(ctx context.Context,
 	request *publicv1.ProjectsListRequest) (response *publicv1.ProjectsListResponse, err error) {
 	privateRequest := &privatev1.ProjectsListRequest{}
 	privateRequest.SetOffset(request.GetOffset())
-	privateRequest.SetLimit(request.GetLimit())
+	if request.HasLimit() {
+		privateRequest.SetLimit(request.GetLimit())
+	}
 	privateRequest.SetOrder(request.GetOrder())
 	privateRequest.SetFilter(request.GetFilter())
 	privateResponse, err := s.private.List(ctx, privateRequest)

@@ -132,6 +132,7 @@ func (b *ClusterVersionsServerBuilder) Build() (*ClusterVersionsServer, error) {
 		SetAttributionLogic(b.attributionLogic).
 		SetTenancyLogic(b.tenancyLogic).
 		SetMetricsRegisterer(b.metricsRegisterer).
+		SetFilterDesc((*publicv1.ClusterVersion)(nil).ProtoReflect().Descriptor()).
 		Build()
 	if err != nil {
 		return nil, err
@@ -149,7 +150,9 @@ func (s *ClusterVersionsServer) List(ctx context.Context,
 	request *publicv1.ClusterVersionsListRequest) (*publicv1.ClusterVersionsListResponse, error) {
 	privateRequest := &privatev1.ClusterVersionsListRequest{}
 	privateRequest.SetOffset(request.GetOffset())
-	privateRequest.SetLimit(request.GetLimit())
+	if request.HasLimit() {
+		privateRequest.SetLimit(request.GetLimit())
+	}
 	composedFilter, err := composeFilterDefaults(request.GetFilter(), clusterVersionFilterDefaults)
 	if err != nil {
 		return nil, grpcstatus.Errorf(grpccodes.InvalidArgument, "%v", err)

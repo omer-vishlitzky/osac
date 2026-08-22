@@ -118,6 +118,7 @@ func (c *runnerContext) run(cmd *cobra.Command, args []string) error {
 		SetConnection(c.conn).
 		AddPackages(cfg.Packages()).
 		SetTenantFunc(config.TenantFromContext).
+		UseGetForStructuredOutput(&publicv1.Secret{}).
 		Build()
 	if err != nil {
 		return fmt.Errorf("failed to create reflection tool: %w", err)
@@ -158,7 +159,7 @@ func (c *runnerContext) run(cmd *cobra.Command, args []string) error {
 	key := args[1]
 
 	// Find the object by identifier or name:
-	object, err := c.helper.FindObject(ctx, key, c.console)
+	object, err := c.fetchObject(ctx, key)
 	if err != nil {
 		return err
 	}
@@ -274,6 +275,23 @@ func (c *runnerContext) findEditor(ctx context.Context) string {
 		slog.String("default", defaultEditor),
 	)
 	return defaultEditor
+}
+
+// fetchObject resolves a key to an object via FindObject, then re-fetches via Get for resource
+// types configured to use Get for structured output (e.g. secrets, where List redacts data).
+// Re-fetch happens after FindObject because FindObject handles ambiguous-match error messaging.
+func (c *runnerContext) fetchObject(ctx context.Context, key string) (proto.Message, error) {
+	object, err := c.helper.FindObject(ctx, key, c.console)
+	if err != nil {
+		return nil, err
+	}
+	if c.helper.UseGetForStructuredOutput() {
+		object, err = c.helper.Get(ctx, c.helper.GetId(object))
+		if err != nil {
+			return nil, fmt.Errorf("failed to get full object: %w", err)
+		}
+	}
+	return object, nil
 }
 
 func (c *runnerContext) update(ctx context.Context, object proto.Message) (result proto.Message, err error) {

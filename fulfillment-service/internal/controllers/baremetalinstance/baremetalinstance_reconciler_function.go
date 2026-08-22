@@ -23,6 +23,7 @@ import (
 	"log/slog"
 	"math/rand/v2"
 	"slices"
+	"strings"
 
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/proto"
@@ -469,6 +470,20 @@ func (t *task) syncStatus(object *bmfov1alpha1.BareMetalInstance) {
 		}.Build())
 	}
 	t.bareMetalInstance.GetStatus().SetNetworkAttachmentStatuses(protoStatuses)
+
+	if hw := object.Status.Hardware; hw != nil {
+		protoNICs := make([]*privatev1.BareMetalNICStatus, 0, len(hw.NICs))
+		for _, n := range hw.NICs {
+			protoNICs = append(protoNICs, privatev1.BareMetalNICStatus_builder{
+				Mac: strings.ToLower(n.MAC),
+			}.Build())
+		}
+		t.bareMetalInstance.GetStatus().SetHardware(privatev1.BareMetalHardware_builder{
+			Nics: protoNICs,
+		}.Build())
+	} else {
+		t.bareMetalInstance.GetStatus().ClearHardware()
+	}
 
 	restartPending := t.bareMetalInstance.GetSpec().GetRestartTrigger() != t.bareMetalInstance.GetStatus().GetRestartTrigger()
 

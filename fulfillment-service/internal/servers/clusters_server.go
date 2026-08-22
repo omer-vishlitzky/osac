@@ -178,6 +178,7 @@ func (b *ClustersServerBuilder) Build() (result *ClustersServer, err error) {
 		SetAttributionLogic(b.attributionLogic).
 		SetTenancyLogic(b.tenancyLogic).
 		SetMetricsRegisterer(b.metricsRegisterer).
+		SetFilterDesc(objectDesc).
 		Build()
 	if err != nil {
 		return
@@ -203,7 +204,9 @@ func (s *ClustersServer) List(ctx context.Context,
 	// Create private request with same parameters:
 	privateRequest := &privatev1.ClustersListRequest{}
 	privateRequest.SetOffset(request.GetOffset())
-	privateRequest.SetLimit(request.GetLimit())
+	if request.HasLimit() {
+		privateRequest.SetLimit(request.GetLimit())
+	}
 	privateRequest.SetFilter(request.GetFilter())
 
 	// Delegate to private server:

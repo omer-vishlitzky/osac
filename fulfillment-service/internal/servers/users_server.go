@@ -114,6 +114,7 @@ func (b *UsersServerBuilder) Build() (result *UsersServer, err error) {
 		SetAttributionLogic(b.attributionLogic).
 		SetTenancyLogic(b.tenancyLogic).
 		SetMetricsRegisterer(b.metricsRegisterer).
+		SetFilterDesc((*publicv1.User)(nil).ProtoReflect().Descriptor()).
 		Build()
 	if err != nil {
 		return
@@ -134,7 +135,9 @@ func (s *UsersServer) List(ctx context.Context,
 	// Create private request with same parameters:
 	privateRequest := &privatev1.UsersListRequest{}
 	privateRequest.SetOffset(request.GetOffset())
-	privateRequest.SetLimit(request.GetLimit())
+	if request.HasLimit() {
+		privateRequest.SetLimit(request.GetLimit())
+	}
 	privateRequest.SetFilter(request.GetFilter())
 
 	// Delegate to private server:

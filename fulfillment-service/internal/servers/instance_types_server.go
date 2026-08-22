@@ -133,6 +133,7 @@ func (b *InstanceTypesServerBuilder) Build() (result *InstanceTypesServer, err e
 		SetAttributionLogic(b.attributionLogic).
 		SetTenancyLogic(b.tenancyLogic).
 		SetMetricsRegisterer(b.metricsRegisterer).
+		SetFilterDesc((*publicv1.InstanceType)(nil).ProtoReflect().Descriptor()).
 		Build()
 	if err != nil {
 		return
@@ -153,7 +154,9 @@ func (s *InstanceTypesServer) List(ctx context.Context,
 	// Create private request with same parameters:
 	privateRequest := &privatev1.InstanceTypesListRequest{}
 	privateRequest.SetOffset(request.GetOffset())
-	privateRequest.SetLimit(request.GetLimit())
+	if request.HasLimit() {
+		privateRequest.SetLimit(request.GetLimit())
+	}
 	composedFilter, err := composeFilterDefaults(request.GetFilter(), instanceTypeFilterDefaults)
 	if err != nil {
 		return nil, grpcstatus.Errorf(grpccodes.InvalidArgument, "%v", err)

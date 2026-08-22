@@ -22,6 +22,7 @@ import (
 	. "github.com/onsi/gomega"
 	"go.uber.org/mock/gomock"
 	"google.golang.org/grpc"
+	"google.golang.org/protobuf/types/known/timestamppb"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -745,7 +746,7 @@ var _ = Describe("Kubernetes validation error handling", func() {
 		Expect(volume.GetStatus().GetHub()).To(Equal("hub-a"))
 	})
 
-	It("persists FAILED state when tenant validation fails", func() {
+	It("marks FAILED without requeue when tenant validation fails", func() {
 		ctx := context.Background()
 		ctrl := gomock.NewController(GinkgoT())
 		DeferCleanup(ctrl.Finish)
@@ -782,9 +783,201 @@ var _ = Describe("Kubernetes validation error handling", func() {
 		}
 
 		err := f.run(ctx, volume)
-		Expect(err).To(HaveOccurred())
+		Expect(err).ToNot(HaveOccurred())
 		Expect(volume.GetStatus().GetState()).To(
 			Equal(privatev1.VolumeState_VOLUME_STATE_FAILED))
 		Expect(volume.GetStatus().GetMessage()).To(ContainSubstring("tenant"))
+	})
+
+	It("requeues without marking FAILED on transient K8s Create error", func() {
+		ctx := context.Background()
+		ctrl := gomock.NewController(GinkgoT())
+		DeferCleanup(ctrl.Finish)
+
+		scheme := runtime.NewScheme()
+		Expect(osacv1alpha1.AddToScheme(scheme)).To(Succeed())
+
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithInterceptorFuncs(interceptor.Funcs{
+				Create: func(ctx context.Context, client clnt.WithWatch, obj clnt.Object, opts ...clnt.CreateOption) error {
+					return errors.New("connection refused")
+				},
+			}).
+			Build()
+
+		hubCache := controllers.NewMockHubCache(ctrl)
+		hubCache.EXPECT().
+			Get(gomock.Any(), "hub-1").
+			Return(&controllers.HubEntry{Namespace: "test-ns", Client: fakeClient}, nil).
+			AnyTimes()
+
+		volumesClient := NewMockVolumesClient(ctrl)
+		volumesClient.EXPECT().
+			Update(gomock.Any(), gomock.Any(), gomock.Any()).
+			Times(0)
+
+		volume := privatev1.Volume_builder{
+			Id: "vol-transient-k8s",
+			Metadata: privatev1.Metadata_builder{
+				Finalizers: []string{finalizers.Controller},
+				Tenant:     "test-tenant",
+			}.Build(),
+			Spec: privatev1.VolumeSpec_builder{
+				StorageTier: "gold",
+				SizeGib:     100,
+				AccessMode:  privatev1.VolumeAccessMode_VOLUME_ACCESS_MODE_READ_WRITE_ONCE,
+			}.Build(),
+			Status: privatev1.VolumeStatus_builder{
+				State: privatev1.VolumeState_VOLUME_STATE_CREATING,
+				Hub:   "hub-1",
+			}.Build(),
+		}.Build()
+
+		f := &function{
+			logger:         logger,
+			hubCache:       hubCache,
+			volumesClient:  volumesClient,
+			maskCalculator: masks.NewCalculator().Build(),
+		}
+
+		err := f.run(ctx, volume)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("connection refused"))
+		Expect(volume.GetStatus().GetState()).To(
+			Equal(privatev1.VolumeState_VOLUME_STATE_CREATING))
+	})
+
+	It("requeues without marking FAILED on transient delete error", func() {
+		ctx := context.Background()
+		ctrl := gomock.NewController(GinkgoT())
+		DeferCleanup(ctrl.Finish)
+
+		scheme := runtime.NewScheme()
+		Expect(osacv1alpha1.AddToScheme(scheme)).To(Succeed())
+
+		cr := newVolumeCR("vol-delete-transient", "test-ns", "vol-test", nil)
+
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(cr).
+			WithInterceptorFuncs(interceptor.Funcs{
+				Delete: func(ctx context.Context, client clnt.WithWatch, obj clnt.Object, opts ...clnt.DeleteOption) error {
+					return errors.New("connection refused")
+				},
+			}).
+			Build()
+
+		hubCache := controllers.NewMockHubCache(ctrl)
+		hubCache.EXPECT().
+			Get(gomock.Any(), "hub-1").
+			Return(&controllers.HubEntry{Namespace: "test-ns", Client: fakeClient}, nil).
+			AnyTimes()
+
+		volumesClient := NewMockVolumesClient(ctrl)
+		volumesClient.EXPECT().
+			Update(gomock.Any(), gomock.Any(), gomock.Any()).
+			Times(0)
+
+		volume := privatev1.Volume_builder{
+			Id: "vol-delete-transient",
+			Metadata: privatev1.Metadata_builder{
+				Finalizers:        []string{finalizers.Controller},
+				Tenant:            "test-tenant",
+				DeletionTimestamp: timestamppb.Now(),
+			}.Build(),
+			Spec: privatev1.VolumeSpec_builder{
+				StorageTier: "gold",
+				SizeGib:     100,
+				AccessMode:  privatev1.VolumeAccessMode_VOLUME_ACCESS_MODE_READ_WRITE_ONCE,
+			}.Build(),
+			Status: privatev1.VolumeStatus_builder{
+				State: privatev1.VolumeState_VOLUME_STATE_CREATING,
+				Hub:   "hub-1",
+			}.Build(),
+		}.Build()
+
+		f := &function{
+			logger:         logger,
+			hubCache:       hubCache,
+			volumesClient:  volumesClient,
+			maskCalculator: masks.NewCalculator().Build(),
+		}
+
+		err := f.run(ctx, volume)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("connection refused"))
+		Expect(volume.GetStatus().GetState()).To(
+			Equal(privatev1.VolumeState_VOLUME_STATE_CREATING))
+	})
+})
+
+var _ = Describe("create status population", func() {
+	It("populates status.backend and protocol from the resolved private volume", func() {
+		ctx := context.Background()
+		ctrl := gomock.NewController(GinkgoT())
+		DeferCleanup(ctrl.Finish)
+
+		scheme := runtime.NewScheme()
+		Expect(osacv1alpha1.AddToScheme(scheme)).To(Succeed())
+
+		var capturedStatus *osacv1alpha1.Volume
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithStatusSubresource(&osacv1alpha1.Volume{}).
+			WithInterceptorFuncs(interceptor.Funcs{
+				SubResourceUpdate: func(ctx context.Context, client clnt.Client, subResourceName string, obj clnt.Object, opts ...clnt.SubResourceUpdateOption) error {
+					if v, ok := obj.(*osacv1alpha1.Volume); ok {
+						capturedStatus = v.DeepCopy()
+					}
+					return nil
+				},
+			}).
+			Build()
+
+		hubCache := controllers.NewMockHubCache(ctrl)
+		hubCache.EXPECT().
+			Get(gomock.Any(), "hub-1").
+			Return(&controllers.HubEntry{Namespace: "test-ns", Client: fakeClient}, nil).
+			AnyTimes()
+
+		volumesClient := NewMockVolumesClient(ctrl)
+		volumesClient.EXPECT().
+			Update(gomock.Any(), gomock.Any(), gomock.Any()).
+			DoAndReturn(func(ctx context.Context, req *privatev1.VolumesUpdateRequest, opts ...grpc.CallOption) (*privatev1.VolumesUpdateResponse, error) {
+				return &privatev1.VolumesUpdateResponse{Object: req.GetObject()}, nil
+			}).
+			AnyTimes()
+
+		volume := privatev1.Volume_builder{
+			Id: "vol-status-test",
+			Metadata: privatev1.Metadata_builder{
+				Finalizers: []string{finalizers.Controller},
+				Tenant:     "test-tenant",
+			}.Build(),
+			Spec: privatev1.VolumeSpec_builder{
+				StorageTier: "gold",
+				SizeGib:     100,
+				AccessMode:  privatev1.VolumeAccessMode_VOLUME_ACCESS_MODE_READ_WRITE_ONCE,
+			}.Build(),
+			Status: privatev1.VolumeStatus_builder{
+				State:    privatev1.VolumeState_VOLUME_STATE_CREATING,
+				Hub:      "hub-1",
+				Backend:  "vast",
+				Protocol: privatev1.StorageProtocol_STORAGE_PROTOCOL_BLOCK,
+			}.Build(),
+		}.Build()
+
+		f := &function{
+			logger:         logger,
+			hubCache:       hubCache,
+			volumesClient:  volumesClient,
+			maskCalculator: masks.NewCalculator().Build(),
+		}
+
+		Expect(f.run(ctx, volume)).To(Succeed())
+		Expect(capturedStatus).ToNot(BeNil())
+		Expect(capturedStatus.Status.Backend).To(Equal("vast"))
+		Expect(capturedStatus.Status.Protocol).To(Equal(osacv1alpha1.VolumeProtocolBlock))
 	})
 })

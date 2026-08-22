@@ -20,7 +20,6 @@ import (
 	"log/slog"
 	"strconv"
 	"strings"
-	"time"
 
 	"maps"
 
@@ -29,6 +28,7 @@ import (
 	grpccodes "google.golang.org/grpc/codes"
 	grpcstatus "google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
 
@@ -46,6 +46,7 @@ type PrivateComputeInstancesServerBuilder struct {
 	attributionLogic  auth.AttributionLogic
 	tenancyLogic      auth.TenancyLogic
 	metricsRegisterer prometheus.Registerer
+	filterDesc        protoreflect.MessageDescriptor
 }
 
 var _ privatev1.ComputeInstancesServer = (*PrivateComputeInstancesServer)(nil)
@@ -96,6 +97,13 @@ func (b *PrivateComputeInstancesServerBuilder) SetTenancyLogic(value auth.Tenanc
 // access objects. This is optional. If not set, no metrics will be recorded.
 func (b *PrivateComputeInstancesServerBuilder) SetMetricsRegisterer(value prometheus.Registerer) *PrivateComputeInstancesServerBuilder {
 	b.metricsRegisterer = value
+	return b
+}
+
+// SetFilterDesc sets the protobuf message descriptor used to validate and translate CEL filter
+// expressions. This is optional. When unset, the descriptor of this server's own private message type is used.
+func (b *PrivateComputeInstancesServerBuilder) SetFilterDesc(value protoreflect.MessageDescriptor) *PrivateComputeInstancesServerBuilder {
+	b.filterDesc = value
 	return b
 }
 
@@ -215,6 +223,7 @@ func (b *PrivateComputeInstancesServerBuilder) Build() (result *PrivateComputeIn
 		SetAttributionLogic(b.attributionLogic).
 		SetTenancyLogic(b.tenancyLogic).
 		SetMetricsRegisterer(b.metricsRegisterer).
+		SetFilterDesc(b.filterDesc).
 		Build()
 	if err != nil {
 		return
@@ -364,12 +373,6 @@ func (s *PrivateComputeInstancesServer) Create(ctx context.Context,
 	warnings, err = s.validateInstanceType(ctx, request.GetObject())
 	if err != nil {
 		return
-	}
-
-	// TEMPORARY WORKAROUND: seed the workaround DiskImage record for e2e tests.
-	// Remove after osac-test-infra provides disk_image in Create requests.
-	if spec.GetDiskImage() != nil && spec.GetDiskImage().GetName() == "fedora-workaround" {
-		s.ensureFedoraDiskImage(ctx)
 	}
 
 	// Validate disk image existence, lifecycle state, and backfill id+name.
@@ -551,13 +554,6 @@ func (s *PrivateComputeInstancesServer) applySpecDefaults(
 	template *privatev1.ComputeInstanceTemplate,
 ) error {
 	utils.ApplySpecDefaults(spec, template.GetSpecDefaults())
-	// TEMPORARY WORKAROUND: default disk_image for e2e tests that don't provide one.
-	// Remove after osac-test-infra provides disk_image in Create requests.
-	if !spec.HasDiskImage() {
-		spec.SetDiskImage(privatev1.DiskImageReference_builder{
-			Name: "fedora-workaround",
-		}.Build())
-	}
 	return utils.ValidateRequiredSpecFields(spec)
 }
 
@@ -633,88 +629,11 @@ func (s *PrivateComputeInstancesServer) validateStorageTiers(
 	return nil
 }
 
-// lookupDiskImage resolves a DiskImage by id or name. The DAO's tenancy filter
-// automatically includes the shared tenant, so both tenant-local and globally
-// visible DiskImages are found.
-func (s *PrivateComputeInstancesServer) lookupDiskImage(ctx context.Context,
-	key string) (result *privatev1.DiskImage, err error) {
-	if key == "" {
-		return
-	}
-	response, err := s.diskImagesDao.List().
-		SetFilter(fmt.Sprintf("this.id == %[1]s || this.metadata.name == %[1]s", strconv.Quote(key))).
-		SetLimit(1).
-		Do(ctx)
-	if err != nil {
-		var deniedErr *dao.ErrDenied
-		if errors.As(err, &deniedErr) {
-			err = grpcstatus.Errorf(grpccodes.PermissionDenied, "%s", deniedErr.Reason)
-			return
-		}
-		s.logger.ErrorContext(ctx, "Failed to lookup disk image",
-			slog.String("key", key),
-			slog.Any("error", err))
-		err = grpcstatus.Errorf(grpccodes.Internal, "failed to lookup disk image")
-		return
-	}
-	switch response.GetTotal() {
-	case 0:
-		err = grpcstatus.Errorf(
-			grpccodes.NotFound,
-			"there is no disk image with identifier or name '%s'",
-			key,
-		)
-	case 1:
-		result = response.GetItems()[0]
-	default:
-		err = grpcstatus.Errorf(
-			grpccodes.InvalidArgument,
-			"there are multiple disk images with identifier or name '%s'",
-			key,
-		)
-	}
-	return
-}
-
-// ensureFedoraDiskImage lazily seeds the "fedora-workaround" DiskImage in the shared tenant
-// if it doesn't already exist.
-// TEMPORARY WORKAROUND: remove after osac-test-infra provides disk_image in Create requests.
-func (s *PrivateComputeInstancesServer) ensureFedoraDiskImage(ctx context.Context) {
-	// Check existence first — a failed insert poisons the PostgreSQL transaction
-	// (SQLSTATE 25P02), making all subsequent queries in the same transaction fail.
-	existing, _ := s.lookupDiskImage(ctx, "fedora-workaround")
-	if existing != nil {
-		return
-	}
-
-	di := privatev1.DiskImage_builder{
-		Metadata: privatev1.Metadata_builder{
-			Name:    "fedora-workaround",
-			Tenant:  auth.SharedTenant,
-			Creator: "system",
-		}.Build(),
-		Spec: privatev1.DiskImageSpec_builder{
-			SourceType:    privatev1.SourceType_SOURCE_TYPE_REGISTRY,
-			SourceRef:     "quay.io/containerdisks/fedora:latest",
-			GuestOsFamily: privatev1.GuestOSFamily_GUEST_OS_FAMILY_LINUX,
-			Architecture: []privatev1.Architecture{
-				privatev1.Architecture_ARCHITECTURE_AMD64,
-			},
-			Lifecycle: privatev1.DiskImageLifecycle_DISK_IMAGE_LIFECYCLE_AVAILABLE,
-		}.Build(),
-	}.Build()
-	_, err := s.diskImagesDao.Create().SetObject(di).Do(ctx)
-	if err != nil {
-		var alreadyExists *dao.ErrAlreadyExists
-		if !errors.As(err, &alreadyExists) {
-			s.logger.WarnContext(ctx, "Failed to seed default DiskImage",
-				slog.Any("error", err))
-		}
-	}
-}
-
-// validateDiskImage resolves the disk_image reference, validates lifecycle state, and
-// backfills id+name on the stored reference. Returns warnings for DEPRECATED images.
+// validateDiskImage resolves the disk_image reference via the shared
+// validateDiskImageState helper (catalog_item_validation.go), which performs the
+// id-or-name lookup and lifecycle validation shared with the Template and CatalogItem
+// servers. On success it backfills id/name/shared on the stored reference so it is
+// complete, and returns warnings for DEPRECATED images.
 func (s *PrivateComputeInstancesServer) validateDiskImage(
 	ctx context.Context,
 	ci *privatev1.ComputeInstance,
@@ -730,32 +649,15 @@ func (s *PrivateComputeInstancesServer) validateDiskImage(
 		return nil, nil
 	}
 
-	diskImage, err := s.lookupDiskImage(ctx, key)
+	diskImage, warnings, err := validateDiskImageState(ctx, s.diskImagesDao, key, "", "")
 	if err != nil {
 		return nil, err
 	}
 
-	// Backfill id and name so the stored reference is complete.
+	// Backfill id, name, and shared so the stored reference is complete.
 	diskImageRef.Id = diskImage.GetId()
 	diskImageRef.Name = diskImage.GetMetadata().GetName()
 	diskImageRef.Shared = diskImage.GetMetadata().GetTenant() == auth.SharedTenant
-
-	lifecycle := diskImage.GetSpec().GetLifecycle()
-	var warnings []string
-
-	switch lifecycle {
-	case privatev1.DiskImageLifecycle_DISK_IMAGE_LIFECYCLE_OBSOLETE:
-		return nil, grpcstatus.Errorf(grpccodes.FailedPrecondition,
-			"disk image '%s' is obsolete and cannot be used", key)
-	case privatev1.DiskImageLifecycle_DISK_IMAGE_LIFECYCLE_DEPRECATED:
-		warning := fmt.Sprintf("Disk image '%s' is deprecated", key)
-		dep := diskImage.GetSpec().GetDeprecation()
-		if dep != nil && dep.GetObsolescenceTimestamp() != nil {
-			warning += fmt.Sprintf(" and will become obsolete on %s",
-				dep.GetObsolescenceTimestamp().AsTime().Format(time.RFC3339))
-		}
-		warnings = append(warnings, warning)
-	}
 
 	return warnings, nil
 }

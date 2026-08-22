@@ -140,12 +140,36 @@ is_tenant_idp_manager if {
   role in tenant_idp_manager_roles
 }
 
-# Check if an account is a regular client (no admin, tenant management roles):
+# CSI driver realm roles. The OSAC CSI driver's Keycloak service account is granted the
+# "osac-csi-driver" realm role. The role name is distinct from VAST's array-side VMS role
+# "osac-csi-<tenant>" to avoid collision. Short term the driver uses a single shared client;
+# the end state is a per-tenant client ("osac-csi-driver-<tenant>") carrying that tenant's
+# organization claim.
+csi_client_roles := {
+  "osac-csi-driver",
+}
+
+# CSI driver identity. Authorization keys on the "osac-csi-driver" realm role - assigned only by a
+# realm administrator - rather than on the username. Keying on the username would be unsafe:
+# users and service accounts share the same username field, so an ordinary user could obtain
+# CSI permissions by choosing a matching username. The CSI driver is a restricted identity -
+# not an admin and not a general client: it may only manage volumes through the private
+# Volume API. Tenant scoping is enforced by the application layer (generic server) via the
+# identity's organization claim; this policy only gates the method set.
+default is_csi = false
+is_csi if {
+  input.auth.identity.authnMethod == "jwt"
+  some role in subject_realm_roles
+  role in csi_client_roles
+}
+
+# Check if an account is a regular client (no admin, tenant management, or CSI roles):
 default is_client = false
 is_client if {
   not is_admin
   not is_tenant_admin
   not is_tenant_idp_manager
+  not is_csi
 }
 
 # Check if account has client-level permissions (clients, tenant admins, or IdP managers):
@@ -221,11 +245,6 @@ allow if {
     "/osac.public.v1.HostTypes/List",
     "/osac.public.v1.InstanceTypes/Get",
     "/osac.public.v1.InstanceTypes/List",
-    "/osac.public.v1.NetworkClasses/Create",
-    "/osac.public.v1.NetworkClasses/Delete",
-    "/osac.public.v1.NetworkClasses/Get",
-    "/osac.public.v1.NetworkClasses/List",
-    "/osac.public.v1.NetworkClasses/Update",
     "/osac.public.v1.Subnets/Create",
     "/osac.public.v1.Subnets/Delete",
     "/osac.public.v1.Subnets/Get",
@@ -341,6 +360,20 @@ allow if {
   is_admin
 }
 
+# The CSI driver identity may only manage volumes through the private Volume API
+# (OSAC-3279). Tenant scoping is enforced by the application layer via the identity's
+# organization claim; this rule only gates the permitted method set. Publish/unpublish on
+# the internal Storage Control Plane API is handled separately (OSAC-3278).
+allow if {
+  is_csi
+  grpc_method in {
+    "/osac.private.v1.Volumes/Create",
+    "/osac.private.v1.Volumes/Get",
+    "/osac.private.v1.Volumes/Delete",
+    "/osac.private.v1.Volumes/List",
+  }
+}
+
 # Project authorization
 # All authenticated users with client permissions can list projects
 # (application layer filters results based on actual project memberships)
@@ -419,11 +452,24 @@ subject_user = split(input.auth.identity.user.username, ":")[3] if {
 subject_tenant_result = ["*"] if {
   is_admin
 }
+
+# TEMPORARY (shared CSI model, OSAC-4109): the CSI driver currently authenticates with a
+# single shared "osac-csi-driver" client that has no per-tenant organization claim, so it is
+# granted universal tenant scope here. The tenant a volume belongs to is carried on the
+# request (metadata.tenant, from the StorageClass "tenant" parameter) rather than enforced by
+# identity. This is a deliberate short-term shortcut: it means fulfillment does NOT enforce
+# tenant isolation by identity for CSI calls. Remove this rule (and the "not is_csi" guards
+# below) once per-tenant "osac-csi-driver-<tenant>" clients land - tracked in OSAC-4197.
+subject_tenant_result = ["*"] if {
+  is_csi
+}
 subject_tenant_result = subject_tenants if {
   not is_admin
+  not is_csi
   input.auth.identity.authnMethod == "jwt"
 }
 subject_tenant_result = [split(input.auth.identity.user.username, ":")[2]] if {
   not is_admin
+  not is_csi
   input.auth.identity.authnMethod == "serviceaccount"
 }

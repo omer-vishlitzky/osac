@@ -1119,8 +1119,7 @@ var _ = Describe("Private compute instances server", func() {
 			Expect(ok).To(BeTrue())
 			Expect(status.Code()).To(Equal(grpccodes.InvalidArgument))
 			Expect(status.Message()).To(ContainSubstring("boot_disk"))
-			// TEMPORARY: skipped — fedora disk_image workaround (OSAC-3714) injects disk_image before validation
-			// Expect(status.Message()).To(ContainSubstring("image"))
+			Expect(status.Message()).To(ContainSubstring("image"))
 			Expect(status.Message()).To(ContainSubstring("instance_type"))
 			Expect(status.Message()).To(ContainSubstring("run_strategy"))
 		})
@@ -1639,8 +1638,7 @@ var _ = Describe("Private compute instances server", func() {
 				Expect(ok).To(BeTrue())
 				Expect(status.Code()).To(Equal(grpccodes.InvalidArgument))
 				Expect(status.Message()).To(ContainSubstring("instance_type"))
-				// TEMPORARY: skipped — fedora disk_image workaround (OSAC-3714) injects disk_image before validation
-				// Expect(status.Message()).To(ContainSubstring("image"))
+				Expect(status.Message()).To(ContainSubstring("image"))
 				Expect(status.Message()).To(ContainSubstring("boot_disk"))
 				Expect(status.Message()).To(ContainSubstring("run_strategy"))
 			})
@@ -2973,29 +2971,6 @@ var _ = Describe("Private compute instances server", func() {
 		})
 
 		Context("disk_image validation", func() {
-			createDiskImageWithLifecycle := func(name string, lifecycle privatev1.DiskImageLifecycle, deprecation *privatev1.DiskImageDeprecation) {
-				diskImagesDao, err := dao.NewGenericDAO[*privatev1.DiskImage]().
-					SetLogger(logger).
-					SetTenancyLogic(tenancy).
-					Build()
-				Expect(err).ToNot(HaveOccurred())
-
-				_, err = diskImagesDao.Create().SetObject(
-					privatev1.DiskImage_builder{
-						Id: name,
-						Metadata: privatev1.Metadata_builder{
-							Name:   name,
-							Tenant: auth.SharedTenant,
-						}.Build(),
-						Spec: privatev1.DiskImageSpec_builder{
-							Lifecycle:   lifecycle,
-							Deprecation: deprecation,
-						}.Build(),
-					}.Build(),
-				).Do(ctx)
-				Expect(err).ToNot(HaveOccurred())
-			}
-
 			createRequestWithDiskImage := func(diskImageKey string) *privatev1.ComputeInstancesCreateRequest {
 				templatesDao, err := dao.NewGenericDAO[*privatev1.ComputeInstanceTemplate]().
 					SetLogger(logger).

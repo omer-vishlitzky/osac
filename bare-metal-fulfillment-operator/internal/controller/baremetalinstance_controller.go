@@ -97,7 +97,7 @@ func NewBareMetalInstanceReconciler(
 // +kubebuilder:rbac:groups=osac.openshift.io,resources=baremetalinstances,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=osac.openshift.io,resources=baremetalinstances/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=osac.openshift.io,resources=baremetalinstances/finalizers,verbs=update
-// +kubebuilder:rbac:groups=metal3.io,resources=baremetalhosts,verbs=get;list;watch;update;patch
+// +kubebuilder:rbac:groups=metal3.io,resources=baremetalhosts,verbs=create;delete;get;list;watch;update;patch
 // +kubebuilder:rbac:groups=osac.openshift.io,resources=subnets,verbs=get;list;watch
 // +kubebuilder:rbac:groups=osac.openshift.io,resources=networkclasses,verbs=get;list;watch
 
@@ -407,9 +407,30 @@ func (r *BareMetalInstanceReconciler) reconcileManagement(ctx context.Context, b
 		}
 	}
 
+	if err := r.reconcileNICMetadata(ctx, bareMetalInstance); err != nil {
+		bareMetalInstance.Status.Phase = v1alpha1.BareMetalInstancePhaseProgressing
+		return ctrl.Result{}, err
+	}
+
 	bareMetalInstance.Status.Phase = v1alpha1.BareMetalInstancePhaseReady
 	log.Info("BareMetalInstance reconcile completed; status changes pending persistence", "bareMetalInstance", bareMetalInstance.Name)
 	return ctrl.Result{}, nil
+}
+
+func (r *BareMetalInstanceReconciler) reconcileNICMetadata(ctx context.Context, bmi *v1alpha1.BareMetalInstance) error {
+	if bmi.Status.Hardware != nil {
+		return nil
+	}
+	nics, err := r.InventoryClient.GetHostNICs(ctx, bmi.Spec.ExternalHostID)
+	if err != nil {
+		return err
+	}
+	hw := &v1alpha1.BareMetalHardware{}
+	for _, n := range nics {
+		hw.NICs = append(hw.NICs, v1alpha1.BareMetalNICStatus{MAC: n.MAC})
+	}
+	bmi.Status.Hardware = hw
+	return nil
 }
 
 // reconcilePower drives the host's power state toward the desired RunStrategy.

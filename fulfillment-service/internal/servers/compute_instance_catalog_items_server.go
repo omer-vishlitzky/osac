@@ -119,6 +119,7 @@ func (b *ComputeInstanceCatalogItemsServerBuilder) Build() (result *ComputeInsta
 		SetAttributionLogic(b.attributionLogic).
 		SetTenancyLogic(b.tenancyLogic).
 		SetMetricsRegisterer(b.metricsRegisterer).
+		SetFilterDesc((*publicv1.ComputeInstanceCatalogItem)(nil).ProtoReflect().Descriptor()).
 		Build()
 	if err != nil {
 		return
@@ -138,7 +139,9 @@ func (s *ComputeInstanceCatalogItemsServer) List(ctx context.Context,
 	request *publicv1.ComputeInstanceCatalogItemsListRequest) (response *publicv1.ComputeInstanceCatalogItemsListResponse, err error) {
 	privateRequest := &privatev1.ComputeInstanceCatalogItemsListRequest{}
 	privateRequest.SetOffset(request.GetOffset())
-	privateRequest.SetLimit(request.GetLimit())
+	if request.HasLimit() {
+		privateRequest.SetLimit(request.GetLimit())
+	}
 	composedFilter, err := s.addPublishedFilter(request.GetFilter())
 	if err != nil {
 		return nil, err

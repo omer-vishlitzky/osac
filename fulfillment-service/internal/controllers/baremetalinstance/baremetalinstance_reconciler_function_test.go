@@ -1967,6 +1967,54 @@ var _ = Describe("syncStatus", func() {
 			privatev1.BareMetalInstanceConditionType_BARE_METAL_INSTANCE_CONDITION_TYPE_PROVISIONED)
 		Expect(cond.GetStatus()).ToNot(Equal(privatev1.ConditionStatus_CONDITION_STATUS_TRUE))
 	})
+
+	It("should propagate hardware.nics when CRD Hardware is non-nil and lowercase MACs", func() {
+		t := newTask(0)
+		object := &bmfov1alpha1.BareMetalInstance{
+			Status: bmfov1alpha1.BareMetalInstanceStatus{
+				Hardware: &bmfov1alpha1.BareMetalHardware{
+					NICs: []bmfov1alpha1.BareMetalNICStatus{
+						{MAC: "AA:BB:CC:DD:EE:01"}, // uppercase input — must be lowercased
+					},
+				},
+			},
+		}
+		t.syncStatus(object)
+		Expect(t.bareMetalInstance.GetStatus().HasHardware()).To(BeTrue())
+		Expect(t.bareMetalInstance.GetStatus().GetHardware().GetNics()).To(HaveLen(1))
+		Expect(t.bareMetalInstance.GetStatus().GetHardware().GetNics()[0].GetMac()).To(Equal("aa:bb:cc:dd:ee:01"))
+	})
+
+	It("should omit hardware field when CRD Hardware is nil", func() {
+		t := newTask(0)
+		object := &bmfov1alpha1.BareMetalInstance{
+			Status: bmfov1alpha1.BareMetalInstanceStatus{
+				Hardware: nil,
+			},
+		}
+		t.syncStatus(object)
+		Expect(t.bareMetalInstance.GetStatus().HasHardware()).To(BeFalse())
+	})
+
+	It("should clear previously-set hardware when CRD Hardware becomes nil", func() {
+		t := newTask(0)
+		// First sync: hardware present
+		withHardware := &bmfov1alpha1.BareMetalInstance{
+			Status: bmfov1alpha1.BareMetalInstanceStatus{
+				Hardware: &bmfov1alpha1.BareMetalHardware{
+					NICs: []bmfov1alpha1.BareMetalNICStatus{{MAC: "aa:bb:cc:dd:ee:01"}},
+				},
+			},
+		}
+		t.syncStatus(withHardware)
+		Expect(t.bareMetalInstance.GetStatus().HasHardware()).To(BeTrue())
+
+		// Second sync: hardware nil — must clear stale data
+		t.syncStatus(&bmfov1alpha1.BareMetalInstance{
+			Status: bmfov1alpha1.BareMetalInstanceStatus{Hardware: nil},
+		})
+		Expect(t.bareMetalInstance.GetStatus().HasHardware()).To(BeFalse())
+	})
 })
 
 var _ = Describe("sanitizeConditionMessage", func() {

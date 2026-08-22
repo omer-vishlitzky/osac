@@ -212,6 +212,20 @@ type HostSelectorSpec struct {
 	HostSelector map[string]string `json:"hostSelector,omitempty"`
 }
 
+// BareMetalNICStatus holds the MAC address of a single physical network interface.
+type BareMetalNICStatus struct {
+	// MAC is the hardware MAC address of this interface, lowercased (e.g. "aa:bb:cc:dd:ee:ff").
+	// +kubebuilder:validation:Pattern=`^[0-9a-f]{2}(:[0-9a-f]{2}){5}$`
+	MAC string `json:"mac"`
+}
+
+// BareMetalHardware holds physical hardware metadata discovered from the inventory backend.
+type BareMetalHardware struct {
+	// NICs lists the physical network interfaces reported by the inventory backend.
+	// +kubebuilder:validation:Optional
+	NICs []BareMetalNICStatus `json:"nics,omitempty"`
+}
+
 // BareMetalNetworkAttachmentStatus captures the runtime networking state for a single NIC.
 type BareMetalNetworkAttachmentStatus struct {
 	// Interface is the physical interface name from the spec's network attachment.
@@ -260,6 +274,10 @@ type BareMetalInstanceStatus struct {
 	// Populated by the operator after DHCP lease discovery.
 	// +kubebuilder:validation:Optional
 	NetworkAttachmentStatuses []BareMetalNetworkAttachmentStatus `json:"networkAttachmentStatuses,omitempty"`
+	// Hardware holds physical hardware metadata fetched from the inventory backend at allocation time.
+	// Absent until the inventory backend provides data.
+	// +kubebuilder:validation:Optional
+	Hardware *BareMetalHardware `json:"hardware,omitempty"`
 }
 
 // GetPoolID returns the owning BareMetalPool UID if the BareMetalInstance is owned by a BareMetalPool.

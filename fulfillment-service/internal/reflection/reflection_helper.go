@@ -77,26 +77,29 @@ type ObjectHelper interface {
 	SetTenant(object proto.Message, tenant string)
 	GetTenant(object proto.Message) string
 	IsTenantScoped() bool
+	UseGetForStructuredOutput() bool
 }
 
 // HelperBuilder contains the data and logic needed to create a reflection helper.
 //
 // Don't create instances of this type directly, use the NewHelper function instead.
 type HelperBuilder struct {
-	logger     *slog.Logger
-	connection *grpc.ClientConn
-	packages   map[string]int
-	tenantFunc any
+	logger                      *slog.Logger
+	connection                  *grpc.ClientConn
+	packages                    map[string]int
+	tenantFunc                  any
+	getForStructuredOutputTypes map[protoreflect.Name]bool
 }
 
 // helper is the default implementation of the Helper interface.
 type helper struct {
-	logger     *slog.Logger
-	connection *grpc.ClientConn
-	packages   map[protoreflect.FullName]int
-	scanOnce   *sync.Once
-	helpers    []objectHelper
-	tenantFunc func(context.Context) (string, error)
+	logger                      *slog.Logger
+	connection                  *grpc.ClientConn
+	packages                    map[protoreflect.FullName]int
+	scanOnce                    *sync.Once
+	helpers                     []objectHelper
+	tenantFunc                  func(context.Context) (string, error)
+	getForStructuredOutputTypes map[protoreflect.Name]bool
 }
 
 // NewHelper creates a builder that can then be used to configure a reflection helper.
@@ -153,6 +156,20 @@ func (b *HelperBuilder) SetTenantFunc(value any) *HelperBuilder {
 	return b
 }
 
+// UseGetForStructuredOutput marks the given proto message types as requiring the Get RPC instead
+// of List when fetching specific objects for structured output (yaml/json). Callers pass generated
+// proto message pointers so that a proto rename produces a compile error rather than a silent
+// dead entry.
+func (b *HelperBuilder) UseGetForStructuredOutput(msgs ...proto.Message) *HelperBuilder {
+	if b.getForStructuredOutputTypes == nil {
+		b.getForStructuredOutputTypes = make(map[protoreflect.Name]bool)
+	}
+	for _, msg := range msgs {
+		b.getForStructuredOutputTypes[msg.ProtoReflect().Descriptor().Name()] = true
+	}
+	return b
+}
+
 // Build uses the data stored in the builder to create a new reflection helper.
 func (b *HelperBuilder) Build() (result Helper, err error) {
 	// Check the parameters:
@@ -186,12 +203,13 @@ func (b *HelperBuilder) Build() (result Helper, err error) {
 
 	// Create and populate the object:
 	result = &helper{
-		logger:     b.logger,
-		packages:   packages,
-		connection: b.connection,
-		scanOnce:   &sync.Once{},
-		helpers:    []objectHelper{},
-		tenantFunc: tenantFunc,
+		logger:                      b.logger,
+		packages:                    packages,
+		connection:                  b.connection,
+		scanOnce:                    &sync.Once{},
+		helpers:                     []objectHelper{},
+		tenantFunc:                  tenantFunc,
+		getForStructuredOutputTypes: b.getForStructuredOutputTypes,
 	}
 	return
 }
@@ -359,14 +377,15 @@ func (h *helper) scanService(serviceDesc protoreflect.ServiceDescriptor) {
 
 	// This is a supported object type:
 	helper := objectHelper{
-		parent:        h,
-		descriptor:    objectDesc,
-		idField:       idFieldDesc,
-		metadataField: metadataFieldDesc,
-		singular:      objectNameSingular,
-		plural:        objectNamePlural,
-		tenantScoped:  !platformScopedTypes[objectDesc.Name()],
-		template:      objectTemplate,
+		parent:                    h,
+		descriptor:                objectDesc,
+		idField:                   idFieldDesc,
+		metadataField:             metadataFieldDesc,
+		singular:                  objectNameSingular,
+		plural:                    objectNamePlural,
+		tenantScoped:              !platformScopedTypes[objectDesc.Name()],
+		useGetForStructuredOutput: h.getForStructuredOutputTypes[objectDesc.Name()],
+		template:                  objectTemplate,
 		get: getInfo{
 			methodInfo: methodInfo{
 				path:     h.makeMethodPath(getDesc),
@@ -569,19 +588,20 @@ func (h *helper) makeTemplate(messageDesc protoreflect.MessageDescriptor) proto.
 
 // objectHelper is the default implementation of the ObjectHelper interface.
 type objectHelper struct {
-	parent        *helper
-	descriptor    protoreflect.MessageDescriptor
-	singular      string
-	plural        string
-	tenantScoped  bool
-	template      proto.Message
-	list          listInfo
-	get           getInfo
-	create        createInfo
-	update        updateInfo
-	delete        deleteInfo
-	idField       protoreflect.FieldDescriptor
-	metadataField protoreflect.FieldDescriptor
+	parent                    *helper
+	descriptor                protoreflect.MessageDescriptor
+	singular                  string
+	plural                    string
+	tenantScoped              bool
+	useGetForStructuredOutput bool
+	template                  proto.Message
+	list                      listInfo
+	get                       getInfo
+	create                    createInfo
+	update                    updateInfo
+	delete                    deleteInfo
+	idField                   protoreflect.FieldDescriptor
+	metadataField             protoreflect.FieldDescriptor
 }
 
 type methodInfo struct {
@@ -776,6 +796,12 @@ func (h *objectHelper) GetTenant(object proto.Message) string {
 // IsTenantScoped returns true if this resource type is scoped to a tenant.
 func (h *objectHelper) IsTenantScoped() bool {
 	return h.tenantScoped
+}
+
+// UseGetForStructuredOutput returns true if the Get RPC should be used instead of List when
+// fetching specific objects for structured output (yaml/json). Configured via the HelperBuilder.
+func (h *objectHelper) UseGetForStructuredOutput() bool {
+	return h.useGetForStructuredOutput
 }
 
 func (h *objectHelper) setId(message proto.Message, field protoreflect.FieldDescriptor, value string) {

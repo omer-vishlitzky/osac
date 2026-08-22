@@ -175,6 +175,16 @@ func (m *Metal3Client) FindFreeHost(ctx context.Context, matchExpressions map[st
 			continue
 		}
 
+		if bmh.Annotations["inspect.metal3.io"] == "disabled" {
+			log.V(1).Info("Skipping BareMetalHost: hardware inspection disabled", "host", bmh.Name)
+			continue
+		}
+
+		if bmh.Status.HardwareDetails == nil || len(bmh.Status.HardwareDetails.NIC) == 0 {
+			log.Error(nil, "Skipping BareMetalHost: available but NIC inventory is missing — host may be misconfigured or inspection incomplete", "host", bmh.Name)
+			continue
+		}
+
 		managedBy := bmh.Labels[Metal3ManagedByLabel]
 		if managedBy == "" {
 			managedBy = shared.OsacDefaultManagedByValue
@@ -251,6 +261,28 @@ func (m *Metal3Client) AssignHost(ctx context.Context, inventoryHostID string, b
 	}
 
 	return bmhToHost(bmh, m.hostClass), nil
+}
+
+func (m *Metal3Client) GetHostNICs(ctx context.Context, inventoryHostID string) ([]HostNIC, error) {
+	namespace, name, err := ParseHostID(inventoryHostID)
+	if err != nil {
+		return nil, err
+	}
+
+	bmh := &metal3api.BareMetalHost{}
+	if err := m.client.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, bmh); err != nil {
+		return nil, fmt.Errorf("failed to get BareMetalHost %s: %w", inventoryHostID, err)
+	}
+
+	if bmh.Status.HardwareDetails == nil || len(bmh.Status.HardwareDetails.NIC) == 0 {
+		return nil, fmt.Errorf("BareMetalHost %s has no NIC inventory despite being allocated", inventoryHostID)
+	}
+
+	nics := make([]HostNIC, 0, len(bmh.Status.HardwareDetails.NIC))
+	for _, n := range bmh.Status.HardwareDetails.NIC {
+		nics = append(nics, HostNIC{MAC: strings.ToLower(n.MAC)})
+	}
+	return nics, nil
 }
 
 func (m *Metal3Client) UnassignHost(ctx context.Context, inventoryHostID string, labels []string) error {

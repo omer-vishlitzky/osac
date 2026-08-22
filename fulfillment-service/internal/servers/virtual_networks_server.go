@@ -16,7 +16,6 @@ package servers
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log/slog"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -94,20 +93,10 @@ func (b *VirtualNetworksServerBuilder) Build() (result *VirtualNetworksServer, e
 		return
 	}
 
-	// Find the network_class field in VirtualNetworkSpec so that we can configure the inMapper to ignore it.
-	// This prevents public Update from clearing network_class (which would trigger a false immutability error
-	// since the field is now OPTIONAL). The Create method restores network_class explicitly after Copy.
-	ncField := new(publicv1.VirtualNetworkSpec).ProtoReflect().Descriptor().Fields().ByName("network_class")
-	if ncField == nil {
-		err = fmt.Errorf("failed to find the network_class field of type '%s'", new(publicv1.VirtualNetworkSpec).ProtoReflect().Descriptor().FullName())
-		return
-	}
-
 	// Create the mappers:
 	inMapper, err := NewGenericMapper[*publicv1.VirtualNetwork, *privatev1.VirtualNetwork]().
 		SetLogger(b.logger).
 		SetStrict(true).
-		AddIgnoredFields(ncField.FullName()).
 		Build()
 	if err != nil {
 		return
@@ -127,6 +116,7 @@ func (b *VirtualNetworksServerBuilder) Build() (result *VirtualNetworksServer, e
 		SetAttributionLogic(b.attributionLogic).
 		SetTenancyLogic(b.tenancyLogic).
 		SetMetricsRegisterer(b.metricsRegisterer).
+		SetFilterDesc((*publicv1.VirtualNetwork)(nil).ProtoReflect().Descriptor()).
 		Build()
 	if err != nil {
 		return
@@ -147,7 +137,9 @@ func (s *VirtualNetworksServer) List(ctx context.Context,
 	// Create private request with same parameters:
 	privateRequest := &privatev1.VirtualNetworksListRequest{}
 	privateRequest.SetOffset(request.GetOffset())
-	privateRequest.SetLimit(request.GetLimit())
+	if request.HasLimit() {
+		privateRequest.SetLimit(request.GetLimit())
+	}
 	privateRequest.SetFilter(request.GetFilter())
 	privateRequest.SetOrder(request.GetOrder())
 
@@ -233,17 +225,6 @@ func (s *VirtualNetworksServer) Create(ctx context.Context,
 		return
 	}
 
-	// Restore network_class from the public request. AddIgnoredFields drops it during Copy
-	// to protect Update from false immutability errors, but on Create the caller's explicit
-	// network_class must be honored. If empty, the private server applies the default.
-	if publicVirtualNetwork.HasSpec() && privateVirtualNetwork.HasSpec() && publicVirtualNetwork.GetSpec().GetNetworkClass() != nil {
-		pubNC := publicVirtualNetwork.GetSpec().GetNetworkClass()
-		privNC := &privatev1.NetworkClassReference{}
-		privNC.SetId(pubNC.GetId())
-		privNC.SetName(pubNC.GetName())
-		privateVirtualNetwork.GetSpec().SetNetworkClass(privNC)
-	}
-
 	// Set default region if not provided (public API doesn't expose region):
 	if privateVirtualNetwork.HasSpec() && privateVirtualNetwork.GetSpec().GetRegion() == "" {
 		privateVirtualNetwork.GetSpec().SetRegion("default")
@@ -299,18 +280,6 @@ func (s *VirtualNetworksServer) Update(ctx context.Context,
 		return nil, err
 	}
 	existingPrivateVirtualNetwork := getResponse.GetObject()
-
-	// Reject explicit network_class changes — the mapper ignores this field to prevent false
-	// immutability errors on Update, but without this check a client sending a different value
-	// gets silent success instead of the expected immutability error.
-	if publicVirtualNetwork.HasSpec() && publicVirtualNetwork.GetSpec().GetNetworkClass() != nil {
-		existingNC := existingPrivateVirtualNetwork.GetSpec().GetNetworkClass()
-		pubNC := publicVirtualNetwork.GetSpec().GetNetworkClass()
-		if refKey(pubNC) != refKey(existingNC) {
-			return nil, grpcstatus.Errorf(grpccodes.InvalidArgument,
-				"field 'spec.network_class' is immutable and cannot be changed")
-		}
-	}
 
 	// Map the public changes to the existing private object (preserving private data):
 	err = s.inMapper.Copy(ctx, publicVirtualNetwork, existingPrivateVirtualNetwork)

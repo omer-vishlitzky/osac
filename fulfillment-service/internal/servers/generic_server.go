@@ -52,6 +52,7 @@ type GenericServerBuilder[O dao.Object] struct {
 	attributionLogic  auth.AttributionLogic
 	tenancyLogic      auth.TenancyLogic
 	metricsRegisterer prometheus.Registerer
+	filterDesc        protoreflect.MessageDescriptor
 }
 
 // GenericServer is a gRPC server that knows how to implement the List, Get, Create, Update and Delete operators for
@@ -173,6 +174,14 @@ func (b *GenericServerBuilder[O]) SetMetricsRegisterer(value prometheus.Register
 	return b
 }
 
+// SetFilterDesc sets the protobuf message descriptor used to validate and translate CEL filter expressions. This is
+// optional. When unset, the descriptor of the O generic parameter is used. Forwarded to
+// [dao.GenericDAOBuilder.SetFilterDesc].
+func (b *GenericServerBuilder[O]) SetFilterDesc(value protoreflect.MessageDescriptor) *GenericServerBuilder[O] {
+	b.filterDesc = value
+	return b
+}
+
 // Build uses the configuration stored in the builder to create and configure a new generic server.
 func (b *GenericServerBuilder[O]) Build() (result *GenericServer[O], err error) {
 	// Check parameters:
@@ -231,6 +240,7 @@ func (b *GenericServerBuilder[O]) Build() (result *GenericServer[O], err error) 
 	if b.table != "" {
 		daoBuilder.SetTableName(b.table)
 	}
+	daoBuilder.SetFilterDesc(b.filterDesc)
 	daoBuilder.SetTenancyLogic(b.tenancyLogic)
 	if b.notifier != nil {
 		daoBuilder.AddEventCallback(s.notifyEvent)
@@ -379,17 +389,24 @@ func (s *GenericServer[O]) List(ctx context.Context, request any, response any) 
 	type requestIface interface {
 		GetOffset() int32
 		GetLimit() int32
+		HasLimit() bool
 		GetFilter() string
 	}
 	requestMsg := request.(requestIface)
 
 	// List the objects:
-	daoResponse, err := s.dao.List().
+	listRequest := s.dao.List().
 		SetFilter(requestMsg.GetFilter()).
-		SetOffset(requestMsg.GetOffset()).
-		SetLimit(requestMsg.GetLimit()).
-		Do(ctx)
+		SetOffset(requestMsg.GetOffset())
+	if requestMsg.HasLimit() {
+		listRequest.SetLimit(requestMsg.GetLimit())
+	}
+	daoResponse, err := listRequest.Do(ctx)
 	if err != nil {
+		var validationErr *dao.ErrValidation
+		if errors.As(err, &validationErr) {
+			return grpcstatus.Errorf(grpccodes.InvalidArgument, "%s", validationErr.Reason)
+		}
 		var deniedErr *dao.ErrDenied
 		if errors.As(err, &deniedErr) {
 			return grpcstatus.Errorf(grpccodes.PermissionDenied, "%s", deniedErr.Reason)
@@ -397,6 +414,10 @@ func (s *GenericServer[O]) List(ctx context.Context, request any, response any) 
 		var deadlockErr *dao.ErrDeadlock
 		if errors.As(err, &deadlockErr) {
 			return grpcstatus.Errorf(grpccodes.Aborted, "%s", deadlockErr.Error())
+		}
+		var invalidFilterErr *dao.ErrInvalidFilter
+		if errors.As(err, &invalidFilterErr) {
+			return grpcstatus.Errorf(grpccodes.InvalidArgument, "%s", invalidFilterErr.Error())
 		}
 		s.logger.ErrorContext(
 			ctx,

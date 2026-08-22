@@ -157,6 +157,12 @@ func (r *Reconciler) reconcileFulfillmentResources(ctx context.Context, fulfillm
 	for id, fs := range fulfillmentState {
 		ps, exists := projMap[id]
 		if !exists {
+			if isTransientForType(fs.resourceType, fs.state) {
+				r.logger.V(1).Info("fulfillment reports transient state for unknown resource, skipping",
+					"resource_id", id,
+					"fulfillment_state", fs.state)
+				continue
+			}
 			if err := r.publishCorrections(ctx, id, fs.resourceType, fs.tenantID, fs.projectID,
 				MissedCreation, "", fs.state, fs.billingDimensions, now); err != nil {
 				return corrections, err
@@ -207,6 +213,20 @@ func (r *Reconciler) reconcileFulfillmentResources(ctx context.Context, fulfillm
 			ps.FulfillmentVersion = fs.version
 			if err := r.store.Upsert(ctx, ps); err != nil && !errors.Is(err, projection.ErrStaleVersion) {
 				return corrections, fmt.Errorf("advancing fulfillment version for %s: %w", id, err)
+			}
+			continue
+		}
+
+		if isTransientForType(fs.resourceType, fs.state) {
+			if fs.version > ps.FulfillmentVersion {
+				r.logger.V(1).Info("fulfillment reports transient state, advancing version only",
+					"resource_id", id,
+					"projection_state", ps.CurrentState,
+					"fulfillment_state", fs.state)
+				ps.FulfillmentVersion = fs.version
+				if err := r.store.Upsert(ctx, ps); err != nil && !errors.Is(err, projection.ErrStaleVersion) {
+					return corrections, fmt.Errorf("advancing version for transient state %s: %w", id, err)
+				}
 			}
 			continue
 		}
@@ -369,6 +389,23 @@ type fulfillmentResource struct {
 var billabilityCheckers = map[string]func(string) bool{
 	events.ResourceTypeComputeInstance: events.IsBillableState,
 	events.ResourceTypeClusterOrder:    events.IsClusterBillableState,
+}
+
+var transientCheckers = map[string]func(string) bool{
+	events.ResourceTypeComputeInstance: events.IsTransientState,
+	events.ResourceTypeClusterOrder:    events.IsClusterTransientState,
+}
+
+// isTransientForType reports whether the given state is transient for the
+// resource type. Returns bool (not (bool, error) like isBillableForType)
+// because unknown resource types have no transient states — returning false
+// is correct, not an error.
+func isTransientForType(resourceType, state string) bool {
+	checker, ok := transientCheckers[resourceType]
+	if !ok {
+		return false
+	}
+	return checker(state)
 }
 
 func isBillableForType(resourceType, state string) (bool, error) {

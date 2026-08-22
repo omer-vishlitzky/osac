@@ -116,6 +116,7 @@ func (b *SubnetsServerBuilder) Build() (result *SubnetsServer, err error) {
 		SetAttributionLogic(b.attributionLogic).
 		SetTenancyLogic(b.tenancyLogic).
 		SetMetricsRegisterer(b.metricsRegisterer).
+		SetFilterDesc((*publicv1.Subnet)(nil).ProtoReflect().Descriptor()).
 		Build()
 	if err != nil {
 		return
@@ -136,7 +137,9 @@ func (s *SubnetsServer) List(ctx context.Context,
 	// Create private request with same parameters:
 	privateRequest := &privatev1.SubnetsListRequest{}
 	privateRequest.SetOffset(request.GetOffset())
-	privateRequest.SetLimit(request.GetLimit())
+	if request.HasLimit() {
+		privateRequest.SetLimit(request.GetLimit())
+	}
 	privateRequest.SetFilter(request.GetFilter())
 	privateRequest.SetOrder(request.GetOrder())
 

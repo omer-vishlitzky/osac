@@ -20,6 +20,8 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
+	"google.golang.org/protobuf/reflect/protoreflect"
+
 	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
 	"github.com/osac-project/osac/fulfillment-service/internal/database/dao"
@@ -32,6 +34,7 @@ type PrivateComputeInstanceTemplatesServerBuilder struct {
 	attributionLogic  auth.AttributionLogic
 	tenancyLogic      auth.TenancyLogic
 	metricsRegisterer prometheus.Registerer
+	filterDesc        protoreflect.MessageDescriptor
 }
 
 var _ privatev1.ComputeInstanceTemplatesServer = (*PrivateComputeInstanceTemplatesServer)(nil)
@@ -41,6 +44,7 @@ type PrivateComputeInstanceTemplatesServer struct {
 	logger           *slog.Logger
 	generic          *GenericServer[*privatev1.ComputeInstanceTemplate]
 	instanceTypesDao *dao.GenericDAO[*privatev1.InstanceType]
+	diskImagesDao    *dao.GenericDAO[*privatev1.DiskImage]
 }
 
 func NewPrivateComputeInstanceTemplatesServer() *PrivateComputeInstanceTemplatesServerBuilder {
@@ -74,6 +78,13 @@ func (b *PrivateComputeInstanceTemplatesServerBuilder) SetMetricsRegisterer(valu
 	return b
 }
 
+// SetFilterDesc sets the protobuf message descriptor used to validate and translate CEL filter
+// expressions. This is optional. When unset, the descriptor of this server's own private message type is used.
+func (b *PrivateComputeInstanceTemplatesServerBuilder) SetFilterDesc(value protoreflect.MessageDescriptor) *PrivateComputeInstanceTemplatesServerBuilder {
+	b.filterDesc = value
+	return b
+}
+
 func (b *PrivateComputeInstanceTemplatesServerBuilder) Build() (result *PrivateComputeInstanceTemplatesServer, err error) {
 	// Check parameters:
 	if b.logger == nil {
@@ -95,6 +106,16 @@ func (b *PrivateComputeInstanceTemplatesServerBuilder) Build() (result *PrivateC
 		return
 	}
 
+	// Create the DiskImages DAO for spec_defaults disk image validation:
+	diskImagesDao, err := dao.NewGenericDAO[*privatev1.DiskImage]().
+		SetLogger(b.logger).
+		SetTenancyLogic(b.tenancyLogic).
+		SetMetricsRegisterer(b.metricsRegisterer).
+		Build()
+	if err != nil {
+		return
+	}
+
 	// Create the generic server:
 	generic, err := NewGenericServer[*privatev1.ComputeInstanceTemplate]().
 		SetLogger(b.logger).
@@ -103,6 +124,7 @@ func (b *PrivateComputeInstanceTemplatesServerBuilder) Build() (result *PrivateC
 		SetAttributionLogic(b.attributionLogic).
 		SetTenancyLogic(b.tenancyLogic).
 		SetMetricsRegisterer(b.metricsRegisterer).
+		SetFilterDesc(b.filterDesc).
 		Build()
 	if err != nil {
 		return
@@ -113,6 +135,7 @@ func (b *PrivateComputeInstanceTemplatesServerBuilder) Build() (result *PrivateC
 		logger:           b.logger,
 		generic:          generic,
 		instanceTypesDao: instanceTypesDao,
+		diskImagesDao:    diskImagesDao,
 	}
 	return
 }
@@ -139,13 +162,20 @@ func (s *PrivateComputeInstanceTemplatesServer) Create(ctx context.Context,
 		obj.GetMetadata().SetName(templateNameFromID(obj.GetId()))
 	}
 
-	// Validate instance type in spec_defaults before creating (D-14, D-17).
+	// Validate instance type and disk image in spec_defaults before creating (D-14, D-17).
 	var warnings []string
 	if request.GetObject() != nil {
-		warnings, err = s.validateSpecDefaultsInstanceType(ctx, request.GetObject().GetSpecDefaults())
+		specDefaults := request.GetObject().GetSpecDefaults()
+		warnings, err = s.validateSpecDefaultsInstanceType(ctx, specDefaults)
 		if err != nil {
 			return
 		}
+		var diskImageWarnings []string
+		diskImageWarnings, err = s.validateSpecDefaultsDiskImage(ctx, specDefaults)
+		if err != nil {
+			return
+		}
+		warnings = append(warnings, diskImageWarnings...)
 	}
 	err = s.generic.Create(ctx, request, &response)
 	if err != nil {
@@ -159,13 +189,20 @@ func (s *PrivateComputeInstanceTemplatesServer) Create(ctx context.Context,
 
 func (s *PrivateComputeInstanceTemplatesServer) Update(ctx context.Context,
 	request *privatev1.ComputeInstanceTemplatesUpdateRequest) (response *privatev1.ComputeInstanceTemplatesUpdateResponse, err error) {
-	// Validate instance type in spec_defaults before updating (D-14, D-17).
+	// Validate instance type and disk image in spec_defaults before updating (D-14, D-17).
 	var warnings []string
 	if request.GetObject() != nil {
-		warnings, err = s.validateSpecDefaultsInstanceType(ctx, request.GetObject().GetSpecDefaults())
+		specDefaults := request.GetObject().GetSpecDefaults()
+		warnings, err = s.validateSpecDefaultsInstanceType(ctx, specDefaults)
 		if err != nil {
 			return
 		}
+		var diskImageWarnings []string
+		diskImageWarnings, err = s.validateSpecDefaultsDiskImage(ctx, specDefaults)
+		if err != nil {
+			return
+		}
+		warnings = append(warnings, diskImageWarnings...)
 	}
 	err = s.generic.Update(ctx, request, &response)
 	if err != nil {
@@ -203,4 +240,25 @@ func (s *PrivateComputeInstanceTemplatesServer) validateSpecDefaultsInstanceType
 
 	// Look up the instance type and validate its state.
 	return validateInstanceTypeState(ctx, s.instanceTypesDao, instanceTypeName, " in spec_defaults")
+}
+
+// validateSpecDefaultsDiskImage validates the optional disk_image reference in template
+// spec_defaults. It resolves the reference through the tenant-filtered DiskImages DAO
+// (a missing or cross-tenant image resolves to NotFound) and validates lifecycle:
+// OBSOLETE is rejected, DEPRECATED yields a warning. The gRPC reference-validation
+// interceptor performs the same existence check earlier and backfills the reference id.
+func (s *PrivateComputeInstanceTemplatesServer) validateSpecDefaultsDiskImage(
+	ctx context.Context,
+	specDefaults *privatev1.ComputeInstanceTemplateSpecDefaults,
+) ([]string, error) {
+	if specDefaults == nil || !specDefaults.HasDiskImage() || specDefaults.GetDiskImage() == nil {
+		return nil, nil
+	}
+
+	diskImageKey := refKey(specDefaults.GetDiskImage())
+
+	// Look up the disk image and validate its state. The resolved object is not needed
+	// here — the interceptor already backfills id/name on the stored reference.
+	_, warnings, err := validateDiskImageState(ctx, s.diskImagesDao, diskImageKey, "", " in spec_defaults")
+	return warnings, err
 }

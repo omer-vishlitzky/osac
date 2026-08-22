@@ -117,6 +117,7 @@ func (b *RoleBindingsServerBuilder) Build() (result *RoleBindingsServer, err err
 		SetAttributionLogic(b.attributionLogic).
 		SetTenancyLogic(b.tenancyLogic).
 		SetMetricsRegisterer(b.metricsRegisterer).
+		SetFilterDesc((*publicv1.RoleBinding)(nil).ProtoReflect().Descriptor()).
 		Build()
 	if err != nil {
 		return
@@ -135,7 +136,9 @@ func (s *RoleBindingsServer) List(ctx context.Context,
 	request *publicv1.RoleBindingsListRequest) (response *publicv1.RoleBindingsListResponse, err error) {
 	privateRequest := &privatev1.RoleBindingsListRequest{}
 	privateRequest.SetOffset(request.GetOffset())
-	privateRequest.SetLimit(request.GetLimit())
+	if request.HasLimit() {
+		privateRequest.SetLimit(request.GetLimit())
+	}
 	privateRequest.SetFilter(request.GetFilter())
 	privateRequest.SetOrder(request.GetOrder())
 

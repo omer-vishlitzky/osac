@@ -219,7 +219,7 @@ endif
 		$(VCLUSTER_HELM_ARGS) \
 		--namespace $(NS) --create-namespace \
 		$(if $(VCLUSTER_KC),--kubeconfig $(VCLUSTER_KC)) \
-		$(if $(DOMAIN),--set service.externalHostname=fulfillment-api-$(NS).$(DOMAIN) --set service.internalHostname=fulfillment-internal-api-$(NS).$(DOMAIN) --set service.auth.issuerUrl=https://keycloak-keycloak.$(DOMAIN)/realms/osac) \
+		$(if $(DOMAIN),--set service.externalHostname=fulfillment-api-$(NS).$(DOMAIN) --set service.internalHostname=fulfillment-internal-api-$(NS).$(DOMAIN) --set service.auth.issuerUrl=https://keycloak-keycloak.$(DOMAIN)/realms/osac --set service.idp.url=https://keycloak-keycloak.$(DOMAIN)) \
 		$(INSTANCE_ARGS) \
 		$(EXTRA_HELM_ARGS) \
 		--wait --timeout 40m

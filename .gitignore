@@ -75,6 +75,7 @@ __pycache__
 /fulfillment-service/logs
 /fulfillment-service/osac
 /fulfillment-service/osac-dev
+/fulfillment-service/.buf
 
 # osac-operator
 /osac-operator/bin/*
