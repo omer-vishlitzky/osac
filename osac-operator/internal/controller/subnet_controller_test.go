@@ -480,10 +480,10 @@ var _ = Describe("SubnetReconciler", func() {
 			disc, err := networkmanager.NewDiscovery(dualDiscoveryClient, "osac")
 			Expect(err).NotTo(HaveOccurred())
 			k8sManagerName := "cudn_net"
-			reconciler.Resolver = dispatcher.NewResolver(dispatcheradapter.NewNetworkClassAdapter(newListingNetworkClassClient(
+			reconciler.Resolver = dispatcher.NewResolver(newListingNetworkClassClient(
 				[]*privatev1.NetworkClass{{Id: "nc-dual", FabricManager: ptr.To("netris"), K8SManager: &k8sManagerName}},
 				&[]*privatev1.NetworkClass{},
-			)), disc)
+			), disc)
 
 			dualVnet := &osacv1alpha1.VirtualNetwork{
 				ObjectMeta: metav1.ObjectMeta{
@@ -557,9 +557,9 @@ var _ = Describe("SubnetReconciler", func() {
 			// NetworkClass being updated (e.g. via fulfillment-service) between reconciles,
 			// without needing to construct a second resolver.
 			transitionNetworkClass := &privatev1.NetworkClass{Id: "nc-dual-to-fabric", FabricManager: ptr.To("netris"), K8SManager: &k8sManagerName}
-			reconciler.Resolver = dispatcher.NewResolver(dispatcheradapter.NewNetworkClassAdapter(newListingNetworkClassClient(
+			reconciler.Resolver = dispatcher.NewResolver(newListingNetworkClassClient(
 				[]*privatev1.NetworkClass{transitionNetworkClass}, &[]*privatev1.NetworkClass{},
-			)), disc)
+			), disc)
 
 			transitionVnet := &osacv1alpha1.VirtualNetwork{
 				ObjectMeta: metav1.ObjectMeta{
