@@ -8,8 +8,8 @@
 #   make install         PLATFORM=kind|openshift  PROFILE=dev|vmaas-ci|bmaas-ci|caas-ci|full-ci  NS=osac
 #   make uninstall       PLATFORM=kind|openshift  PROFILE=dev|vmaas-ci|bmaas-ci|caas-ci|full-ci  NS=osac
 #   make install-infra   PLATFORM=kind|openshift  PROFILE=dev|vmaas-ci|bmaas-ci|caas-ci|full-ci  NS=osac
-#   make install-osac    PLATFORM=kind|openshift  PROFILE=dev|vmaas-ci|bmaas-ci|caas-ci|full-ci  NS=osac  [VCLUSTER=true]
-#   make uninstall-osac  PLATFORM=kind|openshift  PROFILE=dev|vmaas-ci|bmaas-ci|caas-ci|full-ci  NS=osac  [VCLUSTER=true]
+#   make install-osac    PLATFORM=kind|openshift  PROFILE=dev|vmaas-ci|bmaas-ci|caas-ci|full-ci  NS=osac
+#   make uninstall-osac  PLATFORM=kind|openshift  PROFILE=dev|vmaas-ci|bmaas-ci|caas-ci|full-ci  NS=osac
 #   make uninstall-infra PLATFORM=kind|openshift  PROFILE=dev|vmaas-ci|bmaas-ci|caas-ci|full-ci  NS=osac
 #   make test            PLATFORM=kind|openshift  PROFILE=dev|vmaas-ci|bmaas-ci|caas-ci|full-ci  NS=osac  SUITE=all|fulfillment|operator|bmf
 #
@@ -68,9 +68,6 @@ DEPS_CHART     := $(CHARTS)/osac-deps
 INFRA_CHART    := $(CHARTS)/osac-infra
 OSAC_CHART     := $(CHARTS)/osac
 
-VCLUSTER ?=
-VCLUSTER_SH := scripts/vcluster.sh
-
 # instancePrefix = namespace as-is.
 # Templates that need PostgreSQL-safe identifiers convert internally.
 INSTANCE_PREFIX := $(NS)
@@ -85,14 +82,6 @@ INSTANCE_VALUES := values/dev/kind-instance.yaml
 else ifdef PROFILE
 INFRA_VALUES    := values/$(PROFILE)/infra.yaml
 INSTANCE_VALUES := values/$(PROFILE)/instance.yaml
-endif
-
-# vcluster overlay: layer vcluster-instance.yaml on top of the profile's instance values.
-VCLUSTER_INSTANCE_VALUES := values/$(PROFILE)/vcluster-instance.yaml
-ifeq ($(VCLUSTER),true)
-VCLUSTER_HELM_ARGS := -f $(VCLUSTER_INSTANCE_VALUES)
-else
-VCLUSTER_HELM_ARGS :=
 endif
 
 # Container tool and Kind cluster config.
@@ -193,13 +182,8 @@ endif
 AAP_LICENSE_FILE ?= values/$(PROFILE)/license.zip
 
 .PHONY: install-osac
-install-osac: ## Install OSAC instance (PLATFORM= PROFILE= NS= required, VCLUSTER=true for vcluster)
+install-osac: ## Install OSAC instance (PLATFORM= PROFILE= NS= required)
 	helm dependency build $(OSAC_CHART)
-ifeq ($(VCLUSTER),true)
-	VCLUSTER_NAME=$(NS) VCLUSTER_NS=$(NS) $(VCLUSTER_SH) create
-	VCLUSTER_NAME=$(NS) VCLUSTER_NS=$(NS) OSAC_NS=$(NS) $(VCLUSTER_SH) setup
-	$(eval VCLUSTER_KC := /tmp/vcluster-$(NS).kubeconfig)
-endif
 ifneq ($(PLATFORM),kind)
 	@[ -n "$(AAP_LICENSE_FILE)" ] || { echo "ERROR: AAP_LICENSE_FILE is required for PLATFORM=openshift" >&2; exit 1; }
 	@[ -f "$(AAP_LICENSE_FILE)" ] || { echo "ERROR: AAP_LICENSE_FILE not found at $(AAP_LICENSE_FILE)" >&2; exit 1; }
@@ -216,21 +200,15 @@ ifneq ($(PLATFORM),kind)
 endif
 	helm upgrade --install osac $(OSAC_CHART) \
 		-f $(INSTANCE_VALUES) \
-		$(VCLUSTER_HELM_ARGS) \
 		--namespace $(NS) --create-namespace \
-		$(if $(VCLUSTER_KC),--kubeconfig $(VCLUSTER_KC)) \
 		$(if $(DOMAIN),--set service.externalHostname=fulfillment-api-$(NS).$(DOMAIN) --set service.internalHostname=fulfillment-internal-api-$(NS).$(DOMAIN) --set service.auth.issuerUrl=https://keycloak-keycloak.$(DOMAIN)/realms/osac --set service.idp.url=https://keycloak-keycloak.$(DOMAIN)) \
 		$(INSTANCE_ARGS) \
 		$(EXTRA_HELM_ARGS) \
 		--wait --timeout 40m
 
 .PHONY: uninstall-osac
-uninstall-osac: ## Uninstall OSAC instance (PLATFORM= PROFILE= NS= required, VCLUSTER=true for vcluster)
-ifeq ($(VCLUSTER),true)
-	VCLUSTER_NAME=$(NS) VCLUSTER_NS=$(NS) $(VCLUSTER_SH) teardown
-else
+uninstall-osac: ## Uninstall OSAC instance (PLATFORM= PROFILE= NS= required)
 	helm uninstall osac --namespace $(NS) --ignore-not-found
-endif
 
 ##@ Composite
 
