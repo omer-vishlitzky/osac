@@ -74,7 +74,9 @@ func createAvailableBareMetalHost(name, ns, hostType string) {
 
 	patchBareMetalHostStatus(name, ns,
 		`{"status":{"operationalStatus":"OK","poweredOn":false,"errorCount":0,`+
-			`"errorMessage":"","provisioning":{"ID":"","state":"available"}}}`)
+			`"errorMessage":"","provisioning":{"ID":"","state":"available"},`+
+			`"hardware":{"nics":[{"name":"eth0","model":"virtio",`+
+			`"mac":"52:54:00:12:34:56","ip":"192.168.111.20","speedGbps":10,"pxe":true}]}}}`)
 }
 
 func deleteBareMetalHost(name, ns string) {
