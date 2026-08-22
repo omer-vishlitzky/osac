@@ -1,5 +1,4 @@
 {{- if .Values.echoAdapter.enabled }}
-{{- $tp := include "osac-metering.topicPrefix" . }}
 apiVersion: kafka.strimzi.io/v1
 kind: KafkaUser
 metadata:
@@ -15,7 +14,7 @@ spec:
     acls:
       - resource:
           type: topic
-          name: {{ if $tp }}{{ $tp }}.{{ end }}osac.metering.
+          name: osac.metering.
           patternType: prefix
         operations:
           - Read

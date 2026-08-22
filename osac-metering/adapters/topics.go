@@ -9,15 +9,11 @@ in compliance with the License. You may obtain a copy of the License at
 
 package adapters
 
-import "os"
-
-var topicPrefix = os.Getenv("KAFKA_TOPIC_PREFIX")
-
 var (
-	TopicLifecycle   = topicPrefix + "osac.metering.lifecycle"
-	TopicHeartbeat   = topicPrefix + "osac.metering.heartbeat"
-	TopicCorrections = topicPrefix + "osac.metering.corrections"
-	TopicInference   = topicPrefix + "osac.metering.inference"
+	TopicLifecycle   = "osac.metering.lifecycle"
+	TopicHeartbeat   = "osac.metering.heartbeat"
+	TopicCorrections = "osac.metering.corrections"
+	TopicInference   = "osac.metering.inference"
 )
 
 var AllTopics = []string{TopicLifecycle, TopicHeartbeat, TopicCorrections, TopicInference}

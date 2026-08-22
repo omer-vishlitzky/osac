@@ -105,11 +105,6 @@ spec:
               value: osac-metering-echo-adapter
             - name: KAFKA_SASL_PASSWORD_FILE
               value: /etc/kafka-secrets/password
-            {{- $tp := include "osac-metering.topicPrefix" . }}
-            {{- if $tp }}
-            - name: KAFKA_TOPIC_PREFIX
-              value: {{ printf "%s." $tp | quote }}
-            {{- end }}
             - name: METRICS_ADDR
               value: ":8080"
           volumeMounts:

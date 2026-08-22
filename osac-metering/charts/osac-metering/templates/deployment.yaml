@@ -126,11 +126,6 @@ spec:
               value: {{ .Values.heartbeat.interval | default "60s" | quote }}
             - name: RECONCILIATION_INTERVAL
               value: {{ .Values.reconciliation.interval | default "60m" | quote }}
-            {{- $tp := include "osac-metering.topicPrefix" . }}
-            {{- if $tp }}
-            - name: KAFKA_TOPIC_PREFIX
-              value: {{ printf "%s." $tp | quote }}
-            {{- end }}
             - name: KAFKA_BROKERS
               value: {{ include "osac-metering.kafkaBrokers" . | quote }}
             - name: KAFKA_TLS_CA_CERT
