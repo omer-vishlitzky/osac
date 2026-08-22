@@ -68,13 +68,6 @@ DEPS_CHART     := $(CHARTS)/osac-deps
 INFRA_CHART    := $(CHARTS)/osac-infra
 OSAC_CHART     := $(CHARTS)/osac
 
-# instancePrefix = namespace as-is.
-# Templates that need PostgreSQL-safe identifiers convert internally.
-INSTANCE_PREFIX := $(NS)
-INSTANCE_ARGS := \
-  --set instancePrefix=$(INSTANCE_PREFIX) \
-  --set metering.topicPrefix=$(INSTANCE_PREFIX)
-
 # Values file selection: kind uses kind-specific files, OpenShift uses profile files.
 ifeq ($(PLATFORM),kind)
 INFRA_VALUES    := values/dev/kind-infra.yaml
@@ -202,7 +195,6 @@ endif
 		-f $(INSTANCE_VALUES) \
 		--namespace $(NS) --create-namespace \
 		$(if $(DOMAIN),--set service.externalHostname=fulfillment-api-$(NS).$(DOMAIN) --set service.internalHostname=fulfillment-internal-api-$(NS).$(DOMAIN) --set service.auth.issuerUrl=https://keycloak-keycloak.$(DOMAIN)/realms/osac --set service.idp.url=https://keycloak-keycloak.$(DOMAIN)) \
-		$(INSTANCE_ARGS) \
 		$(EXTRA_HELM_ARGS) \
 		--wait --timeout 40m
 

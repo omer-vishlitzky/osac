@@ -32,11 +32,11 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- end }}
 
 {{/*
-PostgreSQL-safe instance prefix: hyphens converted to underscores.
-All database identifiers derive from this single template.
+PostgreSQL identifier prefix. All database identifiers derive from this
+single template.
 */}}
 {{- define "osac.pgPrefix" -}}
-{{ replace "-" "_" .Values.instancePrefix }}
+osac
 {{- end }}
 
 {{- define "osac.dbNameService" -}}
@@ -45,13 +45,6 @@ All database identifiers derive from this single template.
 
 {{- define "osac.dbNameMetering" -}}
 {{ include "osac.pgPrefix" . }}_metering
-{{- end }}
-
-{{/*
-Per-instance Kafka topic prefix (with trailing dot).
-*/}}
-{{- define "osac.topicPrefix" -}}
-{{ .Values.instancePrefix }}.
 {{- end }}
 
 {{/*

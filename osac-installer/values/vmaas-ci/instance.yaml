@@ -1,4 +1,3 @@
-instancePrefix: vmaas-ci
 # VMaaS CI environment -- instance values for osac chart.
 
 # --- CSI Driver ---

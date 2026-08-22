@@ -1,4 +1,3 @@
-instancePrefix: bmaas-ci
 # BMaaS CI environment -- instance values for osac chart.
 
 # --- Operator ---

@@ -3,10 +3,7 @@
 
 cliImage: quay.io/openshift/origin-cli:4.20.0
 
-# The namespace name. Always set via --set instancePrefix=<NS> by the Makefile.
-instancePrefix: ""
-
-# Shared PostgreSQL host for db-init hook (only used when instancePrefix is set).
+# Shared PostgreSQL host for the db-init hook.
 dbInit:
   host: "postgres.osac-infra.svc.cluster.local"
 

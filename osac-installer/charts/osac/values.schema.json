@@ -8,15 +8,9 @@
       "type": "string",
       "description": "Default OpenShift CLI image used by hook jobs"
     },
-    "instancePrefix": {
-      "type": "string",
-      "description": "The namespace name. Templates convert hyphens to underscores where needed (PostgreSQL identifiers).",
-      "pattern": "^[a-zA-Z][a-zA-Z0-9-]*$",
-      "minLength": 1
-    },
     "dbInit": {
       "type": "object",
-      "description": "Shared PostgreSQL host for the db-init hook (only used when instancePrefix is set)",
+      "description": "Shared PostgreSQL host for the db-init hook",
       "properties": {
         "host": {
           "type": "string",
@@ -1444,7 +1438,5 @@
       }
     }
   },
-  "required": [
-    "instancePrefix"
-  ]
+  "required": []
 }

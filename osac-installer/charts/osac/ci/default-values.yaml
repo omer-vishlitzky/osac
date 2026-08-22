@@ -39,4 +39,3 @@ service:
         items:
         - key: url
           param: url
-instancePrefix: ci

@@ -1,11 +1,5 @@
 {{- $serviceDb := include "osac.dbNameService" . }}
 {{- $meteringDb := include "osac.dbNameMetering" . }}
-{{- if not (regexMatch "^[a-zA-Z_][a-zA-Z0-9_]*$" $serviceDb) }}
-{{- fail (printf "instancePrefix produces invalid PostgreSQL identifier: %s" $serviceDb) }}
-{{- end }}
-{{- if not (regexMatch "^[a-zA-Z_][a-zA-Z0-9_]*$" $meteringDb) }}
-{{- fail (printf "instancePrefix produces invalid PostgreSQL identifier: %s" $meteringDb) }}
-{{- end }}
 apiVersion: cert-manager.io/v1
 kind: Certificate
 metadata:

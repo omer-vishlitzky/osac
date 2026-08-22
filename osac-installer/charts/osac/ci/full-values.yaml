@@ -117,4 +117,3 @@ networkFulfillment:
     NETRIS_TENANT_NAME: "Admin"
   secret:
     NETRIS_PASSWORD: "test-password"
-instancePrefix: ci

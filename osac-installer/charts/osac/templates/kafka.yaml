@@ -1,5 +1,4 @@
-{{- if and .Values.instancePrefix .Values.metering.enabled }}
-{{- $prefix := .Values.instancePrefix }}
+{{- if .Values.metering.enabled }}
 {{- $ns := .Values.kafka.clusterNamespace }}
 {{- $cluster := .Values.kafka.clusterName }}
 {{- $replicas := .Values.kafka.replicas | int }}
@@ -14,7 +13,7 @@
 apiVersion: kafka.strimzi.io/v1
 kind: KafkaTopic
 metadata:
-  name: {{ $prefix }}.osac.metering.{{ .suffix }}
+  name: osac.metering.{{ .suffix }}
   namespace: {{ $ns }}
   labels:
     strimzi.io/cluster: {{ $cluster }}

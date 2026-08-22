@@ -49,4 +49,3 @@ service:
           param: sslkey
         - key: ca.crt
           param: sslrootcert
-instancePrefix: ci
