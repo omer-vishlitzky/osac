@@ -74,18 +74,10 @@
 
 - name: Build metering plugin entries
   ansible.builtin.set_fact:
-    _metering_plugin:
-      type: external-metering
-      name: external-metering
-      json:
-        kafkaBrokers: "{{ ocp_4_20_ai_maas_metering_kafka_brokers }}"
-        kafkaTopic: "{{ ocp_4_20_ai_maas_metering_kafka_topic }}"
-        kafkaTLSCA: "{{ '/etc/metering/kafka-ca/ca.crt' if _metering_tls_enabled else '' }}"
-        kafkaTLSEnabled: "{{ _metering_tls_enabled }}"
-        kafkaSASLUser: "{{ ocp_4_20_ai_maas_metering_kafka_sasl_user }}"
-        kafkaSASLPassFile: /etc/metering/kafka-credentials/password
-        source: maas-gateway
-        failOpen: true
+    # Only external-metering-streaming is registered: a profile may not mix
+    # ResponseProcessor (external-metering) and ResponseChunkProcessor
+    # (external-metering-streaming) plugins, and the streaming plugin already
+    # handles non-streaming bodies by reassembling chunks.
     _metering_streaming_plugin:
       type: external-metering-streaming
       name: external-metering-streaming
@@ -96,7 +88,7 @@
         kafkaTLSEnabled: "{{ _metering_tls_enabled }}"
         kafkaSASLUser: "{{ ocp_4_20_ai_maas_metering_kafka_sasl_user }}"
         kafkaSASLPassFile: /etc/metering/kafka-credentials/password
-        source: maas-gateway
+        source: shared-inference-gateway
         failOpen: true
 
 - name: Filter out existing metering plugins (idempotency)
@@ -111,8 +103,8 @@
       {% for profile in _ipp_config_yaml.profiles %}
       {% set req_filtered = profile.plugins.request | rejectattr('pluginRef', 'in', ['external-metering', 'external-metering-streaming']) | list %}
       {% set resp_filtered = profile.plugins.response | rejectattr('pluginRef', 'in', ['external-metering', 'external-metering-streaming']) | list %}
-      {% set request_plugins = req_filtered + [{'pluginRef': 'external-metering'}, {'pluginRef': 'external-metering-streaming'}] %}
-      {% set response_plugins = [{'pluginRef': 'external-metering'}, {'pluginRef': 'external-metering-streaming'}] + resp_filtered %}
+      {% set request_plugins = req_filtered + [{'pluginRef': 'external-metering-streaming'}] %}
+      {% set response_plugins = [{'pluginRef': 'external-metering-streaming'}] + resp_filtered %}
       {% set _ = profiles.append(profile | combine({'plugins': {'request': request_plugins, 'response': response_plugins}}, recursive=true)) %}
       {% endfor %}
       {{ profiles }}
@@ -130,7 +122,7 @@
       data:
         custom-ipp-config.yaml: |
           {{ _ipp_config_yaml | combine({
-               'plugins': _existing_plugins + [_metering_plugin, _metering_streaming_plugin],
+               'plugins': _existing_plugins + [_metering_streaming_plugin],
                'profiles': _updated_profiles
              }) | to_nice_yaml(indent=2) }}
   register: _r
@@ -170,6 +162,8 @@
       metadata:
         name: payload-processing
         namespace: openshift-ingress
+        annotations:
+          opendatahub.io/managed: "false"
       spec:
         template:
           spec:

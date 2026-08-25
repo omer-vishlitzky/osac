@@ -58,7 +58,7 @@ ocp_4_20_ai_maas_lws_channel: stable-v1.0
 ocp_4_20_ai_maas_lws_source: redhat-operators
 
 # RHOAI
-ocp_4_20_ai_maas_rhoai_channel: stable-3.4
+ocp_4_20_ai_maas_rhoai_channel: stable-3.5
 ocp_4_20_ai_maas_rhoai_source: redhat-operators
 
 # --- DSC ---
@@ -137,6 +137,19 @@ ocp_4_20_ai_maas_tiers:
     token_limit: 100000
     window: 1m
     priority: 2
+
+# Per-(tenant, project) upstream subscriptions (shared cluster only — empty on tenant clusters).
+# Each entry gets its own Keycloak group/service-user, MaaSSubscription named
+# "<tenant>--<project>", and (via configure_tenant_upstream_keys.yaml) a durable API key that
+# tenant clusters use as their ExternalModel upstream_credential.
+ocp_4_20_ai_maas_tenant_projects: []
+# Example entry:
+#   - tenant: acme
+#     project: proj-a
+#     token_limit: 100000
+#     window: 1m
+#     priority: 10
+ocp_4_20_ai_maas_tenant_upstream_key_expires_in: 2159h
 
 # Monitoring
 ocp_4_20_ai_maas_monitoring_retention: 24h

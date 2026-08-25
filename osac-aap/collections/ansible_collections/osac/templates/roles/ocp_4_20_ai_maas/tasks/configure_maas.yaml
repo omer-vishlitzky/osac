@@ -342,26 +342,56 @@
         | selectattr('status', 'equalto', 'True')
         | list | length) == 0
 
-- name: Configure Tenant CR
+- name: Wait for bootstrap AITenant
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ admin_kubeconfig }}"
+    api_version: maas.opendatahub.io/v1alpha1
+    kind: AITenant
+    name: models-as-a-service
+    namespace: ai-tenants
+  register: _aitenant
+  retries: "{{ ocp_4_20_ai_maas_operator_retries }}"
+  delay: "{{ ocp_4_20_ai_maas_operator_delay }}"
+  until:
+    - _aitenant.resources is defined
+    - _aitenant.resources | length > 0
+
+- name: Configure AITenant gateway and OIDC
   kubernetes.core.k8s:
     kubeconfig: "{{ admin_kubeconfig }}"
     state: present
     definition:
       apiVersion: maas.opendatahub.io/v1alpha1
-      kind: Tenant
+      kind: AITenant
       metadata:
-        name: "{{ ocp_4_20_ai_maas_tenant_name }}"
-        namespace: models-as-a-service
+        name: models-as-a-service
+        namespace: ai-tenants
       spec:
-        gatewayRef:
-          namespace: openshift-ingress
+        gateway:
           name: maas-default-gateway
-        externalOIDC: >-
+        oidc: >-
           {{ {'issuerUrl': 'https://' + ocp_4_20_ai_maas_keycloak_namespace + '.' + _cluster_domain + '/realms/' + ocp_4_20_ai_maas_keycloak_realm,
               'clientId': ocp_4_20_ai_maas_keycloak_client_id}
              if ocp_4_20_ai_maas_enable_keycloak | bool
              else {'issuerUrl': ocp_4_20_ai_maas_oidc_issuer,
                    'clientId': ocp_4_20_ai_maas_oidc_client_id} }}
+    merge_type: merge
+  register: _r_ait
+  retries: 5
+  delay: 10
+  until: _r_ait is not failed
+
+- name: Configure MaasTenantConfig
+  kubernetes.core.k8s:
+    kubeconfig: "{{ admin_kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: maas.opendatahub.io/v1alpha1
+      kind: MaasTenantConfig
+      metadata:
+        name: "{{ ocp_4_20_ai_maas_tenant_name }}"
+        namespace: models-as-a-service
+      spec:
         apiKeys:
           maxExpirationDays: "{{ ocp_4_20_ai_maas_api_key_max_expiration_days }}"
         telemetry:
@@ -372,36 +402,35 @@
             captureOrganization: "{{ ocp_4_20_ai_maas_telemetry_capture_organization }}"
             captureModelUsage: "{{ ocp_4_20_ai_maas_telemetry_capture_model_usage }}"
     merge_type: merge
-  register: _r
+  register: _r_mtc
   retries: 5
   delay: 10
-  until: _r is not failed
+  until: _r_mtc is not failed
 
-- name: Wait for Tenant Active
+- name: Wait for MaasTenantConfig Active
   kubernetes.core.k8s_info:
     kubeconfig: "{{ admin_kubeconfig }}"
     api_version: maas.opendatahub.io/v1alpha1
-    kind: Tenant
+    kind: MaasTenantConfig
     name: "{{ ocp_4_20_ai_maas_tenant_name }}"
     namespace: models-as-a-service
-  register: _tenant
+  register: _mtc
   retries: "{{ ocp_4_20_ai_maas_operator_retries }}"
   delay: "{{ ocp_4_20_ai_maas_operator_delay }}"
   ignore_errors: true
   until:
-    - _tenant.resources is defined
-    - _tenant.resources | length > 0
-    - _tenant.resources[0].status.phase | default('') == 'Active'
+    - _mtc.resources is defined
+    - _mtc.resources | length > 0
+    - _mtc.resources[0].status.phase | default('') == 'Active'
 
-- name: Fail if Tenant never became Active
+- name: Fail if MaasTenantConfig never became Active
   ansible.builtin.fail:
     msg: >-
-      Tenant {{ ocp_4_20_ai_maas_tenant_name }} did not become Active after
+      MaasTenantConfig {{ ocp_4_20_ai_maas_tenant_name }} did not become Active after
       {{ ocp_4_20_ai_maas_operator_retries }} retries.
   when: >-
-    _tenant.resources is not defined
-    or _tenant.resources | length == 0
-    or _tenant.resources[0].status.phase | default('') != 'Active'
+    _mtc.resources is not defined or _mtc.resources | length == 0
+    or _mtc.resources[0].status.phase | default('') != 'Active'
 
 # --- Phase 3b: Dashboard feature flags ---
 
@@ -543,6 +572,20 @@
   delay: 10
   until: _r is not failed
 
+- name: Create per-(tenant, project) MaaSSubscriptions
+  kubernetes.core.k8s:
+    kubeconfig: "{{ admin_kubeconfig }}"
+    state: present
+    definition: "{{ item }}"
+  loop: "{{ lookup('ansible.builtin.template', 'maas-tenant-subscriptions.yaml.j2') | from_yaml_all | list }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+  when: ocp_4_20_ai_maas_tenant_projects | length > 0
+  register: _r
+  retries: 5
+  delay: 10
+  until: _r is not failed
+
 - name: Wait for auto-generated AuthPolicy
   kubernetes.core.k8s_info:
     kubeconfig: "{{ admin_kubeconfig }}"
@@ -636,6 +679,10 @@
        | selectattr('type', 'equalto', 'Enforced')
        | selectattr('status', 'equalto', 'True')
        | list | length == 0)
+
+- name: Mint upstream API keys for tenant-project subscriptions
+  ansible.builtin.include_tasks: configure_tenant_upstream_keys.yaml
+  when: ocp_4_20_ai_maas_tenant_projects | length > 0
 
 - name: Configure OSAC inference metering
   ansible.builtin.include_tasks: configure_metering.yaml
