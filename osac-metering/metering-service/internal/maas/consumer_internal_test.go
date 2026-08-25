@@ -59,19 +59,18 @@ func (m *mockTenantsClient) List(_ context.Context, _ *privatev1.TenantsListRequ
 	return &privatev1.TenantsListResponse{Items: items}, nil
 }
 
-func makeRawEvent(orgID, model string, promptTokens, completionTokens int) []byte {
+func makeRawEvent(subscription, model string, promptTokens, completionTokens int) []byte {
 	event := map[string]any{
 		"specversion":     "1.0",
 		"id":              "evt-test-123",
-		"source":          "maas-gateway",
+		"source":          "shared-inference-gateway",
 		"type":            "inference.tokens.used",
 		"time":            "2026-08-15T12:00:00Z",
 		"datacontenttype": "application/json",
 		"data": map[string]any{
 			"user":                  "alice",
 			"group":                 "engineering",
-			"subscription":          "ai-tenant-acme/sub-1",
-			"organization_id":       orgID,
+			"subscription":          subscription,
 			"cost_center":           "ml-team",
 			"provider":              "anthropic",
 			"model":                 model,
@@ -99,7 +98,7 @@ var _ = Describe("consumerHandler", func() {
 	BeforeEach(func() {
 		publisher = &mockPublisher{}
 		cache = NewTenantCache(
-			&mockTenantsClient{tenants: []string{"acme-corp"}},
+			&mockTenantsClient{tenants: []string{"acme"}},
 			logr.Discard(),
 			5*time.Minute,
 		)
@@ -113,7 +112,7 @@ var _ = Describe("consumerHandler", func() {
 
 	It("enriches and publishes a valid inference event", func() {
 		msg := &sarama.ConsumerMessage{
-			Value: makeRawEvent("acme-corp", "claude-sonnet-4-20250514", 1000, 500),
+			Value: makeRawEvent("acme--proj-a", "claude-sonnet-4-20250514", 1000, 500),
 		}
 		err := handler.processMessage(context.Background(), msg)
 		Expect(err).NotTo(HaveOccurred())
@@ -124,35 +123,50 @@ var _ = Describe("consumerHandler", func() {
 		ce := published[0]
 		Expect(ce.Type()).To(Equal(events.EventInferenceUsage))
 		Expect(ce.Extensions()["osacresourcetype"]).To(Equal(events.ResourceTypeMaaSInference))
-		Expect(ce.Extensions()["osactenant"]).To(Equal("acme-corp"))
+		Expect(ce.Extensions()["osactenant"]).To(Equal("acme"))
+		Expect(ce.Extensions()["osacproject"]).To(Equal("proj-a"))
 		Expect(ce.Time()).To(Equal(time.Date(2026, 8, 15, 12, 0, 0, 0, time.UTC)))
 
 		var data schema.LifecycleData
 		Expect(json.Unmarshal(ce.Data(), &data)).To(Succeed())
-		Expect(data.TenantID).To(Equal("acme-corp"))
+		Expect(data.TenantID).To(Equal("acme"))
 		Expect(data.ResourceType).To(Equal(events.ResourceTypeMaaSInference))
+		Expect(data.BillingDimensions["subscription"]).To(Equal("acme--proj-a"))
 		Expect(data.BillingDimensions["model"]).To(Equal("claude-sonnet-4-20250514"))
 		Expect(data.BillingDimensions["prompt_tokens"]).To(BeNumerically("==", 1000))
 		Expect(data.BillingDimensions["completion_tokens"]).To(BeNumerically("==", 500))
 		Expect(data.BillingDimensions["total_tokens"]).To(BeNumerically("==", 1500))
-		Expect(data.BillingDimensions["organization_id"]).To(Equal("acme-corp"))
 		Expect(data.SchemaVersion).To(Equal("v1"))
 	})
 
-	It("permanently rejects events with missing organization_id", func() {
+	It("permanently rejects events with the wrong source", func() {
+		var event map[string]any
+		Expect(json.Unmarshal(makeRawEvent("acme--proj-a", "gpt-4o", 100, 50), &event)).To(Succeed())
+		event["source"] = "maas-gateway"
+		raw, _ := json.Marshal(event)
+		msg := &sarama.ConsumerMessage{Value: raw}
+
+		err := handler.processMessage(context.Background(), msg)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("has source"))
+		Expect(errors.As(err, &permanentError{})).To(BeTrue())
+		Expect(publisher.events()).To(BeEmpty())
+	})
+
+	It("permanently rejects events with an unparseable subscription", func() {
 		msg := &sarama.ConsumerMessage{
 			Value: makeRawEvent("", "claude-sonnet-4-20250514", 100, 50),
 		}
 		err := handler.processMessage(context.Background(), msg)
 		Expect(err).To(HaveOccurred())
-		Expect(err.Error()).To(ContainSubstring("no organization_id"))
+		Expect(err.Error()).To(ContainSubstring("unparseable subscription"))
 		Expect(errors.As(err, &permanentError{})).To(BeTrue())
 		Expect(publisher.events()).To(BeEmpty())
 	})
 
 	It("permanently rejects events with unknown tenant", func() {
 		msg := &sarama.ConsumerMessage{
-			Value: makeRawEvent("unknown-org", "gpt-4o", 100, 50),
+			Value: makeRawEvent("unknown--proj-a", "gpt-4o", 100, 50),
 		}
 		err := handler.processMessage(context.Background(), msg)
 		Expect(err).To(HaveOccurred())
@@ -170,7 +184,7 @@ var _ = Describe("consumerHandler", func() {
 			logger:      logr.Discard(),
 		}
 		msg := &sarama.ConsumerMessage{
-			Value: makeRawEvent("some-org", "gpt-4o", 100, 50),
+			Value: makeRawEvent("some--proj-a", "gpt-4o", 100, 50),
 		}
 		err := failingHandler.processMessage(context.Background(), msg)
 		Expect(err).To(HaveOccurred())
@@ -181,7 +195,7 @@ var _ = Describe("consumerHandler", func() {
 
 	It("permanently rejects events with missing model", func() {
 		msg := &sarama.ConsumerMessage{
-			Value: makeRawEvent("acme-corp", "", 100, 50),
+			Value: makeRawEvent("acme--proj-a", "", 100, 50),
 		}
 		err := handler.processMessage(context.Background(), msg)
 		Expect(err).To(HaveOccurred())
@@ -194,12 +208,12 @@ var _ = Describe("consumerHandler", func() {
 		event := map[string]any{
 			"specversion": "1.0",
 			"id":          "evt-bad-time",
-			"source":      "maas-gateway",
+			"source":      "shared-inference-gateway",
 			"type":        "inference.tokens.used",
 			"time":        "not-a-timestamp",
 			"data": map[string]any{
-				"organization_id": "acme-corp",
-				"model":           "gpt-4o",
+				"subscription": "acme--proj-a",
+				"model":        "gpt-4o",
 			},
 		}
 		data, _ := json.Marshal(event)
@@ -222,7 +236,7 @@ var _ = Describe("consumerHandler", func() {
 	It("returns transient error when publisher fails", func() {
 		publisher.err = errors.New("kafka unavailable")
 		msg := &sarama.ConsumerMessage{
-			Value: makeRawEvent("acme-corp", "claude-sonnet-4-20250514", 100, 50),
+			Value: makeRawEvent("acme--proj-a", "claude-sonnet-4-20250514", 100, 50),
 		}
 		err := handler.processMessage(context.Background(), msg)
 		Expect(err).To(HaveOccurred())
@@ -235,15 +249,15 @@ var _ = Describe("consumerHandler", func() {
 		event := map[string]any{
 			"specversion": "1.0",
 			"id":          "evt-duration-test",
-			"source":      "maas-gateway",
+			"source":      "shared-inference-gateway",
 			"type":        "inference.tokens.used",
 			"time":        "2026-08-15T12:00:00Z",
 			"data": map[string]any{
-				"organization_id": "acme-corp",
-				"model":           "gpt-4o",
-				"prompt_tokens":   100,
-				"total_tokens":    100,
-				"duration_ms":     1234.567,
+				"subscription":  "acme--proj-a",
+				"model":         "gpt-4o",
+				"prompt_tokens": 100,
+				"total_tokens":  100,
+				"duration_ms":   1234.567,
 			},
 		}
 		raw, _ := json.Marshal(event)
@@ -271,7 +285,7 @@ var _ = Describe("ConsumeClaim", func() {
 	BeforeEach(func() {
 		publisher = &mockPublisher{}
 		cache = NewTenantCache(
-			&mockTenantsClient{tenants: []string{"acme-corp"}},
+			&mockTenantsClient{tenants: []string{"acme"}},
 			logr.Discard(),
 			5*time.Minute,
 		)
@@ -290,7 +304,7 @@ var _ = Describe("ConsumeClaim", func() {
 
 		messages <- &sarama.ConsumerMessage{Value: []byte("bad json"), Offset: 0, Partition: 0}
 		messages <- &sarama.ConsumerMessage{
-			Value:     makeRawEvent("acme-corp", "gpt-4o", 100, 50),
+			Value:     makeRawEvent("acme--proj-a", "gpt-4o", 100, 50),
 			Offset:    1,
 			Partition: 0,
 		}
@@ -311,12 +325,12 @@ var _ = Describe("ConsumeClaim", func() {
 		claim := &mockConsumerGroupClaim{messages: messages}
 
 		messages <- &sarama.ConsumerMessage{
-			Value:     makeRawEvent("nonexistent-org", "gpt-4o", 100, 50),
+			Value:     makeRawEvent("nonexistent--proj-a", "gpt-4o", 100, 50),
 			Offset:    0,
 			Partition: 0,
 		}
 		messages <- &sarama.ConsumerMessage{
-			Value:     makeRawEvent("acme-corp", "gpt-4o", 200, 100),
+			Value:     makeRawEvent("acme--proj-a", "gpt-4o", 200, 100),
 			Offset:    1,
 			Partition: 0,
 		}
@@ -336,7 +350,7 @@ var _ = Describe("ConsumeClaim", func() {
 		claim := &mockConsumerGroupClaim{messages: messages}
 
 		messages <- &sarama.ConsumerMessage{
-			Value:     makeRawEvent("acme-corp", "gpt-4o", 100, 50),
+			Value:     makeRawEvent("acme--proj-a", "gpt-4o", 100, 50),
 			Offset:    0,
 			Partition: 0,
 		}
