@@ -437,6 +437,23 @@ argument_specs:
           rate limits. Also creates Keycloak groups and test users. Each entry
           needs name, group, token_limit, window, and priority.
 
+      # --- Per-(tenant, project) upstream subscriptions (shared cluster only) ---
+      ocp_4_20_ai_maas_tenant_projects:
+        type: list
+        elements: dict
+        required: false
+        description: >
+          Per-(tenant, project) upstream subscriptions for the shared cluster. Each entry
+          creates a Keycloak group/service-user, a MaaSSubscription named "<tenant>--<project>",
+          and a durable upstream API key for tenant clusters to use as their ExternalModel
+          upstream_credential. Each entry needs tenant, project, token_limit, window, and
+          priority. Empty on tenant clusters.
+      ocp_4_20_ai_maas_tenant_upstream_key_expires_in:
+        type: str
+        required: false
+        default: "2159h"
+        description: Expiry duration passed to the upstream API key mint request for each tenant-project entry.
+
       # --- Monitoring ---
       ocp_4_20_ai_maas_monitoring_retention:
         type: str
