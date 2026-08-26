@@ -303,13 +303,17 @@
         components:
           kserve:
             managementState: Managed
-          aigateway:
-            managementState: Managed
-            modelsAsAService:
-              # Removed, not Managed: the RHOAI-bundled maas-controller predates
-              # X-MaaS-Username/maas-headers-guard/stream-usage-enforcer on every
-              # channel that currently ships (E20/E21). maas-controller is deployed
-              # separately below, from a pinned main-branch commit, via kustomize.
+            modelsAsService:
+              # Removed, not Managed: verified live against the actual installed CSV
+              # (rhods-operator.3.4.3, what stable-3.x currently resolves to) — its
+              # DataScienceCluster CRD, v1 AND v2 alike, has no aigateway component at
+              # all; modelsAsAService/aigateway is main-branch-only and does not exist
+              # on any channel that ships today. modelsAsService (this spelling, under
+              # kserve) is the field that actually exists and actually gates the
+              # RHOAI-bundled maas-controller, which predates X-MaaS-Username/
+              # maas-headers-guard/stream-usage-enforcer (E20/E21). maas-controller is
+              # deployed separately below, from a pinned main-branch commit, via
+              # kustomize.
               managementState: Removed
     merge_type: merge
   register: _r
@@ -344,7 +348,7 @@
 
 # maas-controller is deployed directly from a pinned models-as-a-service commit via
 # kustomize (E9/E13/E24 etc. are evidenced against this exact commit — see doc's pinned
-# commit table), independent of aigateway's own modelsAsAService (Removed above).
+# commit table), independent of kserve.modelsAsService (Removed above).
 - name: Create local kustomize wrapper directories
   ansible.builtin.file:
     path: "/tmp/maas-controller-{{ item }}-{{ ocp_4_20_ai_maas_maas_controller_ref }}"
