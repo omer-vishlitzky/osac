@@ -602,7 +602,7 @@
     - _lws_sub.resources | length > 0
     - _lws_sub.resources[0].status.installedCSV is defined
 
-# --- Step 6: RHOAI 3.4 ---
+# --- Step 6: RHOAI ---
 
 - name: Create RHOAI namespace
   kubernetes.core.k8s:
