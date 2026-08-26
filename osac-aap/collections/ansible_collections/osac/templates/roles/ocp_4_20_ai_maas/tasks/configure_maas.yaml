@@ -295,7 +295,7 @@
     kubeconfig: "{{ admin_kubeconfig }}"
     state: present
     definition:
-      apiVersion: datasciencecluster.opendatahub.io/v1
+      apiVersion: datasciencecluster.opendatahub.io/v2
       kind: DataScienceCluster
       metadata:
         name: default-dsc
@@ -303,18 +303,24 @@
         components:
           kserve:
             managementState: Managed
-            modelsAsService:
-              managementState: Managed
+          aigateway:
+            managementState: Managed
+            modelsAsAService:
+              # Removed, not Managed: the RHOAI-bundled maas-controller predates
+              # X-MaaS-Username/maas-headers-guard/stream-usage-enforcer on every
+              # channel that currently ships (E20/E21). maas-controller is deployed
+              # separately below, from a pinned main-branch commit, via kustomize.
+              managementState: Removed
     merge_type: merge
   register: _r
   retries: 5
   delay: 10
   until: _r is not failed
 
-- name: Wait for MaaS components ready
+- name: Wait for DataScienceCluster Ready
   kubernetes.core.k8s_info:
     kubeconfig: "{{ admin_kubeconfig }}"
-    api_version: datasciencecluster.opendatahub.io/v1
+    api_version: datasciencecluster.opendatahub.io/v2
     kind: DataScienceCluster
     name: default-dsc
   register: _dsc_maas
@@ -324,23 +330,112 @@
   until:
     - _dsc_maas.resources is defined
     - _dsc_maas.resources | length > 0
-    - (_dsc_maas.resources[0].status.conditions | default([]))
-      | selectattr('type', 'equalto', 'ModelsAsServiceReady')
-      | selectattr('status', 'equalto', 'True')
-      | list | length > 0
+    - _dsc_maas.resources[0].status.phase | default('') == 'Ready'
 
-- name: Fail if MaaS components never became ready
+- name: Fail if DataScienceCluster never became ready
   ansible.builtin.fail:
     msg: >-
-      MaaS components did not become ready after {{ ocp_4_20_ai_maas_operator_retries }} retries.
-      Check DSC status and RHOAI operator logs.
+      DataScienceCluster did not reach phase Ready after {{ ocp_4_20_ai_maas_operator_retries }}
+      retries. Check DSC status and RHOAI operator logs.
   when: >-
     _dsc_maas.resources is not defined
     or _dsc_maas.resources | length == 0
-    or (_dsc_maas.resources[0].status.conditions | default([])
-        | selectattr('type', 'equalto', 'ModelsAsServiceReady')
-        | selectattr('status', 'equalto', 'True')
-        | list | length) == 0
+    or _dsc_maas.resources[0].status.phase | default('') != 'Ready'
+
+# maas-controller is deployed directly from a pinned models-as-a-service commit via
+# kustomize (E9/E13/E24 etc. are evidenced against this exact commit — see doc's pinned
+# commit table), independent of aigateway's own modelsAsAService (Removed above).
+- name: Create local kustomize wrapper directories
+  ansible.builtin.file:
+    path: "/tmp/maas-controller-{{ item }}-{{ ocp_4_20_ai_maas_maas_controller_ref }}"
+    state: directory
+    mode: "0755"
+  loop:
+    - crds
+    - default
+
+- name: Render maas-controller kustomize wrappers
+  ansible.builtin.template:
+    src: "maas-controller-{{ item }}-kustomization.yaml.j2"
+    dest: "/tmp/maas-controller-{{ item }}-{{ ocp_4_20_ai_maas_maas_controller_ref }}/kustomization.yaml"
+    mode: "0644"
+  loop:
+    - crds
+    - default
+
+- name: Apply maas-controller CRDs
+  environment:
+    KUBECONFIG: "{{ admin_kubeconfig | expanduser }}"
+  ansible.builtin.command:
+    cmd: "oc apply -k /tmp/maas-controller-crds-{{ ocp_4_20_ai_maas_maas_controller_ref }}"
+  changed_when: true
+  register: _r
+  retries: 5
+  delay: 10
+  until: _r is not failed
+
+# CRDs must be Established before the "default" bundle's CRs of those kinds can be
+# admitted — applying both kustomize targets in one shot races the API server.
+- name: Wait for maas-controller CRDs Established
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ admin_kubeconfig }}"
+    api_version: apiextensions.k8s.io/v1
+    kind: CustomResourceDefinition
+    name: "{{ item }}"
+  register: _maas_crd
+  retries: 30
+  delay: 5
+  until:
+    - _maas_crd.resources | length > 0
+    - (_maas_crd.resources[0].status.conditions | default([]))
+      | selectattr('type', 'equalto', 'Established')
+      | selectattr('status', 'equalto', 'True')
+      | list | length > 0
+  loop:
+    - aitenants.maas.opendatahub.io
+    - configs.maas.opendatahub.io
+    - externalmodels.inference.opendatahub.io
+    - externalmodels.maas.opendatahub.io
+    - externalproviders.inference.opendatahub.io
+    - maasauthpolicies.maas.opendatahub.io
+    - maasmodelrefs.maas.opendatahub.io
+    - maassubscriptions.maas.opendatahub.io
+    - maastenantconfigs.maas.opendatahub.io
+    - tenants.maas.opendatahub.io
+  loop_control:
+    label: "{{ item }}"
+
+- name: Apply maas-controller (RBAC, manager, monitoring, webhook)
+  environment:
+    KUBECONFIG: "{{ admin_kubeconfig | expanduser }}"
+  ansible.builtin.command:
+    cmd: "oc apply -k /tmp/maas-controller-default-{{ ocp_4_20_ai_maas_maas_controller_ref }}"
+  changed_when: true
+  register: _r
+  retries: 5
+  delay: 10
+  until: _r is not failed
+
+- name: Wait for maas-controller Deployment ready
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ admin_kubeconfig }}"
+    api_version: apps/v1
+    kind: Deployment
+    name: maas-controller
+    namespace: redhat-ods-applications
+  register: _maas_ctrl
+  retries: "{{ ocp_4_20_ai_maas_operator_retries }}"
+  delay: "{{ ocp_4_20_ai_maas_operator_delay }}"
+  until:
+    - _maas_ctrl.resources | length > 0
+    - (_maas_ctrl.resources[0].status.availableReplicas | default(0)) > 0
+
+- name: Fail if maas-controller never became ready
+  ansible.builtin.fail:
+    msg: >-
+      maas-controller Deployment did not become ready after
+      {{ ocp_4_20_ai_maas_operator_retries }} retries.
+  when: (_maas_ctrl.resources[0].status.availableReplicas | default(0)) == 0
 
 - name: Wait for bootstrap AITenant
   kubernetes.core.k8s_info:

@@ -2,6 +2,12 @@
 # OCP release image
 ocp_4_20_ai_maas_ocp_release_image: quay.io/openshift-release-dev/ocp-release:4.20.0-multi
 
+# maas-controller is deployed via kustomize from this pinned models-as-a-service commit,
+# independent of whichever maas-controller version ships bundled with the installed RHOAI
+# channel (configure_maas.yaml sets aigateway.modelsAsAService: Removed so the two don't
+# both try to run).
+ocp_4_20_ai_maas_maas_controller_ref: "8f11ce9c7b4bf5ac395d570170ae034fab4d6bc9"
+
 # Feature flags
 ocp_4_20_ai_maas_enable_maas: true
 ocp_4_20_ai_maas_enable_keycloak: true
@@ -58,7 +64,7 @@ ocp_4_20_ai_maas_lws_channel: stable-v1.0
 ocp_4_20_ai_maas_lws_source: redhat-operators
 
 # RHOAI
-ocp_4_20_ai_maas_rhoai_channel: stable-3.5
+ocp_4_20_ai_maas_rhoai_channel: stable-3.x
 ocp_4_20_ai_maas_rhoai_source: redhat-operators
 
 # --- DSC ---
