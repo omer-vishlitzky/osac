@@ -369,7 +369,7 @@
 
 - name: Apply maas-controller CRDs
   environment:
-    KUBECONFIG: "{{ admin_kubeconfig | expanduser }}"
+    KUBECONFIG: "{{ admin_kubeconfig_path }}"
   ansible.builtin.command:
     cmd: "oc apply -k /tmp/maas-controller-crds-{{ ocp_4_20_ai_maas_maas_controller_ref }}"
   changed_when: true
@@ -411,7 +411,7 @@
 
 - name: Apply maas-controller (RBAC, manager, monitoring, webhook)
   environment:
-    KUBECONFIG: "{{ admin_kubeconfig | expanduser }}"
+    KUBECONFIG: "{{ admin_kubeconfig_path }}"
   ansible.builtin.command:
     cmd: "oc apply -k /tmp/maas-controller-default-{{ ocp_4_20_ai_maas_maas_controller_ref }}"
   changed_when: true
@@ -705,7 +705,7 @@
 # restart, subscriptions stay Degraded and inference returns 403.
 - name: Restart maas-controller for subscription reconciliation
   environment:
-    KUBECONFIG: "{{ admin_kubeconfig | expanduser }}"
+    KUBECONFIG: "{{ admin_kubeconfig_path }}"
   ansible.builtin.shell: |
     oc rollout restart deployment/maas-controller -n redhat-ods-applications
     oc rollout status deployment/maas-controller -n redhat-ods-applications --timeout=180s

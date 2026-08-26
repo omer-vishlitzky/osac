@@ -211,9 +211,9 @@
 # --- Guard: clean stale sailoperator CRDs ---
 - name: Clean stale sailoperator CRDs (prevents SM install plan failure)
   environment:
-    KUBECONFIG: "{{ admin_kubeconfig }}"
+    KUBECONFIG: "{{ admin_kubeconfig_path }}"
   ansible.builtin.shell: |
-    export KUBECONFIG="{{ admin_kubeconfig | expanduser }}"
+    export KUBECONFIG="{{ admin_kubeconfig_path }}"
     SM_OK=$(oc get csv -n openshift-operators -o jsonpath='{.items[*].metadata.name}' 2>/dev/null | tr ' ' '\n' | grep servicemeshoperator3 | head -1)
     if [ -n "$SM_OK" ]; then
       # SM CSV exists (any state) — CRDs are actively needed, don't delete.
@@ -243,10 +243,10 @@
     # v1.4.0 installation before hold-until-clean can reject.
     - name: Delete stale subscriptions, CSVs, and install plans in openshift-operators
       environment:
-        KUBECONFIG: "{{ admin_kubeconfig }}"
+        KUBECONFIG: "{{ admin_kubeconfig_path }}"
         ACCEPT: "{{ ocp_4_20_ai_maas_accept_version }}"
       ansible.builtin.shell: |
-        export KUBECONFIG="{{ admin_kubeconfig | expanduser }}"
+        export KUBECONFIG="{{ admin_kubeconfig_path }}"
         # Skip cleanup if all operators have a v1.3.x CSV Succeeded
         ALL_OK=true
         for op in authorino-operator limitador-operator dns-operator rhcl-operator; do
@@ -286,7 +286,7 @@
     # See: https://access.redhat.com/solutions/7097633
     - name: Install SM with Ingress Operator race protection
       environment:
-        KUBECONFIG: "{{ admin_kubeconfig | expanduser }}"
+        KUBECONFIG: "{{ admin_kubeconfig_path }}"
         SM_CSV: "{{ ocp_4_20_ai_maas_sm_starting_csv }}"
         SM_CHANNEL: "{{ ocp_4_20_ai_maas_sm_channel }}"
         SM_SOURCE: "{{ ocp_4_20_ai_maas_sm_source }}"
@@ -444,11 +444,11 @@
     # v1.4.0 upgrades, leading to an infinite loop or stuck Replacing CSVs.
     - name: Approve install plans and wait for sub-operator CSVs
       environment:
-        KUBECONFIG: "{{ admin_kubeconfig }}"
+        KUBECONFIG: "{{ admin_kubeconfig_path }}"
         REJECT: "{{ ocp_4_20_ai_maas_reject_version }}"
         ACCEPT: "{{ ocp_4_20_ai_maas_accept_version }}"
       ansible.builtin.shell: |
-        export KUBECONFIG="{{ admin_kubeconfig | expanduser }}"
+        export KUBECONFIG="{{ admin_kubeconfig_path }}"
 
         # Early exit if all three have a v1.3.x CSV Succeeded
         ALL_OK=true
@@ -529,11 +529,11 @@
     # for RHCL itself. End of RHCL version pinning workaround block.
     - name: Approve install plans and wait for RHCL CSV
       environment:
-        KUBECONFIG: "{{ admin_kubeconfig }}"
+        KUBECONFIG: "{{ admin_kubeconfig_path }}"
         REJECT: "{{ ocp_4_20_ai_maas_reject_version }}"
         ACCEPT: "{{ ocp_4_20_ai_maas_accept_version }}"
       ansible.builtin.shell: |
-        export KUBECONFIG="{{ admin_kubeconfig | expanduser }}"
+        export KUBECONFIG="{{ admin_kubeconfig_path }}"
         for plan in $(oc get installplan -n openshift-operators \
           -o jsonpath='{range .items[?(@.spec.approved==false)]}{.metadata.name}{" "}{end}' 2>/dev/null); do
           csvs=$(oc get installplan "$plan" -n openshift-operators \
@@ -695,9 +695,9 @@
 # retain Manual installPlanApproval. Approve any unapproved SM install plans.
 - name: Approve SM install plans for auto-install (inference-only)
   environment:
-    KUBECONFIG: "{{ admin_kubeconfig }}"
+    KUBECONFIG: "{{ admin_kubeconfig_path }}"
   ansible.builtin.shell: |
-    export KUBECONFIG="{{ admin_kubeconfig | expanduser }}"
+    export KUBECONFIG="{{ admin_kubeconfig_path }}"
     SM_CSV=$(oc get csv -n openshift-operators --no-headers 2>/dev/null | grep servicemeshoperator3 | head -1 | awk '{print $1}')
     if [ -n "$SM_CSV" ]; then
       PHASE=$(oc get csv "$SM_CSV" -n openshift-operators -o jsonpath='{.status.phase}' 2>/dev/null)
@@ -851,10 +851,10 @@
 
 - name: Delete stale COO subscription, CSVs, and install plans
   environment:
-    KUBECONFIG: "{{ admin_kubeconfig }}"
+    KUBECONFIG: "{{ admin_kubeconfig_path }}"
     COO_CSV: "{{ ocp_4_20_ai_maas_coo_starting_csv }}"
   ansible.builtin.shell: |
-    export KUBECONFIG="{{ admin_kubeconfig | expanduser }}"
+    export KUBECONFIG="{{ admin_kubeconfig_path }}"
     # Skip if COO already at target version
     phase=$(oc get csv "$COO_CSV" -n openshift-cluster-observability-operator \
       -o jsonpath='{.status.phase}' 2>/dev/null)
@@ -896,10 +896,10 @@
 
 - name: Approve COO v1.4.0 install plan
   environment:
-    KUBECONFIG: "{{ admin_kubeconfig }}"
+    KUBECONFIG: "{{ admin_kubeconfig_path }}"
     COO_CSV: "{{ ocp_4_20_ai_maas_coo_starting_csv }}"
   ansible.builtin.shell: |
-    export KUBECONFIG="{{ admin_kubeconfig | expanduser }}"
+    export KUBECONFIG="{{ admin_kubeconfig_path }}"
     for plan in $(oc get installplan -n openshift-cluster-observability-operator \
       -o jsonpath='{range .items[?(@.spec.approved==false)]}{.metadata.name}{" "}{end}' 2>/dev/null); do
       csvs=$(oc get installplan "$plan" -n openshift-cluster-observability-operator \

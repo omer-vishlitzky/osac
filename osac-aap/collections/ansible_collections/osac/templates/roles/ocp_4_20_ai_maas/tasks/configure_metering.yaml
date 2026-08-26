@@ -189,7 +189,7 @@
 
 - name: Wait for IPP rollout
   environment:
-    KUBECONFIG: "{{ admin_kubeconfig | expanduser }}"
+    KUBECONFIG: "{{ admin_kubeconfig_path }}"
   ansible.builtin.shell: |
     oc rollout status deployment/payload-processing -n openshift-ingress --timeout=180s
   args:
