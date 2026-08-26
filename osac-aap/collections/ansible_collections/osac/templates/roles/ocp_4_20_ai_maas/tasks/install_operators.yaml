@@ -286,73 +286,95 @@
     # See: https://access.redhat.com/solutions/7097633
     - name: Install SM with Ingress Operator race protection
       environment:
-        KUBECONFIG: "{{ admin_kubeconfig_path }}"
+        GUEST_KUBECONFIG: "{{ admin_kubeconfig_path }}"
+        HCP_NAMESPACE: "{{ cluster_working_namespace }}-{{ cluster_order.metadata.name }}"
         SM_CSV: "{{ ocp_4_20_ai_maas_sm_starting_csv }}"
         SM_CHANNEL: "{{ ocp_4_20_ai_maas_sm_channel }}"
         SM_SOURCE: "{{ ocp_4_20_ai_maas_sm_source }}"
         REJECT: "{{ ocp_4_20_ai_maas_reject_version }}"
       ansible.builtin.shell: |
-        PHASE=$(oc get csv "$SM_CSV" -n openshift-operators \
+        guest_oc() {
+          KUBECONFIG="$GUEST_KUBECONFIG" oc "$@"
+        }
+
+        PHASE=$(guest_oc get csv "$SM_CSV" -n openshift-operators \
           -o jsonpath='{.status.phase}' 2>/dev/null)
         [ "$PHASE" = "Succeeded" ] && exit 0
 
-        if [ -z "$PHASE" ]; then
-          for csv in $(oc get csv -n openshift-operators --no-headers \
-            -o custom-columns=NAME:.metadata.name 2>/dev/null | grep servicemeshoperator3); do
-            oc delete csv "$csv" -n openshift-operators --ignore-not-found 2>/dev/null || true
-          done
-        fi
+        # Clear stale SM state before racing the hosted ingress operator.
+        guest_oc delete sub servicemeshoperator3 -n openshift-operators \
+          --ignore-not-found 2>/dev/null || true
+        for csv in $(guest_oc get csv -n openshift-operators --no-headers \
+          -o custom-columns=NAME:.metadata.name 2>/dev/null | grep servicemeshoperator3); do
+          guest_oc delete csv "$csv" -n openshift-operators --ignore-not-found 2>/dev/null || true
+        done
+        for plan in $(guest_oc get installplan -n openshift-operators --no-headers \
+          -o custom-columns=NAME:.metadata.name,CSVS:.spec.clusterServiceVersionNames 2>/dev/null | \
+          grep servicemeshoperator3 | awk '{print $1}'); do
+          guest_oc delete installplan "$plan" -n openshift-operators --ignore-not-found 2>/dev/null || true
+        done
 
-        oc scale deployment ingress-operator -n openshift-ingress-operator \
+        # In HyperShift the ingress operator runs in the management-cluster
+        # hosted-control-plane namespace, not inside the guest cluster.
+        oc scale deployment ingress-operator -n "$HCP_NAMESPACE" \
           --replicas=0 --timeout=15s 2>/dev/null || true
         sleep 3
 
         for attempt in $(seq 1 10); do
-          CHANNEL=$(oc get sub servicemeshoperator3 -n openshift-operators \
+          CHANNEL=$(guest_oc get sub servicemeshoperator3 -n openshift-operators \
             -o jsonpath='{.spec.channel}' 2>/dev/null)
 
           if [ -z "$CHANNEL" ]; then
             echo "Attempt $attempt: subscription missing, creating..."
-            echo "{\"apiVersion\":\"operators.coreos.com/v1alpha1\",\"kind\":\"Subscription\",\"metadata\":{\"name\":\"servicemeshoperator3\",\"namespace\":\"openshift-operators\"},\"spec\":{\"channel\":\"${SM_CHANNEL}\",\"installPlanApproval\":\"Manual\",\"name\":\"servicemeshoperator3\",\"source\":\"${SM_SOURCE}\",\"sourceNamespace\":\"openshift-marketplace\",\"startingCSV\":\"${SM_CSV}\"}}" | oc apply -f - 2>/dev/null
+            echo "{\"apiVersion\":\"operators.coreos.com/v1alpha1\",\"kind\":\"Subscription\",\"metadata\":{\"name\":\"servicemeshoperator3\",\"namespace\":\"openshift-operators\"},\"spec\":{\"channel\":\"${SM_CHANNEL}\",\"installPlanApproval\":\"Manual\",\"name\":\"servicemeshoperator3\",\"source\":\"${SM_SOURCE}\",\"sourceNamespace\":\"openshift-marketplace\",\"startingCSV\":\"${SM_CSV}\"}}" | guest_oc apply -f - 2>/dev/null
             sleep 3
             continue
           elif [ "$CHANNEL" != "$SM_CHANNEL" ]; then
             echo "Attempt $attempt: channel=$CHANNEL (wrong), deleting+recreating..."
-            oc delete sub servicemeshoperator3 -n openshift-operators \
+            guest_oc delete sub servicemeshoperator3 -n openshift-operators \
               --ignore-not-found 2>/dev/null || true
+            for csv in $(guest_oc get csv -n openshift-operators --no-headers \
+              -o custom-columns=NAME:.metadata.name 2>/dev/null | grep servicemeshoperator3); do
+              guest_oc delete csv "$csv" -n openshift-operators --ignore-not-found 2>/dev/null || true
+            done
+            for plan in $(guest_oc get installplan -n openshift-operators --no-headers \
+              -o custom-columns=NAME:.metadata.name,CSVS:.spec.clusterServiceVersionNames 2>/dev/null | \
+              grep servicemeshoperator3 | awk '{print $1}'); do
+              guest_oc delete installplan "$plan" -n openshift-operators --ignore-not-found 2>/dev/null || true
+            done
             sleep 2
-            echo "{\"apiVersion\":\"operators.coreos.com/v1alpha1\",\"kind\":\"Subscription\",\"metadata\":{\"name\":\"servicemeshoperator3\",\"namespace\":\"openshift-operators\"},\"spec\":{\"channel\":\"${SM_CHANNEL}\",\"installPlanApproval\":\"Manual\",\"name\":\"servicemeshoperator3\",\"source\":\"${SM_SOURCE}\",\"sourceNamespace\":\"openshift-marketplace\",\"startingCSV\":\"${SM_CSV}\"}}" | oc apply -f - 2>/dev/null
+            echo "{\"apiVersion\":\"operators.coreos.com/v1alpha1\",\"kind\":\"Subscription\",\"metadata\":{\"name\":\"servicemeshoperator3\",\"namespace\":\"openshift-operators\"},\"spec\":{\"channel\":\"${SM_CHANNEL}\",\"installPlanApproval\":\"Manual\",\"name\":\"servicemeshoperator3\",\"source\":\"${SM_SOURCE}\",\"sourceNamespace\":\"openshift-marketplace\",\"startingCSV\":\"${SM_CSV}\"}}" | guest_oc apply -f - 2>/dev/null
             sleep 2
             continue
           fi
 
-          CSV_EXISTS=$(oc get csv "$SM_CSV" -n openshift-operators \
+          CSV_EXISTS=$(guest_oc get csv "$SM_CSV" -n openshift-operators \
             -o jsonpath='{.metadata.name}' 2>/dev/null)
           if [ -z "$CSV_EXISTS" ]; then
-            INSTALLED_CSV=$(oc get sub servicemeshoperator3 -n openshift-operators \
+            INSTALLED_CSV=$(guest_oc get sub servicemeshoperator3 -n openshift-operators \
               -o jsonpath='{.status.installedCSV}' 2>/dev/null)
             if [ -n "$INSTALLED_CSV" ]; then
               echo "Attempt $attempt: stale installedCSV=$INSTALLED_CSV but CSV gone, recreating..."
-              oc delete sub servicemeshoperator3 -n openshift-operators \
+              guest_oc delete sub servicemeshoperator3 -n openshift-operators \
                 --ignore-not-found 2>/dev/null || true
               sleep 2
-              echo "{\"apiVersion\":\"operators.coreos.com/v1alpha1\",\"kind\":\"Subscription\",\"metadata\":{\"name\":\"servicemeshoperator3\",\"namespace\":\"openshift-operators\"},\"spec\":{\"channel\":\"${SM_CHANNEL}\",\"installPlanApproval\":\"Manual\",\"name\":\"servicemeshoperator3\",\"source\":\"${SM_SOURCE}\",\"sourceNamespace\":\"openshift-marketplace\",\"startingCSV\":\"${SM_CSV}\"}}" | oc apply -f - 2>/dev/null
+              echo "{\"apiVersion\":\"operators.coreos.com/v1alpha1\",\"kind\":\"Subscription\",\"metadata\":{\"name\":\"servicemeshoperator3\",\"namespace\":\"openshift-operators\"},\"spec\":{\"channel\":\"${SM_CHANNEL}\",\"installPlanApproval\":\"Manual\",\"name\":\"servicemeshoperator3\",\"source\":\"${SM_SOURCE}\",\"sourceNamespace\":\"openshift-marketplace\",\"startingCSV\":\"${SM_CSV}\"}}" | guest_oc apply -f - 2>/dev/null
               sleep 3
               continue
             fi
           fi
 
-          for plan in $(oc get installplan -n openshift-operators \
+          for plan in $(guest_oc get installplan -n openshift-operators \
             -o jsonpath='{range .items[?(@.spec.approved==false)]}{.metadata.name}{" "}{end}' 2>/dev/null); do
-            csvs=$(oc get installplan "$plan" -n openshift-operators \
+            csvs=$(guest_oc get installplan "$plan" -n openshift-operators \
               -o jsonpath='{.spec.clusterServiceVersionNames}' 2>/dev/null)
             if ! echo "$csvs" | grep -q "$REJECT"; then
-              oc patch installplan "$plan" -n openshift-operators \
+              guest_oc patch installplan "$plan" -n openshift-operators \
                 --type merge -p '{"spec":{"approved":true}}' 2>/dev/null || true
             fi
           done
 
-          PHASE=$(oc get csv "$SM_CSV" -n openshift-operators \
+          PHASE=$(guest_oc get csv "$SM_CSV" -n openshift-operators \
             -o jsonpath='{.status.phase}' 2>/dev/null)
           [ "$PHASE" = "Succeeded" ] && exit 0
           echo "Attempt $attempt: channel=OK, CSV phase=$PHASE, waiting..."
