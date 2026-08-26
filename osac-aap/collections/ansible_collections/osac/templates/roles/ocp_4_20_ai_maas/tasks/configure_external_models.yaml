@@ -12,6 +12,26 @@
       through maas-default-gateway which only exists when MaaS is enabled.
   when: ocp_4_20_ai_maas_external_models | length > 0
 
+- name: Initialise resolved external model list
+  ansible.builtin.set_fact:
+    _resolved_external_models: []
+  no_log: true
+  when: ocp_4_20_ai_maas_external_models | length > 0
+
+- name: Resolve external model upstream credentials
+  ansible.builtin.include_tasks: resolve_external_model_credentials.yaml
+  loop: "{{ ocp_4_20_ai_maas_external_models }}"
+  loop_control:
+    label: "{{ item.name | default('unnamed') }}"
+  no_log: true
+  when: ocp_4_20_ai_maas_external_models | length > 0
+
+- name: Replace external models with resolved credentials
+  ansible.builtin.set_fact:
+    ocp_4_20_ai_maas_external_models: "{{ _resolved_external_models }}"
+  no_log: true
+  when: ocp_4_20_ai_maas_external_models | length > 0
+
 # --- Clean up leftover resources from prior failed runs (idempotent retry support) ---
 
 - name: Clean up leftover external subscriptions

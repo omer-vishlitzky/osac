@@ -157,6 +157,13 @@ ocp_4_20_ai_maas_tenant_projects: []
 #     priority: 10
 ocp_4_20_ai_maas_tenant_upstream_key_expires_in: 2159h
 
+# Management-cluster handoff for shared-cluster upstream credentials.
+# In AAP this uses in-cluster auth by default; local runs can point at the
+# management cluster explicitly when needed.
+ocp_4_20_ai_maas_management_kubeconfig: ""
+ocp_4_20_ai_maas_upstream_credentials_secret_namespace: "osac"
+ocp_4_20_ai_maas_upstream_credentials_secret_name: "maas-upstream-credentials"
+
 # Monitoring
 ocp_4_20_ai_maas_monitoring_retention: 24h
 

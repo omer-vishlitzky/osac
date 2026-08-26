@@ -55,20 +55,52 @@
           and the MaaSSubscription owner.
       when: _tenant_key.json.subscription | default('') != (item.tenant ~ '--' ~ item.project)
 
-    - name: Save upstream credential for this tenant-project to a local file
-      ansible.builtin.copy:
-        content: "{{ _tenant_key.json.key }}"
-        dest: "{{ playbook_dir }}/upstream-credentials-{{ item.tenant }}-{{ item.project }}.txt"
-        mode: "0600"
+    - name: Read existing management-cluster upstream credentials Secret
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Secret
+        name: "{{ ocp_4_20_ai_maas_upstream_credentials_secret_name }}"
+        namespace: "{{ ocp_4_20_ai_maas_upstream_credentials_secret_namespace }}"
+        kubeconfig: "{{ (ocp_4_20_ai_maas_management_kubeconfig | default('') | length > 0) | ternary(ocp_4_20_ai_maas_management_kubeconfig | expanduser, omit) }}"
       no_log: true
+      register: _existing_upstream_credentials_secret
 
-    - name: Report upstream credential saved
+    - name: Persist upstream credential in management-cluster Secret
+      kubernetes.core.k8s:
+        state: present
+        kubeconfig: "{{ (ocp_4_20_ai_maas_management_kubeconfig | default('') | length > 0) | ternary(ocp_4_20_ai_maas_management_kubeconfig | expanduser, omit) }}"
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: "{{ ocp_4_20_ai_maas_upstream_credentials_secret_name }}"
+            namespace: "{{ ocp_4_20_ai_maas_upstream_credentials_secret_namespace }}"
+            labels:
+              app.kubernetes.io/managed-by: osac-aap
+              osac.openshift.io/component: maas-upstream-credentials
+          type: Opaque
+          data: >-
+            {{
+              (
+                _existing_upstream_credentials_secret.resources[0].data
+                if (_existing_upstream_credentials_secret.resources | length > 0)
+                else {}
+              )
+              | combine({(item.tenant ~ '--' ~ item.project): (_tenant_key.json.key | b64encode)})
+            }}
+      no_log: true
+      register: _r
+      retries: 5
+      delay: 10
+      until: _r is not failed
+
+    - name: Report upstream credential secret updated
       ansible.builtin.debug:
         msg: >-
-          Upstream credential for {{ item.tenant }}/{{ item.project }} saved to
-          {{ playbook_dir }}/upstream-credentials-{{ item.tenant }}-{{ item.project }}.txt
-          (subscription={{ _tenant_key.json.subscription }}). Use this as upstream_credential
-          in the tenant cluster's ExternalModel entry.
+          Upstream credential for {{ item.tenant }}/{{ item.project }} saved to Secret
+          {{ ocp_4_20_ai_maas_upstream_credentials_secret_namespace }}/{{ ocp_4_20_ai_maas_upstream_credentials_secret_name }}
+          under data key {{ item.tenant }}--{{ item.project }}
+          (subscription={{ _tenant_key.json.subscription }}).
   loop: "{{ ocp_4_20_ai_maas_tenant_projects }}"
   loop_control:
     label: "{{ item.tenant }}--{{ item.project }}"

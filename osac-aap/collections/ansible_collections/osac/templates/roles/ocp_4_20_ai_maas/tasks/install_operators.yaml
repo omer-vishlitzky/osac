@@ -56,7 +56,6 @@
       - item.name is defined
       - item.secured is defined
       - item.upstream_endpoint is defined
-      - item.upstream_credential is defined
       - item.upstream_model_ns is defined
       - item.upstream_model_name is defined
       - item.model_id is defined
@@ -65,7 +64,7 @@
       - item.priority is defined
     fail_msg: >-
       External model '{{ item.name | default("unnamed") }}' is missing required fields.
-      Required: name, secured, upstream_endpoint, upstream_credential, upstream_model_ns,
+      Required: name, secured, upstream_endpoint, upstream_model_ns,
       upstream_model_name, model_id, token_limit, window, priority.
   loop: "{{ ocp_4_20_ai_maas_external_models }}"
   loop_control:
@@ -73,18 +72,40 @@
   no_log: true
   when: ocp_4_20_ai_maas_external_models | length > 0
 
-- name: Validate external model credentials are not empty
+- name: Validate external model credentials are configured
   ansible.builtin.assert:
     that:
-      - item.upstream_credential | length > 0
+      - >-
+        (item.upstream_credential | default('') | length > 0)
+        or
+        (item.upstream_credential_secret_key | default('') | length > 0)
     fail_msg: >-
-      External model '{{ item.name }}' has empty upstream_credential.
-      MaaS rejects empty api-key. Use a valid credential or 'dummy-not-used' for unsecured.
+      External model '{{ item.name }}' must define either upstream_credential or
+      upstream_credential_secret_key. MaaS rejects an empty api-key. Use a valid
+      credential or 'dummy-not-used' for unsecured.
   loop: "{{ ocp_4_20_ai_maas_external_models }}"
   loop_control:
     label: "{{ item.name | default('unnamed') }}"
   no_log: true
   when: ocp_4_20_ai_maas_external_models | length > 0
+
+- name: Validate external model secret references are complete
+  ansible.builtin.assert:
+    that:
+      - item.upstream_credential_secret_key | default('') | length > 0
+      - item.upstream_credential_secret_name | default(ocp_4_20_ai_maas_upstream_credentials_secret_name) | length > 0
+      - item.upstream_credential_secret_namespace | default(ocp_4_20_ai_maas_upstream_credentials_secret_namespace) | length > 0
+    fail_msg: >-
+      External model '{{ item.name }}' uses secret-backed credentials but the secret
+      reference is incomplete. Define upstream_credential_secret_key, or provide
+      upstream_credential inline.
+  loop: "{{ ocp_4_20_ai_maas_external_models }}"
+  loop_control:
+    label: "{{ item.name | default('unnamed') }}"
+  no_log: true
+  when:
+    - ocp_4_20_ai_maas_external_models | length > 0
+    - item.upstream_credential | default('') | length == 0
 
 - name: Validate hardware profile entries have required fields
   ansible.builtin.assert:

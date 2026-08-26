@@ -86,13 +86,21 @@ argument_specs:
             name            - Local model name (CR names derived from this)
             secured         - true = deploy proxy (Path B/C), false = direct Route (Path A)
             upstream_endpoint - Gateway FQDN (secured) or Route FQDN (unsecured)
-            upstream_credential - MaaS API key (B), K8s SA token (C), or 'dummy-not-used' (A)
+            upstream_credential - Optional inline MaaS API key (B), K8s SA token (C), or 'dummy-not-used' (A)
+            upstream_credential_secret_key - Optional management-cluster Secret data key
+              used to resolve upstream_credential automatically
+            upstream_credential_secret_name - Optional Secret name for secret-backed
+              upstream credentials (default: maas-upstream-credentials)
+            upstream_credential_secret_namespace - Optional Secret namespace for
+              secret-backed upstream credentials (default: osac)
             upstream_model_ns - Model namespace on upstream cluster
             upstream_model_name - Model name on upstream cluster
             model_id        - spec.targetModel for ExternalModel (e.g. granite-3.1-8b-instruct-fp8)
             token_limit     - Tenant-side rate limit (tokens per window)
             window          - Rate limit window (e.g. 1m, 1h)
             priority        - MaaSSubscription priority (lower number = lower tier)
+
+          Each entry must define either upstream_credential or upstream_credential_secret_key.
 
           When secured=true, a maas-proxy Deployment is created targeting
           upstream_endpoint. The proxy adds /<upstream_model_ns>/<upstream_model_name>/
@@ -455,6 +463,24 @@ argument_specs:
         required: false
         default: "2159h"
         description: Expiry duration passed to the upstream API key mint request for each tenant-project entry.
+      ocp_4_20_ai_maas_management_kubeconfig:
+        type: str
+        required: false
+        default: ""
+        description: >
+          Optional kubeconfig for the management cluster when local or out-of-cluster runs need
+          to read or write the shared upstream credentials Secret. Leave empty in AAP to use
+          in-cluster auth.
+      ocp_4_20_ai_maas_upstream_credentials_secret_namespace:
+        type: str
+        required: false
+        default: "osac"
+        description: Namespace of the management-cluster Secret that stores shared upstream credentials.
+      ocp_4_20_ai_maas_upstream_credentials_secret_name:
+        type: str
+        required: false
+        default: "maas-upstream-credentials"
+        description: Name of the management-cluster Secret that stores shared upstream credentials.
 
       # --- Metering (OSAC inference metering via Kafka; shared cluster only) ---
       ocp_4_20_ai_maas_enable_metering:

@@ -82,7 +82,9 @@ parameters:
     description: >
       List of external models to access from upstream clusters. Each entry creates
       an ExternalModel CR with MaaS governance. When secured=true, a maas-proxy
-      is deployed. Requires enable_maas=true.
+      is deployed. Requires enable_maas=true. Each entry must provide either
+      upstream_credential inline or upstream_credential_secret_key to resolve it
+      from the management-cluster Secret.
     type: list
     required: false
     default: []
@@ -154,3 +156,24 @@ parameters:
     type: string
     required: false
     default: "2159h"
+  - name: management_kubeconfig
+    title: Management Cluster Kubeconfig
+    description: >
+      Optional kubeconfig used to read or write the shared upstream credentials
+      Secret during local or out-of-cluster runs. Leave empty in AAP to use
+      in-cluster auth.
+    type: string
+    required: false
+    default: ""
+  - name: upstream_credentials_secret_namespace
+    title: Upstream Credentials Secret Namespace
+    description: Namespace of the management-cluster Secret that stores shared upstream credentials.
+    type: string
+    required: false
+    default: "osac"
+  - name: upstream_credentials_secret_name
+    title: Upstream Credentials Secret Name
+    description: Name of the management-cluster Secret that stores shared upstream credentials.
+    type: string
+    required: false
+    default: "maas-upstream-credentials"
