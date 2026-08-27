@@ -25,7 +25,7 @@
 - name: Deploy Keycloak MaaS instance
   when: ocp_4_20_ai_maas_enable_keycloak | default(true) | bool
   block:
-    - name: Apply Keycloak resources (namespace, RHBK, PostgreSQL, instance, route)
+    - name: Apply Keycloak resources (namespace, RHBK, PostgreSQL, instance)
       kubernetes.core.k8s:
         kubeconfig: "{{ admin_kubeconfig }}"
         state: present
@@ -84,6 +84,20 @@
             | selectattr('type', 'equalto', 'Ready')
             | selectattr('status', 'equalto', 'True')
             | list | length) == 0
+
+    - name: Apply Keycloak Route
+      environment:
+        KUBECONFIG: "{{ admin_kubeconfig_path }}"
+      ansible.builtin.shell: |
+        cat <<'EOF' | oc apply -f -
+        {{ lookup('ansible.builtin.template', 'keycloak-route.yaml.j2') | trim }}
+        EOF
+      args:
+        executable: /bin/bash
+      register: _r
+      retries: 5
+      delay: 10
+      until: _r.rc == 0
 
     - name: Apply Keycloak realm import
       kubernetes.core.k8s:
