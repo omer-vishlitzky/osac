@@ -287,61 +287,72 @@
     - name: Install SM with Ingress Operator race protection
       environment:
         GUEST_KUBECONFIG: "{{ admin_kubeconfig_path }}"
+        MANAGEMENT_KUBECONFIG: "{{ (ocp_4_20_ai_maas_management_kubeconfig | default('') | length > 0) | ternary(ocp_4_20_ai_maas_management_kubeconfig | expanduser, '') }}"
         HCP_NAMESPACE: "{{ cluster_working_namespace }}-{{ cluster_order.metadata.name }}"
         SM_CSV: "{{ ocp_4_20_ai_maas_sm_starting_csv }}"
         SM_CHANNEL: "{{ ocp_4_20_ai_maas_sm_channel }}"
         SM_SOURCE: "{{ ocp_4_20_ai_maas_sm_source }}"
-        REJECT: "{{ ocp_4_20_ai_maas_reject_version }}"
       ansible.builtin.shell: |
         guest_oc() {
           KUBECONFIG="$GUEST_KUBECONFIG" oc "$@"
+        }
+
+        hcp_oc() {
+          if [ -n "$MANAGEMENT_KUBECONFIG" ]; then
+            KUBECONFIG="$MANAGEMENT_KUBECONFIG" oc "$@"
+          else
+            oc "$@"
+          fi
+        }
+
+        scale_hcp_ingress() {
+          hcp_oc scale deployment ingress-operator -n "$HCP_NAMESPACE" \
+            --replicas="$1" --timeout=15s 2>/dev/null || true
+        }
+
+        cleanup_sm_state() {
+          for sub in servicemeshoperator3 rhcl-operator limitador-operator; do
+            guest_oc delete sub "$sub" -n openshift-operators \
+              --ignore-not-found 2>/dev/null || true
+          done
+          for csv in $(guest_oc get csv -n openshift-operators --no-headers \
+            -o custom-columns=NAME:.metadata.name 2>/dev/null | \
+            grep -E 'servicemeshoperator3|rhcl-operator|limitador-operator'); do
+            guest_oc delete csv "$csv" -n openshift-operators --ignore-not-found 2>/dev/null || true
+          done
+          for plan in $(guest_oc get installplan -n openshift-operators --no-headers \
+            -o custom-columns=NAME:.metadata.name,CSVS:.spec.clusterServiceVersionNames 2>/dev/null | \
+            grep -E 'servicemeshoperator3|rhcl-operator|limitador-operator' | awk '{print $1}'); do
+            guest_oc delete installplan "$plan" -n openshift-operators --ignore-not-found 2>/dev/null || true
+          done
         }
 
         PHASE=$(guest_oc get csv "$SM_CSV" -n openshift-operators \
           -o jsonpath='{.status.phase}' 2>/dev/null)
         [ "$PHASE" = "Succeeded" ] && exit 0
 
-        # Clear stale SM state before racing the hosted ingress operator.
-        guest_oc delete sub servicemeshoperator3 -n openshift-operators \
-          --ignore-not-found 2>/dev/null || true
-        for csv in $(guest_oc get csv -n openshift-operators --no-headers \
-          -o custom-columns=NAME:.metadata.name 2>/dev/null | grep servicemeshoperator3); do
-          guest_oc delete csv "$csv" -n openshift-operators --ignore-not-found 2>/dev/null || true
-        done
-        for plan in $(guest_oc get installplan -n openshift-operators --no-headers \
-          -o custom-columns=NAME:.metadata.name,CSVS:.spec.clusterServiceVersionNames 2>/dev/null | \
-          grep servicemeshoperator3 | awk '{print $1}'); do
-          guest_oc delete installplan "$plan" -n openshift-operators --ignore-not-found 2>/dev/null || true
-        done
-
-        # In HyperShift the ingress operator runs in the management-cluster
-        # hosted-control-plane namespace, not inside the guest cluster.
-        oc scale deployment ingress-operator -n "$HCP_NAMESPACE" \
-          --replicas=0 --timeout=15s 2>/dev/null || true
+        # Clear stale SM, RHCL, and stale Limitador state before racing the
+        # hosted ingress operator.
+        cleanup_sm_state
+        scale_hcp_ingress 0
         sleep 3
 
         for attempt in $(seq 1 10); do
+          scale_hcp_ingress 0
+          sleep 3
           CHANNEL=$(guest_oc get sub servicemeshoperator3 -n openshift-operators \
             -o jsonpath='{.spec.channel}' 2>/dev/null)
+          STARTING_CSV=$(guest_oc get sub servicemeshoperator3 -n openshift-operators \
+            -o jsonpath='{.spec.startingCSV}' 2>/dev/null)
 
           if [ -z "$CHANNEL" ]; then
             echo "Attempt $attempt: subscription missing, creating..."
             echo "{\"apiVersion\":\"operators.coreos.com/v1alpha1\",\"kind\":\"Subscription\",\"metadata\":{\"name\":\"servicemeshoperator3\",\"namespace\":\"openshift-operators\"},\"spec\":{\"channel\":\"${SM_CHANNEL}\",\"installPlanApproval\":\"Manual\",\"name\":\"servicemeshoperator3\",\"source\":\"${SM_SOURCE}\",\"sourceNamespace\":\"openshift-marketplace\",\"startingCSV\":\"${SM_CSV}\"}}" | guest_oc apply -f - 2>/dev/null
             sleep 3
             continue
-          elif [ "$CHANNEL" != "$SM_CHANNEL" ]; then
-            echo "Attempt $attempt: channel=$CHANNEL (wrong), deleting+recreating..."
-            guest_oc delete sub servicemeshoperator3 -n openshift-operators \
-              --ignore-not-found 2>/dev/null || true
-            for csv in $(guest_oc get csv -n openshift-operators --no-headers \
-              -o custom-columns=NAME:.metadata.name 2>/dev/null | grep servicemeshoperator3); do
-              guest_oc delete csv "$csv" -n openshift-operators --ignore-not-found 2>/dev/null || true
-            done
-            for plan in $(guest_oc get installplan -n openshift-operators --no-headers \
-              -o custom-columns=NAME:.metadata.name,CSVS:.spec.clusterServiceVersionNames 2>/dev/null | \
-              grep servicemeshoperator3 | awk '{print $1}'); do
-              guest_oc delete installplan "$plan" -n openshift-operators --ignore-not-found 2>/dev/null || true
-            done
+          elif [ "$CHANNEL" != "$SM_CHANNEL" ] || [ "$STARTING_CSV" != "$SM_CSV" ]; then
+            echo "Attempt $attempt: channel=$CHANNEL startingCSV=$STARTING_CSV (wrong), deleting+recreating..."
+            cleanup_sm_state
             sleep 2
             echo "{\"apiVersion\":\"operators.coreos.com/v1alpha1\",\"kind\":\"Subscription\",\"metadata\":{\"name\":\"servicemeshoperator3\",\"namespace\":\"openshift-operators\"},\"spec\":{\"channel\":\"${SM_CHANNEL}\",\"installPlanApproval\":\"Manual\",\"name\":\"servicemeshoperator3\",\"source\":\"${SM_SOURCE}\",\"sourceNamespace\":\"openshift-marketplace\",\"startingCSV\":\"${SM_CSV}\"}}" | guest_oc apply -f - 2>/dev/null
             sleep 2
@@ -355,8 +366,7 @@
               -o jsonpath='{.status.installedCSV}' 2>/dev/null)
             if [ -n "$INSTALLED_CSV" ]; then
               echo "Attempt $attempt: stale installedCSV=$INSTALLED_CSV but CSV gone, recreating..."
-              guest_oc delete sub servicemeshoperator3 -n openshift-operators \
-                --ignore-not-found 2>/dev/null || true
+              cleanup_sm_state
               sleep 2
               echo "{\"apiVersion\":\"operators.coreos.com/v1alpha1\",\"kind\":\"Subscription\",\"metadata\":{\"name\":\"servicemeshoperator3\",\"namespace\":\"openshift-operators\"},\"spec\":{\"channel\":\"${SM_CHANNEL}\",\"installPlanApproval\":\"Manual\",\"name\":\"servicemeshoperator3\",\"source\":\"${SM_SOURCE}\",\"sourceNamespace\":\"openshift-marketplace\",\"startingCSV\":\"${SM_CSV}\"}}" | guest_oc apply -f - 2>/dev/null
               sleep 3
@@ -364,15 +374,21 @@
             fi
           fi
 
-          for plan in $(guest_oc get installplan -n openshift-operators \
-            -o jsonpath='{range .items[?(@.spec.approved==false)]}{.metadata.name}{" "}{end}' 2>/dev/null); do
-            csvs=$(guest_oc get installplan "$plan" -n openshift-operators \
+          SM_PLAN=$(guest_oc get sub servicemeshoperator3 -n openshift-operators \
+            -o jsonpath='{.status.installPlanRef.name}' 2>/dev/null)
+          if [ -n "$SM_PLAN" ]; then
+            csvs=$(guest_oc get installplan "$SM_PLAN" -n openshift-operators \
               -o jsonpath='{.spec.clusterServiceVersionNames}' 2>/dev/null)
-            if ! echo "$csvs" | grep -q "$REJECT"; then
-              guest_oc patch installplan "$plan" -n openshift-operators \
+            if echo "$csvs" | grep -q "$SM_CSV"; then
+              guest_oc patch installplan "$SM_PLAN" -n openshift-operators \
                 --type merge -p '{"spec":{"approved":true}}' 2>/dev/null || true
+            else
+              echo "Attempt $attempt: install plan $SM_PLAN does not contain $SM_CSV, recreating..."
+              cleanup_sm_state
+              sleep 2
+              continue
             fi
-          done
+          fi
 
           PHASE=$(guest_oc get csv "$SM_CSV" -n openshift-operators \
             -o jsonpath='{.status.phase}' 2>/dev/null)
@@ -1067,22 +1083,26 @@
 
 # TEMPORARY WORKAROUND (end): Restore Ingress Operator after version-pinned install.
 - name: Scale up Ingress Operator
-  kubernetes.core.k8s:
-    kubeconfig: "{{ admin_kubeconfig }}"
-    state: present
-    definition:
-      apiVersion: apps/v1
-      kind: Deployment
-      metadata:
-        name: ingress-operator
-        namespace: openshift-ingress-operator
-      spec:
-        replicas: 1
-    merge_type: merge
+  environment:
+    MANAGEMENT_KUBECONFIG: "{{ (ocp_4_20_ai_maas_management_kubeconfig | default('') | length > 0) | ternary(ocp_4_20_ai_maas_management_kubeconfig | expanduser, '') }}"
+    HCP_NAMESPACE: "{{ cluster_working_namespace }}-{{ cluster_order.metadata.name }}"
+  ansible.builtin.shell: |
+    hcp_oc() {
+      if [ -n "$MANAGEMENT_KUBECONFIG" ]; then
+        KUBECONFIG="$MANAGEMENT_KUBECONFIG" oc "$@"
+      else
+        oc "$@"
+      fi
+    }
+    hcp_oc scale deployment ingress-operator -n "$HCP_NAMESPACE" \
+      --replicas=1 --timeout=30s
+  args:
+    executable: /bin/bash
   register: _r
   retries: 5
   delay: 10
-  until: _r is not failed
+  until: _r.rc == 0
+  changed_when: false
   when: ocp_4_20_ai_maas_enable_maas | bool
 
 - name: Report operator installation complete
