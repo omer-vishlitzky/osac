@@ -8,6 +8,7 @@ from collections.abc import Iterator
 
 import pytest
 
+from tests.core.cidrs import subnet_cidr, vnet_cidr
 from tests.core.grpc_client import GRPCClient
 from tests.core.helpers import (
     wait_for_subnet_cr,
@@ -68,7 +69,7 @@ def default_networking(grpc: GRPCClient, k8s_hub_client: K8sClient, test_run_id:
         # Create virtual network with unique name
         vn_name = f"test-vn-{test_run_id}"
         print(f"\nCreating VirtualNetwork: {vn_name}")
-        vn_id = grpc.create_virtual_network(name=vn_name, ipv4_cidr="10.200.0.0/16")
+        vn_id = grpc.create_virtual_network(name=vn_name, ipv4_cidr=vnet_cidr())
         vn_cr_name = wait_for_virtual_network_cr(k8s=k8s_hub_client, uuid=vn_id)
         print(f"Waiting for VirtualNetwork {vn_cr_name} to become Ready...")
         wait_for_virtual_network_ready(k8s=k8s_hub_client, name=vn_cr_name)
@@ -77,7 +78,7 @@ def default_networking(grpc: GRPCClient, k8s_hub_client: K8sClient, test_run_id:
         # Create subnet with unique name
         subnet_name = f"test-subnet-{test_run_id}"
         print(f"Creating Subnet: {subnet_name}")
-        subnet_id = grpc.create_subnet(name=subnet_name, virtual_network=vn_id, ipv4_cidr="10.200.100.0/24")
+        subnet_id = grpc.create_subnet(name=subnet_name, virtual_network=vn_id, ipv4_cidr=subnet_cidr())
         subnet_cr_name = wait_for_subnet_cr(k8s=k8s_hub_client, uuid=subnet_id)
         print(f"Waiting for Subnet {subnet_cr_name} to become Ready...")
         wait_for_subnet_ready(k8s=k8s_hub_client, name=subnet_cr_name)

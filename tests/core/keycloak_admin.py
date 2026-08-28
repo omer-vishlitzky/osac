@@ -36,14 +36,14 @@ def get_admin_token(*, keycloak_url: str, username: str, password: str) -> str:
 
 
 def keycloak_admin_request(
-    *, keycloak_url: str, admin_token: str, method: str, path: str, data: Any = None
+    *, keycloak_url: str, admin_token: str, realm: str, method: str, path: str, data: Any = None
 ) -> tuple[int, bytes]:
     """
-    Make an authenticated request to the Keycloak admin API for the 'osac' realm.
-    The path is relative to /admin/realms/osac (e.g., "/organizations", "/users/{id}").
+    Make an authenticated request to the Keycloak admin API for the given realm.
+    The path is relative to /admin/realms/{realm} (e.g., "/organizations", "/users/{id}").
     Returns (status_code, response_body).
     """
-    url = f"{keycloak_url}/admin/realms/osac{path}"
+    url = f"{keycloak_url}/admin/realms/{realm}{path}"
     args = [
         "curl",
         "-sk",
@@ -73,7 +73,7 @@ def keycloak_admin_request(
 
 
 def wait_for_organization(
-    *, keycloak_url: str, admin_token: str, org_name: str, timeout_seconds: int = 60
+    *, keycloak_url: str, admin_token: str, realm: str, org_name: str, timeout_seconds: int = 60
 ) -> str:
     """
     Wait for an organization to be synced to Keycloak and return its ID.
@@ -88,6 +88,7 @@ def wait_for_organization(
         status, body = keycloak_admin_request(
             keycloak_url=keycloak_url,
             admin_token=admin_token,
+            realm=realm,
             method="GET",
             path=f"/organizations?{query}",
         )
@@ -106,11 +107,11 @@ def wait_for_organization(
     raise RuntimeError(f"Organization '{org_name}' not found in Keycloak after {timeout_seconds}s")
 
 
-def get_user_id(*, keycloak_url: str, admin_token: str, username: str) -> str:
+def get_user_id(*, keycloak_url: str, admin_token: str, realm: str, username: str) -> str:
     """Get a user's ID by username."""
     query = urlencode({"username": username, "exact": "true"})
     status, body = keycloak_admin_request(
-        keycloak_url=keycloak_url, admin_token=admin_token, method="GET", path=f"/users?{query}"
+        keycloak_url=keycloak_url, admin_token=admin_token, realm=realm, method="GET", path=f"/users?{query}"
     )
 
     if status != 200:
@@ -124,12 +125,13 @@ def get_user_id(*, keycloak_url: str, admin_token: str, username: str) -> str:
 
 
 def add_user_to_organization(
-    *, keycloak_url: str, admin_token: str, org_id: str, user_id: str, username: str, org_name: str
+    *, keycloak_url: str, admin_token: str, realm: str, org_id: str, user_id: str, username: str, org_name: str
 ) -> None:
     """Add a user to a Keycloak organization."""
     status, body = keycloak_admin_request(
         keycloak_url=keycloak_url,
         admin_token=admin_token,
+        realm=realm,
         method="POST",
         path=f"/organizations/{org_id}/members",
         data=user_id,
@@ -149,7 +151,7 @@ def add_user_to_organization(
         )
 
 
-def ensure_organization_group(*, keycloak_url: str, admin_token: str, org_id: str, org_name: str) -> str:
+def ensure_organization_group(*, keycloak_url: str, admin_token: str, realm: str, org_id: str, org_name: str) -> str:
     """
     Ensure a /members group exists in the organization and return its ID.
     Creates the group if it doesn't exist.
@@ -160,6 +162,7 @@ def ensure_organization_group(*, keycloak_url: str, admin_token: str, org_id: st
     status, body = keycloak_admin_request(
         keycloak_url=keycloak_url,
         admin_token=admin_token,
+        realm=realm,
         method="POST",
         path=f"/organizations/{org_id}/groups",
         data=group_payload,
@@ -172,7 +175,11 @@ def ensure_organization_group(*, keycloak_url: str, admin_token: str, org_id: st
     elif status == 409:
         # Group already exists, need to fetch it
         status, body = keycloak_admin_request(
-            keycloak_url=keycloak_url, admin_token=admin_token, method="GET", path=f"/organizations/{org_id}/groups"
+            keycloak_url=keycloak_url,
+            admin_token=admin_token,
+            realm=realm,
+            method="GET",
+            path=f"/organizations/{org_id}/groups",
         )
 
         if status != 200:
@@ -193,12 +200,21 @@ def ensure_organization_group(*, keycloak_url: str, admin_token: str, org_id: st
 
 
 def add_user_to_organization_group(
-    *, keycloak_url: str, admin_token: str, org_id: str, group_id: str, user_id: str, username: str, org_name: str
+    *,
+    keycloak_url: str,
+    admin_token: str,
+    realm: str,
+    org_id: str,
+    group_id: str,
+    user_id: str,
+    username: str,
+    org_name: str,
 ) -> None:
     """Add a user to a group within a Keycloak organization."""
     status, body = keycloak_admin_request(
         keycloak_url=keycloak_url,
         admin_token=admin_token,
+        realm=realm,
         method="PUT",
         path=f"/organizations/{org_id}/groups/{group_id}/members/{user_id}",
     )
@@ -217,3 +233,55 @@ def add_user_to_organization_group(
             f"Failed to add user '{username}' to group in organization '{org_name}': "
             f"status={status} body={body.decode()}"
         )
+
+
+def set_password(*, keycloak_url: str, admin_token: str, realm: str, user_id: str, password: str) -> None:
+    """Set (or reset) a Keycloak user's password."""
+    status, body = keycloak_admin_request(
+        keycloak_url=keycloak_url,
+        admin_token=admin_token,
+        realm=realm,
+        method="PUT",
+        path=f"/users/{user_id}/reset-password",
+        data={"type": "password", "value": password, "temporary": False},
+    )
+
+    if status not in (201, 204):
+        raise RuntimeError(
+            f"Failed to set password for Keycloak user '{user_id}' in realm '{realm}': "
+            f"status={status} body={body.decode()}"
+        )
+
+
+def create_user(*, keycloak_url: str, admin_token: str, realm: str, username: str, password: str) -> None:
+    """Create a Keycloak user with an initial password; idempotent.
+
+    On 409 (username already exists) the existing user's password is reset so
+    re-runs converge on the same credential.
+    """
+    status, body = keycloak_admin_request(
+        keycloak_url=keycloak_url,
+        admin_token=admin_token,
+        realm=realm,
+        method="POST",
+        path="/users",
+        data={
+            "username": username,
+            "enabled": True,
+            "credentials": [{"type": "password", "value": password, "temporary": False}],
+        },
+    )
+
+    if status in (201, 204):
+        print(f"Created Keycloak user '{username}' in realm '{realm}'")
+        return
+    if status == 409:
+        print(f"Keycloak user '{username}' already exists in realm '{realm}' — resetting password")
+        user_id = get_user_id(keycloak_url=keycloak_url, admin_token=admin_token, realm=realm, username=username)
+        set_password(
+            keycloak_url=keycloak_url, admin_token=admin_token, realm=realm, user_id=user_id, password=password
+        )
+        return
+    raise RuntimeError(
+        f"Failed to create Keycloak user '{username}' in realm '{realm}': status={status} body={body.decode()}"
+    )

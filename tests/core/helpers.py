@@ -9,7 +9,7 @@ import pytest
 
 from tests.core.grpc_client import GRPCClient
 from tests.core.k8s_client import K8sClient
-from tests.core.runner import poll_until, run_unchecked
+from tests.core.runner import env, poll_until, run_unchecked
 
 _POOL_READY_STATE = "EXTERNAL_IP_POOL_STATE_READY"
 
@@ -395,7 +395,7 @@ def _force_cleanup_agentcluster_finalizers(*, k8s: K8sClient, name: str) -> None
 
 
 def _force_cleanup_agent_labels(*, k8s: K8sClient, name: str) -> None:
-    agent_ns = "hardware-inventory"
+    agent_ns = env("OSAC_AGENT_NAMESPACE")
     clusterorder_label = "osac.openshift.io/clusterorder"
     clusterdeployment_ns_label = "agent-install.openshift.io/clusterdeployment-namespace"
     base_args = [*k8s._base(), "--as", "system:admin"]

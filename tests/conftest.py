@@ -14,6 +14,7 @@ from tests.core.keycloak import get_jwt
 from tests.core.keycloak_admin import (
     add_user_to_organization,
     add_user_to_organization_group,
+    create_user,
     ensure_organization_group,
     get_admin_token,
     get_user_id,
@@ -22,6 +23,7 @@ from tests.core.keycloak_admin import (
 from tests.core.metering import MeteringCollector
 from tests.core.osac_cli import OsacCLI
 from tests.core.runner import env, run
+from tests.core.tenants import jwt_users, tenant_admin, tenant_name, tenant_user
 
 
 def pytest_configure(config: pytest.Config) -> None:
@@ -76,7 +78,7 @@ def keycloak_client_id() -> str:
 
 @pytest.fixture(scope="session")
 def jwt_username() -> str:
-    return env("OSAC_JWT_USERNAME", "tenant1_admin")
+    return env("OSAC_JWT_USERNAME", tenant_admin(1))
 
 
 @pytest.fixture(scope="session")
@@ -110,20 +112,35 @@ def private_grpc(fulfillment_private_address: str, namespace: str, service_accou
 
 @pytest.fixture(scope="session", autouse=True)
 def ensure_tenants(private_grpc: GRPCClient) -> None:
-    for name in ("tenant1", "tenant2"):
-        private_grpc.ensure_tenant(name=name)
+    for number in (1, 2):
+        private_grpc.ensure_tenant(name=tenant_name(number))
 
 
 @pytest.fixture(scope="session", autouse=True)
-def ensure_jwt_users(ensure_tenants: None, private_grpc: GRPCClient) -> None:
+def ensure_keycloak_users(
+    ensure_tenants: None, keycloak_url: str, keycloak_realm: str, keycloak_admin_password: str, jwt_password: str
+) -> None:
+    """Provision the derived JWT users in Keycloak with the run's JWT password.
+
+    The realm's devFixtures only cover the fixed local-dev usernames, so
+    per-run renamed users must get credentials here or JWT auth fails.
+    """
+    admin_token = get_admin_token(keycloak_url=keycloak_url, username="admin", password=keycloak_admin_password)
+    for username, _tenant in jwt_users():
+        create_user(
+            keycloak_url=keycloak_url,
+            admin_token=admin_token,
+            realm=keycloak_realm,
+            username=username,
+            password=jwt_password,
+        )
+
+
+@pytest.fixture(scope="session", autouse=True)
+def ensure_jwt_users(ensure_keycloak_users: None, ensure_tenants: None, private_grpc: GRPCClient) -> None:
     """Pre-create users that JWT fixtures authenticate as, so JIT provisioning
     doesn't race on concurrent first requests from xdist workers."""
-    for username, tenant in [
-        ("tenant1_admin", "tenant1"),
-        ("tenant1_user", "tenant1"),
-        ("tenant2_user", "tenant2"),
-        ("tenant2_admin", "tenant2"),
-    ]:
+    for username, tenant in jwt_users():
         with contextlib.suppress(subprocess.CalledProcessError):
             private_grpc.call(
                 service=f"{PRIVATE_API}.Users/Create",
@@ -143,7 +160,11 @@ def keycloak_admin_password() -> str:
 
 @pytest.fixture(scope="session", autouse=True)
 def setup_organization_memberships(
-    ensure_tenants: None, keycloak_url: str, keycloak_admin_password: str
+    ensure_keycloak_users: None,
+    ensure_tenants: None,
+    keycloak_url: str,
+    keycloak_realm: str,
+    keycloak_admin_password: str,
 ) -> None:
     """
     Add test users to their corresponding Keycloak organizations.
@@ -154,21 +175,25 @@ def setup_organization_memberships(
     admin_token = get_admin_token(keycloak_url=keycloak_url, username="admin", password=keycloak_admin_password)
 
     # Map of organization name -> list of usernames
-    org_users = {
-        "tenant1": ["tenant1_user", "tenant1_admin"],
-        "tenant2": ["tenant2_user", "tenant2_admin"],
-    }
+    org_users: dict[str, list[str]] = {}
+    for username, tenant in jwt_users():
+        org_users.setdefault(tenant, []).append(username)
 
     for org_name, usernames in org_users.items():
         # Wait for the organization to be synced to Keycloak by the tenant controller
-        org_id = wait_for_organization(keycloak_url=keycloak_url, admin_token=admin_token, org_name=org_name)
+        org_id = wait_for_organization(
+            keycloak_url=keycloak_url, admin_token=admin_token, realm=keycloak_realm, org_name=org_name
+        )
 
         # Add each user to the organization
         for username in usernames:
-            user_id = get_user_id(keycloak_url=keycloak_url, admin_token=admin_token, username=username)
+            user_id = get_user_id(
+                keycloak_url=keycloak_url, admin_token=admin_token, realm=keycloak_realm, username=username
+            )
             add_user_to_organization(
                 keycloak_url=keycloak_url,
                 admin_token=admin_token,
+                realm=keycloak_realm,
                 org_id=org_id,
                 user_id=user_id,
                 username=username,
@@ -178,14 +203,17 @@ def setup_organization_memberships(
         # Create /members group in the organization and add all users to it
         # This is required for the organization scope to include the organization in the JWT token
         group_id = ensure_organization_group(
-            keycloak_url=keycloak_url, admin_token=admin_token, org_id=org_id, org_name=org_name
+            keycloak_url=keycloak_url, admin_token=admin_token, realm=keycloak_realm, org_id=org_id, org_name=org_name
         )
 
         for username in usernames:
-            user_id = get_user_id(keycloak_url=keycloak_url, admin_token=admin_token, username=username)
+            user_id = get_user_id(
+                keycloak_url=keycloak_url, admin_token=admin_token, realm=keycloak_realm, username=username
+            )
             add_user_to_organization_group(
                 keycloak_url=keycloak_url,
                 admin_token=admin_token,
+                realm=keycloak_realm,
                 org_id=org_id,
                 group_id=group_id,
                 user_id=user_id,
@@ -200,11 +228,21 @@ def k8s_hub_client(namespace: str) -> K8sClient:
 
 
 @pytest.fixture(scope="session")
-def cli(namespace: str, fulfillment_address: str, keycloak_url: str, jwt_username: str, jwt_password: str) -> Iterator[OsacCLI]:  # noqa: E501
+def cli(
+    namespace: str,
+    fulfillment_address: str,
+    keycloak_url: str,
+    keycloak_realm: str,
+    keycloak_client_id: str,
+    jwt_username: str,
+    jwt_password: str,
+) -> Iterator[OsacCLI]:
     instance = OsacCLI(
         binary=env("OSAC_CLI_PATH", "osac"),
         address=f"https://{fulfillment_address.rsplit(':', 1)[0]}",
-        token_script=_make_jwt_token_script(keycloak_url, jwt_username, jwt_password),
+        token_script=_make_jwt_token_script(
+            keycloak_url, keycloak_realm, keycloak_client_id, jwt_username, jwt_password
+        ),
         namespace=namespace,
     )
     yield instance
@@ -234,21 +272,31 @@ def jwt_password() -> str:
     return env("OSAC_JWT_PASSWORD", "foobar")
 
 
-def _make_jwt_token_script(keycloak_url: str, username: str, password: str) -> str:
+def _make_jwt_token_script(keycloak_url: str, realm: str, client_id: str, username: str, password: str) -> str:
     return (
-        f"curl -sk -X POST {keycloak_url}/realms/osac/protocol/openid-connect/token"
-        f" -d grant_type=password -d client_id=osac-cli"
+        f"curl -sk -X POST {keycloak_url}/realms/{realm}/protocol/openid-connect/token"
+        f" -d grant_type=password -d client_id={client_id}"
         f" -d username={username} -d password={password} -d 'scope=openid organization'"
         " | python3 -c \"import sys,json;print(json.load(sys.stdin)['access_token'])\""
     )
 
 
 @pytest.fixture(scope="session")
-def jwt_cli_user(namespace: str, fulfillment_address: str, keycloak_url: str, jwt_password: str) -> Iterator[OsacCLI]:
+def jwt_cli_user(
+    namespace: str,
+    fulfillment_address: str,
+    keycloak_url: str,
+    keycloak_realm: str,
+    keycloak_client_id: str,
+    jwt_password: str,
+) -> Iterator[OsacCLI]:
+    tenant1_user = tenant_user(1)
     instance = OsacCLI(
         binary=env("OSAC_CLI_PATH", "osac"),
         address=f"https://{fulfillment_address.rsplit(':', 1)[0]}",
-        token_script=_make_jwt_token_script(keycloak_url, "tenant1_user", jwt_password),
+        token_script=_make_jwt_token_script(
+            keycloak_url, keycloak_realm, keycloak_client_id, tenant1_user, jwt_password
+        ),
         namespace=namespace,
     )
     yield instance
@@ -256,11 +304,21 @@ def jwt_cli_user(namespace: str, fulfillment_address: str, keycloak_url: str, jw
 
 
 @pytest.fixture(scope="session")
-def jwt_cli_admin(namespace: str, fulfillment_address: str, keycloak_url: str, jwt_password: str) -> Iterator[OsacCLI]:
+def jwt_cli_admin(
+    namespace: str,
+    fulfillment_address: str,
+    keycloak_url: str,
+    keycloak_realm: str,
+    keycloak_client_id: str,
+    jwt_password: str,
+) -> Iterator[OsacCLI]:
+    tenant1_admin = tenant_admin(1)
     instance = OsacCLI(
         binary=env("OSAC_CLI_PATH", "osac"),
         address=f"https://{fulfillment_address.rsplit(':', 1)[0]}",
-        token_script=_make_jwt_token_script(keycloak_url, "tenant1_admin", jwt_password),
+        token_script=_make_jwt_token_script(
+            keycloak_url, keycloak_realm, keycloak_client_id, tenant1_admin, jwt_password
+        ),
         namespace=namespace,
     )
     yield instance
@@ -268,42 +326,48 @@ def jwt_cli_admin(namespace: str, fulfillment_address: str, keycloak_url: str, j
 
 
 @pytest.fixture(scope="session")
-def jwt_grpc_tenant1_admin(fulfillment_address: str, keycloak_url: str, jwt_password: str) -> GRPCClient:
+def jwt_grpc_tenant1_admin(
+    fulfillment_address: str, keycloak_url: str, keycloak_realm: str, keycloak_client_id: str, jwt_password: str
+) -> GRPCClient:
     return GRPCClient(
         address=fulfillment_address,
         token_factory=lambda: get_jwt(
             keycloak_url=keycloak_url,
-            realm="osac",
-            client_id="osac-cli",
-            username="tenant1_admin",
+            realm=keycloak_realm,
+            client_id=keycloak_client_id,
+            username=tenant_admin(1),
             password=jwt_password,
         ),
     )
 
 
 @pytest.fixture(scope="session")
-def jwt_grpc_tenant1(fulfillment_address: str, keycloak_url: str, jwt_password: str) -> GRPCClient:
+def jwt_grpc_tenant1(
+    fulfillment_address: str, keycloak_url: str, keycloak_realm: str, keycloak_client_id: str, jwt_password: str
+) -> GRPCClient:
     return GRPCClient(
         address=fulfillment_address,
         token_factory=lambda: get_jwt(
             keycloak_url=keycloak_url,
-            realm="osac",
-            client_id="osac-cli",
-            username="tenant1_user",
+            realm=keycloak_realm,
+            client_id=keycloak_client_id,
+            username=tenant_user(1),
             password=jwt_password,
         ),
     )
 
 
 @pytest.fixture(scope="session")
-def jwt_grpc_tenant2(fulfillment_address: str, keycloak_url: str, jwt_password: str) -> GRPCClient:
+def jwt_grpc_tenant2(
+    fulfillment_address: str, keycloak_url: str, keycloak_realm: str, keycloak_client_id: str, jwt_password: str
+) -> GRPCClient:
     return GRPCClient(
         address=fulfillment_address,
         token_factory=lambda: get_jwt(
             keycloak_url=keycloak_url,
-            realm="osac",
-            client_id="osac-cli",
-            username="tenant2_user",
+            realm=keycloak_realm,
+            client_id=keycloak_client_id,
+            username=tenant_user(2),
             password=jwt_password,
         ),
     )

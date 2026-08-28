@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from uuid import uuid4
 
+from tests.core import cidrs
 from tests.core.grpc_client import GRPCClient
 from tests.core.helpers import (
     wait_for_virtual_network_cr,
@@ -14,7 +15,7 @@ from tests.core.runner import poll_until
 
 def test_virtual_network_lifecycle(grpc: GRPCClient, k8s_hub_client: K8sClient) -> None:
     vn_name: str = f"test-vnet-{uuid4().hex[:8]}"
-    vn_id: str = grpc.create_virtual_network(name=vn_name, ipv4_cidr="10.100.0.0/16")
+    vn_id: str = grpc.create_virtual_network(name=vn_name, ipv4_cidr=cidrs.test_cidr(3))
     cr_name: str = wait_for_virtual_network_cr(k8s=k8s_hub_client, uuid=vn_id)
 
     assert vn_id in grpc.list_virtual_network_ids()

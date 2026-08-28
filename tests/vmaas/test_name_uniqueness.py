@@ -6,6 +6,7 @@ import uuid
 
 import pytest
 
+from tests.core import cidrs
 from tests.core.grpc_client import PUBLIC_API, GRPCClient
 from tests.core.helpers import (
     assert_grpc_rejected,
@@ -29,9 +30,9 @@ class TestVirtualNetworkProjectScopedUniqueness:
         vn_name = f"dup-vn-{uuid.uuid4().hex[:8]}"
         vn_id: str | None = None
         try:
-            vn_id = jwt_grpc_tenant1.create_virtual_network(name=vn_name, ipv4_cidr="10.120.0.0/16")
+            vn_id = jwt_grpc_tenant1.create_virtual_network(name=vn_name, ipv4_cidr=cidrs.test_cidr(5))
             with pytest.raises(subprocess.CalledProcessError) as exc_info:
-                jwt_grpc_tenant1.create_virtual_network(name=vn_name, ipv4_cidr="10.121.0.0/16")
+                jwt_grpc_tenant1.create_virtual_network(name=vn_name, ipv4_cidr=cidrs.test_cidr(5))
             assert_grpc_rejected(exc_info, "AlreadyExists")
             msg = _grpc_error_message(exc_info.value)
             assert "virtual network" in msg.lower(), f"Error should mention 'virtual network', got: {msg}"
@@ -43,14 +44,14 @@ class TestVirtualNetworkProjectScopedUniqueness:
         self, jwt_grpc_tenant1: GRPCClient, k8s_hub_client: K8sClient
     ) -> None:
         vn_name = f"del-dup-{uuid.uuid4().hex[:8]}"
-        vn_id = jwt_grpc_tenant1.create_virtual_network(name=vn_name, ipv4_cidr="10.122.0.0/16")
+        vn_id = jwt_grpc_tenant1.create_virtual_network(name=vn_name, ipv4_cidr=cidrs.test_cidr(5))
         cr_name = wait_for_virtual_network_cr(k8s=k8s_hub_client, uuid=vn_id)
         wait_for_virtual_network_ready(k8s=k8s_hub_client, name=cr_name)
 
         jwt_grpc_tenant1.delete_virtual_network(vn_id=vn_id)
 
         with pytest.raises(subprocess.CalledProcessError) as exc_info:
-            jwt_grpc_tenant1.create_virtual_network(name=vn_name, ipv4_cidr="10.123.0.0/16")
+            jwt_grpc_tenant1.create_virtual_network(name=vn_name, ipv4_cidr=cidrs.test_cidr(5))
         assert_grpc_rejected(exc_info, "AlreadyExists")
 
         wait_for_virtual_network_deletion(k8s=k8s_hub_client, name=cr_name)
@@ -62,8 +63,8 @@ class TestVirtualNetworkProjectScopedUniqueness:
         vn_id_t1: str | None = None
         vn_id_t2: str | None = None
         try:
-            vn_id_t1 = jwt_grpc_tenant1.create_virtual_network(name=vn_name, ipv4_cidr="10.124.0.0/16")
-            vn_id_t2 = jwt_grpc_tenant2.create_virtual_network(name=vn_name, ipv4_cidr="10.125.0.0/16")
+            vn_id_t1 = jwt_grpc_tenant1.create_virtual_network(name=vn_name, ipv4_cidr=cidrs.test_cidr(5))
+            vn_id_t2 = jwt_grpc_tenant2.create_virtual_network(name=vn_name, ipv4_cidr=cidrs.test_cidr(6))
             assert vn_id_t1 != vn_id_t2
         finally:
             if vn_id_t1:
@@ -84,7 +85,7 @@ class TestVirtualNetworkProjectScopedUniqueness:
                 data={
                     "object": {
                         "metadata": {"name": vn_name, "project": "project-alpha"},
-                        "spec": {"ipv4_cidr": "10.126.0.0/16"},
+                        "spec": {"ipv4_cidr": cidrs.test_cidr(5)},
                     }
                 },
             )["object"]["id"]
@@ -93,7 +94,7 @@ class TestVirtualNetworkProjectScopedUniqueness:
                 data={
                     "object": {
                         "metadata": {"name": vn_name, "project": "project-beta"},
-                        "spec": {"ipv4_cidr": "10.127.0.0/16"},
+                        "spec": {"ipv4_cidr": cidrs.test_cidr(6)},
                     }
                 },
             )["object"]["id"]

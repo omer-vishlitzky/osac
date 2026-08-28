@@ -8,6 +8,7 @@ from uuid import uuid4
 
 import pytest
 
+from tests.core.cidrs import subnet_cidr, vnet_cidr
 from tests.core.grpc_client import GRPCClient
 from tests.core.helpers import (
     wait_for_subnet_cr,
@@ -92,7 +93,7 @@ def catalog_networking(
     try:
         vn_id = grpc.create_virtual_network(
             name=f"e2e-cat-vn-{tag}",
-            ipv4_cidr="10.200.0.0/16",
+            ipv4_cidr=vnet_cidr(),
         )
         vn_cr_name = wait_for_virtual_network_cr(k8s=k8s_hub_client, uuid=vn_id)
         wait_for_virtual_network_ready(k8s=k8s_hub_client, name=vn_cr_name)
@@ -100,7 +101,7 @@ def catalog_networking(
         subnet_id = grpc.create_subnet(
             name=f"e2e-cat-subnet-{tag}",
             virtual_network=vn_id,
-            ipv4_cidr="10.200.100.0/24",
+            ipv4_cidr=subnet_cidr(),
         )
         subnet_cr_name = wait_for_subnet_cr(k8s=k8s_hub_client, uuid=subnet_id)
         wait_for_subnet_ready(k8s=k8s_hub_client, name=subnet_cr_name)

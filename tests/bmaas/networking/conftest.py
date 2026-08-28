@@ -8,6 +8,9 @@ import pytest
 from tests.core.grpc_client import GRPCClient
 from tests.core.runner import env
 
+if not env("OSAC_ENABLE_NETRIS", ""):
+    pytest.skip("netris backend suite requires OSAC_ENABLE_NETRIS", allow_module_level=True)
+
 
 @pytest.fixture(scope="session")
 def external_ip_pool_name() -> str:

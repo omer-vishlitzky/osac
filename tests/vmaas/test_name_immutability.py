@@ -5,6 +5,7 @@ import uuid
 
 import pytest
 
+from tests.core import cidrs
 from tests.core.grpc_client import PUBLIC_API, GRPCClient
 from tests.core.helpers import assert_grpc_rejected
 
@@ -20,7 +21,7 @@ class TestVirtualNetworkImmutability:
         vn_name = f"imm-name-{uuid.uuid4().hex[:8]}"
         vn_id: str | None = None
         try:
-            vn_id = jwt_grpc_tenant1.create_virtual_network(name=vn_name, ipv4_cidr="10.130.0.0/16")
+            vn_id = jwt_grpc_tenant1.create_virtual_network(name=vn_name, ipv4_cidr=cidrs.test_cidr(7))
 
             with pytest.raises(subprocess.CalledProcessError) as exc_info:
                 jwt_grpc_tenant1.call(
@@ -29,7 +30,7 @@ class TestVirtualNetworkImmutability:
                         "object": {
                             "id": vn_id,
                             "metadata": {"name": f"renamed-{vn_name}"},
-                            "spec": {"ipv4_cidr": "10.130.0.0/16"},
+                            "spec": {"ipv4_cidr": cidrs.test_cidr(7)},
                         },
                         "update_mask": {"paths": ["metadata.name"]},
                     },
@@ -60,7 +61,7 @@ class TestVirtualNetworkImmutability:
         vn_name = f"imm-tp-{uuid.uuid4().hex[:8]}"
         vn_id: str | None = None
         try:
-            vn_id = jwt_grpc_tenant1.create_virtual_network(name=vn_name, ipv4_cidr="10.131.0.0/16")
+            vn_id = jwt_grpc_tenant1.create_virtual_network(name=vn_name, ipv4_cidr=cidrs.test_cidr(7))
 
             with pytest.raises(subprocess.CalledProcessError) as exc_info:
                 jwt_grpc_tenant1.call(
@@ -69,7 +70,7 @@ class TestVirtualNetworkImmutability:
                         "object": {
                             "id": vn_id,
                             "metadata": {"name": vn_name, field_key: field_value},
-                            "spec": {"ipv4_cidr": "10.131.0.0/16"},
+                            "spec": {"ipv4_cidr": cidrs.test_cidr(7)},
                         },
                         "update_mask": {"paths": [field_path]},
                     },

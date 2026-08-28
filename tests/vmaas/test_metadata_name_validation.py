@@ -6,6 +6,7 @@ import uuid
 
 import pytest
 
+from tests.core import cidrs
 from tests.core.grpc_client import PUBLIC_API, GRPCClient
 from tests.core.helpers import (
     assert_grpc_rejected,
@@ -30,7 +31,7 @@ class TestVirtualNetworkNameValidation:
         with pytest.raises(subprocess.CalledProcessError) as exc_info:
             grpc.call(
                 service=f"{PUBLIC_API}.VirtualNetworks/Create",
-                data={"object": {"spec": {"ipv4_cidr": "10.100.0.0/16"}}},
+                data={"object": {"spec": {"ipv4_cidr": cidrs.test_cidr(0)}}},
             )
         assert_grpc_rejected(exc_info, "InvalidArgument")
         grpc_msg = _grpc_error_message(exc_info.value)
@@ -45,13 +46,13 @@ class TestVirtualNetworkNameValidation:
         with pytest.raises(subprocess.CalledProcessError) as exc_info:
             grpc.call(
                 service=f"{PUBLIC_API}.VirtualNetworks/Create",
-                data={"object": {"metadata": {"name": invalid_name}, "spec": {"ipv4_cidr": "10.100.0.0/16"}}},
+                data={"object": {"metadata": {"name": invalid_name}, "spec": {"ipv4_cidr": cidrs.test_cidr(0)}}},
             )
         assert_grpc_rejected(exc_info, "InvalidArgument")
 
     def test_create_with_valid_dns_name(self, grpc: GRPCClient, k8s_hub_client: K8sClient) -> None:
         vn_name = f"test-valid-dns-{uuid.uuid4().hex[:8]}"
-        vn_id: str = grpc.create_virtual_network(name=vn_name, ipv4_cidr="10.110.0.0/16")
+        vn_id: str = grpc.create_virtual_network(name=vn_name, ipv4_cidr=cidrs.test_cidr(4))
         cr_name: str | None = None
         try:
             cr_name = wait_for_virtual_network_cr(k8s=k8s_hub_client, uuid=vn_id)
