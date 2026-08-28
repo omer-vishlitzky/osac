@@ -1,0 +1,153 @@
+{{- if and .Values.keycloak.enabled .Values.keycloak.route.publicIngress }}
+# This hook patches the per-install Keycloak Route to set destinationCACertificate
+# for reencrypt TLS mode. Uses pre-upgrade (not post-upgrade) to apply the CA cert
+# before the Route is accessed during upgrade, ensuring the reencrypt termination is
+# properly configured when Keycloak starts. The default-ca Secret lives in the
+# shared cert-manager namespace (ClusterIssuer default-ca is cluster-scoped).
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: osac-patch-keycloak-route
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "osac.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": post-install,pre-upgrade
+    "helm.sh/hook-delete-policy": before-hook-creation
+    "helm.sh/hook-weight": "15"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: osac-patch-keycloak-route-cert-manager
+  namespace: cert-manager
+  labels:
+    {{- include "osac.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": post-install,pre-upgrade
+    "helm.sh/hook-delete-policy": before-hook-creation
+    "helm.sh/hook-weight": "15"
+rules:
+- apiGroups: [""]
+  resources: [secrets]
+  resourceNames: [default-ca]
+  verbs: [get, watch, list]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: osac-patch-keycloak-route
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "osac.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": post-install,pre-upgrade
+    "helm.sh/hook-delete-policy": before-hook-creation
+    "helm.sh/hook-weight": "15"
+rules:
+- apiGroups: [route.openshift.io]
+  resources: [routes]
+  resourceNames: [keycloak]
+  verbs: [get, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: osac-patch-keycloak-route-cert-manager
+  namespace: cert-manager
+  labels:
+    {{- include "osac.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": post-install,pre-upgrade
+    "helm.sh/hook-delete-policy": before-hook-creation
+    "helm.sh/hook-weight": "15"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: osac-patch-keycloak-route-cert-manager
+subjects:
+- kind: ServiceAccount
+  name: osac-patch-keycloak-route
+  namespace: {{ .Release.Namespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: osac-patch-keycloak-route
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "osac.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": post-install,pre-upgrade
+    "helm.sh/hook-delete-policy": before-hook-creation
+    "helm.sh/hook-weight": "15"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: osac-patch-keycloak-route
+subjects:
+- kind: ServiceAccount
+  name: osac-patch-keycloak-route
+  namespace: {{ .Release.Namespace }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: osac-patch-keycloak-route
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "osac.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": post-install,pre-upgrade
+    "helm.sh/hook-delete-policy": before-hook-creation
+    "helm.sh/hook-weight": "15"
+spec:
+  backoffLimit: 5
+  activeDeadlineSeconds: 600
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        {{- include "osac.labels" . | nindent 8 }}
+    spec:
+      serviceAccountName: osac-patch-keycloak-route
+      restartPolicy: OnFailure
+      volumes:
+      - name: tmp
+        emptyDir: {}
+      - name: scripts
+        configMap:
+          name: osac-keycloak-hook-scripts
+          defaultMode: 0755
+      containers:
+      - name: patch-route
+        image: {{ .Values.cliImage }}
+        env:
+        - name: HOME
+          value: /tmp
+        - name: KEYCLOAK_NAMESPACE
+          value: {{ .Release.Namespace }}
+        volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+        - name: scripts
+          mountPath: /scripts
+          readOnly: true
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - "ALL"
+        resources:
+          requests:
+            cpu: 50m
+            memory: 128Mi
+          limits:
+            cpu: 200m
+            memory: 256Mi
+        command:
+        - /bin/bash
+        - /scripts/patch-keycloak-route.sh
+{{- end }}

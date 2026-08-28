@@ -1,0 +1,108 @@
+{{- if .Values.keycloak.enabled }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: osac-wait-keycloak
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "osac.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-delete-policy": before-hook-creation
+    "helm.sh/hook-weight": "15"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: osac-wait-keycloak
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "osac.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-delete-policy": before-hook-creation
+    "helm.sh/hook-weight": "15"
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: osac-wait-keycloak
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "osac.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-delete-policy": before-hook-creation
+    "helm.sh/hook-weight": "15"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: osac-wait-keycloak
+subjects:
+  - kind: ServiceAccount
+    name: osac-wait-keycloak
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: osac-wait-keycloak
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "osac.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-delete-policy": before-hook-creation
+    "helm.sh/hook-weight": "15"
+spec:
+  backoffLimit: 5
+  activeDeadlineSeconds: 1800
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        {{- include "osac.labels" . | nindent 8 }}
+    spec:
+      serviceAccountName: osac-wait-keycloak
+      restartPolicy: OnFailure
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: scripts
+          configMap:
+            name: osac-keycloak-hook-scripts
+      containers:
+        - name: wait-keycloak
+          image: {{ .Values.cliImage }}
+          env:
+            - name: HOME
+              value: /tmp
+            - name: KEYCLOAK_NAMESPACE
+              value: {{ .Release.Namespace }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: scripts
+              mountPath: /scripts
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+          command:
+            - /bin/bash
+            - /scripts/wait-keycloak.sh
+{{- end }}

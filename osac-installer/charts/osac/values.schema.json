@@ -1631,6 +1631,123 @@
         }
       }
     },
+    "keycloak": {
+      "type": "object",
+      "description": "Per-install Keycloak deployed into the release namespace (pool mode). When disabled, the instance uses the shared Keycloak from osac-infra.",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Deploy a dedicated Keycloak into .Release.Namespace instead of using the shared osac-infra Keycloak",
+          "default": false
+        },
+        "devFixtures": {
+          "type": "boolean",
+          "description": "Seed known passwords for the realm's built-in tenant/test users (dev/CI pool runs only)",
+          "default": true
+        },
+        "routeHost": {
+          "type": "string",
+          "description": "Public Route host for this install's Keycloak. Required when enabled -- enforced in the template via `required` (e.g. keycloak-pool-abc.apps.example.com)",
+          "default": ""
+        },
+        "internalHost": {
+          "type": "string",
+          "description": "Internal hostname set as KC_HOSTNAME and on the TLS cert. Defaults to keycloak.<release-namespace>.svc.cluster.local",
+          "default": ""
+        },
+        "realmOverwrite": {
+          "type": "boolean",
+          "description": "Set KC_SPI_IMPORT_REALM_FILE_STRATEGY=OVERWRITE so realm import re-applies on upgrades",
+          "default": true
+        },
+        "adminUsername": {
+          "type": "string",
+          "description": "Keycloak admin username",
+          "default": "admin"
+        },
+        "adminPassword": {
+          "type": "string",
+          "description": "Keycloak admin password",
+          "default": "admin"
+        },
+        "defaultUserPassword": {
+          "type": "string",
+          "description": "Password seeded for demo users when devFixtures is enabled",
+          "default": "foobar"
+        },
+        "route": {
+          "type": "object",
+          "description": "Keycloak Route settings",
+          "properties": {
+            "publicIngress": {
+              "type": "boolean",
+              "description": "Terminate the Route with reencrypt TLS using the cluster's public ingress certificate (requires the patch-keycloak-route hook)",
+              "default": false
+            }
+          }
+        },
+        "resources": {
+          "type": "object",
+          "description": "Resource requests and limits for the Keycloak container",
+          "properties": {
+            "limits": {
+              "type": "object",
+              "properties": {
+                "cpu": { "type": "string", "description": "CPU limit" },
+                "memory": { "type": "string", "description": "Memory limit" }
+              }
+            },
+            "requests": {
+              "type": "object",
+              "properties": {
+                "cpu": { "type": "string", "description": "CPU request" },
+                "memory": { "type": "string", "description": "Memory request" }
+              }
+            }
+          }
+        },
+        "postgres": {
+          "type": "object",
+          "description": "Bundled PostgreSQL settings for the per-install Keycloak",
+          "properties": {
+            "resources": {
+              "type": "object",
+              "description": "Resource requests and limits for the PostgreSQL container",
+              "properties": {
+                "limits": {
+                  "type": "object",
+                  "properties": {
+                    "cpu": { "type": "string", "description": "CPU limit" },
+                    "memory": { "type": "string", "description": "Memory limit" }
+                  }
+                },
+                "requests": {
+                  "type": "object",
+                  "properties": {
+                    "cpu": { "type": "string", "description": "CPU request" },
+                    "memory": { "type": "string", "description": "Memory request" }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "images": {
+          "type": "object",
+          "description": "Container images for the per-install Keycloak stack",
+          "properties": {
+            "keycloak": {
+              "type": "string",
+              "description": "Keycloak container image"
+            },
+            "postgres": {
+              "type": "string",
+              "description": "PostgreSQL container image"
+            }
+          }
+        }
+      }
+    },
     "clusterVersions": {
       "type": "object",
       "description": "Seed ClusterVersion records in the fulfillment-service after install",

@@ -23,6 +23,11 @@ SHELL := /usr/bin/env bash -o pipefail
 # Extra helm --set/--set-string args appended to install commands.
 EXTRA_HELM_ARGS ?=
 
+# Pool mode (install-osac only): set KEYCLOAK_HOST to deploy a per-install
+# Keycloak into $(NS) and point the instance's auth/idp/vault issuer URLs at
+# it, instead of the shared osac-infra Keycloak (keycloak-keycloak.$(DOMAIN)).
+# Leave unset for the default full install -- nothing changes.
+
 # -- Fail-fast parameter validation ------------------------------------
 # Guards fire at parse time, gated by MAKECMDGOALS so `make help` works.
 
@@ -195,6 +200,7 @@ endif
 		-f $(INSTANCE_VALUES) \
 		--namespace $(NS) --create-namespace \
 		$(if $(DOMAIN),--set service.externalHostname=fulfillment-api-$(NS).$(DOMAIN) --set service.internalHostname=fulfillment-internal-api-$(NS).$(DOMAIN) --set service.auth.issuerUrl=https://keycloak-keycloak.$(DOMAIN)/realms/osac --set service.idp.url=https://keycloak-keycloak.$(DOMAIN)) \
+		$(if $(KEYCLOAK_HOST),--set keycloak.enabled=true --set keycloak.routeHost=$(KEYCLOAK_HOST) --set service.auth.issuerUrl=https://$(KEYCLOAK_HOST)/realms/osac --set service.idp.url=https://$(KEYCLOAK_HOST) --set service.vault.keycloakIssuerUrl=https://$(KEYCLOAK_HOST)/realms/osac) \
 		$(EXTRA_HELM_ARGS) \
 		--wait --timeout 40m
 

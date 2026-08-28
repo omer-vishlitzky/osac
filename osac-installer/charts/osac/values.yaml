@@ -377,6 +377,52 @@ bundledVault:
       cpu: 100m
       memory: 256Mi
 
+# --- Per-install Keycloak (pool mode) ---
+keycloak:
+  # Deploy a dedicated Keycloak into the release namespace (pool mode) instead
+  # of using the shared osac-infra Keycloak. Off by default -- default full
+  # installs keep using the shared instance from Phase 2, byte-identical.
+  enabled: false
+  # Seed known, non-random passwords for the realm's built-in tenant/test
+  # users (admin, user, tenant1_admin, ...). Dev/CI pool runs only.
+  devFixtures: true
+  # [REQUIRED when enabled] Public Route host for this install's Keycloak
+  # (e.g. keycloak-pool-abc.apps.example.com). Enforced in the template via
+  # `required`; a pool install without it fails loud.
+  routeHost: ""
+  # Internal hostname set as KC_HOSTNAME and on the TLS cert. Defaults to
+  # keycloak.<release-namespace>.svc.cluster.local.
+  internalHost: ""
+  realmOverwrite: true
+  adminUsername: admin
+  adminPassword: admin
+  defaultUserPassword: foobar
+  route:
+    publicIngress: false
+  # Resource requests/limits for the Keycloak container. The shared
+  # osac-infra Keycloak runs without limits; pool installs need them so a
+  # per-install Keycloak cannot starve the cluster (accepted ops exemption
+  # from the byte-diff contract).
+  resources:
+    requests:
+      cpu: 500m
+      memory: 768Mi
+    limits:
+      cpu: "1"
+      memory: 2Gi
+  # Resource requests/limits for the bundled PostgreSQL container.
+  postgres:
+    resources:
+      requests:
+        cpu: 250m
+        memory: 512Mi
+      limits:
+        cpu: "1"
+        memory: 1Gi
+  images:
+    keycloak: quay.io/keycloak/keycloak:26.6.4
+    postgres: quay.io/sclorg/postgresql-18-c10s@sha256:6be2c9d855f06fb665257a6b0911676a38d740be7022cc61acee1c99a832b1b2
+
 clusterVersions:
   enabled: false
   versions: []

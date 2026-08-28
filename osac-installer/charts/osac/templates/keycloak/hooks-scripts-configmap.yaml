@@ -1,0 +1,21 @@
+{{- if .Values.keycloak.enabled }}
+# Scripts for the per-install Keycloak hook Jobs (wait-keycloak,
+# patch-keycloak-route, create-controller-credentials). Delivered as a
+# pre-install hook ConfigMap, mirroring the osac-infra chart's
+# osac-infra-hook-scripts pattern.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: osac-keycloak-hook-scripts
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "osac.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-delete-policy": before-hook-creation
+data:
+  {{- range $path, $_ := .Files.Glob "files/hooks/*.sh" }}
+  {{ $path | base }}: |
+{{ $.Files.Get $path | indent 4 }}
+  {{- end }}
+{{- end }}
