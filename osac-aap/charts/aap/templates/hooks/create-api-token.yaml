@@ -1,3 +1,5 @@
+{{- $tokenSecretName := .Values.remote.apiTokenSecret.name | default "osac-aap-api-token" }}
+{{- $tokenSecretNamespace := .Values.remote.apiTokenSecret.namespace | default .Release.Namespace }}
 {{- if .Values.apiToken.create }}
 apiVersion: batch/v1
 kind: Job
@@ -63,13 +65,13 @@ spec:
               "http://${AAP_GATEWAY_HOSTNAME}/api/gateway/v1/tokens/" \
               | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
             [[ -n "${TOKEN}" ]] || { echo "ERROR: Token was empty"; exit 1; }
-            echo "Storing token in secret osac-aap-api-token..."
+            echo "Storing token in secret {{ $tokenSecretName }}..."
             cat <<YAML | oc apply -f -
             apiVersion: v1
             kind: Secret
             metadata:
-              name: osac-aap-api-token
-              namespace: {{ .Release.Namespace }}
+              name: {{ $tokenSecretName }}
+              namespace: {{ $tokenSecretNamespace }}
             type: Opaque
             stringData:
               token: "${TOKEN}"
@@ -89,7 +91,7 @@ spec:
         - name: HOME
           value: /tmp
         - name: AAP_GATEWAY_HOSTNAME
-          value: {{ include "osac-aap.gatewayHostname" . | quote }}
+          value: {{ .Values.bootstrap.gateway.hostname | default (include "osac-aap.gatewayHostname" .) | quote }}
         volumeMounts:
         - name: aap-admin-password
           mountPath: /var/run/secrets/aap-admin
@@ -111,7 +113,7 @@ spec:
       volumes:
       - name: aap-admin-password
         secret:
-          secretName: {{ include "osac-aap.instanceName" . }}-admin-password
+          secretName: {{ include "osac-aap.adminPasswordSecret" . }}
       - name: tmp
         emptyDir: {}
       serviceAccountName: {{ .Values.serviceAccounts.osacSa }}

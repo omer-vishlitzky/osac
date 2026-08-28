@@ -3,6 +3,23 @@
   ansible.builtin.include_vars:
     dir: vars/
 
+# Pool installs share one AAP instance and must not leave recurring jobs
+# polling it, so the periodic project-sync and config-as-code schedules are
+# dropped entirely (not just disabled) when their env flags are false.
+- name: Drop the periodic project-sync schedule when disabled
+  ansible.builtin.set_fact:
+    controller_schedules: "{{ controller_schedules
+      | rejectattr('name', 'equalto', aap_prefix ~ '-sync')
+      | list }}"
+  when: not (osac_project_sync_enabled | bool)
+
+- name: Drop the periodic config-as-code schedule when disabled
+  ansible.builtin.set_fact:
+    controller_schedules: "{{ controller_schedules
+      | rejectattr('name', 'equalto', aap_prefix ~ '-config-as-code')
+      | list }}"
+  when: not (osac_config_as_code_enabled | bool)
+
 - name: Configure project SCM and merge into controller projects
   ansible.builtin.include_tasks: configure_project_scm.yml
 

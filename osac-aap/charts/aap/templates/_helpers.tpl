@@ -60,6 +60,16 @@ AAP controller hostname
 {{- end }}
 
 {{/*
+Admin-password Secret source: bootstrap.adminPasswordSecret when the install
+points at a shared AAP in remote mode (Secret created out-of-band in
+.Release.Namespace), otherwise the local instance's operator-managed
+<instanceName>-admin-password Secret.
+*/}}
+{{- define "osac-aap.adminPasswordSecret" -}}
+{{- .Values.bootstrap.adminPasswordSecret | default (printf "%s-admin-password" (include "osac-aap.instanceName" .)) }}
+{{- end }}
+
+{{/*
 Shared wait-for-aap readiness script (bootstrap-job.yaml, create-api-token.yaml).
 Wall-clock-bounded (1500s epoch deadline, not iteration count) since each
 iteration can take up to ~65s worst case -- keep activeDeadlineSeconds above this.
@@ -203,13 +213,16 @@ env:
 - name: HOME
   value: /tmp
 - name: AAP_GATEWAY_HOSTNAME
-  value: {{ include "osac-aap.gatewayHostname" . | quote }}
+  {{- /* bootstrap.gateway.hostname overrides the local AAP gateway service
+         name (full FQDN when the install points at a shared AAP in another
+         namespace). */}}
+  value: {{ .Values.bootstrap.gateway.hostname | default (include "osac-aap.gatewayHostname" .) | quote }}
 - name: AAP_CONTROLLER_GATEWAY_HOSTNAME
-  value: {{ include "osac-aap.controllerHostname" . | quote }}
+  value: {{ .Values.bootstrap.controller.hostname | default (include "osac-aap.controllerHostname" .) | quote }}
 - name: AAP_PASSWORD
   valueFrom:
     secretKeyRef:
-      name: {{ include "osac-aap.instanceName" . }}-admin-password
+      name: {{ include "osac-aap.adminPasswordSecret" . }}
       key: password
 - name: AAP_READINESS_CONSECUTIVE_SUCCESSES
   value: {{ .Values.bootstrap.readinessConsecutiveSuccesses | quote }}
@@ -241,7 +254,7 @@ env:
     fieldRef:
       fieldPath: metadata.namespace
 - name: AAP_ADMIN_SECRET_NAME
-  value: {{ printf "%s-admin-password" (include "osac-aap.instanceName" .) | quote }}
+  value: {{ include "osac-aap.adminPasswordSecret" . | quote }}
 volumeMounts:
 - name: tmp
   mountPath: /tmp

@@ -1,0 +1,40 @@
+{{- if .Values.remote.rbacEnabled }}
+{{/* Lets the shared AAP controller (running in another namespace, as the
+     ServiceAccount named by aap.remote.controllerServiceAccount) create and
+     manage its config-as-code job pods in THIS install's namespace, where
+     the instance-group pod specs mount their ConfigMaps/Secrets. Requires
+     both remote values to be set explicitly -- fail loudly otherwise. */}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "osac-aap.fullname" . }}-aap-job-pods
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "osac-aap.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["pods/attach"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "osac-aap.fullname" . }}-aap-job-pods
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "osac-aap.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "osac-aap.fullname" . }}-aap-job-pods
+subjects:
+  - kind: ServiceAccount
+    name: {{ required "aap.remote.controllerServiceAccount is required when aap.remote.rbacEnabled is true" .Values.remote.controllerServiceAccount }}
+    namespace: {{ required "aap.remote.controllerNamespace is required when aap.remote.rbacEnabled is true" .Values.remote.controllerNamespace }}
+{{- end }}

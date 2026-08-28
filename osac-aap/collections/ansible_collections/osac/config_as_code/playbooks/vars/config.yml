@@ -32,3 +32,8 @@ remote_cluster_kubeconfig_secret_key: "{{ lookup('env', 'REMOTE_CLUSTER_KUBECONF
 osac_publish_templates_enabled: "{{ lookup('env', 'OSAC_PUBLISH_TEMPLATES_ENABLED', default='true') | bool }}"
 osac_import_agents_enabled: "{{ lookup('env', 'OSAC_IMPORT_AGENTS_ENABLED', default='false') | bool }}"
 osac_import_bcm_agents_enabled: "{{ lookup('env', 'OSAC_IMPORT_BCM_AGENTS_ENABLED', default='false') | bool }}"
+# Pool installs point at a shared AAP: recurring project syncs and
+# config-as-code runs would hit the cross-namespace admin credential, so
+# those two schedules are removed (not merely disabled) when these are false.
+osac_project_sync_enabled: "{{ lookup('env', 'OSAC_PROJECT_SYNC_ENABLED', default='true') | bool }}"
+osac_config_as_code_enabled: "{{ lookup('env', 'OSAC_CONFIG_AS_CODE_ENABLED', default='true') | bool }}"

@@ -1,3 +1,7 @@
+{{- $tokenSecretName := .Values.aap.remote.apiTokenSecret.name | default "osac-aap-api-token" }}
+{{- $tokenSecretNamespace := .Values.aap.remote.apiTokenSecret.namespace | default .Release.Namespace }}
+{{- $gatewayURL := .Values.aap.remote.gatewayURL | default (printf "http://%s" .Values.aap.aap.instance.name) }}
+{{- $templatePrefix := .Values.aap.configAsCode.aapPrefix | default (.Values.operator.aap.templatePrefix | default "osac") }}
 {{- if .Values.aap.instanceGroups.publishTemplates.enabled }}
 apiVersion: batch/v1
 kind: Job
@@ -29,13 +33,13 @@ spec:
           - pipefail
           - -c
           - |
-            AAP_TOKEN=$(kubectl get secret osac-aap-api-token -n {{ .Release.Namespace }} \
+            AAP_TOKEN=$(kubectl get secret {{ $tokenSecretName }} -n {{ $tokenSecretNamespace }} \
               -o jsonpath='{.data.token}' | base64 -d)
-            [[ -n "${AAP_TOKEN}" ]] || { echo "ERROR: osac-aap-api-token secret is empty"; exit 1; }
+            [[ -n "${AAP_TOKEN}" ]] || { echo "ERROR: {{ $tokenSecretName }} secret is empty"; exit 1; }
 
-            AAP_URL="http://{{ .Values.aap.aap.instance.name }}"
+            AAP_URL="{{ $gatewayURL }}"
 
-            TEMPLATE_NAME="{{ .Values.operator.aap.templatePrefix | default "osac" }}-publish-templates"
+            TEMPLATE_NAME="{{ $templatePrefix }}-publish-templates"
             echo "Looking up ${TEMPLATE_NAME} job template..."
             JT_RESPONSE=$(curl -sf -H "Authorization: Bearer ${AAP_TOKEN}" \
               "${AAP_URL}/api/controller/v2/job_templates/?name=${TEMPLATE_NAME}")

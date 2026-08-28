@@ -577,6 +577,21 @@
               "default": 3,
               "minimum": 1
             },
+            "remote": {
+              "type": "boolean",
+              "description": "Shared-AAP remote mode: bootstrap config-as-code against an AAP instance in another namespace/cluster. Skips the wait-for-admin-secret init container (no operator-managed local admin secret).",
+              "default": false
+            },
+            "adminPasswordSecret": {
+              "type": "string",
+              "description": "Secret (in the install namespace) holding the shared AAP admin password; empty falls back to the local instance's operator-managed <instanceName>-admin-password Secret",
+              "default": ""
+            },
+            "skipSubscription": {
+              "type": "boolean",
+              "description": "Skip the osac.config_as_code.subscription playbook (the shared AAP is already licensed by whoever owns it)",
+              "default": false
+            },
             "gateway": {
               "type": "object",
               "properties": {
@@ -629,6 +644,88 @@
               "type": "boolean",
               "description": "Enable BCM inventory backend. Sets OSAC_IMPORT_BCM_AGENTS_ENABLED=true in the config-as-code-ig Secret and gates the bcm-certs Secret.",
               "default": false
+            },
+            "aapHostname": {
+              "type": "string",
+              "description": "Remote-mode AAP host (AAP_HOSTNAME), e.g. http://osac-aap.osac-aap.svc.cluster.local; empty uses the local instance name",
+              "default": ""
+            },
+            "aapUsername": {
+              "type": "string",
+              "description": "Remote-mode AAP username (AAP_USERNAME); empty uses the Ansible default (admin)",
+              "default": ""
+            },
+            "aapValidateCerts": {
+              "type": "string",
+              "description": "Remote-mode AAP TLS validation (AAP_VALIDATE_CERTS, \"true\"/\"false\"); empty uses the Ansible default (true)",
+              "default": ""
+            },
+            "aapPrefix": {
+              "type": "string",
+              "description": "Per-install AAP object-name prefix (AAP_PREFIX) so a shared AAP can host many installs; empty uses the organization name",
+              "default": ""
+            },
+            "aapOrganizationName": {
+              "type": "string",
+              "description": "AAP organization name (AAP_ORGANIZATION_NAME); empty uses the Ansible default (osac)",
+              "default": ""
+            },
+            "aapProjectName": {
+              "type": "string",
+              "description": "AAP project name (AAP_PROJECT_NAME); empty uses the install namespace",
+              "default": ""
+            },
+            "projectSyncEnabled": {
+              "type": "boolean",
+              "description": "Keep the periodic project-sync schedule; false removes it (pool installs against a shared AAP set this to false)",
+              "default": true
+            },
+            "configAsCodeEnabled": {
+              "type": "boolean",
+              "description": "Keep the periodic config-as-code schedule; false removes it (pool installs against a shared AAP set this to false)",
+              "default": true
+            }
+          }
+        },
+        "remote": {
+          "type": "object",
+          "description": "Shared-AAP remote mode: point this install at an AAP instance managed elsewhere. Empty values fall back to today's expressions (local AAP services, osac-aap-api-token Secret in the install namespace).",
+          "properties": {
+            "rbacEnabled": {
+              "type": "boolean",
+              "description": "Render a Role/RoleBinding in the install namespace granting the shared AAP controller's ServiceAccount the job-pod permissions its pod specs need here",
+              "default": false
+            },
+            "controllerServiceAccount": {
+              "type": "string",
+              "description": "ServiceAccount the shared AAP controller pods run as (required when rbacEnabled is true)",
+              "default": ""
+            },
+            "controllerNamespace": {
+              "type": "string",
+              "description": "Namespace the shared AAP controller runs in (required when rbacEnabled is true)",
+              "default": ""
+            },
+            "gatewayURL": {
+              "type": "string",
+              "description": "URL of the shared AAP gateway, e.g. http://osac-aap.osac-aap.svc.cluster.local; used by the publish-templates hook",
+              "default": ""
+            },
+            "apiTokenSecret": {
+              "type": "object",
+              "description": "Where the AAP API token Secret lives (created by the create-api-token hook, read by the publish-templates hook)",
+              "properties": {
+                "name": {
+                  "type": "string",
+                  "description": "Token Secret name; empty falls back to osac-aap-api-token",
+                  "default": ""
+                },
+                "namespace": {
+                  "type": "string",
+                  "description": "Token Secret namespace; empty falls back to the install namespace",
+                  "default": ""
+                }
+              }
             }
           }
         },

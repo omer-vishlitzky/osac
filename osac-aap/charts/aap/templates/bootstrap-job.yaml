@@ -17,7 +17,7 @@ metadata:
 rules:
   - apiGroups: [""]
     resources: ["secrets"]
-    resourceNames: ["{{ include "osac-aap.instanceName" . }}-admin-password"]
+    resourceNames: ["{{ include "osac-aap.adminPasswordSecret" . }}"]
     verbs: ["get"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -60,6 +60,11 @@ spec:
     spec:
       serviceAccountName: {{ include "osac-aap.fullname" . }}-bootstrap
       initContainers:
+      {{- /* Remote mode skips the wait-for-admin-secret init container: there
+           is no operator-managed local admin secret to wait for --
+           bootstrap.adminPasswordSecret names an out-of-band Secret with the
+           shared AAP's admin password. */}}
+      {{- if not .Values.bootstrap.remote }}
       - name: wait-for-admin-secret
         image: {{ .Values.bootstrap.cliImage }}
         command:
@@ -68,6 +73,7 @@ spec:
           - |
             {{- include "osac-aap.waitForAdminSecretScript" . | nindent 12 }}
         {{- include "osac-aap.waitForAdminSecretContainerSpec" . | nindent 8 }}
+      {{- end }}
       - name: wait-for-aap
         image: {{ .Values.bootstrap.cliImage }}
         command:
@@ -81,7 +87,11 @@ spec:
         image: {{ .Values.bootstrap.image }}
         args:
         - ansible-playbook
+        {{- if not .Values.bootstrap.skipSubscription }}
+        {{- /* The shared AAP is already licensed by whoever owns it; pool
+             installs skip the subscription playbook. */}}
         - osac.config_as_code.subscription
+        {{- end }}
         - osac.config_as_code.configure
         envFrom:
         - secretRef:
@@ -90,7 +100,7 @@ spec:
         - name: AAP_PASSWORD
           valueFrom:
             secretKeyRef:
-              name: {{ include "osac-aap.instanceName" . }}-admin-password
+              name: {{ include "osac-aap.adminPasswordSecret" . }}
               key: password
         - name: NAMESPACE
           valueFrom:

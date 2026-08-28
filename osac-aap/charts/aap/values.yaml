@@ -20,6 +20,20 @@ bootstrap:
   cliImage: quay.io/openshift/origin-cli:4.20.0
   backoffLimit: 15
   readinessConsecutiveSuccesses: 3
+  # Shared-AAP remote mode: bootstrap config-as-code against an AAP instance
+  # living in another namespace/cluster instead of the local one. Skips the
+  # wait-for-admin-secret init container (the operator will not create a
+  # local admin secret) and reads the admin password from adminPasswordSecret
+  # instead. gateway.hostname/controller.hostname override the AAP service
+  # hostnames used by the wait-for-aap checks (full FQDN when the shared AAP
+  # is in another namespace).
+  remote: false
+  adminPasswordSecret: ""
+  skipSubscription: false
+  gateway:
+    hostname: ""
+  controller:
+    hostname: ""
 
 configAsCode:
   manifestSecret: "config-as-code-manifest-ig"
@@ -36,6 +50,21 @@ configAsCode:
   projectGitBranch: ""
   importAgentsEnabled: false
   importBcmAgentsEnabled: false
+  # Remote-mode AAP connection settings. Empty values are omitted from the
+  # config-as-code-ig Secret, so the Ansible defaults (local AAP instance
+  # name, osac organization, ...) keep today's behavior.
+  aapHostname: ""
+  aapUsername: ""
+  aapValidateCerts: ""
+  aapPrefix: ""
+  aapOrganizationName: ""
+  aapProjectName: ""
+  # Pool installs must not leave recurring project-sync/config-as-code
+  # schedules polling a shared AAP; setting these to false renders
+  # OSAC_*_ENABLED=false into the config-as-code-ig Secret, which makes the
+  # config-as-code role drop those schedules entirely.
+  projectSyncEnabled: true
+  configAsCodeEnabled: true
   manifest:
     create: false
     data: {}
@@ -53,6 +82,22 @@ serviceAccounts:
 
 apiToken:
   create: true
+
+# Point an install at a shared AAP instance managed elsewhere. Empty values
+# fall back to today's expressions (local AAP instance services, token
+# secret created by the create-api-token hook in .Release.Namespace).
+remote:
+  rbacEnabled: false
+  # ServiceAccount the shared AAP controller pods use; must be set (together
+  # with controllerNamespace) when rbacEnabled is true so the RoleBinding in
+  # this namespace grants the controller job-pod permissions here.
+  controllerServiceAccount: ""
+  controllerNamespace: ""
+  # URL of the shared AAP gateway (e.g. http://osac-aap.osac-aap.svc.cluster.local)
+  gatewayURL: ""
+  apiTokenSecret:
+    name: ""
+    namespace: ""
 
 instanceGroups:
   clusterFulfillment:

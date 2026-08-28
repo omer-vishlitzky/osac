@@ -134,6 +134,14 @@ aap:
     image: ghcr.io/osac-project/osac-aap:latest  # PLACEHOLDER -- overwritten at release time by publish-charts.yaml
     backoffLimit: 15
     readinessConsecutiveSuccesses: 3
+    # Shared-AAP remote mode: bootstrap config-as-code against an AAP instance
+    # living in another namespace/cluster. Skips the wait-for-admin-secret
+    # init container and reads the admin password from adminPasswordSecret.
+    remote: false
+    adminPasswordSecret: ""
+    # The shared AAP is already licensed; pool installs skip the subscription
+    # playbook.
+    skipSubscription: false
     gateway:
       hostname: ""
     controller:
@@ -146,6 +154,30 @@ aap:
     projectGitBranch: ""
     importAgentsEnabled: false
     importBcmAgentsEnabled: false
+    # Remote-mode AAP connection settings (rendered into the config-as-code-ig
+    # Secret only when set).
+    aapHostname: ""
+    aapUsername: ""
+    aapValidateCerts: ""
+    aapPrefix: ""
+    aapOrganizationName: ""
+    aapProjectName: ""
+    # Pool installs must not leave recurring project-sync/config-as-code
+    # schedules polling a shared AAP; false removes those schedules.
+    projectSyncEnabled: true
+    configAsCodeEnabled: true
+  remote:
+    # Point an install at a shared AAP instance managed elsewhere.
+    rbacEnabled: false
+    # ServiceAccount the shared AAP controller pods use (required, together
+    # with controllerNamespace, when rbacEnabled is true).
+    controllerServiceAccount: ""
+    controllerNamespace: ""
+    # URL of the shared AAP gateway, e.g. http://osac-aap.osac-aap.svc.cluster.local
+    gatewayURL: ""
+    apiTokenSecret:
+      name: ""
+      namespace: ""
   importAgents:
     servers: []
   importBcmAgents:
