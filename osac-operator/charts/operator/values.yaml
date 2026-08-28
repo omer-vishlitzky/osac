@@ -1,3 +1,7 @@
+# Suffix appended to ClusterRole/ClusterRoleBinding names, for parallel
+# installs of this chart in a cluster that already has them.
+rbacNameSuffix: ""
+
 image:
   repository: ghcr.io/osac-project/osac-operator
   tag: latest  # PLACEHOLDER -- overwritten at release time by publish-charts.yaml

@@ -22,6 +22,13 @@ Create a default fully qualified app name.
 {{- end }}
 
 {{/*
+Cluster-scoped RBAC resource name: fullname plus rbacNameSuffix.
+*/}}
+{{- define "bare-metal-fulfillment-operator.rbacName" -}}
+{{- include "bare-metal-fulfillment-operator.fullname" . }}{{ .Values.rbacNameSuffix }}
+{{- end }}
+
+{{/*
 Common labels
 */}}
 {{- define "bare-metal-fulfillment-operator.labels" -}}

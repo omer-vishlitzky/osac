@@ -2,7 +2,7 @@
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: {{ include "bare-metal-fulfillment-operator.fullname" . }}-manager-role
+  name: {{ include "bare-metal-fulfillment-operator.rbacName" . }}-manager-role
   labels:
     {{- include "bare-metal-fulfillment-operator.labels" . | nindent 4 }}
 rules:

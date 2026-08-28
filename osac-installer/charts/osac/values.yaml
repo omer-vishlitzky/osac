@@ -21,6 +21,9 @@ operatorCrds:
 # --- Operator ---
 operator:
   enabled: true
+  # Suffix appended to ClusterRole/ClusterRoleBinding names, for installs
+  # where the cluster-scoped RBAC already exists (CRD-only namespace install).
+  rbacNameSuffix: ""
   image:
     repository: ghcr.io/osac-project/osac-operator
     tag: latest  # PLACEHOLDER -- overwritten at release time by publish-charts.yaml
@@ -248,11 +251,15 @@ csiDriver:
 csiBackends: {}
 
 # --- Bare Metal Fulfillment Operator CRDs ---
-bmfCrds: {}
+bmfCrds:
+  install: true
 
 # --- Bare Metal Fulfillment Operator ---
 bmf:
   enabled: true
+  # Suffix appended to ClusterRole/ClusterRoleBinding names, for installs
+  # where the cluster-scoped RBAC already exists (CRD-only namespace install).
+  rbacNameSuffix: ""
   image:
     repository: ghcr.io/osac-project/bare-metal-fulfillment-operator
     tag: latest  # PLACEHOLDER -- overwritten at release time by publish-charts.yaml

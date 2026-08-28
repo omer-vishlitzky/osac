@@ -56,6 +56,11 @@
       "type": "object",
       "description": "OSAC Operator configuration",
       "properties": {
+        "rbacNameSuffix": {
+          "type": "string",
+          "description": "Suffix appended to OSAC Operator ClusterRole/ClusterRoleBinding names (for installs where the cluster-scoped RBAC already exists)",
+          "default": ""
+        },
         "enabled": {
           "type": "boolean",
           "description": "Deploy the OSAC operator",
@@ -1187,12 +1192,24 @@
     },
     "bmfCrds": {
       "type": "object",
-      "description": "Bare Metal Fulfillment Operator CRDs configuration"
+      "description": "Bare Metal Fulfillment Operator CRDs configuration",
+      "properties": {
+        "install": {
+          "type": "boolean",
+          "description": "Install Bare Metal Fulfillment Operator CRDs",
+          "default": true
+        }
+      }
     },
     "bmf": {
       "type": "object",
       "description": "Bare Metal Fulfillment Operator configuration",
       "properties": {
+        "rbacNameSuffix": {
+          "type": "string",
+          "description": "Suffix appended to BMF Operator ClusterRole/ClusterRoleBinding names (for installs where the cluster-scoped RBAC already exists)",
+          "default": ""
+        },
         "enabled": {
           "type": "boolean",
           "description": "Enable or disable the BMF operator subchart",

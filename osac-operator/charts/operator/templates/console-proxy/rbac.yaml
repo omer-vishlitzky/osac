@@ -2,7 +2,7 @@
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: {{ include "osac-operator.fullname" . }}-console-proxy
+  name: {{ include "osac-operator.rbacName" . }}-console-proxy
   labels:
     {{- include "osac-operator.consoleProxy.labels" . | nindent 4 }}
 rules:
@@ -28,13 +28,13 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: {{ include "osac-operator.fullname" . }}-console-proxy
+  name: {{ include "osac-operator.rbacName" . }}-console-proxy
   labels:
     {{- include "osac-operator.consoleProxy.labels" . | nindent 4 }}
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: {{ include "osac-operator.fullname" . }}-console-proxy
+  name: {{ include "osac-operator.rbacName" . }}-console-proxy
 subjects:
 - kind: ServiceAccount
   name: {{ include "osac-operator.fullname" . }}-console-proxy
@@ -44,7 +44,7 @@ subjects:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: {{ include "osac-operator.fullname" . }}-console-proxy-secret-reader
+  name: {{ include "osac-operator.rbacName" . }}-console-proxy-secret-reader
   labels:
     {{- include "osac-operator.consoleProxy.labels" . | nindent 4 }}
 rules:
@@ -59,14 +59,14 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: {{ include "osac-operator.fullname" . }}-console-proxy-secret-reader
+  name: {{ include "osac-operator.rbacName" . }}-console-proxy-secret-reader
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "osac-operator.consoleProxy.labels" . | nindent 4 }}
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: {{ include "osac-operator.fullname" . }}-console-proxy-secret-reader
+  name: {{ include "osac-operator.rbacName" . }}-console-proxy-secret-reader
 subjects:
 - kind: ServiceAccount
   name: {{ include "osac-operator.fullname" . }}-console-proxy
@@ -76,7 +76,7 @@ subjects:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: {{ include "osac-operator.fullname" . }}-console-proxy-auth-delegator
+  name: {{ include "osac-operator.rbacName" . }}-console-proxy-auth-delegator
   labels:
     {{- include "osac-operator.consoleProxy.labels" . | nindent 4 }}
 roleRef:

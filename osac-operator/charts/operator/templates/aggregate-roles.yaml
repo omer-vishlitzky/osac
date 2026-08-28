@@ -2,7 +2,7 @@
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: {{ include "osac-operator.fullname" . }}-clusterorder-editor
+  name: {{ include "osac-operator.rbacName" . }}-clusterorder-editor
   labels:
     {{- include "osac-operator.labels" . | nindent 4 }}
 rules:
@@ -28,7 +28,7 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: {{ include "osac-operator.fullname" . }}-clusterorder-viewer
+  name: {{ include "osac-operator.rbacName" . }}-clusterorder-viewer
   labels:
     {{- include "osac-operator.labels" . | nindent 4 }}
 rules:
@@ -50,7 +50,7 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: {{ include "osac-operator.fullname" . }}-computeinstance-admin
+  name: {{ include "osac-operator.rbacName" . }}-computeinstance-admin
   labels:
     {{- include "osac-operator.labels" . | nindent 4 }}
 rules:
@@ -70,7 +70,7 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: {{ include "osac-operator.fullname" . }}-computeinstance-editor
+  name: {{ include "osac-operator.rbacName" . }}-computeinstance-editor
   labels:
     {{- include "osac-operator.labels" . | nindent 4 }}
 rules:
@@ -96,7 +96,7 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: {{ include "osac-operator.fullname" . }}-computeinstance-viewer
+  name: {{ include "osac-operator.rbacName" . }}-computeinstance-viewer
   labels:
     {{- include "osac-operator.labels" . | nindent 4 }}
 rules:
@@ -118,7 +118,7 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: {{ include "osac-operator.fullname" . }}-tenant-admin
+  name: {{ include "osac-operator.rbacName" . }}-tenant-admin
   labels:
     {{- include "osac-operator.labels" . | nindent 4 }}
 rules:
@@ -138,7 +138,7 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: {{ include "osac-operator.fullname" . }}-tenant-editor
+  name: {{ include "osac-operator.rbacName" . }}-tenant-editor
   labels:
     {{- include "osac-operator.labels" . | nindent 4 }}
 rules:
@@ -164,7 +164,7 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: {{ include "osac-operator.fullname" . }}-tenant-viewer
+  name: {{ include "osac-operator.rbacName" . }}-tenant-viewer
   labels:
     {{- include "osac-operator.labels" . | nindent 4 }}
 rules:
@@ -186,7 +186,7 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: {{ include "osac-operator.fullname" . }}-admin
+  name: {{ include "osac-operator.rbacName" . }}-admin
   labels:
     {{- include "osac-operator.labels" . | nindent 4 }}
 roleRef:
@@ -201,7 +201,7 @@ subjects:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: {{ include "osac-operator.fullname" . }}-metrics-auth
+  name: {{ include "osac-operator.rbacName" . }}-metrics-auth
   labels:
     {{- include "osac-operator.labels" . | nindent 4 }}
 rules:
@@ -221,13 +221,13 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: {{ include "osac-operator.fullname" . }}-metrics-auth
+  name: {{ include "osac-operator.rbacName" . }}-metrics-auth
   labels:
     {{- include "osac-operator.labels" . | nindent 4 }}
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: {{ include "osac-operator.fullname" . }}-metrics-auth
+  name: {{ include "osac-operator.rbacName" . }}-metrics-auth
 subjects:
 - kind: ServiceAccount
   name: {{ include "osac-operator.serviceAccountName" . }}
@@ -236,7 +236,7 @@ subjects:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: {{ include "osac-operator.fullname" . }}-metrics-reader
+  name: {{ include "osac-operator.rbacName" . }}-metrics-reader
   labels:
     {{- include "osac-operator.labels" . | nindent 4 }}
 rules:

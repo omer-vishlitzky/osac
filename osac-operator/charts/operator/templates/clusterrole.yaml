@@ -1,7 +1,7 @@
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: {{ include "osac-operator.fullname" . }}-manager
+  name: {{ include "osac-operator.rbacName" . }}-manager
   labels:
     {{- include "osac-operator.labels" . | nindent 4 }}
 rules:

@@ -12,7 +12,7 @@ metadata:
   labels:
     {{- include "bare-metal-fulfillment-operator.labels" . | nindent 4 }}
     rbac.authorization.k8s.io/aggregate-to-edit: "true"
-  name: {{ include "bare-metal-fulfillment-operator.fullname" . }}-baremetalpool-editor-role
+  name: {{ include "bare-metal-fulfillment-operator.rbacName" . }}-baremetalpool-editor-role
 rules:
 - apiGroups:
   - osac.openshift.io
@@ -46,7 +46,7 @@ metadata:
   labels:
     {{- include "bare-metal-fulfillment-operator.labels" . | nindent 4 }}
     rbac.authorization.k8s.io/aggregate-to-view: "true"
-  name: {{ include "bare-metal-fulfillment-operator.fullname" . }}-baremetalpool-viewer-role
+  name: {{ include "bare-metal-fulfillment-operator.rbacName" . }}-baremetalpool-viewer-role
 rules:
 - apiGroups:
   - osac.openshift.io
@@ -76,7 +76,7 @@ metadata:
   labels:
     {{- include "bare-metal-fulfillment-operator.labels" . | nindent 4 }}
     rbac.authorization.k8s.io/aggregate-to-admin: "true"
-  name: {{ include "bare-metal-fulfillment-operator.fullname" . }}-baremetalpool-admin-role
+  name: {{ include "bare-metal-fulfillment-operator.rbacName" . }}-baremetalpool-admin-role
 rules:
 - apiGroups:
   - osac.openshift.io
@@ -94,7 +94,7 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: {{ include "bare-metal-fulfillment-operator.fullname" . }}-metrics-auth-role
+  name: {{ include "bare-metal-fulfillment-operator.rbacName" . }}-metrics-auth-role
   labels:
     {{- include "bare-metal-fulfillment-operator.labels" . | nindent 4 }}
 rules:
@@ -114,13 +114,13 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: {{ include "bare-metal-fulfillment-operator.fullname" . }}-metrics-auth-rolebinding
+  name: {{ include "bare-metal-fulfillment-operator.rbacName" . }}-metrics-auth-rolebinding
   labels:
     {{- include "bare-metal-fulfillment-operator.labels" . | nindent 4 }}
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: {{ include "bare-metal-fulfillment-operator.fullname" . }}-metrics-auth-role
+  name: {{ include "bare-metal-fulfillment-operator.rbacName" . }}-metrics-auth-role
 subjects:
 - kind: ServiceAccount
   name: {{ include "bare-metal-fulfillment-operator.serviceAccountName" . }}
@@ -129,7 +129,7 @@ subjects:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: {{ include "bare-metal-fulfillment-operator.fullname" . }}-metrics-reader
+  name: {{ include "bare-metal-fulfillment-operator.rbacName" . }}-metrics-reader
   labels:
     {{- include "bare-metal-fulfillment-operator.labels" . | nindent 4 }}
 rules:

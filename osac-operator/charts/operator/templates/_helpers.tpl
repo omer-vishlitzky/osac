@@ -22,6 +22,13 @@ Create a default fully qualified app name.
 {{- end }}
 
 {{/*
+Cluster-scoped RBAC resource name: fullname plus rbacNameSuffix.
+*/}}
+{{- define "osac-operator.rbacName" -}}
+{{- include "osac-operator.fullname" . }}{{ .Values.rbacNameSuffix }}
+{{- end }}
+
+{{/*
 Common labels
 */}}
 {{- define "osac-operator.labels" -}}
