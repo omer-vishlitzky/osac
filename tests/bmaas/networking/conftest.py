@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 import uuid
 from pathlib import Path
 
@@ -8,8 +10,14 @@ import pytest
 from tests.core.grpc_client import GRPCClient
 from tests.core.runner import env
 
-if not env("OSAC_ENABLE_NETRIS", ""):
-    pytest.skip("netris backend suite requires OSAC_ENABLE_NETRIS", allow_module_level=True)
+# Runtime gate, not a collection-time skip: collected test IDs must
+# stay identical on pool and non-pool clusters (collection-diff gate). Every
+# test skips loudly at runtime unless OSAC_ENABLE_NETRIS is set (the netris
+# fabric does not exist on pool clusters).
+pytestmark = pytest.mark.skipif(
+    "OSAC_ENABLE_NETRIS" not in os.environ,
+    reason="netris backend suite requires OSAC_ENABLE_NETRIS",
+)
 
 
 @pytest.fixture(scope="session")

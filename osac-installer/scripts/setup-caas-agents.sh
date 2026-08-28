@@ -190,8 +190,8 @@ echo "Downloading discovery ISO..."
 curl -k -L --fail-with-body -o '${ISO_FILE}' '${ISO_URL}'
 
 # Create agent VM
-virsh --connect '${LIBVIRT_URI}' destroy '${AGENT_VM_NAME}' 2>/dev/null || true
-virsh --connect '${LIBVIRT_URI}' undefine '${AGENT_VM_NAME}' 2>/dev/null || true
+virsh --connect '${LIBVIRT_URI}' destroy '${AGENT_VM_NAME}' 2>/dev/null || true # justified: idempotent re-create prelude — an absent domain is the expected first-run state; the domain is (re)defined by virt-install below
+virsh --connect '${LIBVIRT_URI}' undefine '${AGENT_VM_NAME}' 2>/dev/null || true # justified: see destroy above
 rm -f '${AGENT_VM_STORAGE_DIR}/${AGENT_VM_NAME}.qcow2'
 if [[ -n '${AGENT_VM_DATA_DISK_SIZE}' ]]; then
     rm -f '${AGENT_VM_STORAGE_DIR}/${AGENT_VM_NAME}-data.qcow2'

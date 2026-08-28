@@ -44,7 +44,7 @@ reconcile() {
     \"op\": \"replace\",
     \"path\": \"/spec/tls/destinationCACertificate\",
     \"value\": $CA_CERT_JSON
-  }]" 2>/dev/null; then
+  }]" 2>/dev/null; then # justified: retry probe — the route may not exist yet during keycloak rollout; the else branch below records the failure and reschedules
     echo "Successfully patched keycloak Route with updated destinationCACertificate"
     LAST_CA_CERT="$CA_CERT"
   else
