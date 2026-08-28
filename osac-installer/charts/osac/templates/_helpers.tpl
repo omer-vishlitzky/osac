@@ -36,7 +36,7 @@ PostgreSQL identifier prefix. All database identifiers derive from this
 single template.
 */}}
 {{- define "osac.pgPrefix" -}}
-osac
+{{ .Values.dbInit.pgPrefix | default "osac" }}
 {{- end }}
 
 {{- define "osac.dbNameService" -}}

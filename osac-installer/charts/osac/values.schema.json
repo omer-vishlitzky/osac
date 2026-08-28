@@ -16,6 +16,17 @@
           "type": "string",
           "description": "PostgreSQL host for db-init hook",
           "default": "postgres.osac-infra.svc.cluster.local"
+        },
+        "pgPrefix": {
+          "type": "string",
+          "description": "Prefix for per-instance PostgreSQL role/database names (underscore-delimited; dashes are rejected)",
+          "default": ""
+        },
+        "poolMaxConns": {
+          "type": "integer",
+          "description": "When > 0, appends pool_max_conns=N to workload DB connection URLs",
+          "default": 0,
+          "minimum": 0
         }
       }
     },
@@ -1145,6 +1156,22 @@
             "connection": {
               "type": "array",
               "description": "Database connection volume sources (secret or configMap references)"
+            }
+          }
+        },
+        "rbacNameSuffix": {
+          "type": "string",
+          "description": "Suffix appended to Role/RoleBinding names in the shared Kafka namespace",
+          "default": ""
+        },
+        "kafka": {
+          "type": "object",
+          "description": "Kafka object provisioning gate for the metering chart",
+          "properties": {
+            "provision": {
+              "type": "boolean",
+              "description": "When false, the metering chart skips KafkaTopic/KafkaUser creation (shared stamped install)",
+              "default": true
             }
           }
         }

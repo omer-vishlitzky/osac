@@ -103,6 +103,9 @@ data:
     hba_file = '/config/access/access.conf'
     fsync = off
     full_page_writes = off
+    {{- if gt (.Values.bundledPostgres.maxConnections | int) 0 }}
+    max_connections = {{ .Values.bundledPostgres.maxConnections | int }}
+    {{- end }}
   access.conf: |
     local all all peer
     hostssl all all 0.0.0.0/0 cert

@@ -6,6 +6,11 @@ cliImage: quay.io/openshift/origin-cli:4.20.0
 # Shared PostgreSQL host for the db-init hook.
 dbInit:
   host: "postgres.osac-infra.svc.cluster.local"
+  # Prefix for per-instance PG role/database names (e.g. osac_pr1_service).
+  # Must not contain dashes (interpolated into SQL as an unquoted identifier).
+  pgPrefix: ""
+  # When > 0, appends pool_max_conns=N to the workload DB connection URLs.
+  poolMaxConns: 0
 
 # Kafka cluster coordinates for per-instance topic/user creation.
 kafka:
@@ -238,6 +243,12 @@ metering:
     repository: ghcr.io/osac-project/metering-service
     tag: latest  # PLACEHOLDER -- overwritten at release time by publish-charts.yaml
     pullPolicy: Always
+  # Suffix for Role/RoleBinding names in the shared Kafka namespace.
+  rbacNameSuffix: ""
+  # When false (shared stamped install), the metering chart skips
+  # KafkaTopic/KafkaUser creation for the shared Kafka cluster.
+  kafka:
+    provision: true
 
 # --- CSI Driver ---
 csiDriver:

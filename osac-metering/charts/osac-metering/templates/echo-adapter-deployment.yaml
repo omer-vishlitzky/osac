@@ -111,6 +111,10 @@ spec:
               value: "true"
             - name: METRICS_ADDR
               value: ":8080"
+            {{- if gt (.Values.echoAdapter.bufferSize | int) 0 }}
+            - name: ECHO_BUFFER_SIZE
+              value: {{ .Values.echoAdapter.bufferSize | int | quote }}
+            {{- end }}
           volumeMounts:
             - name: kafka-secrets
               mountPath: /etc/kafka-secrets

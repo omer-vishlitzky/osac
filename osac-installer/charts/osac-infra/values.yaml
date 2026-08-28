@@ -84,6 +84,8 @@ bundledPostgres:
   database:
     name: service
     user: service
+  # When > 0, sets max_connections in the rendered server.conf.
+  maxConnections: 0
   resources:
     limits:
       cpu: 500m

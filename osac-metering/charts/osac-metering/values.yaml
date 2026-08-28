@@ -34,6 +34,13 @@ kafka:
   clusterName: ""      # default: osac-kafka
   clusterNamespace: "" # default: osac-kafka
   caSecret: ""         # default: osac-kafka-cluster-ca-cert
+  # When false (shared stamped install), skip KafkaTopic/KafkaUser creation
+  # so per-run installs never touch the shared Kafka CRs.
+  provision: true
+
+# Suffix appended to Role/RoleBinding names in the shared Kafka cluster
+# namespace so concurrent installs do not flap each other's bindings.
+rbacNameSuffix: ""
 
 # Prefix prepended to all topic names (e.g. "pr101" -> "pr101.osac.metering.lifecycle").
 # When set, this chart skips KafkaTopic/KafkaUser creation (the parent chart owns them).
@@ -42,6 +49,8 @@ kafka:
 ## Enable and configure via environment-specific values (e.g., values/vmaas-ci/values.yaml).
 echoAdapter:
   enabled: false
+  # When > 0, sets ECHO_BUFFER_SIZE on the echo adapter (Go default: 1000).
+  bufferSize: 0
   # image:
   #   repository: ghcr.io/osac-project/metering-echo-adapter
   #   tag: latest
