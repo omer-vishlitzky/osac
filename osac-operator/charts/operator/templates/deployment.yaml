@@ -98,6 +98,10 @@ spec:
             valueFrom:
               fieldRef:
                 fieldPath: metadata.namespace
+          {{- if .Values.agentNamespace }}
+          - name: OSAC_AGENT_NAMESPACE
+            value: {{ .Values.agentNamespace | quote }}
+          {{- end }}
           - name: OSAC_ENABLE_CLUSTER_CONTROLLER
             value: {{ .Values.controllers.clusterOrder | quote }}
           - name: OSAC_ENABLE_COMPUTE_INSTANCE_CONTROLLER

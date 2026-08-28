@@ -112,6 +112,17 @@ images:
   pullPolicy: IfNotPresent
   envoy: docker.io/envoyproxy/envoy:v1.37.1
 
+# Resource requests and limits applied to every service deployment (grpc-server,
+# rest-gateway, controller, ingress-proxy, console-proxy). Without these the
+# containers are BestEffort and get randomly evicted under node memory pressure.
+resources:
+  requests:
+    cpu: 256m
+    memory: 512Mi
+  limits:
+    cpu: "1"
+    memory: 1Gi
+
 # Database connection configuration. The service expects an external PostgreSQL database to be available. The database
 # should be created before installing this chart.
 database:

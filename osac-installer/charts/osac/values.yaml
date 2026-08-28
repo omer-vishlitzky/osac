@@ -29,18 +29,24 @@ operator:
   # Suffix appended to ClusterRole/ClusterRoleBinding names, for installs
   # where the cluster-scoped RBAC already exists (CRD-only namespace install).
   rbacNameSuffix: ""
+  # Namespace for OSAC_AGENT_NAMESPACE, for installs that must pin the agent
+  # namespace (e.g. pool instances sharing a stamped agent namespace). When
+  # empty the env var is not rendered.
+  agentNamespace: ""
   image:
     repository: ghcr.io/osac-project/osac-operator
     tag: latest  # PLACEHOLDER -- overwritten at release time by publish-charts.yaml
     pullPolicy: Always
   replicaCount: 1
+  # Memory raised from 64Mi request/128Mi limit: the operator was being
+  # OOM-killed under real reconcile load (ops exemption from byte-diff).
   resources:
     limits:
       cpu: 500m
-      memory: 128Mi
+      memory: 1Gi
     requests:
       cpu: 10m
-      memory: 64Mi
+      memory: 512Mi
   aap:
     url: ""
     token: ""
@@ -308,13 +314,15 @@ bmf:
     tag: latest  # PLACEHOLDER -- overwritten at release time by publish-charts.yaml
     pullPolicy: Always
   replicaCount: 1
+  # Memory raised from 64Mi request/128Mi limit: same ops exemption as the
+  # osac-operator resources above.
   resources:
     limits:
       cpu: 500m
-      memory: 128Mi
+      memory: 1Gi
     requests:
       cpu: 10m
-      memory: 64Mi
+      memory: 512Mi
   serviceAccount:
     create: true
     name: ""

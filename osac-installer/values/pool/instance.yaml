@@ -1,0 +1,239 @@
+# Pool instance values -- one OSAC instance stamped onto a shared cluster
+# that was installed with a base profile. Deploy with:
+#   make install-osac PLATFORM=openshift PROFILE=pool NS=<run-ns>
+# (PROFILE=pool resolves to this file). Namespace-dependent values and the
+# per-run RBAC/DB suffixes are passed as --set overrides by the stamping
+# pipeline, not baked in here.
+
+# --- CRD gates ---
+# Cluster-scoped CRDs already exist from the stamped install; per-run
+# releases must not touch them.
+operatorCrds:
+  install: false
+bmfCrds:
+  install: false
+
+# --- CSI Driver ---
+# The stamped cluster already runs the CSI driver (osac-csi namespace).
+csiDriver:
+  enabled: false
+
+# --- Operator ---
+operator:
+  # Cluster-scoped RBAC already exists from the stamped install.
+  # Override per run: --set operator.rbacNameSuffix=<run>
+  rbacNameSuffix: ""
+  image:
+    repository: ghcr.io/osac-project/osac-operator
+    tag: latest
+    pullPolicy: Always
+  provisioning:
+    provider: "aap"
+  aap:
+    insecureSkipVerify: "true"
+    # Talks to the shared stamped AAP; the token secret must be pre-created
+    # in this namespace by the stamping pipeline.
+    tokenSecret:
+      name: osac-aap-api-token
+      key: token
+  fulfillment:
+    serverAddress: "fulfillment-internal-api:8001"
+    tokenFile: "/var/run/secrets/kubernetes.io/serviceaccount/token"
+  controllers:
+    clusterOrder: false
+    computeInstance: true
+    tenant: true
+    networking: true
+    storage: true
+  # The console-proxy APIService is registered cluster-wide by the stamped
+  # install; a second registration would conflict, so it stays off.
+  consoleProxy:
+    disabled: true
+  hubAccess:
+    enabled: true
+
+# --- Fulfillment Service ---
+service:
+  externalHostname: ""  # Set dynamically by make install-osac
+  internalHostname: ""  # Set dynamically by make install-osac
+  variant: openshift
+  images:
+    service: ghcr.io/osac-project/fulfillment-service:main
+    envoy: ghcr.io/osac-project/envoy:v1.33.0
+  certs:
+    issuerRef:
+      kind: ClusterIssuer
+      name: default-ca
+    caBundle:
+      configMap: ca-bundle
+  auth:
+    issuerUrl: https://keycloak.keycloak.svc.cluster.local/realms/osac
+    emergencyServiceAccounts:
+    - admin
+    - osac-operator
+    - osac-operator-controller-manager
+    - template-publisher
+    - osac-metering
+    controllerCredentials:
+    - secret:
+        name: fulfillment-controller-credentials
+        items:
+        - key: client-id
+          param: client-id
+        - key: client-secret
+          param: client-secret
+  idp:
+    provider: keycloak
+    url: https://keycloak.keycloak.svc.cluster.local
+    credentials:
+    - secret:
+        name: fulfillment-controller-credentials
+        items:
+        - key: client-id
+          param: client-id
+        - key: client-secret
+          param: client-secret
+  database:
+    connection:
+    - secret:
+        name: osac-db-config
+        items:
+        - key: url
+          param: url
+    - secret:
+        name: osac-db-client-cert
+        items:
+        - key: tls.crt
+          param: sslcert
+        - key: tls.key
+          param: sslkey
+        - key: ca.crt
+          param: sslrootcert
+  log:
+    level: debug
+  vault:
+    # Bundled per-run OpenBao (bundledVault below) -- namespace-dependent.
+    # Override per run: --set service.vault.endpoint=https://openbao.<NS>.svc.cluster.local:8200
+    endpoint: ""
+    namespace: osac
+    kvMountPath: secret
+    lifecycleRole: lifecycle
+    lifecycleMountPath: jwt
+    keycloakClientId: osac-controller
+    keycloakIssuerUrl: "https://keycloak.keycloak.svc.cluster.local/realms/osac"
+    keycloakAudience: osac-api
+    caBundle:
+      configMap: ca-bundle
+    credentials:
+    - secret:
+        name: fulfillment-controller-credentials
+        items:
+        - key: client-secret
+          param: client-secret
+
+# --- UI ---
+ui:
+  enabled: true
+  images:
+    ui: ghcr.io/osac-project/osac-ui:latest
+  api:
+    fulfillment:
+      certs:
+        caBundle:
+          configMap: ca-bundle
+  auth:
+    certs:
+      caBundle:
+        configMap: ca-bundle
+
+# --- AAP ---
+aap:
+  aap:
+    instance:
+      # The shared stamped AAP instance is reused; no per-run AAP operator.
+      enabled: false
+  bootstrap:
+    # The shared AAP is already bootstrapped; skip the per-run bootstrap Job.
+    enabled: false
+  # No per-run AAP API token -- the operator authenticates with the shared
+  # AAP token secret pre-created by the stamping pipeline.
+  apiToken:
+    create: false
+  # TODO(WP3): enable per-run Keycloak wiring once WP3 lands:
+  #   keycloak:
+  #     enabled: true   # --set aap.keycloak.routeHost=<ns-dependent route>
+  # TODO(WP2/WP3): remote-AAP RBAC + namespace-dependent placeholders, all
+  # passed as --set overrides once the keys exist:
+  #   --set aap.remote.rbacEnabled=true
+  #   --set aap.remote.controllerServiceAccount=<sa>
+  #   --set aap.remote.controllerNamespace=<ns>
+  #   --set aap.remote.gatewayURL=<url>
+
+# --- Validation ---
+validation:
+  enabled: true
+
+# --- Bare Metal Fulfillment Operator ---
+bmf:
+  enabled: false
+  # Cluster-scoped RBAC already exists from the stamped install.
+  # Override per run: --set bmf.rbacNameSuffix=<run>
+  rbacNameSuffix: ""
+
+# --- Hub Access ---
+hubAccess:
+  enabled: true
+
+# --- Metering ---
+metering:
+  enabled: true
+  reconciliation:
+    interval: "5m"
+  # Role/RoleBinding names in the shared Kafka namespace collide across
+  # runs; the stamped install owns the unsuffixed ones.
+  # Override per run: --set metering.rbacNameSuffix=<run>
+  rbacNameSuffix: ""
+  # The shared stamped Kafka cluster already has its topics/users; per-run
+  # releases must not create KafkaTopic/KafkaUser resources (coordinates
+  # still point at the shared cluster via the default kafka.* values).
+  kafka:
+    provision: false
+  # Echo adapter -- test/development tool only, not needed on pool runs.
+  echoAdapter:
+    enabled: false
+  database:
+    connection:
+    - secret:
+        name: osac-db-metering-config
+        items:
+        - key: url
+          param: url
+    - secret:
+        name: osac-db-metering-client-cert
+        items:
+        - key: tls.crt
+          param: sslcert
+        - key: tls.key
+          param: sslkey
+        - key: ca.crt
+          param: sslrootcert
+
+# --- Shared PostgreSQL ---
+dbInit:
+  # Per-run PG role/database prefix on the shared stamped PostgreSQL.
+  # Override per run: --set dbInit.pgPrefix=<run> (no dashes -- interpolated
+  # into SQL as an unquoted identifier).
+  pgPrefix: ""
+  # Cap connection pooling so parallel pool runs cannot exhaust the shared
+  # PostgreSQL's max_connections.
+  poolMaxConns: 4
+
+# --- Bundled OpenBao ---
+bundledVault:
+  # Per-run Vault-compatible store (dev mode -- see service.vault.endpoint).
+  enabled: true
+  devRootToken: "dev-root-token"
+
+# --- LVMS StorageBackend registration ---
+lvms:
+  enabled: true

@@ -121,6 +121,8 @@ spec:
       - name: controller
         image: {{ .Values.images.service }}
         imagePullPolicy: {{ .Values.images.pullPolicy }}
+        resources:
+          {{- toYaml .Values.resources | nindent 10 }}
         volumeMounts:
         - name: cas
           mountPath: /etc/fulfillment-controller/tls/cas

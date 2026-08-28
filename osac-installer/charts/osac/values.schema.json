@@ -72,6 +72,11 @@
           "description": "Suffix appended to OSAC Operator ClusterRole/ClusterRoleBinding names (for installs where the cluster-scoped RBAC already exists)",
           "default": ""
         },
+        "agentNamespace": {
+          "type": "string",
+          "description": "Namespace rendered as OSAC_AGENT_NAMESPACE (for installs that must pin the agent namespace); when empty the env var is not rendered",
+          "default": ""
+        },
         "enabled": {
           "type": "boolean",
           "description": "Deploy the OSAC operator",

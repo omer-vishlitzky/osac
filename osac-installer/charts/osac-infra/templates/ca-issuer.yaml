@@ -56,6 +56,12 @@ spec:
     configMap:
       key: bundle.pem
     namespaceSelector:
+      {{- with .Values.caBundle.extraMatchLabels }}
+      matchLabels:
+        {{- range $key, $value := . }}
+        {{ $key }}: {{ $value }}
+        {{- end }}
+      {{- end }}
       matchExpressions:
       - key: kubernetes.io/metadata.name
         operator: In

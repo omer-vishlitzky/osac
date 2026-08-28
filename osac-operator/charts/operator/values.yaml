@@ -2,6 +2,11 @@
 # installs of this chart in a cluster that already has them.
 rbacNameSuffix: ""
 
+# Namespace rendered as OSAC_AGENT_NAMESPACE, for installs that must pin the
+# agent namespace (e.g. pool instances sharing a stamped agent namespace).
+# When empty the env var is not rendered.
+agentNamespace: ""
+
 image:
   repository: ghcr.io/osac-project/osac-operator
   tag: latest  # PLACEHOLDER -- overwritten at release time by publish-charts.yaml

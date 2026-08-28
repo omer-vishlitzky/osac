@@ -52,6 +52,8 @@ spec:
       - name: console-proxy
         image: {{ .Values.images.service }}
         imagePullPolicy: {{ .Values.images.pullPolicy }}
+        resources:
+          {{- toYaml .Values.resources | nindent 10 }}
         securityContext:
           allowPrivilegeEscalation: false
           readOnlyRootFilesystem: true

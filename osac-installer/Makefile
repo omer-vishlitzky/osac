@@ -5,11 +5,11 @@
 #
 # Usage:
 # Every deployment target requires PLATFORM, PROFILE, and NS. No exceptions.
-#   make install         PLATFORM=kind|openshift  PROFILE=dev|vmaas-ci|bmaas-ci|caas-ci|full-ci  NS=osac
+#   make install         PLATFORM=kind|openshift  PROFILE=dev|vmaas-ci|bmaas-ci|caas-ci|full-ci|pool  NS=osac
 #   make uninstall       PLATFORM=kind|openshift  PROFILE=dev|vmaas-ci|bmaas-ci|caas-ci|full-ci  NS=osac
 #   make install-infra   PLATFORM=kind|openshift  PROFILE=dev|vmaas-ci|bmaas-ci|caas-ci|full-ci  NS=osac
-#   make install-osac    PLATFORM=kind|openshift  PROFILE=dev|vmaas-ci|bmaas-ci|caas-ci|full-ci  NS=osac
-#   make uninstall-osac  PLATFORM=kind|openshift  PROFILE=dev|vmaas-ci|bmaas-ci|caas-ci|full-ci  NS=osac
+#   make install-osac    PLATFORM=kind|openshift  PROFILE=dev|vmaas-ci|bmaas-ci|caas-ci|full-ci|pool  NS=osac
+#   make uninstall-osac  PLATFORM=kind|openshift  PROFILE=dev|vmaas-ci|bmaas-ci|caas-ci|full-ci|pool  NS=osac
 #   make uninstall-infra PLATFORM=kind|openshift  PROFILE=dev|vmaas-ci|bmaas-ci|caas-ci|full-ci  NS=osac
 #   make test            PLATFORM=kind|openshift  PROFILE=dev|vmaas-ci|bmaas-ci|caas-ci|full-ci  NS=osac  SUITE=all|fulfillment|operator|bmf
 #
@@ -41,10 +41,17 @@ ifeq ($(filter $(PLATFORM),kind openshift),)
 $(error PLATFORM=$(PLATFORM) is invalid; must be kind or openshift)
 endif
 ifndef PROFILE
-$(error PROFILE is required (dev|vmaas-ci|bmaas-ci|caas-ci|full-ci))
+$(error PROFILE is required (dev|vmaas-ci|bmaas-ci|caas-ci|full-ci|pool))
 endif
-ifeq ($(filter $(PROFILE),dev vmaas-ci bmaas-ci caas-ci full-ci),)
-$(error PROFILE=$(PROFILE) is invalid; must be dev, vmaas-ci, bmaas-ci, caas-ci, or full-ci)
+ifeq ($(filter $(PROFILE),dev vmaas-ci bmaas-ci caas-ci full-ci pool),)
+$(error PROFILE=$(PROFILE) is invalid; must be dev, vmaas-ci, bmaas-ci, caas-ci, full-ci, or pool)
+endif
+# pool is instance-values-only: a stamped cluster already has infra, so
+# infra-touching targets have no values/pool/infra.yaml to consume.
+ifeq ($(PROFILE),pool)
+ifneq ($(filter $(MAKECMDGOALS),install install-infra uninstall uninstall-infra test),)
+$(error PROFILE=pool only supports install-osac/uninstall-osac on a stamped cluster)
+endif
 endif
 ifndef NS
 $(error NS is required (namespace for OSAC instance, e.g. NS=osac))
@@ -195,6 +202,12 @@ ifneq ($(PLATFORM),kind)
 	@bash -c 'source scripts/lib.sh && check_postgres_prerequisites "$(NS)" "$(INFRA_VALUES)"'
 	$(eval DOMAIN := $(shell oc get ingresses.config/cluster -o jsonpath='{.spec.domain}'))
 	@[ -n "$(DOMAIN)" ] || { echo "ERROR: Could not determine cluster domain. Is oc logged in?" >&2; exit 1; }
+endif
+# POOL_LABEL_NS=1 stamps the target namespace as a pool instance so the
+# osac-infra Bundle (with caBundle.extraMatchLabels) propagates the CA
+# bundle to it. Default off -- plain installs are unchanged.
+ifeq ($(POOL_LABEL_NS),1)
+	oc label ns $(NS) osac.openshift.io/pool-instance=true --overwrite
 endif
 	helm upgrade --install osac $(OSAC_CHART) \
 		-f $(INSTANCE_VALUES) \

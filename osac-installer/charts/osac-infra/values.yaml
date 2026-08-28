@@ -101,3 +101,10 @@ certs:
     name: default-ca
   caBundle:
     configMap: ca-bundle
+
+# Extra labels merged into the trust-manager Bundle's namespaceSelector
+# matchLabels (ca-issuer.yaml). Empty by default. Pool-instance stamping
+# labels the per-run namespace with osac.openshift.io/pool-instance: "true"
+# and requires it here so only stamped namespaces receive the CA bundle.
+caBundle:
+  extraMatchLabels: {}
