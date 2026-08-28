@@ -250,6 +250,14 @@
               "default": false
             }
           }
+        },
+        "consoleProxy": {
+          "type": "object",
+          "properties": {
+            "disabled": {
+              "type": "boolean"
+            }
+          }
         }
       }
     },
@@ -1129,6 +1137,14 @@
               }
             }
           }
+        },
+        "apiToken": {
+          "type": "object",
+          "properties": {
+            "create": {
+              "type": "boolean"
+            }
+          }
         }
       }
     },
@@ -1274,6 +1290,21 @@
               "type": "boolean",
               "description": "When false, the metering chart skips KafkaTopic/KafkaUser creation (shared stamped install)",
               "default": true
+            }
+          }
+        },
+        "echoAdapter": {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "image": {
+              "type": "object"
+            },
+            "bufferSize": {
+              "type": "integer",
+              "minimum": 0
             }
           }
         }
@@ -1621,15 +1652,27 @@
             "limits": {
               "type": "object",
               "properties": {
-                "cpu": { "type": "string", "description": "CPU limit" },
-                "memory": { "type": "string", "description": "Memory limit" }
+                "cpu": {
+                  "type": "string",
+                  "description": "CPU limit"
+                },
+                "memory": {
+                  "type": "string",
+                  "description": "Memory limit"
+                }
               }
             },
             "requests": {
               "type": "object",
               "properties": {
-                "cpu": { "type": "string", "description": "CPU request" },
-                "memory": { "type": "string", "description": "Memory request" }
+                "cpu": {
+                  "type": "string",
+                  "description": "CPU request"
+                },
+                "memory": {
+                  "type": "string",
+                  "description": "Memory request"
+                }
               }
             }
           }
@@ -1698,15 +1741,27 @@
             "limits": {
               "type": "object",
               "properties": {
-                "cpu": { "type": "string", "description": "CPU limit" },
-                "memory": { "type": "string", "description": "Memory limit" }
+                "cpu": {
+                  "type": "string",
+                  "description": "CPU limit"
+                },
+                "memory": {
+                  "type": "string",
+                  "description": "Memory limit"
+                }
               }
             },
             "requests": {
               "type": "object",
               "properties": {
-                "cpu": { "type": "string", "description": "CPU request" },
-                "memory": { "type": "string", "description": "Memory request" }
+                "cpu": {
+                  "type": "string",
+                  "description": "CPU request"
+                },
+                "memory": {
+                  "type": "string",
+                  "description": "Memory request"
+                }
               }
             }
           }
@@ -1722,15 +1777,27 @@
                 "limits": {
                   "type": "object",
                   "properties": {
-                    "cpu": { "type": "string", "description": "CPU limit" },
-                    "memory": { "type": "string", "description": "Memory limit" }
+                    "cpu": {
+                      "type": "string",
+                      "description": "CPU limit"
+                    },
+                    "memory": {
+                      "type": "string",
+                      "description": "Memory limit"
+                    }
                   }
                 },
                 "requests": {
                   "type": "object",
                   "properties": {
-                    "cpu": { "type": "string", "description": "CPU request" },
-                    "memory": { "type": "string", "description": "Memory request" }
+                    "cpu": {
+                      "type": "string",
+                      "description": "CPU request"
+                    },
+                    "memory": {
+                      "type": "string",
+                      "description": "Memory request"
+                    }
                   }
                 }
               }
@@ -1812,7 +1879,7 @@
         },
         "title": {
           "type": "string",
-          "description": "Human-friendly short title for the NetworkClass. Required when enabled — the fulfillment service rejects NetworkClass creation without one.",
+          "description": "Human-friendly short title for the NetworkClass. Required when enabled \u2014 the fulfillment service rejects NetworkClass creation without one.",
           "default": ""
         },
         "description": {

@@ -31,8 +31,9 @@ operator:
     provider: "aap"
   aap:
     insecureSkipVerify: "true"
-    # Talks to the shared stamped AAP; the token secret must be pre-created
-    # in this namespace by the stamping pipeline.
+    # Talks to the shared stamped AAP. Override per run:
+    #   --set operator.aap.url=$AAP_GATEWAY_URL
+    #   --set operator.aap.templatePrefix=osac-<runid>
     tokenSecret:
       name: osac-aap-api-token
       key: token
@@ -67,7 +68,7 @@ service:
     caBundle:
       configMap: ca-bundle
   auth:
-    issuerUrl: https://keycloak.keycloak.svc.cluster.local/realms/osac
+    issuerUrl: ""  # --set via KEYCLOAK_HOST env (Makefile); blank fails rendering
     emergencyServiceAccounts:
     - admin
     - osac-operator
@@ -84,7 +85,7 @@ service:
           param: client-secret
   idp:
     provider: keycloak
-    url: https://keycloak.keycloak.svc.cluster.local
+    url: ""  # --set via KEYCLOAK_HOST env (Makefile); blank fails rendering
     credentials:
     - secret:
         name: fulfillment-controller-credentials
@@ -112,7 +113,7 @@ service:
   log:
     level: debug
   vault:
-    # Bundled per-run OpenBao (bundledVault below) -- namespace-dependent.
+    # Bundled per-run OpenBao (bundledVault below).
     # Override per run: --set service.vault.endpoint=https://openbao.<NS>.svc.cluster.local:8200
     endpoint: ""
     namespace: osac
@@ -120,7 +121,7 @@ service:
     lifecycleRole: lifecycle
     lifecycleMountPath: jwt
     keycloakClientId: osac-controller
-    keycloakIssuerUrl: "https://keycloak.keycloak.svc.cluster.local/realms/osac"
+    keycloakIssuerUrl: ""  # --set via KEYCLOAK_HOST env (Makefile); blank fails rendering
     keycloakAudience: osac-api
     caBundle:
       configMap: ca-bundle
@@ -153,21 +154,43 @@ aap:
       # The shared stamped AAP instance is reused; no per-run AAP operator.
       enabled: false
   bootstrap:
-    # The shared AAP is already bootstrapped; skip the per-run bootstrap Job.
-    enabled: false
-  # No per-run AAP API token -- the operator authenticates with the shared
-  # AAP token secret pre-created by the stamping pipeline.
+    # Runs config-as-code against the shared AAP with this run's prefix.
+    # The bootstrap pod's downward-API NAMESPACE is baked into every job
+    # template's pod spec (metadata.namespace), so AAP job pods land here.
+    enabled: true
+    remote: true
+    skipSubscription: true
+    # The shared AAP admin password, copied into this namespace by the
+    # workflow before helm install (the secret name matches the stamped
+    # AAP_ADMIN_SECRET_NAME).
+    adminPasswordSecret: osac-aap-admin-password
+    # gateway.hostname / controller.hostname: --set by the workflow from
+    # AAP_GATEWAY_HOSTNAME / AAP_CONTROLLER_HOSTNAME.
+  configAsCode:
+    # --set by the workflow: aapHostname=$AAP_GATEWAY_URL,
+    # aapUsername=admin, aapValidateCerts=false, aapPrefix=osac-<runid>,
+    # aapOrganizationName=osac-<runid>-org, projectGitUri/Branch=the PR
+    # checkout. No defaults here: a pool install that forgets them must fail.
+    projectSyncEnabled: false
+    configAsCodeEnabled: false
+  remote:
+    rbacEnabled: true
+    # controllerServiceAccount / controllerNamespace / gatewayURL: --set by
+    # the workflow. rbacEnabled=true without them fails helm rendering (the
+    # chart requires them together), so a misconfigured workflow is loud.
   apiToken:
+    # No create-api-token hook against the shared AAP; the workflow writes
+    # the shared AAP token into this namespace as Secret
+    # osac-aap-api-token before helm install.
     create: false
-  # TODO(WP3): enable per-run Keycloak wiring once WP3 lands:
-  #   keycloak:
-  #     enabled: true   # --set aap.keycloak.routeHost=<ns-dependent route>
-  # TODO(WP2/WP3): remote-AAP RBAC + namespace-dependent placeholders, all
-  # passed as --set overrides once the keys exist:
-  #   --set aap.remote.rbacEnabled=true
-  #   --set aap.remote.controllerServiceAccount=<sa>
-  #   --set aap.remote.controllerNamespace=<ns>
-  #   --set aap.remote.gatewayURL=<url>
+
+# --- Per-install Keycloak ---
+keycloak:
+  enabled: true
+  # routeHost is --set by the workflow via the Makefile KEYCLOAK_HOST env
+  # (which also re-points service.auth.issuerUrl / idp.url / vault issuer).
+  # devFixtures defaults to true: realm users are seeded with the fixed
+  # passwords that OSAC_JWT_PASSWORD / OSAC_KEYCLOAK_ADMIN_PASSWORD carry.
 
 # --- Validation ---
 validation:

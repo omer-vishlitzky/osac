@@ -166,6 +166,7 @@ else
 		--set lvms.channel=stable-$(OCP_VERSION) \
 		--set keycloak.hostname=https://keycloak-keycloak.$(DOMAIN) \
 		--set keycloak.route.hostname=keycloak-keycloak.$(DOMAIN) \
+		$(EXTRA_HELM_ARGS) \
 		--timeout 30m --wait-for-jobs
 endif
 

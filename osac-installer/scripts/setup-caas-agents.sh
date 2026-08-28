@@ -16,7 +16,10 @@ source "${SCRIPT_DIR}/lib.sh"
 INSTALLER_NAMESPACE=${INSTALLER_NAMESPACE:-"osac-e2e-ci"}
 AGENT_NAMESPACE=${AGENT_NAMESPACE:-"hardware-inventory"}
 AGENT_RESOURCE_CLASS=${AGENT_RESOURCE_CLASS:-"ci-worker"}
-AGENT_VM_NAME=${AGENT_VM_NAME:?"AGENT_VM_NAME must be set"}
+# LIBVIRT_URI is new: pool runs target a dedicated VM-pool host
+# (qemu+ssh://...); the default keeps today's local-libvirt behavior.
+LIBVIRT_URI=${LIBVIRT_URI:-"qemu:///system"}
+AGENT_VM_NAME=${AGENT_VM_NAME:-"agent-${AGENT_NAMESPACE}"}
 AGENT_VM_MEMORY=${AGENT_VM_MEMORY:-"16384"}
 AGENT_VM_VCPUS=${AGENT_VM_VCPUS:-"4"}
 
@@ -25,7 +28,7 @@ AGENT_VM_VCPUS=${AGENT_VM_VCPUS:-"4"}
 AGENT_VM_DISK_SIZE=${AGENT_VM_DISK_SIZE:-"120G"}
 AGENT_VM_DATA_DISK_SIZE=${AGENT_VM_DATA_DISK_SIZE:-""}
 AGENT_VM_STORAGE_DIR=${AGENT_VM_STORAGE_DIR:-"/data/osac-storage"}
-LIBVIRT_NETWORK=${LIBVIRT_NETWORK:?"LIBVIRT_NETWORK must be set"}
+LIBVIRT_NETWORK=${LIBVIRT_NETWORK:-"osac-agents"}
 SSH_CONFIG=${SSH_CONFIG:-""}
 
 # Validate inputs that are interpolated into the generated hypervisor script
@@ -187,8 +190,8 @@ echo "Downloading discovery ISO..."
 curl -k -L --fail-with-body -o '${ISO_FILE}' '${ISO_URL}'
 
 # Create agent VM
-virsh --connect qemu:///system destroy '${AGENT_VM_NAME}' 2>/dev/null || true
-virsh --connect qemu:///system undefine '${AGENT_VM_NAME}' 2>/dev/null || true
+virsh --connect '${LIBVIRT_URI}' destroy '${AGENT_VM_NAME}' 2>/dev/null || true
+virsh --connect '${LIBVIRT_URI}' undefine '${AGENT_VM_NAME}' 2>/dev/null || true
 rm -f '${AGENT_VM_STORAGE_DIR}/${AGENT_VM_NAME}.qcow2'
 if [[ -n '${AGENT_VM_DATA_DISK_SIZE}' ]]; then
     rm -f '${AGENT_VM_STORAGE_DIR}/${AGENT_VM_NAME}-data.qcow2'
@@ -200,7 +203,7 @@ if [[ -n '${AGENT_VM_DATA_DISK_SIZE}' ]]; then
 fi
 
 _virt_install_args=(
-  --connect qemu:///system
+  --connect '${LIBVIRT_URI}'
   --name '${AGENT_VM_NAME}'
   --memory '${AGENT_VM_MEMORY}'
   --vcpus '${AGENT_VM_VCPUS}'
