@@ -226,6 +226,8 @@ HVEOF
 echo "[4/6] Configuring host DNS for ISO download..."
 echo "[5/6] Creating agent VM..."
 
+AGENT_COUNT_BEFORE=$(oc get agent -n "${AGENT_NAMESPACE}" --no-headers 2>/dev/null | wc -l)
+
 if [[ -n "${SSH_CONFIG}" ]]; then
     generate_hypervisor_script | timeout -s 9 10m ssh -F "${SSH_CONFIG}" ci_machine bash -s
 else
@@ -233,14 +235,19 @@ else
 fi
 
 echo "[6/6] Waiting for agent to register..."
-retry_until 600 10 '[[ $(oc get agent -n ${AGENT_NAMESPACE} --no-headers 2>/dev/null | wc -l) -gt 0 ]]' || {
+EXPECTED_COUNT=$((AGENT_COUNT_BEFORE + 1))
+retry_until 600 10 '[[ $(oc get agent -n ${AGENT_NAMESPACE} --no-headers 2>/dev/null | wc -l) -ge '"${EXPECTED_COUNT}"' ]]' || {
     echo "Timed out waiting for agent to register. Current state:"
     oc get infraenv -n "${AGENT_NAMESPACE}" -o yaml 2>&1 || true
     oc get agent -n "${AGENT_NAMESPACE}" -o yaml 2>&1 || true
     exit 1
 }
 
-AGENT_NAME=$(oc get agent -n "${AGENT_NAMESPACE}" -o jsonpath='{.items[0].metadata.name}')
+AGENT_NAME=$(oc get agent -n "${AGENT_NAMESPACE}" --no-headers -o custom-columns=NAME:.metadata.name,LABEL:.metadata.labels."osac\.openshift\.io/resource_class" 2>/dev/null \
+    | grep '<none>' | head -1 | awk '{print $1}')
+if [[ -z "${AGENT_NAME}" ]]; then
+    AGENT_NAME=$(oc get agent -n "${AGENT_NAMESPACE}" -o jsonpath='{.items[-1:].metadata.name}')
+fi
 echo "Agent registered: ${AGENT_NAME}"
 
 oc label agent/"${AGENT_NAME}" -n "${AGENT_NAMESPACE}" "osac.openshift.io/resource_class=${AGENT_RESOURCE_CLASS}" --overwrite
