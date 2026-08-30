@@ -1,0 +1,15 @@
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: {{ ocp_4_20_ai_maas_keycloak_namespace }}
+  namespace: {{ ocp_4_20_ai_maas_keycloak_namespace }}
+spec:
+  host: "{{ ocp_4_20_ai_maas_keycloak_namespace }}.{{ _cluster_domain }}"
+  to:
+    kind: Service
+    name: {{ ocp_4_20_ai_maas_keycloak_namespace }}-service
+  port:
+    targetPort: http
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect

@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/IBM/sarama"
@@ -36,6 +37,16 @@ type permanentError struct {
 
 func (e permanentError) Error() string { return e.err.Error() }
 func (e permanentError) Unwrap() error { return e.err }
+
+// tenantProjectSeparator splits a MaaSSubscription name of the form
+// "<tenant>--<project>" into its two components. Double-hyphen because a
+// single "-" is legal inside either component.
+const tenantProjectSeparator = "--"
+
+// expectedSource is the only IPP deployment allowed to publish inference events for billing —
+// the shared cluster's own gateway, which stamps X-MaaS-Subscription from its own Authorino
+// validation. Defense in depth against a misconfigured tenant-side IPP double-counting (G6).
+const expectedSource = "shared-inference-gateway"
 
 var (
 	inferenceEventsProcessed = promauto.NewCounter(prometheus.CounterOpts{
@@ -70,9 +81,10 @@ type rawInferenceData struct {
 
 // rawCloudEvent is the minimal CloudEvent envelope fields we need.
 type rawCloudEvent struct {
-	ID   string           `json:"id"`
-	Time string           `json:"time"`
-	Data rawInferenceData `json:"data"`
+	ID     string           `json:"id"`
+	Time   string           `json:"time"`
+	Source string           `json:"source"`
+	Data   rawInferenceData `json:"data"`
 }
 
 // Consumer reads raw inference events from Kafka, resolves tenant
@@ -179,9 +191,15 @@ func (h *consumerHandler) processMessage(ctx context.Context, msg *sarama.Consum
 		return permanentError{fmt.Errorf("parsing CloudEvent: %w", err)}
 	}
 
-	if raw.Data.OrganizationID == "" {
-		inferenceIngestErrors.WithLabelValues("missing_organization_id").Inc()
-		return permanentError{fmt.Errorf("inference event %s has no organization_id", raw.ID)}
+	if raw.Source != expectedSource {
+		inferenceIngestErrors.WithLabelValues("wrong_source").Inc()
+		return permanentError{fmt.Errorf("inference event %s has source %q, want %q", raw.ID, raw.Source, expectedSource)}
+	}
+
+	tenant, project, ok := strings.Cut(raw.Data.Subscription, tenantProjectSeparator)
+	if !ok || tenant == "" || project == "" {
+		inferenceIngestErrors.WithLabelValues("unparseable_subscription").Inc()
+		return permanentError{fmt.Errorf("inference event %s has unparseable subscription %q", raw.ID, raw.Data.Subscription)}
 	}
 
 	if raw.Data.Model == "" {
@@ -195,13 +213,13 @@ func (h *consumerHandler) processMessage(ctx context.Context, msg *sarama.Consum
 		return permanentError{fmt.Errorf("inference event %s has invalid time %q: %w", raw.ID, raw.Time, err)}
 	}
 
-	tenantName, err := h.tenantCache.Resolve(ctx, raw.Data.OrganizationID)
+	tenantName, err := h.tenantCache.Resolve(ctx, tenant)
 	if err != nil {
 		inferenceIngestErrors.WithLabelValues("tenant_resolution_failed").Inc()
-		return fmt.Errorf("resolving tenant for organization %q: %w", raw.Data.OrganizationID, err)
+		return fmt.Errorf("resolving tenant %q: %w", tenant, err)
 	}
 
-	enrichedEvent := buildInferenceEvent(raw.ID, raw.Data, tenantName, eventTime)
+	enrichedEvent := buildInferenceEvent(raw.ID, raw.Data, tenantName, project, eventTime)
 
 	if err := h.publisher.Publish(ctx, enrichedEvent); err != nil {
 		inferenceIngestErrors.WithLabelValues("publish_error").Inc()
@@ -212,7 +230,7 @@ func (h *consumerHandler) processMessage(ctx context.Context, msg *sarama.Consum
 	return nil
 }
 
-func buildInferenceEvent(rawEventID string, raw rawInferenceData, tenantID string, eventTime time.Time) cloudevents.Event {
+func buildInferenceEvent(rawEventID string, raw rawInferenceData, tenantID, projectID string, eventTime time.Time) cloudevents.Event {
 	ce := cloudevents.NewEvent()
 
 	ce.SetID(rawEventID)
@@ -220,7 +238,7 @@ func buildInferenceEvent(rawEventID string, raw rawInferenceData, tenantID strin
 	ce.SetType(events.EventInferenceUsage)
 	ce.SetTime(eventTime)
 
-	events.SetOSACExtensions(&ce, rawEventID, events.ResourceTypeMaaSInference, tenantID, "")
+	events.SetOSACExtensions(&ce, rawEventID, events.ResourceTypeMaaSInference, tenantID, projectID)
 
 	data := schema.LifecycleData{
 		ResourceID:   rawEventID,

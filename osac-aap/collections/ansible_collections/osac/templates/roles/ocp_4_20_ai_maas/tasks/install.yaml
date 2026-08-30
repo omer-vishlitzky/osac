@@ -17,6 +17,25 @@
     ocp_4_20_ai_maas_enable_dashboard: "{{ template_parameters.enable_dashboard | default(true) | bool }}"
     ocp_4_20_ai_maas_hardware_profiles: "{{ template_parameters.hardware_profiles | default(ocp_4_20_ai_maas_hardware_profiles) }}"
     ocp_4_20_ai_maas_external_models: "{{ template_parameters.external_models | default(ocp_4_20_ai_maas_external_models) }}"
+    ocp_4_20_ai_maas_tenant_projects: "{{ template_parameters.tenant_projects | default(ocp_4_20_ai_maas_tenant_projects) }}"
+    ocp_4_20_ai_maas_enable_metering: "{{ template_parameters.enable_metering | default(false) | bool }}"
+    ocp_4_20_ai_maas_management_kubeconfig: "{{ template_parameters.management_kubeconfig | default(ocp_4_20_ai_maas_management_kubeconfig) }}"
+    ocp_4_20_ai_maas_upstream_credentials_secret_namespace: "{{ template_parameters.upstream_credentials_secret_namespace | default(ocp_4_20_ai_maas_upstream_credentials_secret_namespace) }}"
+    ocp_4_20_ai_maas_upstream_credentials_secret_name: "{{ template_parameters.upstream_credentials_secret_name | default(ocp_4_20_ai_maas_upstream_credentials_secret_name) }}"
+  when: template_parameters is defined
+
+# Separate task (no_log) — metering_kafka_sasl_password is a credential and must not
+# be echoed in job output the way the flags above safely can be.
+- name: Bridge metering templateParameters to role variables
+  ansible.builtin.set_fact:
+    ocp_4_20_ai_maas_metering_kafka_brokers: "{{ template_parameters.metering_kafka_brokers | default(ocp_4_20_ai_maas_metering_kafka_brokers) }}"
+    ocp_4_20_ai_maas_metering_kafka_topic: "{{ template_parameters.metering_kafka_topic | default(ocp_4_20_ai_maas_metering_kafka_topic) }}"
+    ocp_4_20_ai_maas_metering_kafka_tls_ca: "{{ template_parameters.metering_kafka_tls_ca | default(ocp_4_20_ai_maas_metering_kafka_tls_ca) }}"
+    ocp_4_20_ai_maas_metering_kafka_sasl_user: "{{ template_parameters.metering_kafka_sasl_user | default(ocp_4_20_ai_maas_metering_kafka_sasl_user) }}"
+    ocp_4_20_ai_maas_metering_kafka_sasl_password: "{{ template_parameters.metering_kafka_sasl_password | default(ocp_4_20_ai_maas_metering_kafka_sasl_password) }}"
+    ocp_4_20_ai_maas_metering_ipp_image: "{{ template_parameters.metering_ipp_image | default(ocp_4_20_ai_maas_metering_ipp_image) }}"
+    ocp_4_20_ai_maas_tenant_upstream_key_expires_in: "{{ template_parameters.tenant_upstream_key_expires_in | default(ocp_4_20_ai_maas_tenant_upstream_key_expires_in) }}"
+  no_log: true
   when: template_parameters is defined
 
 - name: Create cluster with RHOAI + MaaS post-install

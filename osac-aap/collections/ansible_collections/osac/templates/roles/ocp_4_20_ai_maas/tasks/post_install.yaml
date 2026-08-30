@@ -13,6 +13,24 @@
       ocp_small pipeline. For local testing, set KUBECONFIG env var
       or pass admin_kubeconfig as a playbook variable.
 
+- name: Create temp file for admin kubeconfig
+  ansible.builtin.tempfile:
+    state: file
+    prefix: maas-admin-kubeconfig-
+  register: _admin_kubeconfig_file
+  changed_when: false
+
+- name: Write admin kubeconfig to temp file
+  ansible.builtin.copy:
+    content: "{{ admin_kubeconfig | to_nice_yaml(indent=2) }}"
+    dest: "{{ _admin_kubeconfig_file.path }}"
+    mode: "0600"
+  changed_when: false
+
+- name: Set admin kubeconfig path
+  ansible.builtin.set_fact:
+    admin_kubeconfig_path: "{{ _admin_kubeconfig_file.path }}"
+
 - name: Install platform operators (BOM Phase 2 + 3)
   ansible.builtin.include_tasks: install_operators.yaml
 

@@ -8,7 +8,7 @@ metadata:
   name: {{ model.name }}-key
   namespace: {{ ocp_4_20_ai_maas_external_model_namespace }}
   labels:
-    inference.networking.k8s.io/bbr-managed: "true"
+    inference.llm-d.ai/ipp-managed: "true"
 type: Opaque
 stringData:
   api-key: "{{ model.upstream_credential }}"

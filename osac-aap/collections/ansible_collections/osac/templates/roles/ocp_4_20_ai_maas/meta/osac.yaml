@@ -2,11 +2,14 @@
 name: ocp-4-20-ai-maas
 title: OpenShift AI 4.20 Cluster with MaaS
 description: >
-  Builds an OpenShift 4.20 cluster with RHOAI 3.4, Models-as-a-Service (GA),
-  Keycloak SSO, and observability (COO + OTel). Supports both GPU deployments
-  and CPU-only simulator mode for testing. Includes RHCL 1.3 version pinning
-  for auth enforcement compatibility with Service Mesh 3.2. Single-tenant
-  deployment — one organization per cluster.
+  Builds an OpenShift 4.20 cluster with RHOAI, Models-as-a-Service, Keycloak
+  SSO, and observability (COO + OTel). Supports both GPU deployments and
+  CPU-only simulator mode for testing. Includes RHCL 1.3 version pinning for
+  auth enforcement compatibility with Service Mesh 3.2. The maas-controller
+  itself is deployed from a pinned main-branch commit via kustomize,
+  independent of whichever RHOAI channel is installed. Set tenant_projects to
+  provision per-(tenant, project) MaaSSubscriptions on a shared inference
+  cluster, or external_models to consume models from one.
 template_type: cluster
 implementation_strategy: ocp_4_20_ai_maas
 default_node_request:
@@ -79,7 +82,98 @@ parameters:
     description: >
       List of external models to access from upstream clusters. Each entry creates
       an ExternalModel CR with MaaS governance. When secured=true, a maas-proxy
-      is deployed. Requires enable_maas=true.
+      is deployed. Requires enable_maas=true. Each entry must provide either
+      upstream_credential inline or upstream_credential_secret_key to resolve it
+      from the management-cluster Secret.
     type: list
     required: false
     default: []
+  - name: tenant_projects
+    title: Per-Tenant-Project Subscriptions
+    description: >
+      Per-(tenant, project) MaaSSubscriptions for a shared inference cluster. Each entry
+      creates a Keycloak group/service-user, a MaaSSubscription named "<tenant>--<project>",
+      and a durable upstream API key for tenant clusters to use as their external_models
+      upstream_credential. Leave empty on tenant clusters.
+    type: list
+    required: false
+    default: []
+  - name: enable_metering
+    title: Enable Inference Metering
+    description: >
+      Deploy the Kafka-based inference metering plugin on this cluster's payload processor.
+      Only valid on a shared inference cluster — enabling it alongside a non-empty
+      external_models list risks double-counting requests already metered by the tenant
+      cluster. Requires metering_kafka_brokers, metering_kafka_sasl_user, and
+      metering_kafka_sasl_password.
+    type: boolean
+    required: false
+    default: false
+  - name: metering_kafka_brokers
+    title: Metering Kafka Brokers
+    description: Comma-separated Kafka bootstrap brokers for inference metering events.
+    type: string
+    required: false
+    default: ""
+  - name: metering_kafka_topic
+    title: Metering Kafka Topic
+    description: Kafka topic inference metering events are published to.
+    type: string
+    required: false
+    default: "osac.metering.inference.raw"
+  - name: metering_kafka_tls_ca
+    title: Metering Kafka TLS CA
+    description: >
+      PEM-encoded CA certificate for the metering Kafka broker's TLS. Leave empty for a
+      plaintext broker.
+    type: string
+    required: false
+    default: ""
+  - name: metering_kafka_sasl_user
+    title: Metering Kafka SASL User
+    description: SASL username for the metering Kafka broker.
+    type: string
+    required: false
+    default: ""
+  - name: metering_kafka_sasl_password
+    title: Metering Kafka SASL Password
+    description: SASL password for the metering Kafka broker.
+    type: string
+    required: false
+    default: ""
+  - name: metering_ipp_image
+    title: Metering Payload Processor Image
+    description: >
+      Payload-processing image with Kafka transport support, overriding the
+      operator-managed image on this cluster. Required for metering — the operator-managed
+      image has no Kafka support.
+    type: string
+    required: false
+    default: "quay.io/rh-ee-ovishlit/ai-gateway-payload-processing:latest"
+  - name: tenant_upstream_key_expires_in
+    title: Tenant Upstream Key Expiry
+    description: Expiry duration passed to the upstream API key mint request for each tenant_projects entry.
+    type: string
+    required: false
+    default: "2159h"
+  - name: management_kubeconfig
+    title: Management Cluster Kubeconfig
+    description: >
+      Optional kubeconfig used to read or write the shared upstream credentials
+      Secret during local or out-of-cluster runs. Leave empty in AAP to use
+      in-cluster auth.
+    type: string
+    required: false
+    default: ""
+  - name: upstream_credentials_secret_namespace
+    title: Upstream Credentials Secret Namespace
+    description: Namespace of the management-cluster Secret that stores shared upstream credentials.
+    type: string
+    required: false
+    default: "osac"
+  - name: upstream_credentials_secret_name
+    title: Upstream Credentials Secret Name
+    description: Name of the management-cluster Secret that stores shared upstream credentials.
+    type: string
+    required: false
+    default: "maas-upstream-credentials"

@@ -1,11 +1,13 @@
 ---
 argument_specs:
   main:
-    short_description: Deploy MaaS on RHOAI 3.4 with RHCL 1.3 version pinning
+    short_description: Deploy MaaS on RHOAI with RHCL 1.3 version pinning
     description: >
-      Provisions an OpenShift cluster with Red Hat OpenShift AI 3.4,
-      Models-as-a-Service (GA), Keycloak SSO, and RHCL 1.3.x version
-      pinning. Extends ocp_small via post-install hook override.
+      Provisions an OpenShift cluster with Red Hat OpenShift AI,
+      Models-as-a-Service, Keycloak SSO, and RHCL 1.3.x version
+      pinning. maas-controller is deployed from a pinned main-branch commit
+      via kustomize, independent of the installed RHOAI channel.
+      Extends ocp_small via post-install hook override.
       SECURITY: All credential defaults (db_password, keycloak_db_password,
       keycloak_client_secret, keycloak_test_password) are for development
       and testing only. You MUST override every credential variable before
@@ -84,13 +86,21 @@ argument_specs:
             name            - Local model name (CR names derived from this)
             secured         - true = deploy proxy (Path B/C), false = direct Route (Path A)
             upstream_endpoint - Gateway FQDN (secured) or Route FQDN (unsecured)
-            upstream_credential - MaaS API key (B), K8s SA token (C), or 'dummy-not-used' (A)
+            upstream_credential - Optional inline MaaS API key (B), K8s SA token (C), or 'dummy-not-used' (A)
+            upstream_credential_secret_key - Optional management-cluster Secret data key
+              used to resolve upstream_credential automatically
+            upstream_credential_secret_name - Optional Secret name for secret-backed
+              upstream credentials (default: maas-upstream-credentials)
+            upstream_credential_secret_namespace - Optional Secret namespace for
+              secret-backed upstream credentials (default: osac)
             upstream_model_ns - Model namespace on upstream cluster
             upstream_model_name - Model name on upstream cluster
             model_id        - spec.targetModel for ExternalModel (e.g. granite-3.1-8b-instruct-fp8)
             token_limit     - Tenant-side rate limit (tokens per window)
             window          - Rate limit window (e.g. 1m, 1h)
             priority        - MaaSSubscription priority (lower number = lower tier)
+
+          Each entry must define either upstream_credential or upstream_credential_secret_key.
 
           When secured=true, a maas-proxy Deployment is created targeting
           upstream_endpoint. The proxy adds /<upstream_model_ns>/<upstream_model_name>/
@@ -244,7 +254,7 @@ argument_specs:
       ocp_4_20_ai_maas_rhoai_channel:
         type: str
         required: false
-        default: "stable-3.4"
+        default: "stable-3.x"
         description: OLM channel for Red Hat OpenShift AI.
       ocp_4_20_ai_maas_rhoai_source:
         type: str
@@ -436,6 +446,82 @@ argument_specs:
           Subscription tiers. Each tier defines a MaaSSubscription with token
           rate limits. Also creates Keycloak groups and test users. Each entry
           needs name, group, token_limit, window, and priority.
+
+      # --- Per-(tenant, project) upstream subscriptions (shared cluster only) ---
+      ocp_4_20_ai_maas_tenant_projects:
+        type: list
+        elements: dict
+        required: false
+        description: >
+          Per-(tenant, project) upstream subscriptions for the shared cluster. Each entry
+          creates a Keycloak group/service-user, a MaaSSubscription named "<tenant>--<project>",
+          and a durable upstream API key for tenant clusters to use as their ExternalModel
+          upstream_credential. Each entry needs tenant, project, token_limit, window, and
+          priority. Empty on tenant clusters.
+      ocp_4_20_ai_maas_tenant_upstream_key_expires_in:
+        type: str
+        required: false
+        default: "2159h"
+        description: Expiry duration passed to the upstream API key mint request for each tenant-project entry.
+      ocp_4_20_ai_maas_management_kubeconfig:
+        type: str
+        required: false
+        default: ""
+        description: >
+          Optional kubeconfig for the management cluster when local or out-of-cluster runs need
+          to read or write the shared upstream credentials Secret. Leave empty in AAP to use
+          in-cluster auth.
+      ocp_4_20_ai_maas_upstream_credentials_secret_namespace:
+        type: str
+        required: false
+        default: "osac"
+        description: Namespace of the management-cluster Secret that stores shared upstream credentials.
+      ocp_4_20_ai_maas_upstream_credentials_secret_name:
+        type: str
+        required: false
+        default: "maas-upstream-credentials"
+        description: Name of the management-cluster Secret that stores shared upstream credentials.
+
+      # --- Metering (OSAC inference metering via Kafka; shared cluster only) ---
+      ocp_4_20_ai_maas_enable_metering:
+        type: bool
+        required: false
+        default: false
+        description: >
+          Deploy the Kafka-based inference metering plugin on this cluster's payload
+          processor. Only valid on a shared inference cluster.
+      ocp_4_20_ai_maas_metering_kafka_brokers:
+        type: str
+        required: false
+        default: ""
+        description: Comma-separated Kafka bootstrap brokers for inference metering events.
+      ocp_4_20_ai_maas_metering_kafka_topic:
+        type: str
+        required: false
+        default: "osac.metering.inference.raw"
+        description: Kafka topic inference metering events are published to.
+      ocp_4_20_ai_maas_metering_kafka_tls_ca:
+        type: str
+        required: false
+        default: ""
+        description: PEM-encoded CA certificate for the metering Kafka broker's TLS.
+      ocp_4_20_ai_maas_metering_kafka_sasl_user:
+        type: str
+        required: false
+        default: ""
+        description: SASL username for the metering Kafka broker.
+      ocp_4_20_ai_maas_metering_kafka_sasl_password:
+        type: str
+        required: false
+        default: ""
+        description: SASL password for the metering Kafka broker.
+      ocp_4_20_ai_maas_metering_ipp_image:
+        type: str
+        required: false
+        default: "quay.io/rh-ee-ovishlit/ai-gateway-payload-processing:latest"
+        description: >
+          Payload-processing image with Kafka transport support, overriding the
+          operator-managed image on this cluster.
 
       # --- Monitoring ---
       ocp_4_20_ai_maas_monitoring_retention:

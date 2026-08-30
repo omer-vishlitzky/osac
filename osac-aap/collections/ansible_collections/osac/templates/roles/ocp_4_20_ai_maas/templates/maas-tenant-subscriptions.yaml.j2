@@ -1,0 +1,21 @@
+{% for item in ocp_4_20_ai_maas_tenant_projects %}
+{% if not loop.first %}
+---
+{% endif %}
+apiVersion: maas.opendatahub.io/v1alpha1
+kind: MaaSSubscription
+metadata:
+  name: "{{ item.tenant }}--{{ item.project }}"
+  namespace: models-as-a-service
+spec:
+  owner:
+    groups:
+    - name: "tenant-{{ item.tenant }}-{{ item.project }}"
+  modelRefs:
+  - name: "{{ ocp_4_20_ai_maas_model_name }}"
+    namespace: "{{ ocp_4_20_ai_maas_model_namespace }}"
+    tokenRateLimits:
+    - limit: {{ item.token_limit }}
+      window: "{{ item.window }}"
+  priority: {{ item.priority }}
+{% endfor %}

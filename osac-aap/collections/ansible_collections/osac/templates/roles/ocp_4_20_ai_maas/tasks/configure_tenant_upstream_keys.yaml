@@ -1,0 +1,106 @@
+---
+# Mint a durable, subscription-bound upstream API key for each (tenant, project) pair on the
+# shared cluster. Tenant clusters use this key as their ExternalModel upstream_credential — it
+# is what the shared Authorino resolves back to the MaaSSubscription (and therefore to
+# tenant/project) at request time, so the value must never be asserted by the tenant.
+
+- name: Set MaaS API and Keycloak URLs for upstream key minting
+  ansible.builtin.set_fact:
+    _maas_api_url: "https://{{ ocp_4_20_ai_maas_gateway_hostname }}.{{ _cluster_domain }}"
+    _keycloak_url: "https://{{ ocp_4_20_ai_maas_keycloak_namespace }}.{{ _cluster_domain }}"
+
+- name: Mint upstream API key per tenant-project
+  block:
+    - name: Get Keycloak JWT for tenant-project service user
+      ansible.builtin.uri:
+        url: "{{ _keycloak_url }}/realms/{{ ocp_4_20_ai_maas_keycloak_realm }}/protocol/openid-connect/token"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          client_id: "{{ ocp_4_20_ai_maas_keycloak_client_id }}"
+          client_secret: "{{ ocp_4_20_ai_maas_keycloak_client_secret }}"
+          username: "svc-{{ item.tenant }}-{{ item.project }}"
+          password: "{{ ocp_4_20_ai_maas_keycloak_test_password }}"
+          grant_type: password
+        validate_certs: false
+      no_log: true
+      register: _tenant_jwt
+
+    - name: Create upstream API key bound to the tenant-project subscription
+      ansible.builtin.uri:
+        url: "{{ _maas_api_url }}/maas-api/v1/api-keys"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ _tenant_jwt.json.access_token }}"
+        body_format: json
+        body:
+          name: "upstream-{{ item.tenant }}-{{ item.project }}"
+          description: "Upstream credential for tenant {{ item.tenant }} project {{ item.project }}"
+          subscription: "{{ item.tenant }}--{{ item.project }}"
+          expiresIn: "{{ ocp_4_20_ai_maas_tenant_upstream_key_expires_in }}"
+        status_code: 201
+        validate_certs: false
+      no_log: true
+      register: _tenant_key
+      retries: 6
+      delay: 10
+      until: _tenant_key is not failed
+
+    - name: Fail if the minted key is not bound to the expected subscription
+      ansible.builtin.fail:
+        msg: >-
+          Upstream key for {{ item.tenant }}/{{ item.project }} is bound to subscription
+          "{{ _tenant_key.json.subscription | default('') }}", expected
+          "{{ item.tenant }}--{{ item.project }}". Check the service user's group membership
+          and the MaaSSubscription owner.
+      when: _tenant_key.json.subscription | default('') != (item.tenant ~ '--' ~ item.project)
+
+    - name: Read existing management-cluster upstream credentials Secret
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Secret
+        name: "{{ ocp_4_20_ai_maas_upstream_credentials_secret_name }}"
+        namespace: "{{ ocp_4_20_ai_maas_upstream_credentials_secret_namespace }}"
+        kubeconfig: "{{ (ocp_4_20_ai_maas_management_kubeconfig | default('') | length > 0) | ternary(ocp_4_20_ai_maas_management_kubeconfig | expanduser, omit) }}"
+      no_log: true
+      register: _existing_upstream_credentials_secret
+
+    - name: Persist upstream credential in management-cluster Secret
+      kubernetes.core.k8s:
+        state: present
+        kubeconfig: "{{ (ocp_4_20_ai_maas_management_kubeconfig | default('') | length > 0) | ternary(ocp_4_20_ai_maas_management_kubeconfig | expanduser, omit) }}"
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: "{{ ocp_4_20_ai_maas_upstream_credentials_secret_name }}"
+            namespace: "{{ ocp_4_20_ai_maas_upstream_credentials_secret_namespace }}"
+            labels:
+              app.kubernetes.io/managed-by: osac-aap
+              osac.openshift.io/component: maas-upstream-credentials
+          type: Opaque
+          data: >-
+            {{
+              (
+                _existing_upstream_credentials_secret.resources[0].data
+                if (_existing_upstream_credentials_secret.resources | length > 0)
+                else {}
+              )
+              | combine({(item.tenant ~ '--' ~ item.project): (_tenant_key.json.key | b64encode)})
+            }}
+      no_log: true
+      register: _r
+      retries: 5
+      delay: 10
+      until: _r is not failed
+
+    - name: Report upstream credential secret updated
+      ansible.builtin.debug:
+        msg: >-
+          Upstream credential for {{ item.tenant }}/{{ item.project }} saved to Secret
+          {{ ocp_4_20_ai_maas_upstream_credentials_secret_namespace }}/{{ ocp_4_20_ai_maas_upstream_credentials_secret_name }}
+          under data key {{ item.tenant }}--{{ item.project }}
+          (subscription={{ _tenant_key.json.subscription }}).
+  loop: "{{ ocp_4_20_ai_maas_tenant_projects }}"
+  loop_control:
+    label: "{{ item.tenant }}--{{ item.project }}"
