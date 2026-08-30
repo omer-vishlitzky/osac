@@ -98,7 +98,7 @@
         kafkaTLSEnabled: "{{ _metering_tls_enabled }}"
         kafkaSASLUser: "{{ ocp_4_20_ai_maas_metering_kafka_sasl_user }}"
         kafkaSASLPassFile: /etc/metering/kafka-credentials/password
-        source: shared-inference-gateway
+        source: "{{ ocp_4_20_ai_maas_metering_source }}"
         failOpen: true
 
 - name: Filter out existing metering plugins (idempotency)

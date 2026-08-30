@@ -33,7 +33,7 @@
       loop: "{{ lookup('ansible.builtin.template', 'keycloak.yaml.j2') | from_yaml_all | list }}"
       loop_control:
         label: "{{ item.kind }}/{{ item.metadata.name }}"
-      no_log: true
+      no_log: "{{ item.kind == 'Secret' }}"
       register: _r
       retries: 5
       delay: 10
@@ -260,7 +260,7 @@
   loop: "{{ lookup('ansible.builtin.template', 'postgres-maas.yaml.j2') | from_yaml_all | list }}"
   loop_control:
     label: "{{ item.kind }}/{{ item.metadata.name }}"
-  no_log: true
+  no_log: "{{ item.kind == 'Secret' }}"
   register: _r
   retries: 5
   delay: 10
