@@ -42,7 +42,11 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 	"sigs.k8s.io/yaml"
 
+	metal3api "github.com/metal3-io/baremetal-operator/apis/metal3.io/v1alpha1"
 	osacv1alpha1 "github.com/osac-project/osac/bare-metal-fulfillment-operator/api/v1alpha1"
+	"github.com/osac-project/osac/bare-metal-fulfillment-operator/internal/baremetalhost"
+	"github.com/osac-project/osac/bare-metal-fulfillment-operator/internal/bcmclient"
+	"github.com/osac-project/osac/bare-metal-fulfillment-operator/internal/bmcdiscovery"
 	"github.com/osac-project/osac/bare-metal-fulfillment-operator/internal/controller"
 	"github.com/osac-project/osac/bare-metal-fulfillment-operator/internal/helpers"
 	"github.com/osac-project/osac/bare-metal-fulfillment-operator/internal/inventory"
@@ -76,17 +80,18 @@ const (
 	envManagementRecheckInterval = "OSAC_MANAGEMENT_RECHECK_INTERVAL"
 	envProvisionPollInterval     = "OSAC_PROVISION_POLL_INTERVAL"
 
-	envAAPURL                = "OSAC_AAP_URL"
-	envAAPToken              = "OSAC_AAP_TOKEN"
-	envAAPStatusPollInterval = "OSAC_AAP_STATUS_POLL_INTERVAL"
-	envAAPInsecureSkipVerify = "OSAC_AAP_INSECURE_SKIP_VERIFY"
-	envAAPTemplatePrefix     = "OSAC_AAP_TEMPLATE_PREFIX"
+	envAAPURL                       = "OSAC_AAP_URL"
+	envAAPToken                     = "OSAC_AAP_TOKEN"
+	envAAPStatusPollInterval        = "OSAC_AAP_STATUS_POLL_INTERVAL"
+	envAAPInsecureSkipVerify        = "OSAC_AAP_INSECURE_SKIP_VERIFY"
+	envAAPTemplatePrefix            = "OSAC_AAP_TEMPLATE_PREFIX"
+	envEnableNetworkingProvisioning = "OSAC_ENABLE_NETWORKING_PROVISIONING"
 )
 
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
-
 	utilruntime.Must(osacv1alpha1.AddToScheme(scheme))
+	utilruntime.Must(metal3api.AddToScheme(scheme))
 	// +kubebuilder:scaffold:scheme
 }
 
@@ -260,15 +265,18 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Create shared provisioning provider
+	// Create shared provisioning, networking, and IP discovery providers
 	var provisioningProvider provisioning.ProvisioningProvider
+	var networkingProvider provisioning.ProvisioningProvider
+	var ipDiscoveryProvider provisioning.ProvisioningProvider
+	var aapClient *aap.Client
 	aapURL := helpers.GetEnvWithDefault(envAAPURL, "")
 	aapToken := helpers.GetEnvWithDefault(envAAPToken, "")
 	if aapURL != "" && aapToken != "" {
 		insecureSkipVerify := helpers.GetEnvWithDefault(envAAPInsecureSkipVerify, false)
 		templatePrefix := helpers.GetEnvWithDefault(envAAPTemplatePrefix, "osac")
 
-		aapClient := aap.NewClient(aapURL, aapToken, insecureSkipVerify)
+		aapClient = aap.NewClient(aapURL, aapToken, insecureSkipVerify)
 
 		var err error
 		provisioningProvider, err = provisioning.NewProvider(provisioning.ProviderConfig{
@@ -278,6 +286,25 @@ func main() {
 		if err != nil {
 			setupLog.Error(err, "failed to create AAP provisioning provider")
 			os.Exit(1)
+		}
+
+		enableNetworkingProvisioning := helpers.GetEnvWithDefault(envEnableNetworkingProvisioning, false)
+		if enableNetworkingProvisioning {
+			// Networking provisioning (onboard) and deprovisioning (offboard) are both a
+			// port move; the single move playbook derives the direction from the CR.
+			networkingProvider = provisioning.NewAAPProvider(
+				aapClient,
+				templatePrefix+"-move-network-attachment",
+				templatePrefix+"-move-network-attachment",
+			)
+
+			ipDiscoveryProvider = provisioning.NewAAPProvider(
+				aapClient,
+				templatePrefix+"-query-dhcp-lease",
+				"",
+			)
+		} else {
+			setupLog.Info("BMI networking provisioning disabled, move-network-attachment and query-dhcp-lease will be skipped")
 		}
 
 		setupLog.Info("AAP provisioning provider configured")
@@ -290,7 +317,10 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err := setupBareMetalInstanceController(ctx, mgr, provisioningProvider); err != nil {
+	if err := setupBareMetalInstanceController(
+		ctx, mgr, provisioningProvider, networkingProvider,
+		ipDiscoveryProvider, aapClient,
+	); err != nil {
 		setupLog.Error(err, "unable to setup controller", "controller", "BareMetalInstance")
 		os.Exit(1)
 	}
@@ -395,6 +425,9 @@ func setupBareMetalInstanceController(
 	ctx context.Context,
 	mgr ctrl.Manager,
 	provisioningProvider provisioning.ProvisioningProvider,
+	networkingProvider provisioning.ProvisioningProvider,
+	ipDiscoveryProvider provisioning.ProvisioningProvider,
+	aapClient *aap.Client,
 ) error {
 	// Read and parse inventory configuration
 	inventoryConfigPath := helpers.GetEnvWithDefault(envInventoryConfigPath, "/etc/osac/inventory/inventory.yaml")
@@ -408,15 +441,8 @@ func setupBareMetalInstanceController(
 		return fmt.Errorf("failed to parse inventory config: %w", err)
 	}
 
-	inventoryClient, err := inventory.NewClient(ctx, &inventoryConfig)
-	if err != nil {
-		return fmt.Errorf("failed to create inventory client: %w", err)
-	}
-	if inventoryClient == nil {
-		return fmt.Errorf("unsupported inventory type %q", inventoryConfig.Type)
-	}
-
-	// Read and parse management configuration
+	// Parse management config before inventory client — the bare-metal management
+	// backend may trigger additional wiring on the inventory config.
 	managementConfigPath := helpers.GetEnvWithDefault(envManagementConfigPath, "/etc/osac/management/management.yaml")
 	managementConfigData, err := os.ReadFile(managementConfigPath)
 	if err != nil {
@@ -426,6 +452,11 @@ func setupBareMetalInstanceController(
 	var managementConfig management.Config
 	if err := yaml.Unmarshal(managementConfigData, &managementConfig); err != nil {
 		return fmt.Errorf("failed to parse management config: %w", err)
+	}
+
+	inventoryClient, err := createInventoryClient(ctx, &inventoryConfig, &managementConfig, mgr)
+	if err != nil {
+		return err
 	}
 
 	managementClient, err := management.NewClient(ctx, &managementConfig)
@@ -464,6 +495,9 @@ func setupBareMetalInstanceController(
 		inventoryClient,
 		managementClient,
 		provisioningProvider,
+		networkingProvider,
+		ipDiscoveryProvider,
+		aapClient,
 		noFreeHostsPollInterval,
 		tryLockFailPollInterval,
 		managementRecheckInterval,
@@ -472,4 +506,88 @@ func setupBareMetalInstanceController(
 		return fmt.Errorf("baremetalinstance controller: %w", err)
 	}
 	return nil
+}
+
+func createInventoryClient(
+	ctx context.Context,
+	inventoryCfg *inventory.Config,
+	managementCfg *management.Config,
+	mgr ctrl.Manager,
+) (inventory.Client, error) {
+	if inventoryCfg.Type == "bcm" {
+		return createBCMInventoryClient(ctx, inventoryCfg, managementCfg, mgr)
+	}
+
+	inventoryClient, err := inventory.NewClient(ctx, inventoryCfg)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create inventory client: %w", err)
+	}
+	if inventoryClient == nil {
+		return nil, fmt.Errorf("unsupported inventory type %q", inventoryCfg.Type)
+	}
+	return inventoryClient, nil
+}
+
+func createBCMInventoryClient(
+	ctx context.Context,
+	inventoryCfg *inventory.Config,
+	managementCfg *management.Config,
+	mgr ctrl.Manager,
+) (inventory.Client, error) {
+	bcmCfg, err := inventory.ParseBCMOptions(inventoryCfg.Options)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse bcm options: %w", err)
+	}
+
+	certDir := filepath.Join("/etc/osac/certs", bcmCfg.CredentialsSecret)
+	// Only set CAFile if ca.crt exists in the mounted Secret.
+	// When caCert is not provided in Helm values, ca.crt won't be present.
+	caFile := filepath.Join(certDir, "ca.crt")
+	if _, err := os.Stat(caFile); os.IsNotExist(err) {
+		caFile = ""
+	}
+	bcmClient, err := bcmclient.NewClient(ctx, &bcmclient.Config{
+		URL:                bcmCfg.URL,
+		CertFile:           filepath.Join(certDir, "tls.crt"),
+		KeyFile:            filepath.Join(certDir, "tls.key"),
+		CAFile:             caFile,
+		InsecureSkipVerify: bcmCfg.InsecureSkipVerify,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create bcm client: %w", err)
+	}
+
+	var bmhMgr *baremetalhost.Manager
+	if managementCfg.Type == "metal3" {
+		ns, err := management.ParseMetal3ManagementNamespace(managementCfg)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse metal3 namespace for BMH manager: %w", err)
+		}
+		// Uncached read+write client for BMC credential Secrets: keeps Secret
+		// access off the cluster-wide informer (no list/watch), so the operator
+		// needs only get/create/update/delete on Secrets in the BMH namespace.
+		secretClient, err := client.New(mgr.GetConfig(), client.Options{Scheme: mgr.GetScheme(), Mapper: mgr.GetRESTMapper()})
+		if err != nil {
+			return nil, fmt.Errorf("failed to create uncached Secret client: %w", err)
+		}
+		bmhMgr = baremetalhost.NewManager(mgr.GetClient(), secretClient, ns)
+		setupLog.Info("BMH manager configured", "namespace", ns)
+	}
+
+	client := inventory.NewBCMClient(bcmClient, bmhMgr, inventoryCfg.HostClass)
+
+	discoverer := &bmcdiscovery.GofishDiscoverer{
+		InsecureSkipVerify: bcmCfg.InsecureSkipVerify,
+	}
+	client.SetBMCDiscoverer(discoverer)
+	setupLog.Info("BMC Redfish discoverer configured", "insecureSkipVerify", bcmCfg.InsecureSkipVerify)
+
+	if cw := client.CertWatcher(); cw != nil {
+		if err := mgr.Add(cw); err != nil {
+			return nil, fmt.Errorf("failed to add BCM cert watcher: %w", err)
+		}
+		setupLog.Info("BCM cert watcher registered")
+	}
+
+	return client, nil
 }

@@ -201,19 +201,13 @@ class NodeSet(Base):
     size: int
 
 
-class ComputeInstanceImage(Base):
-    """Image configuration for compute instance spec defaults."""
+class DiskImageReference(Base):
+    """Reference to a DiskImage resource."""
 
-    source_type: str = pydantic.Field(
-        default="registry",
-        validation_alias=pydantic.AliasChoices("sourceType", "source_type"),
-        serialization_alias="source_type",
-    )
-    source_ref: str = pydantic.Field(
-        ...,
-        validation_alias=pydantic.AliasChoices("sourceRef", "source_ref"),
-        serialization_alias="source_ref",
-    )
+    id: str | None = None
+    name: str | None = None
+    project: str | None = None
+    shared: bool | None = None
 
 
 class ComputeInstanceDisk(Base):
@@ -231,12 +225,17 @@ class ComputeInstanceTemplateSpecDefaults(Base):
 
     Maps from Ansible camelCase (defaults/main.yaml) to proto snake_case.
 
-    Note: cores/memory_gib are intentionally absent — they are reserved
-    (removed) on the fulfillment-service ComputeInstanceTemplateSpecDefaults
-    proto. instance_type is now the sole way to size a ComputeInstance.
+    Note: cores/memory_gib/image are reserved (removed) on the
+    fulfillment-service ComputeInstanceTemplateSpecDefaults proto.
+    instance_type is the sole way to size a ComputeInstance;
+    disk_image references a DiskImage resource by name or ID.
     """
 
-    image: ComputeInstanceImage | None = None
+    disk_image: DiskImageReference | None = pydantic.Field(
+        default=None,
+        validation_alias=pydantic.AliasChoices("diskImage", "disk_image"),
+        serialization_alias="disk_image",
+    )
     boot_disk: ComputeInstanceDisk | None = pydantic.Field(
         default=None,
         validation_alias=pydantic.AliasChoices("bootDisk", "boot_disk"),
@@ -335,8 +334,14 @@ class Metadata(Base):
     )
     default_node_request: list[NodeRequest] = pydantic.Field(default_factory=list)
     allowed_resource_classes: list[str] | None = None
-    # Network-specific fields
-    implementation_strategy: str | None = None
+    # Network-specific fields. implementation_strategy is no longer forwarded to the
+    # NetworkClass API (fulfillment-service reserved the field) — fabric_manager/
+    # k8s_manager are now the identity source. An implementation_strategy key left
+    # over in a role's osac.yaml is silently dropped rather than rejected, but only
+    # because Base's model_config above doesn't set extra="forbid" (Pydantic v2
+    # defaults to extra="ignore"). If that config is ever tightened, either add
+    # implementation_strategy back here as a deprecated no-op field or strip it from
+    # osac.yaml files first.
     fabric_manager: str | None = None
     k8s_manager: str | None = None
     is_default: bool = False
@@ -427,7 +432,7 @@ class NetworkClassTemplate(Base):
     """Template for NetworkClass registration.
 
     Unlike cluster/compute_instance templates, NetworkClass resources have a different
-    shape (implementation_strategy, capabilities) rather than parameters. This model
+    shape (fabric_manager/k8s_manager, capabilities) rather than parameters. This model
     serializes directly to the NetworkClass API payload.
     """
 
@@ -441,7 +446,6 @@ class NetworkClassTemplate(Base):
     defaults: NetworkDefaults | None = pydantic.Field(default=None, exclude=True)
     title: str
     description: str | None = None
-    implementation_strategy: str
     fabric_manager: str | None = None
     k8s_manager: str | None = None
     is_default: bool = False
@@ -464,7 +468,15 @@ class NetworkClassTemplate(Base):
 
     @pydantic.computed_field
     def metadata(self) -> dict[str, str]:
-        name = self.metadata_name if self.metadata_name else self.implementation_strategy.replace("_", "-")
+        """Derive the NetworkClass's metadata.name the same way fulfillment-service does
+        when a caller omits it: prefer fabric_manager, falling back to k8s_manager
+        (guaranteed non-empty by the network-role gating in Collection.templates()).
+        """
+        if self.metadata_name:
+            name = self.metadata_name
+        else:
+            identity = self.fabric_manager or self.k8s_manager or self.name
+            name = identity.replace("_", "-")
         return {"name": name}
 
 
@@ -624,10 +636,11 @@ class Collection(Base):
                             spec_defaults=cluster_spec_defaults,
                         )
                     elif metadata.template_type == TemplateTypeEnum.network:
-                        if not metadata.implementation_strategy:
+                        if not metadata.fabric_manager and not metadata.k8s_manager:
                             display.warning(
                                 f"Network role '{path.name}' in collection '{self.name}' "
-                                f"is missing required 'implementation_strategy' in osac.yaml"
+                                f"is missing required 'fabric_manager' or 'k8s_manager' in osac.yaml "
+                                f"(at least one is required)"
                             )
                             continue
                         yield NetworkClassTemplate(
@@ -637,7 +650,6 @@ class Collection(Base):
                             metadata_name=metadata.metadata_name,
                             title=metadata.title,
                             description=metadata.description,
-                            implementation_strategy=metadata.implementation_strategy,
                             fabric_manager=metadata.fabric_manager,
                             k8s_manager=metadata.k8s_manager,
                             is_default=metadata.is_default,

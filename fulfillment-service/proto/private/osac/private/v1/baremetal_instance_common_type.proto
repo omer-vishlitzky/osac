@@ -15,6 +15,10 @@ syntax = "proto3";
 
 package osac.private.v1;
 
+import "cleanapi/cleanapi.proto";
+
+option (cleanapi.file).package = "osac.public.v1";
+
 // Contains the image configuration for a bare metal instance.
 message BareMetalInstanceImage {
   // Image source type (e.g. "registry").

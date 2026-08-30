@@ -26,7 +26,6 @@ import (
 
 	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
 	publicv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/public/v1"
-	"github.com/osac-project/osac/fulfillment-service/internal/auth"
 	"github.com/osac-project/osac/fulfillment-service/internal/database/dao"
 )
 
@@ -99,7 +98,7 @@ var _ = Describe("Compute instances server", func() {
 				Id: "test-vnet",
 				Metadata: privatev1.Metadata_builder{
 					Name:   "test-vnet",
-					Tenant: auth.SharedTenant,
+					Tenant: testTenant,
 				}.Build(),
 			}.Build()
 
@@ -116,7 +115,7 @@ var _ = Describe("Compute instances server", func() {
 				Id: "test-subnet",
 				Metadata: privatev1.Metadata_builder{
 					Name:   "test-subnet",
-					Tenant: auth.SharedTenant,
+					Tenant: testTenant,
 				}.Build(),
 				Spec: privatev1.SubnetSpec_builder{
 					VirtualNetwork: privatev1.VirtualNetworkLocalReference_builder{Id: "test-vnet"}.Build(),
@@ -142,7 +141,7 @@ var _ = Describe("Compute instances server", func() {
 					Id: "standard-4-16",
 					Metadata: privatev1.Metadata_builder{
 						Name:   "standard-4-16",
-						Tenant: auth.SharedTenant,
+						Tenant: testTenant,
 					}.Build(),
 					Spec: privatev1.InstanceTypeSpec_builder{
 						Cores:     4,
@@ -164,13 +163,39 @@ var _ = Describe("Compute instances server", func() {
 					Id: "standard",
 					Metadata: privatev1.Metadata_builder{
 						Name:   "standard",
-						Tenant: auth.SharedTenant,
+						Tenant: testTenant,
 					}.Build(),
 					Spec: privatev1.StorageTierSpec_builder{
 						Description: "Standard storage tier",
 					}.Build(),
 					Status: privatev1.StorageTierStatus_builder{
 						State: privatev1.StorageTierState_STORAGE_TIER_STATE_ACTIVE,
+					}.Build(),
+				}.Build(),
+			).Do(ctx)
+			Expect(err).ToNot(HaveOccurred())
+
+			diskImagesDao, err := dao.NewGenericDAO[*privatev1.DiskImage]().
+				SetLogger(logger).
+				SetTenancyLogic(tenancy).
+				Build()
+			Expect(err).ToNot(HaveOccurred())
+
+			_, err = diskImagesDao.Create().SetObject(
+				privatev1.DiskImage_builder{
+					Id: "test-disk-image",
+					Metadata: privatev1.Metadata_builder{
+						Name:   "test-disk-image",
+						Tenant: testTenant,
+					}.Build(),
+					Spec: privatev1.DiskImageSpec_builder{
+						SourceType:    privatev1.SourceType_SOURCE_TYPE_REGISTRY,
+						SourceRef:     "quay.io/containerdisks/fedora:41",
+						GuestOsFamily: privatev1.GuestOSFamily_GUEST_OS_FAMILY_LINUX,
+						Lifecycle:     privatev1.DiskImageLifecycle_DISK_IMAGE_LIFECYCLE_AVAILABLE,
+						Architecture: []privatev1.Architecture{
+							privatev1.Architecture_ARCHITECTURE_AMD64,
+						},
 					}.Build(),
 				}.Build(),
 			).Do(ctx)
@@ -198,7 +223,7 @@ var _ = Describe("Compute instances server", func() {
 				Description: "Test template for validation",
 				Metadata: privatev1.Metadata_builder{
 					Name:   strings.ReplaceAll(templateID, ".", "-"),
-					Tenant: auth.SharedTenant,
+					Tenant: testTenant,
 				}.Build(),
 				Parameters: []*privatev1.ComputeInstanceTemplateParameterDefinition{
 					{
@@ -220,10 +245,7 @@ var _ = Describe("Compute instances server", func() {
 				},
 				SpecDefaults: privatev1.ComputeInstanceTemplateSpecDefaults_builder{
 					InstanceType: privatev1.InstanceTypeReference_builder{Id: "standard-4-16"}.Build(),
-					Image: privatev1.ComputeInstanceImage_builder{
-						SourceType: "registry",
-						SourceRef:  "quay.io/containerdisks/fedora:latest",
-					}.Build(),
+					DiskImage:    privatev1.DiskImageReference_builder{Id: "test-disk-image"}.Build(),
 					BootDisk: privatev1.ComputeInstanceDisk_builder{
 						SizeGib:     10,
 						StorageTier: new("standard"),
@@ -258,8 +280,8 @@ var _ = Describe("Compute instances server", func() {
 					Spec: publicv1.ComputeInstanceSpec_builder{
 						Template:           publicv1.ComputeInstanceTemplateReference_builder{Id: "general.small"}.Build(),
 						TemplateParameters: templateParams,
-						NetworkAttachments: []*publicv1.NetworkAttachment{
-							publicv1.NetworkAttachment_builder{
+						NetworkAttachments: []*publicv1.ComputeNetworkAttachment{
+							publicv1.ComputeNetworkAttachment_builder{
 								Subnet: publicv1.SubnetLocalReference_builder{Id: "test-subnet"}.Build(),
 							}.Build(),
 						},
@@ -292,8 +314,8 @@ var _ = Describe("Compute instances server", func() {
 						}.Build(),
 						Spec: publicv1.ComputeInstanceSpec_builder{
 							Template: publicv1.ComputeInstanceTemplateReference_builder{Id: templateID}.Build(),
-							NetworkAttachments: []*publicv1.NetworkAttachment{
-								publicv1.NetworkAttachment_builder{
+							NetworkAttachments: []*publicv1.ComputeNetworkAttachment{
+								publicv1.ComputeNetworkAttachment_builder{
 									Subnet: publicv1.SubnetLocalReference_builder{Id: "test-subnet"}.Build(),
 								}.Build(),
 							},
@@ -328,8 +350,8 @@ var _ = Describe("Compute instances server", func() {
 						}.Build(),
 						Spec: publicv1.ComputeInstanceSpec_builder{
 							Template: publicv1.ComputeInstanceTemplateReference_builder{Id: templateID}.Build(),
-							NetworkAttachments: []*publicv1.NetworkAttachment{
-								publicv1.NetworkAttachment_builder{
+							NetworkAttachments: []*publicv1.ComputeNetworkAttachment{
+								publicv1.ComputeNetworkAttachment_builder{
 									Subnet: publicv1.SubnetLocalReference_builder{Id: "test-subnet"}.Build(),
 								}.Build(),
 							},
@@ -366,8 +388,8 @@ var _ = Describe("Compute instances server", func() {
 						}.Build(),
 						Spec: publicv1.ComputeInstanceSpec_builder{
 							Template: publicv1.ComputeInstanceTemplateReference_builder{Id: templateID}.Build(),
-							NetworkAttachments: []*publicv1.NetworkAttachment{
-								publicv1.NetworkAttachment_builder{
+							NetworkAttachments: []*publicv1.ComputeNetworkAttachment{
+								publicv1.ComputeNetworkAttachment_builder{
 									Subnet: publicv1.SubnetLocalReference_builder{Id: "test-subnet"}.Build(),
 								}.Build(),
 							},
@@ -402,8 +424,8 @@ var _ = Describe("Compute instances server", func() {
 					}.Build(),
 					Spec: publicv1.ComputeInstanceSpec_builder{
 						Template: publicv1.ComputeInstanceTemplateReference_builder{Id: "general.small"}.Build(),
-						NetworkAttachments: []*publicv1.NetworkAttachment{
-							publicv1.NetworkAttachment_builder{
+						NetworkAttachments: []*publicv1.ComputeNetworkAttachment{
+							publicv1.ComputeNetworkAttachment_builder{
 								Subnet: publicv1.SubnetLocalReference_builder{Id: "test-subnet"}.Build(),
 							}.Build(),
 						},
@@ -447,16 +469,13 @@ var _ = Describe("Compute instances server", func() {
 						Template:     publicv1.ComputeInstanceTemplateReference_builder{Id: "general.small"}.Build(),
 						InstanceType: publicv1.InstanceTypeReference_builder{Id: "standard-4-16"}.Build(),
 						RunStrategy:  new("Always"),
-						Image: publicv1.ComputeInstanceImage_builder{
-							SourceType: "registry",
-							SourceRef:  "quay.io/test:latest",
-						}.Build(),
+						DiskImage:    publicv1.DiskImageReference_builder{Id: "test-disk-image"}.Build(),
 						BootDisk: publicv1.ComputeInstanceDisk_builder{
 							SizeGib:     20,
 							StorageTier: new("standard"),
 						}.Build(),
-						NetworkAttachments: []*publicv1.NetworkAttachment{
-							publicv1.NetworkAttachment_builder{
+						NetworkAttachments: []*publicv1.ComputeNetworkAttachment{
+							publicv1.ComputeNetworkAttachment_builder{
 								Subnet: publicv1.SubnetLocalReference_builder{Id: "test-subnet"}.Build(),
 							}.Build(),
 						},
@@ -495,7 +514,7 @@ var _ = Describe("Compute instances server", func() {
 			Expect(object.GetSpec().GetTemplate().GetId()).To(Equal("general.small"))
 			Expect(object.GetSpec().GetInstanceType().GetId()).To(Equal("standard-4-16"))
 			Expect(object.GetSpec().GetRunStrategy()).To(Equal("Always"))
-			Expect(object.GetSpec().GetImage().GetSourceRef()).To(Equal("quay.io/test:latest"))
+			Expect(object.GetSpec().GetDiskImage().GetId()).To(Equal("test-disk-image"))
 			Expect(object.GetSpec().GetBootDisk().GetSizeGib()).To(BeNumerically("==", 20))
 
 			// Verify they survive a round-trip through the database:
@@ -506,7 +525,7 @@ var _ = Describe("Compute instances server", func() {
 			fetched := getResponse.GetObject()
 			Expect(fetched.GetSpec().GetInstanceType().GetId()).To(Equal("standard-4-16"))
 			Expect(fetched.GetSpec().GetRunStrategy()).To(Equal("Always"))
-			Expect(fetched.GetSpec().GetImage().GetSourceRef()).To(Equal("quay.io/test:latest"))
+			Expect(fetched.GetSpec().GetDiskImage().GetId()).To(Equal("test-disk-image"))
 			Expect(fetched.GetSpec().GetBootDisk().GetSizeGib()).To(BeNumerically("==", 20))
 			Expect(fetched.GetSpec().GetRestartRequestedAt()).ToNot(BeNil())
 		})
@@ -523,8 +542,8 @@ var _ = Describe("Compute instances server", func() {
 					}.Build(),
 					Spec: publicv1.ComputeInstanceSpec_builder{
 						Template: publicv1.ComputeInstanceTemplateReference_builder{Id: "general.small"}.Build(),
-						NetworkAttachments: []*publicv1.NetworkAttachment{
-							publicv1.NetworkAttachment_builder{
+						NetworkAttachments: []*publicv1.ComputeNetworkAttachment{
+							publicv1.ComputeNetworkAttachment_builder{
 								Subnet: publicv1.SubnetLocalReference_builder{Id: "test-subnet"}.Build(),
 							}.Build(),
 						},
@@ -605,8 +624,8 @@ var _ = Describe("Compute instances server", func() {
 					Spec: publicv1.ComputeInstanceSpec_builder{
 						Template:    publicv1.ComputeInstanceTemplateReference_builder{Id: "mapping-template"}.Build(),
 						RunStrategy: new("Halted"),
-						NetworkAttachments: []*publicv1.NetworkAttachment{
-							publicv1.NetworkAttachment_builder{
+						NetworkAttachments: []*publicv1.ComputeNetworkAttachment{
+							publicv1.ComputeNetworkAttachment_builder{
 								Subnet: publicv1.SubnetLocalReference_builder{Id: "test-subnet"}.Build(),
 							}.Build(),
 						},
@@ -621,8 +640,7 @@ var _ = Describe("Compute instances server", func() {
 			Expect(spec.GetRunStrategy()).To(Equal("Halted"))
 			// Template defaults should be stored:
 			Expect(spec.GetInstanceType().GetId()).To(Equal("standard-4-16"))
-			Expect(spec.GetImage().GetSourceType()).To(Equal("registry"))
-			Expect(spec.GetImage().GetSourceRef()).To(Equal("quay.io/containerdisks/fedora:latest"))
+			Expect(spec.GetDiskImage().GetId()).To(Equal("test-disk-image"))
 			Expect(spec.GetBootDisk().GetSizeGib()).To(Equal(int32(10)))
 		})
 	})

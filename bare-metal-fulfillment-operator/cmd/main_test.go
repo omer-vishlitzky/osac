@@ -17,12 +17,16 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"testing"
 
 	. "github.com/onsi/ginkgo/v2" //nolint:revive,staticcheck
 	. "github.com/onsi/gomega"    //nolint:revive,staticcheck
 
+	metal3api "github.com/metal3-io/baremetal-operator/apis/metal3.io/v1alpha1"
 	osacv1alpha1 "github.com/osac-project/osac/bare-metal-fulfillment-operator/api/v1alpha1"
+	"github.com/osac-project/osac/bare-metal-fulfillment-operator/internal/inventory"
+	"github.com/osac-project/osac/bare-metal-fulfillment-operator/internal/management"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -76,11 +80,36 @@ var _ = Describe("Scheme Initialization", func() {
 	})
 
 	It("should handle core Kubernetes types", func() {
-		// Test that standard Kubernetes types are available
 		pod := &corev1.Pod{}
 		gvks, _, err := scheme.ObjectKinds(pod)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(gvks).NotTo(BeEmpty())
 		Expect(gvks[0].Kind).To(Equal("Pod"))
+	})
+
+	It("should register metal3 BareMetalHost types", func() {
+		Expect(scheme.IsGroupRegistered("metal3.io")).To(BeTrue())
+
+		bmh := &metal3api.BareMetalHost{}
+		gvks, _, err := scheme.ObjectKinds(bmh)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(gvks).NotTo(BeEmpty())
+		Expect(gvks[0].Kind).To(Equal("BareMetalHost"))
+	})
+})
+
+var _ = Describe("createInventoryClient", func() {
+	It("should return error for unsupported inventory type", func() {
+		inventoryCfg := &inventory.Config{
+			Type: "unknown",
+		}
+		managementCfg := &management.Config{
+			Type: "metal3",
+		}
+
+		client, err := createInventoryClient(context.Background(), inventoryCfg, managementCfg, nil)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("unsupported inventory type"))
+		Expect(client).To(BeNil())
 	})
 })

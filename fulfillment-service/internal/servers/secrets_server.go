@@ -36,6 +36,7 @@ type SecretsServerBuilder struct {
 	tenancyLogic      auth.TenancyLogic
 	metricsRegisterer prometheus.Registerer
 	secretStore       vault.SecretStore
+	hubSecretFetcher  HubSecretFetcher
 }
 
 var _ publicv1.SecretsServer = (*SecretsServer)(nil)
@@ -83,6 +84,11 @@ func (b *SecretsServerBuilder) SetSecretStore(value vault.SecretStore) *SecretsS
 	return b
 }
 
+func (b *SecretsServerBuilder) SetHubSecretFetcher(value HubSecretFetcher) *SecretsServerBuilder {
+	b.hubSecretFetcher = value
+	return b
+}
+
 func (b *SecretsServerBuilder) Build() (result *SecretsServer, err error) {
 	if b.logger == nil {
 		err = errors.New("logger is mandatory")
@@ -115,6 +121,8 @@ func (b *SecretsServerBuilder) Build() (result *SecretsServer, err error) {
 		SetTenancyLogic(b.tenancyLogic).
 		SetMetricsRegisterer(b.metricsRegisterer).
 		SetSecretStore(b.secretStore).
+		SetFilterDesc((*publicv1.Secret)(nil).ProtoReflect().Descriptor()).
+		SetHubSecretFetcher(b.hubSecretFetcher).
 		Build()
 	if err != nil {
 		return
@@ -170,7 +178,9 @@ func (s *SecretsServer) List(ctx context.Context,
 	request *publicv1.SecretsListRequest) (response *publicv1.SecretsListResponse, err error) {
 	privateRequest := &privatev1.SecretsListRequest{}
 	privateRequest.SetOffset(request.GetOffset())
-	privateRequest.SetLimit(request.GetLimit())
+	if request.HasLimit() {
+		privateRequest.SetLimit(request.GetLimit())
+	}
 	privateRequest.SetFilter(request.GetFilter())
 	privateRequest.SetOrder(request.GetOrder())
 

@@ -15,9 +15,12 @@ syntax = "proto3";
 
 package osac.private.v1;
 
+import "cleanapi/cleanapi.proto";
 import "google/api/field_behavior.proto";
 import "osac/private/v1/metadata_type.proto";
 import "osac/private/v1/virtual_network_type.proto";
+
+option (cleanapi.file).package = "osac.public.v1";
 
 // Represents a subdivision of a VirtualNetwork for organizing compute instances.
 //
@@ -123,7 +126,7 @@ message SubnetStatus {
   //
   // The fulfillment-service controller randomly selects a hub from available hubs and stores the hub ID here.
   // This tracks which hub cluster the Subnet CR is deployed to for reconciliation and cleanup.
-  string hub = 3;
+  string hub = 3 [(cleanapi.field).private = true];
 }
 
 // Lifecycle states for Subnet resources.

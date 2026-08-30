@@ -1251,18 +1251,26 @@ var _ = Describe("Generic DAO", func() {
 				Expect(response.GetItems()[0].Id).To(Equal(objects[0].Id))
 			})
 
-			It("Interprets negative limit as requesting zero items", func() {
-				response, err := generic.List().
+			It("Rejects negative limit with an error", func() {
+				_, err := generic.List().
 					SetLimit(-123).
+					Do(ctx)
+				Expect(err).To(HaveOccurred())
+				Expect(err.Error()).To(ContainSubstring("limit must be a non-negative integer"))
+			})
+
+			It("Returns only count when limit is explicitly set to zero", func() {
+				response, err := generic.List().
+					SetLimit(0).
 					Do(ctx)
 				Expect(err).ToNot(HaveOccurred())
 				Expect(response.GetSize()).To(BeZero())
+				Expect(response.GetTotal()).To(BeNumerically("==", objectCount))
 				Expect(response.GetItems()).To(BeEmpty())
 			})
 
-			It("Interprets zero limit as requesting the default number of items", func() {
+			It("Uses default limit when limit is not set", func() {
 				response, err := generic.List().
-					SetLimit(0).
 					Do(ctx)
 				Expect(err).ToNot(HaveOccurred())
 				Expect(response.GetSize()).To(BeNumerically("==", defaultLimit))
@@ -2577,6 +2585,49 @@ var _ = Describe("Generic DAO", func() {
 				Expect(objects).To(HaveLen(1))
 				object := objects[0]
 				Expect(object.GetMetadata().GetName()).To(Equal("object-a"))
+			})
+		})
+
+		Describe("Filter descriptor override", func() {
+			It("Behaves identically when SetFilterDesc is set explicitly to the object's own descriptor", func() {
+				explicitDao, err := NewGenericDAO[*testsv1.Object]().
+					SetLogger(logger).
+					SetTenancyLogic(tenancy).
+					SetFilterDesc((*testsv1.Object)(nil).ProtoReflect().Descriptor()).
+					Build()
+				Expect(err).ToNot(HaveOccurred())
+				_, err = explicitDao.Create().
+					SetObject(
+						testsv1.Object_builder{
+							Metadata: testsv1.Metadata_builder{
+								Tenant: "my-tenant",
+								Name:   "my-object",
+							}.Build(),
+							MyBool: true,
+						}.Build(),
+					).
+					Do(ctx)
+				Expect(err).ToNot(HaveOccurred())
+				response, err := explicitDao.List().
+					SetFilter("this.my_bool == true").
+					Do(ctx)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(response.GetItems()).To(HaveLen(1))
+			})
+
+			It("Rejects a filter referencing a field absent from the overridden descriptor", func() {
+				restrictedDao, err := NewGenericDAO[*testsv1.Object]().
+					SetLogger(logger).
+					SetTenancyLogic(tenancy).
+					SetFilterDesc((*testsv1.Status)(nil).ProtoReflect().Descriptor()).
+					Build()
+				Expect(err).ToNot(HaveOccurred())
+				_, err = restrictedDao.List().
+					SetFilter("this.my_bool == true").
+					Do(ctx)
+				Expect(err).To(HaveOccurred())
+				var invalidFilterErr *ErrInvalidFilter
+				Expect(errors.As(err, &invalidFilterErr)).To(BeTrue())
 			})
 		})
 	})

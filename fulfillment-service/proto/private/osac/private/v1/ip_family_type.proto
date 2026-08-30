@@ -15,6 +15,10 @@ syntax = "proto3";
 
 package osac.private.v1;
 
+import "cleanapi/cleanapi.proto";
+
+option (cleanapi.file).package = "osac.public.v1";
+
 // IP address family for IP pools.
 enum IPFamily {
   // IP family is unknown or has not been specified.

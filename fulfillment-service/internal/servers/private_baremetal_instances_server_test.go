@@ -115,6 +115,26 @@ var _ = Describe("Private bare metal instances server", func() {
 			}.Build())
 			Expect(err).ToNot(HaveOccurred())
 			catalogItemID = catalogResp.GetObject().GetId()
+
+			// Create an ExternalIPPool so auto_external_ip_attachment tests can allocate.
+			externalIPPoolDao, err := dao.NewGenericDAO[*privatev1.ExternalIPPool]().
+				SetLogger(logger).
+				SetTenancyLogic(tenancy).
+				Build()
+			Expect(err).ToNot(HaveOccurred())
+			_, err = externalIPPoolDao.Create().SetObject(
+				privatev1.ExternalIPPool_builder{
+					Metadata: privatev1.Metadata_builder{
+						Name:   fmt.Sprintf("test-pool-%s", uuid.NewString()[:8]),
+						Tenant: auth.SharedTenant,
+					}.Build(),
+					Status: privatev1.ExternalIPPoolStatus_builder{
+						State:     privatev1.ExternalIPPoolState_EXTERNAL_IP_POOL_STATE_READY,
+						Available: 10,
+					}.Build(),
+				}.Build(),
+			).Do(ctx)
+			Expect(err).ToNot(HaveOccurred())
 		})
 
 		createTemplate := func(id string, params []*privatev1.BareMetalInstanceTemplateParameterDefinition) {
@@ -130,7 +150,7 @@ var _ = Describe("Private bare metal instances server", func() {
 				Description: "Template with parameters",
 				Metadata: privatev1.Metadata_builder{
 					Name:   id,
-					Tenant: auth.SharedTenant,
+					Tenant: testTenant,
 				}.Build(),
 				Parameters: params,
 			}.Build()
@@ -571,7 +591,7 @@ var _ = Describe("Private bare metal instances server", func() {
 				Description: "Has default image in spec_defaults",
 				Metadata: privatev1.Metadata_builder{
 					Name:   "image-default-template",
-					Tenant: auth.SharedTenant,
+					Tenant: testTenant,
 				}.Build(),
 				SpecDefaults: privatev1.BareMetalInstanceTemplateSpecDefaults_builder{
 					Image: privatev1.BareMetalInstanceImage_builder{
@@ -626,7 +646,7 @@ var _ = Describe("Private bare metal instances server", func() {
 				Description: "Has default image in spec_defaults",
 				Metadata: privatev1.Metadata_builder{
 					Name:   "image-override-template",
-					Tenant: auth.SharedTenant,
+					Tenant: testTenant,
 				}.Build(),
 				SpecDefaults: privatev1.BareMetalInstanceTemplateSpecDefaults_builder{
 					Image: privatev1.BareMetalInstanceImage_builder{
@@ -685,7 +705,7 @@ var _ = Describe("Private bare metal instances server", func() {
 				Description: "Has default image in spec_defaults",
 				Metadata: privatev1.Metadata_builder{
 					Name:   "image-partial-merge-template",
-					Tenant: auth.SharedTenant,
+					Tenant: testTenant,
 				}.Build(),
 				SpecDefaults: privatev1.BareMetalInstanceTemplateSpecDefaults_builder{
 					Image: privatev1.BareMetalInstanceImage_builder{
@@ -809,6 +829,7 @@ var _ = Describe("Private bare metal instances server", func() {
 			Expect(err).ToNot(HaveOccurred())
 			object := createResponse.GetObject()
 			name := object.GetMetadata().GetName()
+
 			_, err = server.Update(ctx, privatev1.BareMetalInstancesUpdateRequest_builder{
 				Object: privatev1.BareMetalInstance_builder{
 					Id:       object.GetId(),
@@ -1331,6 +1352,43 @@ var _ = Describe("Private bare metal instances server", func() {
 			Expect(getResponse.GetObject().GetSpec().GetAutoExternalIpAttachment()).To(BeTrue())
 		})
 
+		It("auto_external_ip_attachment creates ExternalIP and ExternalIPAttachment in DB", func() {
+			response, err := server.Create(ctx, privatev1.BareMetalInstancesCreateRequest_builder{
+				Object: privatev1.BareMetalInstance_builder{
+					Metadata: privatev1.Metadata_builder{
+						Name: fmt.Sprintf("test-%s", uuid.NewString()[:8]),
+					}.Build(),
+					Spec: privatev1.BareMetalInstanceSpec_builder{
+						CatalogItem:              privatev1.BareMetalInstanceCatalogItemReference_builder{Id: catalogItemID}.Build(),
+						AutoExternalIpAttachment: true,
+					}.Build(),
+				}.Build(),
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+			bmiID := response.GetObject().GetId()
+
+			eipDao, err := dao.NewGenericDAO[*privatev1.ExternalIP]().
+				SetLogger(logger).SetTenancyLogic(tenancy).Build()
+			Expect(err).ToNot(HaveOccurred())
+
+			eipList, err := eipDao.List().
+				SetFilter(fmt.Sprintf("this.metadata.labels['osac.openshift.io/auto-created-for'] == '%s'", bmiID)).
+				Do(ctx)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(eipList.GetItems()).To(HaveLen(1))
+
+			attDao, err := dao.NewGenericDAO[*privatev1.ExternalIPAttachment]().
+				SetLogger(logger).SetTenancyLogic(tenancy).Build()
+			Expect(err).ToNot(HaveOccurred())
+
+			attList, err := attDao.List().
+				SetFilter(fmt.Sprintf("this.metadata.labels['osac.openshift.io/auto-created-for'] == '%s'", bmiID)).
+				Do(ctx)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(attList.GetItems()).To(HaveLen(1))
+			Expect(attList.GetItems()[0].GetSpec().GetBaremetalInstance().GetId()).To(Equal(bmiID))
+		})
+
 		It("Rejects PATCH that changes auto_external_ip_attachment", func() {
 			createResponse, err := server.Create(ctx, privatev1.BareMetalInstancesCreateRequest_builder{
 				Object: privatev1.BareMetalInstance_builder{
@@ -1405,6 +1463,8 @@ var _ = Describe("Private bare metal instances server", func() {
 			catalogServer *PrivateBareMetalInstanceCatalogItemsServer
 			catIDWithHT   string
 			catIDNoHT     string
+			subnetID1     string
+			subnetID2     string
 		)
 
 		boolPtr := func(v bool) *bool { return &v }
@@ -1437,7 +1497,7 @@ var _ = Describe("Private bare metal instances server", func() {
 				Id:    "test-host-type",
 				Title: "Test Host Type",
 				Metadata: privatev1.Metadata_builder{
-					Tenant: auth.SharedTenant,
+					Tenant: testTenant,
 					Name:   fmt.Sprintf("test-%s", uuid.NewString()[:8]),
 				}.Build(),
 				Interfaces: []*privatev1.NetworkInterface{
@@ -1460,7 +1520,7 @@ var _ = Describe("Private bare metal instances server", func() {
 				Title:    "Template with HostType",
 				HostType: "test-host-type",
 				Metadata: privatev1.Metadata_builder{
-					Tenant: auth.SharedTenant,
+					Tenant: testTenant,
 					Name:   fmt.Sprintf("test-%s", uuid.NewString()[:8]),
 				}.Build(),
 			}.Build()).Do(ctx)
@@ -1471,11 +1531,67 @@ var _ = Describe("Private bare metal instances server", func() {
 				Id:    "template-no-ht",
 				Title: "Template without HostType",
 				Metadata: privatev1.Metadata_builder{
-					Tenant: auth.SharedTenant,
+					Tenant: testTenant,
 					Name:   fmt.Sprintf("test-%s", uuid.NewString()[:8]),
 				}.Build(),
 			}.Build()).Do(ctx)
 			Expect(err).ToNot(HaveOccurred())
+
+			// Create subnets with a full NC → VN → Subnet chain so that both the
+			// check_bmi_subnet_refs DB trigger and validateNetworkAttachmentsRequireFabricManager
+			// are satisfied.
+			ncDao, err := dao.NewGenericDAO[*privatev1.NetworkClass]().
+				SetLogger(logger).
+				SetTenancyLogic(tenancy).
+				Build()
+			Expect(err).ToNot(HaveOccurred())
+			fm := "test-fabric"
+			ncResp, err := ncDao.Create().SetObject(privatev1.NetworkClass_builder{
+				FabricManager: &fm,
+				Metadata: privatev1.Metadata_builder{
+					Tenant: testTenant,
+				}.Build(),
+			}.Build()).Do(ctx)
+			Expect(err).ToNot(HaveOccurred())
+
+			vnDao, err := dao.NewGenericDAO[*privatev1.VirtualNetwork]().
+				SetLogger(logger).
+				SetTenancyLogic(tenancy).
+				Build()
+			Expect(err).ToNot(HaveOccurred())
+			vnResp, err := vnDao.Create().SetObject(privatev1.VirtualNetwork_builder{
+				Metadata: privatev1.Metadata_builder{
+					Tenant: testTenant,
+				}.Build(),
+				Spec: privatev1.VirtualNetworkSpec_builder{
+					NetworkClass: privatev1.NetworkClassReference_builder{Id: ncResp.GetObject().GetId()}.Build(),
+				}.Build(),
+			}.Build()).Do(ctx)
+			Expect(err).ToNot(HaveOccurred())
+
+			subnetDao, err := dao.NewGenericDAO[*privatev1.Subnet]().
+				SetLogger(logger).
+				SetTenancyLogic(tenancy).
+				Build()
+			Expect(err).ToNot(HaveOccurred())
+			for i, idPtr := range []*string{&subnetID1, &subnetID2} {
+				cidr := fmt.Sprintf("10.0.%d.0/24", i+1)
+				resp, createErr := subnetDao.Create().SetObject(privatev1.Subnet_builder{
+					Metadata: privatev1.Metadata_builder{
+						Tenant: testTenant,
+						Name:   fmt.Sprintf("test-subnet-%d-%s", i+1, uuid.NewString()[:8]),
+					}.Build(),
+					Spec: privatev1.SubnetSpec_builder{
+						Ipv4Cidr:       &cidr,
+						VirtualNetwork: privatev1.VirtualNetworkLocalReference_builder{Id: vnResp.GetObject().GetId()}.Build(),
+					}.Build(),
+					Status: privatev1.SubnetStatus_builder{
+						State: privatev1.SubnetState_SUBNET_STATE_READY,
+					}.Build(),
+				}.Build()).Do(ctx)
+				Expect(createErr).ToNot(HaveOccurred())
+				*idPtr = resp.GetObject().GetId()
+			}
 
 			// Create catalog items referencing the templates.
 			catResp, err := catalogServer.Create(ctx, privatev1.BareMetalInstanceCatalogItemsCreateRequest_builder{
@@ -1515,7 +1631,7 @@ var _ = Describe("Private bare metal instances server", func() {
 						CatalogItem: privatev1.BareMetalInstanceCatalogItemReference_builder{Id: catIDWithHT}.Build(),
 						NetworkAttachments: []*privatev1.BareMetalNetworkAttachment{
 							privatev1.BareMetalNetworkAttachment_builder{
-								Subnet: privatev1.SubnetLocalReference_builder{Id: "subnet-1"}.Build(),
+								Subnet: privatev1.SubnetLocalReference_builder{Id: subnetID1}.Build(),
 							}.Build(),
 						},
 					}.Build(),
@@ -1534,7 +1650,7 @@ var _ = Describe("Private bare metal instances server", func() {
 						CatalogItem: privatev1.BareMetalInstanceCatalogItemReference_builder{Id: catIDWithHT}.Build(),
 						NetworkAttachments: []*privatev1.BareMetalNetworkAttachment{
 							privatev1.BareMetalNetworkAttachment_builder{
-								Subnet:    privatev1.SubnetLocalReference_builder{Id: "subnet-1"}.Build(),
+								Subnet:    privatev1.SubnetLocalReference_builder{Id: subnetID1}.Build(),
 								Interface: strPtr("data-0"),
 							}.Build(),
 						},
@@ -1554,12 +1670,12 @@ var _ = Describe("Private bare metal instances server", func() {
 						CatalogItem: privatev1.BareMetalInstanceCatalogItemReference_builder{Id: catIDWithHT}.Build(),
 						NetworkAttachments: []*privatev1.BareMetalNetworkAttachment{
 							privatev1.BareMetalNetworkAttachment_builder{
-								Subnet:    privatev1.SubnetLocalReference_builder{Id: "subnet-1"}.Build(),
+								Subnet:    privatev1.SubnetLocalReference_builder{Id: subnetID1}.Build(),
 								Interface: strPtr("data-0"),
 								Primary:   boolPtr(true),
 							}.Build(),
 							privatev1.BareMetalNetworkAttachment_builder{
-								Subnet:    privatev1.SubnetLocalReference_builder{Id: "subnet-2"}.Build(),
+								Subnet:    privatev1.SubnetLocalReference_builder{Id: subnetID2}.Build(),
 								Interface: strPtr("data-1"),
 							}.Build(),
 						},
@@ -1579,7 +1695,7 @@ var _ = Describe("Private bare metal instances server", func() {
 						CatalogItem: privatev1.BareMetalInstanceCatalogItemReference_builder{Id: catIDWithHT}.Build(),
 						NetworkAttachments: []*privatev1.BareMetalNetworkAttachment{
 							privatev1.BareMetalNetworkAttachment_builder{
-								Subnet:    privatev1.SubnetLocalReference_builder{Id: "subnet-1"}.Build(),
+								Subnet:    privatev1.SubnetLocalReference_builder{Id: subnetID1}.Build(),
 								Interface: strPtr("nonexistent-port"),
 							}.Build(),
 						},
@@ -1604,12 +1720,12 @@ var _ = Describe("Private bare metal instances server", func() {
 						CatalogItem: privatev1.BareMetalInstanceCatalogItemReference_builder{Id: catIDWithHT}.Build(),
 						NetworkAttachments: []*privatev1.BareMetalNetworkAttachment{
 							privatev1.BareMetalNetworkAttachment_builder{
-								Subnet:    privatev1.SubnetLocalReference_builder{Id: "subnet-1"}.Build(),
+								Subnet:    privatev1.SubnetLocalReference_builder{Id: subnetID1}.Build(),
 								Interface: strPtr("data-0"),
 								Primary:   boolPtr(true),
 							}.Build(),
 							privatev1.BareMetalNetworkAttachment_builder{
-								Subnet:    privatev1.SubnetLocalReference_builder{Id: "subnet-2"}.Build(),
+								Subnet:    privatev1.SubnetLocalReference_builder{Id: subnetID2}.Build(),
 								Interface: strPtr("data-0"),
 							}.Build(),
 						},
@@ -1634,7 +1750,7 @@ var _ = Describe("Private bare metal instances server", func() {
 						CatalogItem: privatev1.BareMetalInstanceCatalogItemReference_builder{Id: catIDWithHT}.Build(),
 						NetworkAttachments: []*privatev1.BareMetalNetworkAttachment{
 							privatev1.BareMetalNetworkAttachment_builder{
-								Subnet:    privatev1.SubnetLocalReference_builder{Id: "subnet-1"}.Build(),
+								Subnet:    privatev1.SubnetLocalReference_builder{Id: subnetID1}.Build(),
 								Interface: strPtr("bmc-0"),
 							}.Build(),
 						},
@@ -1659,11 +1775,11 @@ var _ = Describe("Private bare metal instances server", func() {
 						CatalogItem: privatev1.BareMetalInstanceCatalogItemReference_builder{Id: catIDWithHT}.Build(),
 						NetworkAttachments: []*privatev1.BareMetalNetworkAttachment{
 							privatev1.BareMetalNetworkAttachment_builder{
-								Subnet:  privatev1.SubnetLocalReference_builder{Id: "subnet-1"}.Build(),
+								Subnet:  privatev1.SubnetLocalReference_builder{Id: subnetID1}.Build(),
 								Primary: boolPtr(true),
 							}.Build(),
 							privatev1.BareMetalNetworkAttachment_builder{
-								Subnet: privatev1.SubnetLocalReference_builder{Id: "subnet-2"}.Build(),
+								Subnet: privatev1.SubnetLocalReference_builder{Id: subnetID2}.Build(),
 							}.Build(),
 						},
 					}.Build(),
@@ -1710,11 +1826,11 @@ var _ = Describe("Private bare metal instances server", func() {
 						CatalogItem: privatev1.BareMetalInstanceCatalogItemReference_builder{Id: catIDWithHT}.Build(),
 						NetworkAttachments: []*privatev1.BareMetalNetworkAttachment{
 							privatev1.BareMetalNetworkAttachment_builder{
-								Subnet:    privatev1.SubnetLocalReference_builder{Id: "subnet-1"}.Build(),
+								Subnet:    privatev1.SubnetLocalReference_builder{Id: subnetID1}.Build(),
 								Interface: strPtr("data-0"),
 							}.Build(),
 							privatev1.BareMetalNetworkAttachment_builder{
-								Subnet:    privatev1.SubnetLocalReference_builder{Id: "subnet-2"}.Build(),
+								Subnet:    privatev1.SubnetLocalReference_builder{Id: subnetID2}.Build(),
 								Interface: strPtr("data-1"),
 							}.Build(),
 						},
@@ -1738,12 +1854,12 @@ var _ = Describe("Private bare metal instances server", func() {
 						CatalogItem: privatev1.BareMetalInstanceCatalogItemReference_builder{Id: catIDWithHT}.Build(),
 						NetworkAttachments: []*privatev1.BareMetalNetworkAttachment{
 							privatev1.BareMetalNetworkAttachment_builder{
-								Subnet:    privatev1.SubnetLocalReference_builder{Id: "subnet-1"}.Build(),
+								Subnet:    privatev1.SubnetLocalReference_builder{Id: subnetID1}.Build(),
 								Interface: strPtr("data-0"),
 								Primary:   boolPtr(true),
 							}.Build(),
 							privatev1.BareMetalNetworkAttachment_builder{
-								Subnet:    privatev1.SubnetLocalReference_builder{Id: "subnet-2"}.Build(),
+								Subnet:    privatev1.SubnetLocalReference_builder{Id: subnetID2}.Build(),
 								Interface: strPtr("data-1"),
 								Primary:   boolPtr(true),
 							}.Build(),
@@ -1768,7 +1884,7 @@ var _ = Describe("Private bare metal instances server", func() {
 						CatalogItem: privatev1.BareMetalInstanceCatalogItemReference_builder{Id: catIDNoHT}.Build(),
 						NetworkAttachments: []*privatev1.BareMetalNetworkAttachment{
 							privatev1.BareMetalNetworkAttachment_builder{
-								Subnet:    privatev1.SubnetLocalReference_builder{Id: "subnet-1"}.Build(),
+								Subnet:    privatev1.SubnetLocalReference_builder{Id: subnetID1}.Build(),
 								Interface: strPtr("any-interface-name"),
 							}.Build(),
 						},
@@ -1788,12 +1904,12 @@ var _ = Describe("Private bare metal instances server", func() {
 						CatalogItem: privatev1.BareMetalInstanceCatalogItemReference_builder{Id: catIDNoHT}.Build(),
 						NetworkAttachments: []*privatev1.BareMetalNetworkAttachment{
 							privatev1.BareMetalNetworkAttachment_builder{
-								Subnet:    privatev1.SubnetLocalReference_builder{Id: "subnet-1"}.Build(),
+								Subnet:    privatev1.SubnetLocalReference_builder{Id: subnetID1}.Build(),
 								Interface: strPtr("nic-0"),
 								Primary:   boolPtr(true),
 							}.Build(),
 							privatev1.BareMetalNetworkAttachment_builder{
-								Subnet:    privatev1.SubnetLocalReference_builder{Id: "subnet-2"}.Build(),
+								Subnet:    privatev1.SubnetLocalReference_builder{Id: subnetID2}.Build(),
 								Interface: strPtr("nic-0"),
 							}.Build(),
 						},
@@ -1831,7 +1947,7 @@ var _ = Describe("Private bare metal instances server", func() {
 						CatalogItem: privatev1.BareMetalInstanceCatalogItemReference_builder{Id: catIDWithHT}.Build(),
 						NetworkAttachments: []*privatev1.BareMetalNetworkAttachment{
 							privatev1.BareMetalNetworkAttachment_builder{
-								Subnet:         privatev1.SubnetLocalReference_builder{Id: "subnet-1"}.Build(),
+								Subnet:         privatev1.SubnetLocalReference_builder{Id: subnetID1}.Build(),
 								Interface:      strPtr("data-0"),
 								SecurityGroups: []*privatev1.SecurityGroupLocalReference{privatev1.SecurityGroupLocalReference_builder{Id: "sg-1"}.Build()},
 							}.Build(),
@@ -1848,7 +1964,7 @@ var _ = Describe("Private bare metal instances server", func() {
 					Spec: privatev1.BareMetalInstanceSpec_builder{
 						NetworkAttachments: []*privatev1.BareMetalNetworkAttachment{
 							privatev1.BareMetalNetworkAttachment_builder{
-								Subnet:         privatev1.SubnetLocalReference_builder{Id: "subnet-1"}.Build(),
+								Subnet:         privatev1.SubnetLocalReference_builder{Id: subnetID1}.Build(),
 								Interface:      strPtr("data-0"),
 								SecurityGroups: []*privatev1.SecurityGroupLocalReference{privatev1.SecurityGroupLocalReference_builder{Id: "sg-1"}.Build(), privatev1.SecurityGroupLocalReference_builder{Id: "sg-2"}.Build()},
 							}.Build(),
@@ -1872,7 +1988,7 @@ var _ = Describe("Private bare metal instances server", func() {
 						CatalogItem: privatev1.BareMetalInstanceCatalogItemReference_builder{Id: catIDWithHT}.Build(),
 						NetworkAttachments: []*privatev1.BareMetalNetworkAttachment{
 							privatev1.BareMetalNetworkAttachment_builder{
-								Subnet:    privatev1.SubnetLocalReference_builder{Id: "subnet-1"}.Build(),
+								Subnet:    privatev1.SubnetLocalReference_builder{Id: subnetID1}.Build(),
 								Interface: strPtr("data-0"),
 							}.Build(),
 						},
@@ -1909,7 +2025,7 @@ var _ = Describe("Private bare metal instances server", func() {
 						CatalogItem: privatev1.BareMetalInstanceCatalogItemReference_builder{Id: catIDWithHT}.Build(),
 						NetworkAttachments: []*privatev1.BareMetalNetworkAttachment{
 							privatev1.BareMetalNetworkAttachment_builder{
-								Subnet:    privatev1.SubnetLocalReference_builder{Id: "subnet-1"}.Build(),
+								Subnet:    privatev1.SubnetLocalReference_builder{Id: subnetID1}.Build(),
 								Interface: strPtr("data-0"),
 							}.Build(),
 						},
@@ -1924,8 +2040,8 @@ var _ = Describe("Private bare metal instances server", func() {
 					Id: id,
 					Spec: privatev1.BareMetalInstanceSpec_builder{
 						NetworkAttachments: []*privatev1.BareMetalNetworkAttachment{
-							privatev1.BareMetalNetworkAttachment_builder{Subnet: privatev1.SubnetLocalReference_builder{Id: "subnet-1"}.Build(), Interface: strPtr("data-0")}.Build(),
-							privatev1.BareMetalNetworkAttachment_builder{Subnet: privatev1.SubnetLocalReference_builder{Id: "subnet-2"}.Build(), Interface: strPtr("data-1")}.Build(),
+							privatev1.BareMetalNetworkAttachment_builder{Subnet: privatev1.SubnetLocalReference_builder{Id: subnetID1}.Build(), Interface: strPtr("data-0")}.Build(),
+							privatev1.BareMetalNetworkAttachment_builder{Subnet: privatev1.SubnetLocalReference_builder{Id: subnetID2}.Build(), Interface: strPtr("data-1")}.Build(),
 						},
 					}.Build(),
 				}.Build(),
@@ -1950,7 +2066,7 @@ var _ = Describe("Private bare metal instances server", func() {
 						CatalogItem: privatev1.BareMetalInstanceCatalogItemReference_builder{Id: catIDWithHT}.Build(),
 						NetworkAttachments: []*privatev1.BareMetalNetworkAttachment{
 							privatev1.BareMetalNetworkAttachment_builder{
-								Subnet:    privatev1.SubnetLocalReference_builder{Id: "subnet-1"}.Build(),
+								Subnet:    privatev1.SubnetLocalReference_builder{Id: subnetID1}.Build(),
 								Interface: strPtr("data-0"),
 							}.Build(),
 						},
@@ -1993,7 +2109,7 @@ var _ = Describe("Private bare metal instances server", func() {
 						CatalogItem: privatev1.BareMetalInstanceCatalogItemReference_builder{Id: catIDWithHT}.Build(),
 						NetworkAttachments: []*privatev1.BareMetalNetworkAttachment{
 							privatev1.BareMetalNetworkAttachment_builder{
-								Subnet:    privatev1.SubnetLocalReference_builder{Id: "subnet-1"}.Build(),
+								Subnet:    privatev1.SubnetLocalReference_builder{Id: subnetID1}.Build(),
 								Interface: strPtr("data-0"),
 							}.Build(),
 						},
@@ -2009,7 +2125,7 @@ var _ = Describe("Private bare metal instances server", func() {
 					Spec: privatev1.BareMetalInstanceSpec_builder{
 						NetworkAttachments: []*privatev1.BareMetalNetworkAttachment{
 							privatev1.BareMetalNetworkAttachment_builder{
-								Subnet:    privatev1.SubnetLocalReference_builder{Id: "subnet-1"}.Build(),
+								Subnet:    privatev1.SubnetLocalReference_builder{Id: subnetID1}.Build(),
 								Interface: strPtr("data-1"),
 							}.Build(),
 						},
@@ -2036,12 +2152,12 @@ var _ = Describe("Private bare metal instances server", func() {
 						CatalogItem: privatev1.BareMetalInstanceCatalogItemReference_builder{Id: catIDWithHT}.Build(),
 						NetworkAttachments: []*privatev1.BareMetalNetworkAttachment{
 							privatev1.BareMetalNetworkAttachment_builder{
-								Subnet:    privatev1.SubnetLocalReference_builder{Id: "subnet-1"}.Build(),
+								Subnet:    privatev1.SubnetLocalReference_builder{Id: subnetID1}.Build(),
 								Interface: strPtr("data-0"),
 								Primary:   boolPtr(true),
 							}.Build(),
 							privatev1.BareMetalNetworkAttachment_builder{
-								Subnet:    privatev1.SubnetLocalReference_builder{Id: "subnet-2"}.Build(),
+								Subnet:    privatev1.SubnetLocalReference_builder{Id: subnetID2}.Build(),
 								Interface: strPtr("data-1"),
 							}.Build(),
 						},
@@ -2057,11 +2173,11 @@ var _ = Describe("Private bare metal instances server", func() {
 					Spec: privatev1.BareMetalInstanceSpec_builder{
 						NetworkAttachments: []*privatev1.BareMetalNetworkAttachment{
 							privatev1.BareMetalNetworkAttachment_builder{
-								Subnet:    privatev1.SubnetLocalReference_builder{Id: "subnet-1"}.Build(),
+								Subnet:    privatev1.SubnetLocalReference_builder{Id: subnetID1}.Build(),
 								Interface: strPtr("data-0"),
 							}.Build(),
 							privatev1.BareMetalNetworkAttachment_builder{
-								Subnet:    privatev1.SubnetLocalReference_builder{Id: "subnet-2"}.Build(),
+								Subnet:    privatev1.SubnetLocalReference_builder{Id: subnetID2}.Build(),
 								Interface: strPtr("data-1"),
 								Primary:   boolPtr(true),
 							}.Build(),
@@ -2274,8 +2390,7 @@ var _ = Describe("Private bare metal instances server", func() {
 				Id:    "template-no-ht-fabric-manager-test",
 				Title: "Template without HostType",
 				Metadata: privatev1.Metadata_builder{
-					Tenant: auth.SharedTenant,
-					Name:   fmt.Sprintf("test-%s", uuid.NewString()[:8]),
+					Tenant: testTenant,
 				}.Build(),
 			}.Build()).Do(ctx)
 			Expect(err).ToNot(HaveOccurred())
@@ -2299,12 +2414,10 @@ var _ = Describe("Private bare metal instances server", func() {
 		createSubnet := func(fabricManager, k8sManager *string) string {
 			ncResp, err := networkClassDao.Create().SetObject(
 				privatev1.NetworkClass_builder{
-					ImplementationStrategy: "test-strategy",
-					FabricManager:          fabricManager,
-					K8SManager:             k8sManager,
+					FabricManager: fabricManager,
+					K8SManager:    k8sManager,
 					Metadata: privatev1.Metadata_builder{
-						Tenant: auth.SharedTenant,
-						Name:   fmt.Sprintf("test-%s", uuid.NewString()[:8]),
+						Tenant: testTenant,
 					}.Build(),
 				}.Build(),
 			).Do(ctx)
@@ -2313,8 +2426,7 @@ var _ = Describe("Private bare metal instances server", func() {
 			vnResp, err := vnDao.Create().SetObject(
 				privatev1.VirtualNetwork_builder{
 					Metadata: privatev1.Metadata_builder{
-						Tenant: auth.SharedTenant,
-						Name:   fmt.Sprintf("test-%s", uuid.NewString()[:8]),
+						Tenant: testTenant,
 					}.Build(),
 					Spec: privatev1.VirtualNetworkSpec_builder{
 						NetworkClass: privatev1.NetworkClassReference_builder{Id: ncResp.GetObject().GetId()}.Build(),
@@ -2326,8 +2438,7 @@ var _ = Describe("Private bare metal instances server", func() {
 			subnetResp, err := subnetDao.Create().SetObject(
 				privatev1.Subnet_builder{
 					Metadata: privatev1.Metadata_builder{
-						Tenant: auth.SharedTenant,
-						Name:   fmt.Sprintf("test-%s", uuid.NewString()[:8]),
+						Tenant: testTenant,
 					}.Build(),
 					Spec: privatev1.SubnetSpec_builder{
 						VirtualNetwork: privatev1.VirtualNetworkLocalReference_builder{Id: vnResp.GetObject().GetId()}.Build(),
@@ -2343,9 +2454,6 @@ var _ = Describe("Private bare metal instances server", func() {
 			subnetID := createSubnet(nil, new("cudn_localnet"))
 			_, err := server.Create(ctx, privatev1.BareMetalInstancesCreateRequest_builder{
 				Object: privatev1.BareMetalInstance_builder{
-					Metadata: privatev1.Metadata_builder{
-						Name: fmt.Sprintf("test-%s", uuid.NewString()[:8]),
-					}.Build(),
 					Spec: privatev1.BareMetalInstanceSpec_builder{
 						CatalogItem: privatev1.BareMetalInstanceCatalogItemReference_builder{Id: catID}.Build(),
 						NetworkAttachments: []*privatev1.BareMetalNetworkAttachment{
@@ -2398,15 +2506,14 @@ var _ = Describe("Private bare metal instances server", func() {
 
 	Describe("Default network_attachments population", func() {
 		var (
-			server        *PrivateBareMetalInstancesServer
-			catalogServer *PrivateBareMetalInstanceCatalogItemsServer
-			catIDWithHT   string
-			catIDNoHT     string
-			defaultSubnet *privatev1.Subnet
-			defaultSG     *privatev1.SecurityGroup
+			server         *PrivateBareMetalInstancesServer
+			catalogServer  *PrivateBareMetalInstanceCatalogItemsServer
+			catIDWithHT    string
+			catIDNoHT      string
+			defaultSubnet  *privatev1.Subnet
+			defaultSG      *privatev1.SecurityGroup
+			customSubnetID string
 		)
-
-		const testTenant = "system"
 
 		BeforeEach(func() {
 			var err error
@@ -2435,7 +2542,7 @@ var _ = Describe("Private bare metal instances server", func() {
 				Id:    "default-test-host-type",
 				Title: "Default Test Host Type",
 				Metadata: privatev1.Metadata_builder{
-					Tenant: auth.SharedTenant,
+					Tenant: testTenant,
 					Name:   fmt.Sprintf("test-%s", uuid.NewString()[:8]),
 				}.Build(),
 				Interfaces: []*privatev1.NetworkInterface{
@@ -2458,7 +2565,7 @@ var _ = Describe("Private bare metal instances server", func() {
 				Title:    "Template with HostType",
 				HostType: "default-test-host-type",
 				Metadata: privatev1.Metadata_builder{
-					Tenant: auth.SharedTenant,
+					Tenant: testTenant,
 					Name:   fmt.Sprintf("test-%s", uuid.NewString()[:8]),
 				}.Build(),
 			}.Build()).Do(ctx)
@@ -2468,7 +2575,7 @@ var _ = Describe("Private bare metal instances server", func() {
 				Id:    "default-template-no-ht",
 				Title: "Template without HostType",
 				Metadata: privatev1.Metadata_builder{
-					Tenant: auth.SharedTenant,
+					Tenant: testTenant,
 					Name:   fmt.Sprintf("test-%s", uuid.NewString()[:8]),
 				}.Build(),
 			}.Build()).Do(ctx)
@@ -2513,8 +2620,7 @@ var _ = Describe("Private bare metal instances server", func() {
 					Name:   "default-nc",
 					Tenant: "system",
 				}.Build(),
-				FabricManager:          &fabricMgr,
-				ImplementationStrategy: "netris",
+				FabricManager: &fabricMgr,
 			}.Build()).Do(ctx)
 			Expect(err).ToNot(HaveOccurred())
 			ncID := ncResp.GetObject().GetId()
@@ -2590,6 +2696,21 @@ var _ = Describe("Private bare metal instances server", func() {
 			}.Build()).Do(ctx)
 			Expect(err).ToNot(HaveOccurred())
 			defaultSG = sgResp.GetObject()
+
+			// Create custom-subnet for the "Does not override" test case.
+			customSubnetResp, err := subnetDao.Create().SetObject(privatev1.Subnet_builder{
+				Metadata: privatev1.Metadata_builder{
+					Tenant: testTenant,
+				}.Build(),
+				Spec: privatev1.SubnetSpec_builder{
+					VirtualNetwork: privatev1.VirtualNetworkLocalReference_builder{Id: vnID}.Build(),
+				}.Build(),
+				Status: privatev1.SubnetStatus_builder{
+					State: privatev1.SubnetState_SUBNET_STATE_READY,
+				}.Build(),
+			}.Build()).Do(ctx)
+			Expect(err).ToNot(HaveOccurred())
+			customSubnetID = customSubnetResp.GetObject().GetId()
 		})
 
 		It("Populates default network_attachments when omitted", func() {
@@ -2623,7 +2744,7 @@ var _ = Describe("Private bare metal instances server", func() {
 						CatalogItem: privatev1.BareMetalInstanceCatalogItemReference_builder{Id: catIDWithHT}.Build(),
 						NetworkAttachments: []*privatev1.BareMetalNetworkAttachment{
 							privatev1.BareMetalNetworkAttachment_builder{
-								Subnet: privatev1.SubnetLocalReference_builder{Id: "custom-subnet"}.Build(),
+								Subnet: privatev1.SubnetLocalReference_builder{Id: customSubnetID}.Build(),
 							}.Build(),
 						},
 					}.Build(),
@@ -2633,7 +2754,7 @@ var _ = Describe("Private bare metal instances server", func() {
 
 			attachments := response.GetObject().GetSpec().GetNetworkAttachments()
 			Expect(attachments).To(HaveLen(1))
-			Expect(attachments[0].GetSubnet().GetId()).To(Equal("custom-subnet"))
+			Expect(attachments[0].GetSubnet().GetId()).To(Equal(customSubnetID))
 		})
 
 		It("Omits interface when template has no HostType", func() {
@@ -2656,7 +2777,16 @@ var _ = Describe("Private bare metal instances server", func() {
 		})
 
 		It("Skips defaults when no default subnet exists", func() {
-			// Delete the default subnet — Create should succeed with no network_attachments.
+			// Delete the default SG first (migration 103 blocks subnet deletion while SGs
+			// reference the same VN), then delete the default subnet.
+			sgDao, sgErr := dao.NewGenericDAO[*privatev1.SecurityGroup]().
+				SetLogger(logger).
+				SetTenancyLogic(tenancy).
+				Build()
+			Expect(sgErr).ToNot(HaveOccurred())
+			_, sgErr = sgDao.Delete().SetId(defaultSG.GetId()).Do(ctx)
+			Expect(sgErr).ToNot(HaveOccurred())
+
 			subnetDao, sdErr := dao.NewGenericDAO[*privatev1.Subnet]().
 				SetLogger(logger).
 				SetTenancyLogic(tenancy).
@@ -2714,8 +2844,7 @@ var _ = Describe("Private bare metal instances server", func() {
 				Id:    "no-fabric-host-type",
 				Title: "No Fabric Host Type",
 				Metadata: privatev1.Metadata_builder{
-					Tenant: auth.SharedTenant,
-					Name:   fmt.Sprintf("test-%s", uuid.NewString()[:8]),
+					Tenant: testTenant,
 				}.Build(),
 				Interfaces: []*privatev1.NetworkInterface{
 					privatev1.NetworkInterface_builder{Name: "mgmt-0", Role: "management"}.Build(),
@@ -2735,8 +2864,7 @@ var _ = Describe("Private bare metal instances server", func() {
 				Title:    "No Fabric Template",
 				HostType: "no-fabric-host-type",
 				Metadata: privatev1.Metadata_builder{
-					Tenant: auth.SharedTenant,
-					Name:   fmt.Sprintf("test-%s", uuid.NewString()[:8]),
+					Tenant: testTenant,
 				}.Build(),
 			}.Build()).Do(ctx)
 			Expect(tmplErr).ToNot(HaveOccurred())
@@ -2769,5 +2897,110 @@ var _ = Describe("Private bare metal instances server", func() {
 			Expect(status.Code()).To(Equal(grpccodes.FailedPrecondition))
 			Expect(status.Message()).To(ContainSubstring("fabric"))
 		})
+	})
+})
+
+var _ = Describe("BareMetalInstance ExternalIP referential integrity", func() {
+	var (
+		externalIPPoolDao       *dao.GenericDAO[*privatev1.ExternalIPPool]
+		externalIPDao           *dao.GenericDAO[*privatev1.ExternalIP]
+		externalIPAttachmentDao *dao.GenericDAO[*privatev1.ExternalIPAttachment]
+	)
+
+	BeforeEach(func() {
+		var err error
+		externalIPPoolDao, err = dao.NewGenericDAO[*privatev1.ExternalIPPool]().
+			SetLogger(logger).SetTenancyLogic(tenancy).Build()
+		Expect(err).ToNot(HaveOccurred())
+		externalIPDao, err = dao.NewGenericDAO[*privatev1.ExternalIP]().
+			SetLogger(logger).SetTenancyLogic(tenancy).Build()
+		Expect(err).ToNot(HaveOccurred())
+		externalIPAttachmentDao, err = dao.NewGenericDAO[*privatev1.ExternalIPAttachment]().
+			SetLogger(logger).SetTenancyLogic(tenancy).Build()
+		Expect(err).ToNot(HaveOccurred())
+	})
+
+	createPool := func() string {
+		resp, err := externalIPPoolDao.Create().SetObject(
+			privatev1.ExternalIPPool_builder{
+				Metadata: privatev1.Metadata_builder{
+					Name: fmt.Sprintf("pool-%s", uuid.NewString()[:8]), Tenant: auth.SharedTenant,
+				}.Build(),
+				Status: privatev1.ExternalIPPoolStatus_builder{
+					State: privatev1.ExternalIPPoolState_EXTERNAL_IP_POOL_STATE_READY, Available: 10,
+				}.Build(),
+			}.Build(),
+		).Do(ctx)
+		Expect(err).ToNot(HaveOccurred())
+		return resp.GetObject().GetId()
+	}
+
+	createEIP := func(poolID string) string {
+		resp, err := externalIPDao.Create().SetObject(
+			privatev1.ExternalIP_builder{
+				Metadata: privatev1.Metadata_builder{
+					Tenant: auth.SharedTenant,
+				}.Build(),
+				Spec: privatev1.ExternalIPSpec_builder{
+					Pool: privatev1.ExternalIPPoolReference_builder{Id: poolID}.Build(),
+				}.Build(),
+			}.Build(),
+		).Do(ctx)
+		Expect(err).ToNot(HaveOccurred())
+		return resp.GetObject().GetId()
+	}
+
+	It("rejects deleting ExternalIP while ExternalIPAttachment references it", func() {
+		poolID := createPool()
+		eipID := createEIP(poolID)
+
+		_, err := externalIPAttachmentDao.Create().SetObject(
+			privatev1.ExternalIPAttachment_builder{
+				Metadata: privatev1.Metadata_builder{Tenant: auth.SharedTenant}.Build(),
+				Spec: privatev1.ExternalIPAttachmentSpec_builder{
+					ExternalIp: privatev1.ExternalIPLocalReference_builder{Id: eipID}.Build(),
+				}.Build(),
+			}.Build(),
+		).Do(ctx)
+		Expect(err).ToNot(HaveOccurred())
+
+		_, err = externalIPDao.Delete().SetId(eipID).Do(ctx)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("in use"))
+	})
+
+	It("rejects deleting ExternalIPPool while ExternalIPs are allocated", func() {
+		poolID := createPool()
+		_ = createEIP(poolID)
+
+		_, err := externalIPPoolDao.Delete().SetId(poolID).Do(ctx)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("in use"))
+	})
+
+	It("rejects creating ExternalIPAttachment with non-existent ExternalIP", func() {
+		_, err := externalIPAttachmentDao.Create().SetObject(
+			privatev1.ExternalIPAttachment_builder{
+				Metadata: privatev1.Metadata_builder{Tenant: auth.SharedTenant}.Build(),
+				Spec: privatev1.ExternalIPAttachmentSpec_builder{
+					ExternalIp: privatev1.ExternalIPLocalReference_builder{Id: "nonexistent-eip-id"}.Build(),
+				}.Build(),
+			}.Build(),
+		).Do(ctx)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("does not exist"))
+	})
+
+	It("rejects creating ExternalIP with non-existent pool", func() {
+		_, err := externalIPDao.Create().SetObject(
+			privatev1.ExternalIP_builder{
+				Metadata: privatev1.Metadata_builder{Tenant: auth.SharedTenant}.Build(),
+				Spec: privatev1.ExternalIPSpec_builder{
+					Pool: privatev1.ExternalIPPoolReference_builder{Id: "nonexistent-pool-id"}.Build(),
+				}.Build(),
+			}.Build(),
+		).Do(ctx)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("does not exist"))
 	})
 })

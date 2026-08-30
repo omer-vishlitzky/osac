@@ -14,10 +14,13 @@ language governing permissions and limitations under the License.
 package servers
 
 import (
+	"errors"
+
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
 	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
+	"github.com/osac-project/osac/fulfillment-service/internal/database/dao"
 )
 
 var _ = Describe("Default networking provisioner", func() {
@@ -32,9 +35,8 @@ var _ = Describe("Default networking provisioner", func() {
 				Name:   "test-network-class",
 				Tenant: "system",
 			}.Build(),
-			IsDefault:              new(true),
-			FabricManager:          new("netris"),
-			ImplementationStrategy: "netris",
+			IsDefault:     new(true),
+			FabricManager: new("netris"),
 			Spec: privatev1.NetworkClassSpec_builder{
 				Defaults: defaults,
 			}.Build(),
@@ -57,7 +59,12 @@ var _ = Describe("Default networking provisioner", func() {
 		}.Build()
 		tenant.SetId(name)
 		_, err := tenantDao.Create().SetObject(tenant).Do(ctx)
-		Expect(err).ToNot(HaveOccurred())
+		if err != nil {
+			var alreadyExists *dao.ErrAlreadyExists
+			if !errors.As(err, &alreadyExists) {
+				Expect(err).ToNot(HaveOccurred())
+			}
+		}
 	}
 
 	createExternalIPPool := func(name, tenant string, available int64) *privatev1.ExternalIPPool {
@@ -89,7 +96,6 @@ var _ = Describe("Default networking provisioner", func() {
 
 	Context("when no default NetworkClass exists", func() {
 		It("returns nil without creating any resources", func() {
-			createTenant("test-tenant")
 			err := provisioner.Provision(ctx, "test-tenant")
 			Expect(err).ToNot(HaveOccurred())
 
@@ -103,7 +109,6 @@ var _ = Describe("Default networking provisioner", func() {
 
 	Context("when default NetworkClass exists with defaults", func() {
 		BeforeEach(func() {
-			createTenant("test-tenant")
 			createNetworkClass(privatev1.NetworkDefaults_builder{
 				VirtualNetworkIpv4Cidr: "10.0.0.0/16",
 				VirtualNetworkIpv6Cidr: "fd00::/48",
@@ -145,7 +150,6 @@ var _ = Describe("Default networking provisioner", func() {
 			Expect(vn.GetSpec().GetIpv4Cidr()).To(Equal("10.0.0.0/16"))
 			Expect(vn.GetSpec().GetIpv6Cidr()).To(Equal("fd00::/48"))
 			Expect(vn.GetSpec().GetNetworkClass().GetId()).ToNot(BeEmpty())
-			Expect(vn.GetSpec().GetImplementationStrategy()).ToNot(BeEmpty())
 			Expect(vn.GetStatus().GetState()).To(Equal(
 				privatev1.VirtualNetworkState_VIRTUAL_NETWORK_STATE_PENDING))
 		})
@@ -256,18 +260,6 @@ var _ = Describe("Default networking provisioner", func() {
 			Expect(ngList.GetItems()).To(BeEmpty())
 		})
 
-		It("sets implementation_strategy on VN from NetworkClass", func() {
-			err := provisioner.Provision(ctx, "test-tenant")
-			Expect(err).ToNot(HaveOccurred())
-
-			vnList, err := provisioner.virtualNetworkDao.List().
-				SetFilter("this.metadata.tenant == 'test-tenant'").
-				Do(ctx)
-			Expect(err).ToNot(HaveOccurred())
-			Expect(vnList.GetItems()).To(HaveLen(1))
-			Expect(vnList.GetItems()[0].GetSpec().GetImplementationStrategy()).To(Equal("netris"))
-		})
-
 		It("creates all four resources in a single Provision call", func() {
 			err := provisioner.Provision(ctx, "test-tenant")
 			Expect(err).ToNot(HaveOccurred())
@@ -357,7 +349,6 @@ var _ = Describe("Default networking provisioner", func() {
 
 	Context("when NetworkClass defaults are partially populated", func() {
 		It("creates only IPv4 subnet when IPv6 CIDRs are empty", func() {
-			createTenant("test-tenant")
 			createNetworkClass(privatev1.NetworkDefaults_builder{
 				VirtualNetworkIpv4Cidr: "10.0.0.0/16",
 				SubnetIpv4Cidr:         "10.0.1.0/24",
@@ -384,7 +375,6 @@ var _ = Describe("Default networking provisioner", func() {
 
 	Context("when NetworkClass has no defaults", func() {
 		It("returns nil without creating any resources", func() {
-			createTenant("test-tenant")
 			createNetworkClass(nil)
 
 			err := provisioner.Provision(ctx, "test-tenant")
@@ -395,6 +385,320 @@ var _ = Describe("Default networking provisioner", func() {
 				Do(ctx)
 			Expect(err).ToNot(HaveOccurred())
 			Expect(vnList.GetItems()).To(BeEmpty())
+		})
+	})
+
+	Describe("Deprovision", func() {
+		Context("when no default VirtualNetwork exists", func() {
+			It("returns nil without touching any resources", func() {
+				err := provisioner.Deprovision(ctx, "test-tenant")
+				Expect(err).ToNot(HaveOccurred())
+			})
+		})
+
+		Context("when default networking resources exist without a NATGateway", func() {
+			BeforeEach(func() {
+				createNetworkClass(privatev1.NetworkDefaults_builder{
+					VirtualNetworkIpv4Cidr: "10.0.0.0/16",
+					SubnetIpv4Cidr:         "10.0.1.0/24",
+					SubnetIpv6Cidr:         "fd00:0:0:1::/64",
+				}.Build())
+				err := provisioner.Provision(ctx, "test-tenant")
+				Expect(err).ToNot(HaveOccurred())
+			})
+
+			It("removes the VirtualNetwork, its Subnets and its SecurityGroup", func() {
+				err := provisioner.Deprovision(ctx, "test-tenant")
+				Expect(err).ToNot(HaveOccurred())
+
+				vnList, err := provisioner.virtualNetworkDao.List().
+					SetFilter("this.metadata.tenant == 'test-tenant'").
+					Do(ctx)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(vnList.GetItems()).To(BeEmpty())
+
+				subnetList, err := provisioner.subnetDao.List().
+					SetFilter("this.metadata.tenant == 'test-tenant'").
+					Do(ctx)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(subnetList.GetItems()).To(BeEmpty())
+
+				sgList, err := provisioner.securityGroupDao.List().
+					SetFilter("this.metadata.tenant == 'test-tenant'").
+					Do(ctx)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(sgList.GetItems()).To(BeEmpty())
+			})
+
+			It("is idempotent when called a second time", func() {
+				err := provisioner.Deprovision(ctx, "test-tenant")
+				Expect(err).ToNot(HaveOccurred())
+
+				err = provisioner.Deprovision(ctx, "test-tenant")
+				Expect(err).ToNot(HaveOccurred())
+			})
+		})
+
+		Context("when a default NATGateway exists", func() {
+			var pool *privatev1.ExternalIPPool
+
+			BeforeEach(func() {
+				createTenant("nat-tenant")
+				createNetworkClass(privatev1.NetworkDefaults_builder{
+					VirtualNetworkIpv4Cidr: "10.0.0.0/16",
+					SubnetIpv4Cidr:         "10.0.1.0/24",
+					EnableNatGateway:       true,
+				}.Build())
+				pool = createExternalIPPool("test-pool", "system", 10)
+
+				err := provisioner.Provision(ctx, "nat-tenant")
+				Expect(err).ToNot(HaveOccurred())
+			})
+
+			It("removes the NATGateway and ExternalIP, and releases pool capacity", func() {
+				err := provisioner.Deprovision(ctx, "nat-tenant")
+				Expect(err).ToNot(HaveOccurred())
+
+				ngList, err := provisioner.natGatewayDao.List().
+					SetFilter("this.metadata.tenant == 'nat-tenant'").
+					Do(ctx)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(ngList.GetItems()).To(BeEmpty())
+
+				eipList, err := provisioner.externalIPDao.List().
+					SetFilter("this.metadata.tenant == 'nat-tenant'").
+					Do(ctx)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(eipList.GetItems()).To(BeEmpty())
+
+				vnList, err := provisioner.virtualNetworkDao.List().
+					SetFilter("this.metadata.tenant == 'nat-tenant'").
+					Do(ctx)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(vnList.GetItems()).To(BeEmpty())
+
+				poolResp, err := provisioner.externalIPPoolDao.Get().
+					SetId(pool.GetId()).
+					Do(ctx)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(poolResp.GetObject().GetStatus().GetAllocated()).To(Equal(int64(0)))
+				Expect(poolResp.GetObject().GetStatus().GetAvailable()).To(Equal(int64(10)))
+			})
+		})
+
+		Context("when a default resource already has a controller finalizer attached", func() {
+			It("fails with an in-use error instead of looping forever on the Subnet", func() {
+				createNetworkClass(privatev1.NetworkDefaults_builder{
+					VirtualNetworkIpv4Cidr: "10.0.0.0/16",
+					SubnetIpv4Cidr:         "10.0.1.0/24",
+				}.Build())
+				err := provisioner.Provision(ctx, "test-tenant")
+				Expect(err).ToNot(HaveOccurred())
+
+				subnetList, err := provisioner.subnetDao.List().
+					SetFilter("this.metadata.tenant == 'test-tenant'").
+					Do(ctx)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(subnetList.GetItems()).To(HaveLen(1))
+				subnet := subnetList.GetItems()[0]
+
+				// Simulate the Subnet controller having already picked up this object, as it
+				// normally would shortly after creation:
+				subnet.GetMetadata().SetFinalizers([]string{"osac.openshift.io/subnet-controller"})
+				_, err = provisioner.subnetDao.Update().SetObject(subnet).Do(ctx)
+				Expect(err).ToNot(HaveOccurred())
+
+				// Delete() on a finalized object only soft-deletes it, so a naive loop would spin
+				// forever. This call must terminate with a clear, typed error instead.
+				err = provisioner.Deprovision(ctx, "test-tenant")
+				Expect(err).To(HaveOccurred())
+				var inUseErr *dao.ErrInUse
+				Expect(errors.As(err, &inUseErr)).To(BeTrue())
+				Expect(inUseErr.Error()).To(ContainSubstring("awaiting asynchronous controller cleanup"))
+
+				// The SecurityGroup had no finalizer, so it was already removed before the Subnet
+				// loop gave up — confirming partial progress isn't silently discarded:
+				sgList, err := provisioner.securityGroupDao.List().
+					SetFilter("this.metadata.tenant == 'test-tenant'").
+					Do(ctx)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(sgList.GetItems()).To(BeEmpty())
+
+				// The VirtualNetwork itself must not have been deleted, since the Subnet still
+				// references it:
+				vnList, err := provisioner.virtualNetworkDao.List().
+					SetFilter("this.metadata.tenant == 'test-tenant'").
+					Do(ctx)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(vnList.GetItems()).To(HaveLen(1))
+			})
+
+			It("fails with an in-use error instead of looping forever on the NATGateway", func() {
+				createTenant("nat-tenant")
+				createNetworkClass(privatev1.NetworkDefaults_builder{
+					VirtualNetworkIpv4Cidr: "10.0.0.0/16",
+					SubnetIpv4Cidr:         "10.0.1.0/24",
+					EnableNatGateway:       true,
+				}.Build())
+				createExternalIPPool("test-pool", "system", 10)
+
+				err := provisioner.Provision(ctx, "nat-tenant")
+				Expect(err).ToNot(HaveOccurred())
+
+				ngList, err := provisioner.natGatewayDao.List().
+					SetFilter("this.metadata.tenant == 'nat-tenant'").
+					Do(ctx)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(ngList.GetItems()).To(HaveLen(1))
+				natGateway := ngList.GetItems()[0]
+
+				// Simulate the NATGateway controller having already picked up this object:
+				natGateway.GetMetadata().SetFinalizers([]string{"osac.openshift.io/nat-gateway-controller"})
+				_, err = provisioner.natGatewayDao.Update().SetObject(natGateway).Do(ctx)
+				Expect(err).ToNot(HaveOccurred())
+
+				err = provisioner.Deprovision(ctx, "nat-tenant")
+				Expect(err).To(HaveOccurred())
+				var inUseErr *dao.ErrInUse
+				Expect(errors.As(err, &inUseErr)).To(BeTrue())
+				Expect(inUseErr.Error()).To(ContainSubstring("awaiting asynchronous controller cleanup"))
+
+				// The ExternalIP must not have been deprovisioned either, since its owning
+				// NATGateway was never actually removed:
+				eipList, err := provisioner.externalIPDao.List().
+					SetFilter("this.metadata.tenant == 'nat-tenant'").
+					Do(ctx)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(eipList.GetItems()).To(HaveLen(1))
+			})
+		})
+
+		Context("when the default Subnet is still in use by a live ComputeInstance", func() {
+			It("fails with a typed in-use error instead of deleting the Subnet", func() {
+				createNetworkClass(privatev1.NetworkDefaults_builder{
+					VirtualNetworkIpv4Cidr: "10.0.0.0/16",
+					SubnetIpv4Cidr:         "10.0.1.0/24",
+				}.Build())
+				err := provisioner.Provision(ctx, "test-tenant")
+				Expect(err).ToNot(HaveOccurred())
+
+				subnetList, err := provisioner.subnetDao.List().
+					SetFilter("this.metadata.tenant == 'test-tenant'").
+					Do(ctx)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(subnetList.GetItems()).To(HaveLen(1))
+				subnetID := subnetList.GetItems()[0].GetId()
+
+				computeInstanceDao, err := dao.NewGenericDAO[*privatev1.ComputeInstance]().
+					SetLogger(logger).
+					SetTenancyLogic(tenancy).
+					Build()
+				Expect(err).ToNot(HaveOccurred())
+				_, err = computeInstanceDao.Create().SetObject(privatev1.ComputeInstance_builder{
+					Metadata: privatev1.Metadata_builder{
+						Name:   "test-instance",
+						Tenant: "test-tenant",
+					}.Build(),
+					Spec: privatev1.ComputeInstanceSpec_builder{
+						NetworkAttachments: []*privatev1.ComputeNetworkAttachment{
+							privatev1.ComputeNetworkAttachment_builder{
+								Subnet: privatev1.SubnetLocalReference_builder{Id: subnetID}.Build(),
+							}.Build(),
+						},
+					}.Build(),
+				}.Build()).Do(ctx)
+				Expect(err).ToNot(HaveOccurred())
+
+				// The Postgres trigger raises an error inside the current transaction, which aborts
+				// it — no further statements can run against ctx's transaction after this, so this
+				// must be the test's last database interaction.
+				err = provisioner.Deprovision(ctx, "test-tenant")
+				Expect(err).To(HaveOccurred())
+				var inUseErr *dao.ErrInUse
+				Expect(errors.As(err, &inUseErr)).To(BeTrue())
+				Expect(inUseErr.Error()).To(ContainSubstring(subnetID))
+				Expect(inUseErr.Error()).To(ContainSubstring("in use by at least one compute instance"))
+			})
+		})
+
+		Context("when the tenant has attached its own resources to the default VirtualNetwork", func() {
+			It("leaves a tenant-owned Subnet in place instead of deleting it", func() {
+				createNetworkClass(privatev1.NetworkDefaults_builder{
+					VirtualNetworkIpv4Cidr: "10.0.0.0/16",
+					SubnetIpv4Cidr:         "10.0.1.0/24",
+				}.Build())
+				err := provisioner.Provision(ctx, "test-tenant")
+				Expect(err).ToNot(HaveOccurred())
+
+				vnList, err := provisioner.virtualNetworkDao.List().
+					SetFilter("this.metadata.tenant == 'test-tenant'").
+					Do(ctx)
+				Expect(err).ToNot(HaveOccurred())
+				vnID := vnList.GetItems()[0].GetId()
+
+				// A tenant-created Subnet, not labeled as a default resource, attached to the same
+				// default VirtualNetwork:
+				_, err = provisioner.subnetDao.Create().SetObject(privatev1.Subnet_builder{
+					Metadata: privatev1.Metadata_builder{
+						Name:   "custom-subnet",
+						Tenant: "test-tenant",
+					}.Build(),
+					Spec: privatev1.SubnetSpec_builder{
+						VirtualNetwork: privatev1.VirtualNetworkLocalReference_builder{Id: vnID}.Build(),
+						Ipv4Cidr:       new("10.0.2.0/24"),
+					}.Build(),
+				}.Build()).Do(ctx)
+				Expect(err).ToNot(HaveOccurred())
+
+				// If deleteByVirtualNetwork ignored the default label and deleted this Subnet too,
+				// Deprovision would succeed here despite having destroyed a tenant-owned resource.
+				// Instead, the custom Subnet must be left in place, and the database's own
+				// check_virtual_network_not_in_use trigger must block the VirtualNetwork delete
+				// because of it. The Postgres error this raises aborts the current transaction, so
+				// this must be the test's last database interaction.
+				err = provisioner.Deprovision(ctx, "test-tenant")
+				Expect(err).To(HaveOccurred())
+				var inUseErr *dao.ErrInUse
+				Expect(errors.As(err, &inUseErr)).To(BeTrue())
+				Expect(inUseErr.Error()).To(ContainSubstring(vnID))
+				Expect(inUseErr.Error()).To(ContainSubstring("Subnet(s) still reference it"))
+			})
+
+			It("leaves a tenant-owned SecurityGroup in place instead of deleting it", func() {
+				createNetworkClass(privatev1.NetworkDefaults_builder{
+					VirtualNetworkIpv4Cidr: "10.0.0.0/16",
+				}.Build())
+				err := provisioner.Provision(ctx, "test-tenant")
+				Expect(err).ToNot(HaveOccurred())
+
+				vnList, err := provisioner.virtualNetworkDao.List().
+					SetFilter("this.metadata.tenant == 'test-tenant'").
+					Do(ctx)
+				Expect(err).ToNot(HaveOccurred())
+				vnID := vnList.GetItems()[0].GetId()
+
+				// A tenant-created SecurityGroup, likewise not labeled as default:
+				_, err = provisioner.securityGroupDao.Create().SetObject(privatev1.SecurityGroup_builder{
+					Metadata: privatev1.Metadata_builder{
+						Name:   "custom-sg",
+						Tenant: "test-tenant",
+					}.Build(),
+					Spec: privatev1.SecurityGroupSpec_builder{
+						VirtualNetwork: privatev1.VirtualNetworkLocalReference_builder{Id: vnID}.Build(),
+					}.Build(),
+				}.Build()).Do(ctx)
+				Expect(err).ToNot(HaveOccurred())
+
+				// Same reasoning as the Subnet case above: the check_virtual_network_not_in_use
+				// trigger must block the VirtualNetwork delete because of the surviving
+				// tenant-owned SecurityGroup. This must be the test's last database interaction.
+				err = provisioner.Deprovision(ctx, "test-tenant")
+				Expect(err).To(HaveOccurred())
+				var inUseErr *dao.ErrInUse
+				Expect(errors.As(err, &inUseErr)).To(BeTrue())
+				Expect(inUseErr.Error()).To(ContainSubstring(vnID))
+				Expect(inUseErr.Error()).To(ContainSubstring("SecurityGroup(s) still reference it"))
+			})
 		})
 	})
 })

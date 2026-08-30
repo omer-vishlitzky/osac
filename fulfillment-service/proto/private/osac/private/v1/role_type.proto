@@ -15,7 +15,10 @@ syntax = "proto3";
 
 package osac.private.v1;
 
+import "cleanapi/cleanapi.proto";
 import "osac/private/v1/metadata_type.proto";
+
+option (cleanapi.file).package = "osac.public.v1";
 
 // Represents a role that can be assigned to groups.
 //

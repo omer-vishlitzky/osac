@@ -60,8 +60,14 @@ var NATGatewayUuid = fmt.Sprintf("%s/%s", group, "natgateway-uuid")
 // TenantUuid is the label where the fulfillment API will write the identifier of the tenant.
 var TenantUuid = fmt.Sprintf("%s/%s", group, "tenant-uuid")
 
+// VolumeUuid is the label where the fulfillment API will write the identifier of the volume.
+var VolumeUuid = fmt.Sprintf("%s/%s", group, "volume-uuid")
+
 // TenantRef is the label used to reference the tenant object from associated resources (e.g., namespaces).
 var TenantRef = fmt.Sprintf("%s/%s", group, "tenant-ref")
 
 // Project is the label used to reference the project (namespace) in which the tenant object lives.
 var Project = fmt.Sprintf("%s/%s", group, "project")
+
+// SecretType is the label used to indicate the type of a system-created secret.
+var SecretType = fmt.Sprintf("%s/%s", group, "secret-type")

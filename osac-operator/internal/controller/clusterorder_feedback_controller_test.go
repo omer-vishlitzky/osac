@@ -19,6 +19,7 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"google.golang.org/genproto/googleapis/api/httpbody"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	grpcstatus "google.golang.org/grpc/status"
@@ -73,6 +74,29 @@ func (m *mockClustersClient) Update(_ context.Context, in *privatev1.ClustersUpd
 		return nil, m.updateError
 	}
 	return m.updateResponse, nil
+}
+
+// GetKubeconfig mocks base method.
+func (m *mockClustersClient) GetKubeconfig(ctx context.Context, in *privatev1.ClustersGetKubeconfigRequest, opts ...grpc.CallOption) (*privatev1.ClustersGetKubeconfigResponse, error) {
+	return nil, errors.New("not implemented")
+
+}
+
+// GetKubeconfigViaHttp mocks base method.
+func (m *mockClustersClient) GetKubeconfigViaHttp(ctx context.Context, in *privatev1.ClustersGetKubeconfigViaHttpRequest, opts ...grpc.CallOption) (*httpbody.HttpBody, error) { //nolint:staticcheck // this is a mock
+	return nil, errors.New("not implemented")
+
+}
+
+// GetPassword mocks base method.
+func (m *mockClustersClient) GetPassword(ctx context.Context, in *privatev1.ClustersGetPasswordRequest, opts ...grpc.CallOption) (*privatev1.ClustersGetPasswordResponse, error) {
+	return nil, errors.New("not implemented")
+
+}
+
+// GetPasswordViaHttp mocks base method.
+func (m *mockClustersClient) GetPasswordViaHttp(ctx context.Context, in *privatev1.ClustersGetPasswordViaHttpRequest, opts ...grpc.CallOption) (*httpbody.HttpBody, error) { //nolint:staticcheck // this is a mock
+	return nil, errors.New("not implemented")
 }
 
 func (m *mockClustersClient) Signal(_ context.Context, in *privatev1.ClustersSignalRequest, _ ...grpc.CallOption) (*privatev1.ClustersSignalResponse, error) {
@@ -604,6 +628,29 @@ var _ = Describe("ClusterOrder FeedbackReconciler", func() {
 			Expect(err).NotTo(HaveOccurred())
 			Expect(mockClient.updateCalled).To(BeTrue())
 			Expect(mockClient.lastUpdate.GetStatus().GetState()).To(Equal(privatev1.ClusterState_CLUSTER_STATE_FAILED))
+		})
+
+		It("should sync VIP endpoints to Cluster proto when set in status", func() {
+			co := &osacv1alpha1.ClusterOrder{}
+			Expect(k8sClient.Get(testCtx, typeNamespacedName, co)).To(Succeed())
+			co.Status.ApiEndpoint = "10.0.0.1"
+			co.Status.IngressEndpoint = "10.0.0.2"
+			Expect(k8sClient.Status().Update(testCtx, co)).To(Succeed())
+
+			request := reconcile.Request{NamespacedName: typeNamespacedName}
+			_, err := reconciler.Reconcile(testCtx, request)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(mockClient.updateCalled).To(BeTrue())
+			Expect(mockClient.lastUpdate.GetStatus().GetApiEndpoint()).To(Equal("10.0.0.1"))
+			Expect(mockClient.lastUpdate.GetStatus().GetIngressEndpoint()).To(Equal("10.0.0.2"))
+		})
+
+		It("should not sync VIP endpoints when status fields are empty", func() {
+			request := reconcile.Request{NamespacedName: typeNamespacedName}
+			_, err := reconciler.Reconcile(testCtx, request)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(mockClient.lastUpdate.GetStatus().GetApiEndpoint()).To(BeEmpty())
+			Expect(mockClient.lastUpdate.GetStatus().GetIngressEndpoint()).To(BeEmpty())
 		})
 
 		It("should not call update when reconciled twice with same data", func() {

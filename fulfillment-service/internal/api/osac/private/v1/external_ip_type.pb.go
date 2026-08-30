@@ -65,7 +65,8 @@ const (
 	//
 	// On deletion of an ExternalIP, the system removes the MetalLB LoadBalancer Service and
 	// returns the address to the pool. An ExternalIP cannot be deleted while attached
-	// (status.attached = true).
+	// (status.attached = true). The resource remains visible in this state until fully
+	// cleaned up.
 	ExternalIPState_EXTERNAL_IP_STATE_DELETING ExternalIPState = 4
 )
 
@@ -121,7 +122,7 @@ func (x ExternalIPState) Number() protoreflect.EnumNumber {
 // ExternalIPAttachment currently exists for this ExternalIP.
 //
 // The lifecycle follows: PENDING (awaiting allocation) -> ALLOCATED (IP assigned).
-// FAILED is a terminal error state. DELETING is set during deprovisioning.
+// FAILED is a terminal error state for provisioning failures. DELETING is set during deprovisioning.
 type ExternalIP struct {
 	state protoimpl.MessageState `protogen:"hybrid.v1"`
 	// Unique identifier of the external IP.

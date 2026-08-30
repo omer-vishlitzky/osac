@@ -17,20 +17,25 @@ package osac.public.v1;
 
 import "google/protobuf/struct.proto";
 
-// Defines a single field on the resource spec that a catalog item controls.
+// Defines a single field on the resource spec that a catalog item controls. Each field definition specifies whether
+// the user can set the field, what default value to apply, and optional JSON Schema validation constraints.
 message FieldDefinition {
-  // Dot-notation path referencing a field in the resource spec.
+  // Dot-notation path referencing a field in the resource spec. For example: "spec.network.pod_cidr" or
+  // "spec.node_sets.workers.size". Wildcards are not supported.
   string path = 1;
 
   // Human friendly label for this field, suitable for displaying in a UI.
   string display_name = 2;
 
-  // Whether the user is allowed to set this field.
+  // Whether the user is allowed to set this field. When false, the field value is always taken from the default and
+  // any user-provided value is overridden.
   bool editable = 3;
 
-  // Default value for this field.
+  // Default value for this field. Applied when the user does not provide a value (for editable fields) or always
+  // applied (for non-editable fields).
   google.protobuf.Value default = 4;
 
-  // Optional JSON Schema (draft 2020-12) for validating user-provided values of editable fields.
+  // Optional JSON Schema (draft 2020-12) for validating user-provided values of editable fields. The schema is stored
+  // as a JSON string. When empty, no validation is performed beyond type checking.
   string validation_schema = 5;
 }

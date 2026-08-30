@@ -19,7 +19,7 @@ Ansible automation for OSAC infrastructure provisioning. See `AGENTS.md` for com
 4. **Missing remote kubeconfig** — always include `osac.service.common` with `tasks_from: get_remote_cluster_kubeconfig`
 5. **Namespace label syntax** — `k8s.ovn.org/primary-user-defined-network: ""` (empty string, not missing value)
 
-## Cross-Repo Coordination
+## Cross-Component Coordination
 
 **Adding a new field to a resource (e.g., `mtu` to Subnet):**
 1. fulfillment-service: Add field to proto, regenerate

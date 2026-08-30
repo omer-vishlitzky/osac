@@ -19,10 +19,52 @@ import (
 
 	"github.com/google/uuid"
 	. "github.com/onsi/gomega"
+	"k8s.io/client-go/rest"
+	clnt "sigs.k8s.io/controller-runtime/pkg/client"
 
 	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
+	"github.com/osac-project/osac/fulfillment-service/internal/auth"
 	"github.com/osac-project/osac/fulfillment-service/internal/database/dao"
 )
+
+// stubHubClientProvider is a test double for HubClientProvider that returns a fixed client.
+type stubHubClientProvider struct {
+	client    clnt.Client
+	config    *rest.Config
+	namespace string
+}
+
+func (s *stubHubClientProvider) GetClient(_ context.Context, _ string) (*HubClientInfo, error) {
+	return &HubClientInfo{
+		Client:    s.client,
+		Config:    s.config,
+		Namespace: s.namespace,
+	}, nil
+}
+
+func (s *stubHubClientProvider) EvictClient(_ string) {
+	// No-op for stub
+}
+
+// hubClientProviderWithEvictionTracking is a test double for HubClientProvider that tracks EvictClient calls.
+type hubClientProviderWithEvictionTracking struct {
+	client        clnt.Client
+	config        *rest.Config
+	namespace     string
+	evictedHubIDs []string
+}
+
+func (h *hubClientProviderWithEvictionTracking) GetClient(_ context.Context, _ string) (*HubClientInfo, error) {
+	return &HubClientInfo{
+		Client:    h.client,
+		Config:    h.config,
+		Namespace: h.namespace,
+	}, nil
+}
+
+func (h *hubClientProviderWithEvictionTracking) EvictClient(hubID string) {
+	h.evictedHubIDs = append(h.evictedHubIDs, hubID)
+}
 
 func createComputeInstanceInState(
 	ctx context.Context,
@@ -45,4 +87,87 @@ func createComputeInstanceInState(
 	).Do(ctx)
 	ExpectWithOffset(1, err).ToNot(HaveOccurred())
 	return resp.GetObject()
+}
+
+// createDiskImageWithLifecycle seeds a DiskImage with the given lifecycle directly through
+// the DAO as a shared/global image, so a tenancy-filtered DAO resolves it. Id and Name are
+// set to the same value so a string default resolves whether treated as an id or a name.
+// Note: unit tests call servers directly, so the gRPC reference-validation interceptor is
+// not in the chain — existence is exercised by the handler's own lookup.
+func createDiskImageWithLifecycle(
+	name string,
+	lifecycle privatev1.DiskImageLifecycle,
+	deprecation *privatev1.DiskImageDeprecation,
+) {
+	diskImagesDao, err := dao.NewGenericDAO[*privatev1.DiskImage]().
+		SetLogger(logger).
+		SetTenancyLogic(tenancy).
+		Build()
+	ExpectWithOffset(1, err).ToNot(HaveOccurred())
+
+	_, err = diskImagesDao.Create().SetObject(
+		privatev1.DiskImage_builder{
+			Id: name,
+			Metadata: privatev1.Metadata_builder{
+				Name:   name,
+				Tenant: auth.SharedTenant,
+			}.Build(),
+			Spec: privatev1.DiskImageSpec_builder{
+				Lifecycle:   lifecycle,
+				Deprecation: deprecation,
+			}.Build(),
+		}.Build(),
+	).Do(ctx)
+	ExpectWithOffset(1, err).ToNot(HaveOccurred())
+}
+
+// createTenant seeds a Tenant row through the universal suite DAO. Non-shared tenants must exist
+// before a DiskImage can reference them: the reverse-reference trigger rejects a disk image whose
+// tenant is unknown.
+func createTenant(id string) {
+	tenantsDao, err := dao.NewGenericDAO[*privatev1.Tenant]().
+		SetLogger(logger).
+		SetTableName("tenants").
+		SetTenancyLogic(tenancy).
+		Build()
+	ExpectWithOffset(1, err).ToNot(HaveOccurred())
+
+	_, err = tenantsDao.Create().SetObject(
+		privatev1.Tenant_builder{
+			Id: id,
+			Metadata: privatev1.Metadata_builder{
+				Name:   id,
+				Tenant: id,
+			}.Build(),
+		}.Build(),
+	).Do(ctx)
+	ExpectWithOffset(1, err).ToNot(HaveOccurred())
+}
+
+// createAvailableDiskImageInTenant seeds an AVAILABLE DiskImage with an explicit id, name, and
+// tenant through the universal suite DAO (an unfiltered write). Used by the name-collision
+// precedence tests, where a shared image and one or more same-name tenant images must coexist so
+// the resolver's own-tenant-then-shared tie-break can be exercised. Unlike
+// createDiskImageWithLifecycle (which only seeds shared images with Id == Name), this decouples id
+// from name so a by-id lookup can be distinguished from a by-name lookup.
+func createAvailableDiskImageInTenant(id, name, tenant string) {
+	diskImagesDao, err := dao.NewGenericDAO[*privatev1.DiskImage]().
+		SetLogger(logger).
+		SetTenancyLogic(tenancy).
+		Build()
+	ExpectWithOffset(1, err).ToNot(HaveOccurred())
+
+	_, err = diskImagesDao.Create().SetObject(
+		privatev1.DiskImage_builder{
+			Id: id,
+			Metadata: privatev1.Metadata_builder{
+				Name:   name,
+				Tenant: tenant,
+			}.Build(),
+			Spec: privatev1.DiskImageSpec_builder{
+				Lifecycle: privatev1.DiskImageLifecycle_DISK_IMAGE_LIFECYCLE_AVAILABLE,
+			}.Build(),
+		}.Build(),
+	).Do(ctx)
+	ExpectWithOffset(1, err).ToNot(HaveOccurred())
 }

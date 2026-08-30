@@ -56,7 +56,7 @@ Minimal OpenShift cluster configuration.
 ### VM Templates
 
 #### `ocp_virt_vm`
-Virtual machine template for OpenShift Virtualization: **Linux and Windows** guests use the same template ID. Linux is the default. Windows is selected when any of the following is true (in order): role var `guest_os_family: windows` (e.g. extra vars), annotation `osac.openshift.io/guest-os-family: windows` on the `ComputeInstance`, or `spec.image.sourceRef` contains the substring `containerdisks/windows` (an informal convention in some community Windows disk images — not a Microsoft-official image catalog). **Windows requires** `spec.image.sourceRef` to point at **your** Windows container disk (golden image or registry path you maintain); this template does not ship a default. Windows uses sysprep / CloudBase-Init paths, Hyper-V domain defaults, and matching delete cleanup.
+Virtual machine template for OpenShift Virtualization: **Linux and Windows** guests use the same template ID. Linux is the default. Windows is selected when any of the following is true (in order): role var `guest_os_family: windows` (e.g. extra vars), annotation `osac.openshift.io/guest-os-family: windows` on the `ComputeInstance`, or the referenced DiskImage resource has `guest_os_family: GUEST_OS_FAMILY_WINDOWS`. **Windows requires** a DiskImage pointing at **your** Windows container disk (golden image or registry path you maintain); this template does not ship a default. Windows uses sysprep / CloudBase-Init paths, Hyper-V domain defaults, and matching delete cleanup.
 
 **Parameters:**
 
@@ -72,7 +72,7 @@ The following are read from the `ComputeInstance` spec:
 | `spec.cores` | Number of CPU cores |
 | `spec.memoryGiB` | Memory allocation in GiB |
 | `spec.bootDisk.sizeGiB` | Root disk size in GiB |
-| `spec.image.sourceRef` | Container disk image |
+| `spec.diskImage` | DiskImage reference (name or id) |
 | `spec.runStrategy` | VM run strategy (Always, Halted, etc.) |
 | `spec.sshKey` | SSH public key for VM access |
 | `spec.userDataSecretRef.name` | Secret containing cloud-init user data |
@@ -144,9 +144,7 @@ single file: `meta/osac.yaml`.
      # always pass instance_type explicitly.
      boot_disk:
        size_gib: 10
-     image:
-       source_type: registry
-       source_ref: "quay.io/containerdisks/fedora:latest"
+     disk_image: "fedora"
      run_strategy: "Always"
 
    parameters:
@@ -234,7 +232,7 @@ extra_var, populated by osac-operator from the Tier API:
   {"name": "default", "protocol": "nfs", "provider": "vast", "backend_id": "be-001",
    "qos_limits": {"static_limits": {"max_reads_bw_mbps": 100, "max_writes_bw_mbps": 100}}},
   {"name": "high-performance", "protocol": "block", "provider": "vast", "backend_id": "be-001",
-   "qos_limits": {"static_limits": {"max_reads_bw_mbps": 500, "max_writes_bw_mbps": 500}}, "quota_bytes": 500}
+   "qos_limits": {"static_limits": {"max_reads_bw_mbps": 500, "max_writes_bw_mbps": 500}}}
 ]
 ```
 
@@ -251,7 +249,6 @@ passed via the `storage_provider_backend_connections` extra_var, keyed by `backe
 | `backend_id` | provider-dependent | Key into `storage_provider_backend_connections` for this tier's backend credentials (required by providers that resolve credentials this way, e.g. VAST) |
 | `qos_policy` | n/a — derived, ignored if set by the caller | QoS policy name (creates STATIC mode policy on VMS), always derived from the tier name (`<name>-qos`). Any caller-supplied value is discarded, never used |
 | `qos_limits` | no | Dict merged into QoS POST body (e.g., `static_limits`, `static_total_limits`). A tier opts out of `qos_policy` derivation unless `qos_limits.static_limits` sets a positive `max_reads_bw_mbps` or `max_writes_bw_mbps` |
-| `quota_bytes` | no | Hard quota in bytes for the tier's view |
 
 **QoS limits:** When a tier has a derived `qos_policy` (see above), the role creates a QoS
 policy via REST API (`POST /api/qospolicies/`). The `qos_limits` dict is merged directly into
@@ -305,7 +302,7 @@ Templates integrate with OSAC through a well-defined interface:
 
 ### Storage Provider Lifecycle
 1. Operator creates Org CR, triggering `{{ aap_prefix }}-create-org` AAP job
-2. `setup` provisions VAST resources per tier (tenant, views, quotas)
+2. `setup` provisions VAST resources per tier (tenant, views)
 3. Per-tenant VAST user created with random password (admin creds never leave AAP)
 4. Tenant config + per-tenant credentials persisted to hub-cluster K8s Secret
 5. VIP pool is pre-configured globally by infra admins (not provisioned per-tenant)

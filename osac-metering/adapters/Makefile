@@ -8,12 +8,17 @@
 GO_VERSION ?= $(shell grep '^go ' go.mod | cut -d' ' -f2)
 GOTOOLCHAIN ?= go$(GO_VERSION)
 GINKGO ?= go run github.com/onsi/ginkgo/v2/ginkgo
-GOLANGCI_LINT_VERSION ?= v2.12.1
+CONTAINER_TOOL ?= podman
 
-LOCALBIN ?= $(shell pwd)/bin
-GOLANGCI_LINT ?= $(LOCALBIN)/golangci-lint
+# Image URLs for building/pushing the two adapter images.
+IMG_M360_ADAPTER ?= ghcr.io/osac-project/metering-m360-adapter:latest
+IMG_ECHO_ADAPTER ?= ghcr.io/osac-project/metering-echo-adapter:latest
 
-.PHONY: all build-echo-adapter build-m360-adapter test lint clean
+include $(shell git rev-parse --show-toplevel)/tools/golangci-lint.mk
+
+.PHONY: all build-echo-adapter build-m360-adapter test lint clean \
+	image-build-m360-adapter image-push-m360-adapter \
+	image-build-echo-adapter image-push-echo-adapter
 
 all: build-echo-adapter build-m360-adapter
 
@@ -28,12 +33,24 @@ build-m360-adapter:
 test:
 	$(GINKGO) run -r .
 
-lint: $(GOLANGCI_LINT)
+lint: golangci-lint
 	$(GOLANGCI_LINT) run ./...
 
-$(GOLANGCI_LINT):
-	@mkdir -p $(LOCALBIN)
-	GOTOOLCHAIN=$(GOTOOLCHAIN) GOBIN=$(LOCALBIN) go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
+# Context is `..` (osac-metering/), not `.` -- both adapter Containerfiles
+# also COPY the sibling schema/ directory, which only exists one level up
+# from adapters/ (matches build-metering-{m360,echo}-adapter-image.yaml's
+# `context: osac-metering`, `file: osac-metering/adapters/Containerfile.*`).
+image-build-m360-adapter:
+	$(CONTAINER_TOOL) build -t $(IMG_M360_ADAPTER) -f Containerfile.m360-adapter ..
+
+image-push-m360-adapter:
+	$(CONTAINER_TOOL) push $(IMG_M360_ADAPTER)
+
+image-build-echo-adapter:
+	$(CONTAINER_TOOL) build -t $(IMG_ECHO_ADAPTER) -f Containerfile.echo-adapter ..
+
+image-push-echo-adapter:
+	$(CONTAINER_TOOL) push $(IMG_ECHO_ADAPTER)
 
 clean:
 	rm -rf bin/

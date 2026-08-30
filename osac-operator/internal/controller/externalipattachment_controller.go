@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"k8s.io/apimachinery/pkg/api/equality"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/util/retry"
@@ -47,7 +48,7 @@ const (
 // ExternalIPAttachmentReconciler reconciles ExternalIPAttachment CRs.
 //
 // Creating a ExternalIPAttachment triggers an attach operation (osac-attach-external-ip AAP
-// template) that moves the MetalLB Service from the parking namespace to the VM namespace.
+// template) that binds the ExternalIP to the target's namespace.
 // Deleting the CR triggers detach (osac-detach-external-ip) which reverses that.
 //
 // The controller uses RunProvisioningLifecycle for provisioning, giving automatic
@@ -66,6 +67,9 @@ type ExternalIPAttachmentReconciler struct {
 	StatusPollInterval         time.Duration
 	MaxJobHistory              int
 	targetCluster              mc.ClusterName
+	// NetworkProvisioningEnabled controls whether the controller dispatches AAP
+	// provisioning jobs. When false, resources are set to Ready immediately.
+	NetworkProvisioningEnabled bool
 }
 
 // NewExternalIPAttachmentReconciler creates a new reconciler for ExternalIPAttachment resources.
@@ -121,6 +125,8 @@ func NewExternalIPAttachmentReconciler(
 // +kubebuilder:rbac:groups=osac.openshift.io,resources=clusterorders/finalizers,verbs=update
 // +kubebuilder:rbac:groups=osac.openshift.io,resources=baremetalinstances,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=osac.openshift.io,resources=baremetalinstances/finalizers,verbs=update
+// +kubebuilder:rbac:groups=osac.openshift.io,resources=subnets,verbs=get;list;watch
+// +kubebuilder:rbac:groups=osac.openshift.io,resources=virtualnetworks,verbs=get;list;watch
 
 // Reconcile handles create/update/delete for a ExternalIPAttachment CR.
 func (r *ExternalIPAttachmentReconciler) Reconcile(ctx context.Context, req mcreconcile.Request) (ctrl.Result, error) {
@@ -177,6 +183,34 @@ func (r *ExternalIPAttachmentReconciler) handleUpdate(ctx context.Context, attac
 		attachment.Status.Phase = v1alpha1.ExternalIPAttachmentPhaseProgressing
 	}
 
+	// When networking provisioning is disabled, skip AAP job dispatch and set Ready
+	// immediately. This must be checked before the BMI primary IP check to avoid
+	// blocking forever waiting for a BMI IP that will never be discovered in noop mode.
+	if !r.NetworkProvisioningEnabled {
+		attachment.Status.Phase = v1alpha1.ExternalIPAttachmentPhaseReady
+		setReadyConditionTrue(&attachment.Status.Conditions)
+		return ctrl.Result{}, nil
+	}
+
+	// Resolve target first — adds the externalip-detach finalizer to the target CR,
+	// which prevents it from being fully deleted while the attachment exists. This must
+	// happen before ExternalIP/Pool resolution because those preconditions can take time,
+	// and the target could be deleted in that window.
+	ci, result, err := r.resolveComputeInstance(ctx, attachment)
+	if err != nil || result.RequeueAfter > 0 {
+		return result, err
+	}
+
+	co, result, err := r.resolveClusterOrder(ctx, attachment)
+	if err != nil || result.RequeueAfter > 0 {
+		return result, err
+	}
+
+	bmi, result, err := r.resolveBaremetalInstance(ctx, attachment)
+	if err != nil || result.RequeueAfter > 0 {
+		return result, err
+	}
+
 	// Resolve parent ExternalIP by UUID label (spec.externalIP contains the fulfillment-service UUID)
 	externalIPList := &v1alpha1.ExternalIPList{}
 	if err := r.List(ctx, externalIPList,
@@ -190,6 +224,11 @@ func (r *ExternalIPAttachmentReconciler) handleUpdate(ctx context.Context, attac
 		return ctrl.Result{RequeueAfter: defaultPreconditionRequeueInterval}, nil
 	}
 	externalIP := &externalIPList.Items[0]
+
+	if externalIP.Status.Address == "" {
+		log.Info("ExternalIP address not allocated yet, requeueing", "externalIP", externalIP.Name)
+		return ctrl.Result{RequeueAfter: defaultPreconditionRequeueInterval}, nil
+	}
 
 	// Resolve parent ExternalIPPool by UUID label
 	poolList := &v1alpha1.ExternalIPPoolList{}
@@ -210,25 +249,23 @@ func (r *ExternalIPAttachmentReconciler) handleUpdate(ctx context.Context, attac
 		implementationStrategy = defaultExternalIPPoolImplementationStrategy
 	}
 
-	// Resolve target ComputeInstance
-	ci, result, err := r.resolveComputeInstance(ctx, attachment)
+	// BMI DNAT precondition: wait for primary IP to be discovered
+	if bmi != nil && bmi.PrimaryIPAddress() == "" {
+		log.Info("BareMetalInstance primary IP not yet discovered, requeueing",
+			"baremetalInstance", bmi.Name)
+		return ctrl.Result{RequeueAfter: defaultPreconditionRequeueInterval}, nil
+	}
+
+	// Resolve the tenant VirtualNetwork name so the AAP job can create the NAT rule in
+	// the tenant VPC that owns the target IP (VPC name == VirtualNetwork name).
+	targetVNName, result, err := r.resolveTargetVirtualNetworkName(ctx, ci, bmi)
 	if err != nil || result.RequeueAfter > 0 {
 		return result, err
 	}
 
-	// Resolve target ClusterOrder
-	co, result, err := r.resolveClusterOrder(ctx, attachment)
-	if err != nil || result.RequeueAfter > 0 {
-		return result, err
-	}
-
-	// Resolve target BareMetalInstance
-	_, result, err = r.resolveBaremetalInstance(ctx, attachment)
-	if err != nil || result.RequeueAfter > 0 {
-		return result, err
-	}
-
-	needsUpdate := r.syncAnnotations(attachment, pool, externalIP, implementationStrategy, ci, co)
+	needsUpdate := r.syncAnnotations(
+		attachment, pool, externalIP, implementationStrategy, ci, co, bmi, targetVNName,
+	)
 	if needsUpdate {
 		if err := r.Update(ctx, attachment); err != nil {
 			return ctrl.Result{}, err
@@ -270,6 +307,8 @@ func (r *ExternalIPAttachmentReconciler) syncAnnotations(
 	implementationStrategy string,
 	ci *v1alpha1.ComputeInstance,
 	co *v1alpha1.ClusterOrder,
+	bmi *bmfov1alpha1.BareMetalInstance,
+	targetVNName string,
 ) bool {
 	if attachment.Annotations == nil {
 		attachment.Annotations = make(map[string]string)
@@ -302,7 +341,91 @@ func (r *ExternalIPAttachmentReconciler) syncAnnotations(
 			needsUpdate = true
 		}
 	}
+	if bmi != nil {
+		targetIP := bmi.PrimaryIPAddress()
+		if targetIP != "" && attachment.Annotations[osacExternalIPTargetIPAnnotation] != targetIP {
+			attachment.Annotations[osacExternalIPTargetIPAnnotation] = targetIP
+			needsUpdate = true
+		}
+	}
+	if targetVNName != "" && attachment.Annotations[osacVirtualNetworkNameAnnotation] != targetVNName {
+		attachment.Annotations[osacVirtualNetworkNameAnnotation] = targetVNName
+		needsUpdate = true
+	}
 	return needsUpdate
+}
+
+// resolveTargetVirtualNetworkName resolves the tenant VirtualNetwork CR name for the
+// attachment's target — the parent VirtualNetwork of the target's primary subnet.
+// Returns "" when the target is not a tenant resource (e.g. a cluster attachment).
+// The AAP role uses this name to resolve the target network on the fabric backend.
+func (r *ExternalIPAttachmentReconciler) resolveTargetVirtualNetworkName(
+	ctx context.Context,
+	ci *v1alpha1.ComputeInstance,
+	bmi *bmfov1alpha1.BareMetalInstance,
+) (string, ctrl.Result, error) {
+	// Look up the target's primary Subnet CR. BMI carries a fulfillment Subnet UUID
+	// (looked up by label); ComputeInstance carries the Subnet CR name.
+	var subnet *v1alpha1.Subnet
+	switch {
+	case bmi != nil:
+		subnetRef := primaryBMISubnetRef(bmi)
+		if subnetRef == "" {
+			return "", ctrl.Result{}, nil
+		}
+		subnetList := &v1alpha1.SubnetList{}
+		if err := r.Client.List(ctx, subnetList,
+			client.InNamespace(r.NetworkingNamespace),
+			client.MatchingLabels{osacSubnetIDLabel: subnetRef}); err != nil {
+			return "", ctrl.Result{}, err
+		}
+		if len(subnetList.Items) == 0 {
+			return "", ctrl.Result{RequeueAfter: defaultPreconditionRequeueInterval}, nil
+		}
+		subnet = &subnetList.Items[0]
+	case ci != nil:
+		subnetName := ci.Spec.PrimarySubnetRef()
+		if subnetName == "" {
+			return "", ctrl.Result{}, nil
+		}
+		s := &v1alpha1.Subnet{}
+		if err := r.Client.Get(ctx,
+			client.ObjectKey{Namespace: r.NetworkingNamespace, Name: subnetName}, s); err != nil {
+			if apierrors.IsNotFound(err) {
+				return "", ctrl.Result{RequeueAfter: defaultPreconditionRequeueInterval}, nil
+			}
+			return "", ctrl.Result{}, err
+		}
+		subnet = s
+	default:
+		return "", ctrl.Result{}, nil
+	}
+
+	// Subnet.Spec.VirtualNetwork is the VN UUID; resolve it to the VN CR name.
+	vnList := &v1alpha1.VirtualNetworkList{}
+	if err := r.Client.List(ctx, vnList,
+		client.InNamespace(r.NetworkingNamespace),
+		client.MatchingLabels{osacVirtualNetworkIDLabel: subnet.Spec.VirtualNetwork}); err != nil {
+		return "", ctrl.Result{}, err
+	}
+	if len(vnList.Items) == 0 {
+		return "", ctrl.Result{RequeueAfter: defaultPreconditionRequeueInterval}, nil
+	}
+	return vnList.Items[0].Name, ctrl.Result{}, nil
+}
+
+// primaryBMISubnetRef returns the SubnetRef of the BareMetalInstance's primary network
+// attachment, mirroring BareMetalInstance.PrimaryIPAddress() selection.
+func primaryBMISubnetRef(bmi *bmfov1alpha1.BareMetalInstance) string {
+	for _, nas := range bmi.Status.NetworkAttachmentStatuses {
+		if nas.Primary && nas.IPAddress != "" {
+			return nas.SubnetRef
+		}
+	}
+	if len(bmi.Status.NetworkAttachmentStatuses) == 1 {
+		return bmi.Status.NetworkAttachmentStatuses[0].SubnetRef
+	}
+	return ""
 }
 
 // resolveComputeInstance looks up the target ComputeInstance by UUID label, handles
@@ -326,8 +449,11 @@ func (r *ExternalIPAttachmentReconciler) resolveComputeInstance(
 		return nil, ctrl.Result{}, err
 	}
 	if len(ciList.Items) == 0 {
-		log.Info("ComputeInstance not found, requeueing", "computeInstanceUUID", *attachment.Spec.ComputeInstance)
-		return nil, ctrl.Result{RequeueAfter: defaultPreconditionRequeueInterval}, nil
+		log.Info("auto-detaching: ComputeInstance no longer exists", "computeInstanceUUID", *attachment.Spec.ComputeInstance)
+		if err := r.Delete(ctx, attachment); err != nil {
+			return nil, ctrl.Result{}, client.IgnoreNotFound(err)
+		}
+		return nil, ctrl.Result{RequeueAfter: time.Second}, nil
 	}
 	ci := &ciList.Items[0]
 
@@ -376,8 +502,11 @@ func (r *ExternalIPAttachmentReconciler) resolveClusterOrder(
 		return nil, ctrl.Result{}, err
 	}
 	if len(coList.Items) == 0 {
-		log.Info("ClusterOrder not found, requeueing", "clusterOrderUUID", *attachment.Spec.Cluster)
-		return nil, ctrl.Result{RequeueAfter: defaultPreconditionRequeueInterval}, nil
+		log.Info("auto-detaching: ClusterOrder no longer exists", "clusterOrderUUID", *attachment.Spec.Cluster)
+		if err := r.Delete(ctx, attachment); err != nil {
+			return nil, ctrl.Result{}, client.IgnoreNotFound(err)
+		}
+		return nil, ctrl.Result{RequeueAfter: time.Second}, nil
 	}
 	co := &coList.Items[0]
 
@@ -445,8 +574,11 @@ func (r *ExternalIPAttachmentReconciler) resolveBaremetalInstance(
 		return nil, ctrl.Result{}, err
 	}
 	if len(bmiList.Items) == 0 {
-		log.Info("BareMetalInstance not found, requeueing", "baremetalInstanceUUID", *attachment.Spec.BaremetalInstance)
-		return nil, ctrl.Result{RequeueAfter: defaultPreconditionRequeueInterval}, nil
+		log.Info("auto-detaching: BareMetalInstance no longer exists", "baremetalInstanceUUID", *attachment.Spec.BaremetalInstance)
+		if err := r.Delete(ctx, attachment); err != nil {
+			return nil, ctrl.Result{}, client.IgnoreNotFound(err)
+		}
+		return nil, ctrl.Result{RequeueAfter: time.Second}, nil
 	}
 	bmi := &bmiList.Items[0]
 
@@ -574,9 +706,13 @@ func (r *ExternalIPAttachmentReconciler) handleDelete(ctx context.Context, attac
 		return ctrl.Result{}, nil
 	}
 
-	result, err := r.handleDeprovisioning(ctx, attachment)
-	if err != nil || result.RequeueAfter > 0 {
-		return result, err
+	if attachment.Annotations[osacImplementationStrategyAnnotation] == "" {
+		log.Info("skipping deprovisioning — attachment was never provisioned")
+	} else {
+		result, err := r.handleDeprovisioning(ctx, attachment)
+		if err != nil || result.RequeueAfter > 0 {
+			return result, err
+		}
 	}
 
 	// Deprovisioning complete: update parent resources and remove finalizers

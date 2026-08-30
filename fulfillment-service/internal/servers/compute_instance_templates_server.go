@@ -116,6 +116,7 @@ func (b *ComputeInstanceTemplatesServerBuilder) Build() (result *ComputeInstance
 		SetAttributionLogic(b.attributionLogic).
 		SetTenancyLogic(b.tenancyLogic).
 		SetMetricsRegisterer(b.metricsRegisterer).
+		SetFilterDesc((*publicv1.ComputeInstanceTemplate)(nil).ProtoReflect().Descriptor()).
 		Build()
 	if err != nil {
 		return
@@ -136,7 +137,9 @@ func (s *ComputeInstanceTemplatesServer) List(ctx context.Context,
 	// Create private request with same parameters:
 	privateRequest := &privatev1.ComputeInstanceTemplatesListRequest{}
 	privateRequest.SetOffset(request.GetOffset())
-	privateRequest.SetLimit(request.GetLimit())
+	if request.HasLimit() {
+		privateRequest.SetLimit(request.GetLimit())
+	}
 	privateRequest.SetFilter(request.GetFilter())
 
 	// Delegate to private server:

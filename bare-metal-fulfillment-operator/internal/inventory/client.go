@@ -41,6 +41,12 @@ type Host struct {
 	ManagedBy           string
 }
 
+// HostNIC represents a physical network interface on an inventory host.
+type HostNIC struct {
+	// MAC is the hardware MAC address, lowercased (e.g. "aa:bb:cc:dd:ee:ff").
+	MAC string
+}
+
 // Client interface for inventory implementations
 type Client interface {
 	// FindFreeHost returns a host with matching fields that is not already assigned
@@ -55,6 +61,11 @@ type Client interface {
 
 	// UnassignHost updates the host by undoing the assign operation
 	UnassignHost(ctx context.Context, inventoryHostID string, labels []string) error
+
+	// GetHostNICs returns the physical network interfaces for an allocated host.
+	// Returns nil, nil when the backend does not support NIC discovery for this host class.
+	// Returns an error when NIC data is expected but unavailable (backend failure or unexpected missing data on a supported backend).
+	GetHostNICs(ctx context.Context, inventoryHostID string) ([]HostNIC, error)
 }
 
 // NewClientFunc is a function that creates a new inventory client from config

@@ -15,17 +15,18 @@ syntax = "proto3";
 
 package osac.private.v1;
 
+import "cleanapi/cleanapi.proto";
 import "osac/private/v1/metadata_type.proto";
 import "osac/private/v1/role_type.proto";
 import "osac/private/v1/user_type.proto";
+
+option (cleanapi.file).package = "osac.public.v1";
 
 // Represents a binding between a role and a set of users.
 //
 // A RoleBinding grants the permissions defined by its referenced role to the users listed in its spec. This is
 // the mechanism by which roles are assigned to users, enabling those users to perform the actions permitted by
 // the role.
-//
-// Users are referenced by their internal User object IDs.
 message RoleBinding {
   // Unique identifier of the role binding.
   string id = 1;
@@ -66,7 +67,7 @@ message RoleBindingStatus {
   // List of users that have been successfully synced to the authorization system. This tracks which users
   // currently have the role assigned in Keycloak, allowing the controller to detect when users are added or
   // removed from the binding.
-  repeated UserReference users = 3;
+  repeated UserReference users = 3 [(cleanapi.field).private = true];
 }
 
 // Synchronization states for RoleBinding objects with the underlying authorization system.

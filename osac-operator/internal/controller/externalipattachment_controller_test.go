@@ -121,6 +121,9 @@ var _ = Describe("ExternalIPAttachmentReconciler", func() {
 			Spec: osacv1alpha1.ExternalIPSpec{
 				Pool: testPoolUUID,
 			},
+			Status: osacv1alpha1.ExternalIPStatus{
+				Address: "198.51.100.10",
+			},
 		}
 
 		ci = &osacv1alpha1.ComputeInstance{
@@ -167,6 +170,7 @@ var _ = Describe("ExternalIPAttachmentReconciler", func() {
 			ProvisioningProvider:       mockProvider,
 			StatusPollInterval:         1 * time.Second,
 			MaxJobHistory:              10,
+			NetworkProvisioningEnabled: true,
 		}
 	}
 
@@ -249,15 +253,19 @@ var _ = Describe("ExternalIPAttachmentReconciler", func() {
 			Expect(result.RequeueAfter).To(Equal(defaultPreconditionRequeueInterval))
 		})
 
-		It("should requeue when ComputeInstance not found", func() {
+		It("should auto-detach when ComputeInstance not found", func() {
 			fakeClient = buildClient(attachment, publicIP, pool) // no CI
 			setupReconciler(fakeClient)
 
 			_, _ = reconcileOnce() // finalizer
+			_, _ = reconcileOnce() // auto-detach: sets DeletionTimestamp
+			_, _ = reconcileOnce() // handleDelete: removes finalizer
 
-			result, err := reconcileOnce()
-			Expect(err).NotTo(HaveOccurred())
-			Expect(result.RequeueAfter).To(Equal(defaultPreconditionRequeueInterval))
+			fetched := &osacv1alpha1.ExternalIPAttachment{}
+			err := fakeClient.Get(ctx, types.NamespacedName{
+				Namespace: attachment.Namespace, Name: attachment.Name,
+			}, fetched)
+			Expect(apierrors.IsNotFound(err)).To(BeTrue())
 		})
 
 		It("should requeue when CI has no VirtualMachineReference", func() {
@@ -893,15 +901,19 @@ var _ = Describe("ExternalIPAttachmentReconciler", func() {
 			return reconciler.Reconcile(testCtx, mcreconcile.Request{Request: ctrl.Request{NamespacedName: clusterKey}})
 		}
 
-		It("should requeue when ClusterOrder not found", func() {
+		It("should auto-detach when ClusterOrder not found", func() {
 			fakeClient = buildClient(clusterAttachment, publicIP, pool)
 			setupReconciler(fakeClient)
 
 			_, _ = clusterReconcileOnce() // finalizer
+			_, _ = clusterReconcileOnce() // auto-detach: sets DeletionTimestamp
+			_, _ = clusterReconcileOnce() // handleDelete: removes finalizer
 
-			result, err := clusterReconcileOnce()
-			Expect(err).NotTo(HaveOccurred())
-			Expect(result.RequeueAfter).To(Equal(defaultPreconditionRequeueInterval))
+			fetched := &osacv1alpha1.ExternalIPAttachment{}
+			err := fakeClient.Get(ctx, types.NamespacedName{
+				Namespace: clusterAttachment.Namespace, Name: clusterAttachment.Name,
+			}, fetched)
+			Expect(apierrors.IsNotFound(err)).To(BeTrue())
 		})
 
 		It("should requeue when ClusterOrder has no API endpoint", func() {
@@ -1282,15 +1294,19 @@ var _ = Describe("ExternalIPAttachmentReconciler", func() {
 			})
 		}
 
-		It("should requeue when BareMetalInstance not found", func() {
+		It("should auto-detach when BareMetalInstance not found", func() {
 			fakeClient = buildClient(bmiAttachment, publicIP, pool)
 			setupReconciler(fakeClient)
 
 			_, _ = bmiReconcileOnce() // finalizer
+			_, _ = bmiReconcileOnce() // auto-detach: sets DeletionTimestamp
+			_, _ = bmiReconcileOnce() // handleDelete: removes finalizer
 
-			result, err := bmiReconcileOnce()
-			Expect(err).NotTo(HaveOccurred())
-			Expect(result.RequeueAfter).To(Equal(defaultPreconditionRequeueInterval))
+			fetched := &osacv1alpha1.ExternalIPAttachment{}
+			err := fakeClient.Get(ctx, types.NamespacedName{
+				Namespace: bmiAttachment.Namespace, Name: bmiAttachment.Name,
+			}, fetched)
+			Expect(apierrors.IsNotFound(err)).To(BeTrue())
 		})
 
 		It("should add detach finalizer to BareMetalInstance", func() {
@@ -1424,5 +1440,126 @@ var _ = Describe("ExternalIPAttachmentReconciler", func() {
 			Expect(fakeClient.Get(testCtx, client.ObjectKeyFromObject(bmi), updatedBMI)).To(Succeed())
 			Expect(updatedBMI.Finalizers).To(ContainElement(osacExternalIPDetachFinalizer))
 		})
+	})
+})
+
+var _ = Describe("ExternalIPAttachment tenant VPC resolution", func() {
+	const (
+		nsNet      = "test-networking"
+		subnetUUID = "subnet-uuid-1"
+		vnUUID     = "vn-uuid-1"
+		vnName     = "virtualnetwork-gctnt"
+	)
+	var (
+		vpcScheme *runtime.Scheme
+		vpcCtx    context.Context
+	)
+
+	BeforeEach(func() {
+		vpcCtx = context.TODO()
+		vpcScheme = runtime.NewScheme()
+		Expect(osacv1alpha1.AddToScheme(vpcScheme)).To(Succeed())
+		Expect(bmfov1alpha1.AddToScheme(vpcScheme)).To(Succeed())
+	})
+
+	newVPCReconciler := func(objs ...client.Object) *ExternalIPAttachmentReconciler {
+		c := fake.NewClientBuilder().WithScheme(vpcScheme).WithObjects(objs...).Build()
+		return &ExternalIPAttachmentReconciler{Client: c, NetworkingNamespace: nsNet}
+	}
+	subnetCR := func(name string) *osacv1alpha1.Subnet {
+		return &osacv1alpha1.Subnet{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: name, Namespace: nsNet,
+				Labels: map[string]string{osacSubnetIDLabel: subnetUUID},
+			},
+			Spec: osacv1alpha1.SubnetSpec{VirtualNetwork: vnUUID},
+		}
+	}
+	vnCR := func() *osacv1alpha1.VirtualNetwork {
+		return &osacv1alpha1.VirtualNetwork{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: vnName, Namespace: nsNet,
+				Labels: map[string]string{osacVirtualNetworkIDLabel: vnUUID},
+			},
+		}
+	}
+
+	It("resolves the VN name from a BMI primary subnet (looked up by UUID)", func() {
+		bmi := &bmfov1alpha1.BareMetalInstance{
+			Status: bmfov1alpha1.BareMetalInstanceStatus{
+				NetworkAttachmentStatuses: []bmfov1alpha1.BareMetalNetworkAttachmentStatus{
+					{Primary: true, IPAddress: "10.100.0.2", SubnetRef: subnetUUID},
+				},
+			},
+		}
+		r := newVPCReconciler(subnetCR("subnet-gxx2l"), vnCR())
+		name, res, err := r.resolveTargetVirtualNetworkName(vpcCtx, nil, bmi)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(res.RequeueAfter).To(BeZero())
+		Expect(name).To(Equal(vnName))
+	})
+
+	It("resolves the VN name from a ComputeInstance primary subnet (looked up by name)", func() {
+		ci := &osacv1alpha1.ComputeInstance{
+			Spec: osacv1alpha1.ComputeInstanceSpec{
+				NetworkAttachments: []osacv1alpha1.ComputeNetworkAttachment{{SubnetRef: "subnet-cr-name"}},
+			},
+		}
+		r := newVPCReconciler(subnetCR("subnet-cr-name"), vnCR())
+		name, res, err := r.resolveTargetVirtualNetworkName(vpcCtx, ci, nil)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(res.RequeueAfter).To(BeZero())
+		Expect(name).To(Equal(vnName))
+	})
+
+	It("returns empty for a non-tenant (cluster) target", func() {
+		r := newVPCReconciler()
+		name, res, err := r.resolveTargetVirtualNetworkName(vpcCtx, nil, nil)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(res.RequeueAfter).To(BeZero())
+		Expect(name).To(BeEmpty())
+	})
+
+	It("requeues when the subnet CR is not present yet", func() {
+		bmi := &bmfov1alpha1.BareMetalInstance{
+			Status: bmfov1alpha1.BareMetalInstanceStatus{
+				NetworkAttachmentStatuses: []bmfov1alpha1.BareMetalNetworkAttachmentStatus{
+					{Primary: true, IPAddress: "10.100.0.2", SubnetRef: subnetUUID},
+				},
+			},
+		}
+		r := newVPCReconciler(vnCR()) // subnet not seeded
+		name, res, err := r.resolveTargetVirtualNetworkName(vpcCtx, nil, bmi)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(name).To(BeEmpty())
+		Expect(res.RequeueAfter).To(BeNumerically(">", 0))
+	})
+})
+
+var _ = Describe("primaryBMISubnetRef", func() {
+	It("returns the primary attachment's subnet ref", func() {
+		bmi := &bmfov1alpha1.BareMetalInstance{Status: bmfov1alpha1.BareMetalInstanceStatus{
+			NetworkAttachmentStatuses: []bmfov1alpha1.BareMetalNetworkAttachmentStatus{
+				{Primary: false, IPAddress: "10.0.0.5", SubnetRef: "s-secondary"},
+				{Primary: true, IPAddress: "10.0.0.2", SubnetRef: "s-primary"},
+			},
+		}}
+		Expect(primaryBMISubnetRef(bmi)).To(Equal("s-primary"))
+	})
+	It("treats a single attachment as implicitly primary", func() {
+		bmi := &bmfov1alpha1.BareMetalInstance{Status: bmfov1alpha1.BareMetalInstanceStatus{
+			NetworkAttachmentStatuses: []bmfov1alpha1.BareMetalNetworkAttachmentStatus{
+				{SubnetRef: "only", IPAddress: "10.0.0.9"},
+			},
+		}}
+		Expect(primaryBMISubnetRef(bmi)).To(Equal("only"))
+	})
+	It("returns empty when multiple attachments and none is primary", func() {
+		bmi := &bmfov1alpha1.BareMetalInstance{Status: bmfov1alpha1.BareMetalInstanceStatus{
+			NetworkAttachmentStatuses: []bmfov1alpha1.BareMetalNetworkAttachmentStatus{
+				{SubnetRef: "a"}, {SubnetRef: "b"},
+			},
+		}}
+		Expect(primaryBMISubnetRef(bmi)).To(BeEmpty())
 	})
 })

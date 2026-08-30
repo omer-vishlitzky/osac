@@ -16,6 +16,7 @@ package computeinstance
 import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"github.com/spf13/pflag"
 	"google.golang.org/protobuf/proto"
 
 	publicv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/public/v1"
@@ -72,9 +73,9 @@ var _ = Describe("buildSpec", func() {
 
 		want := publicv1.ComputeInstanceSpec_builder{
 			Template: publicv1.ComputeInstanceTemplateReference_builder{Id: "tmpl"}.Build(),
-			NetworkAttachments: []*publicv1.NetworkAttachment{
-				publicv1.NetworkAttachment_builder{Subnet: publicv1.SubnetLocalReference_builder{Id: "n1"}.Build()}.Build(),
-				publicv1.NetworkAttachment_builder{
+			NetworkAttachments: []*publicv1.ComputeNetworkAttachment{
+				publicv1.ComputeNetworkAttachment_builder{Subnet: publicv1.SubnetLocalReference_builder{Id: "n1"}.Build()}.Build(),
+				publicv1.ComputeNetworkAttachment_builder{
 					Subnet:         publicv1.SubnetLocalReference_builder{Id: "n2"}.Build(),
 					SecurityGroups: []*publicv1.SecurityGroupLocalReference{publicv1.SecurityGroupLocalReference_builder{Id: "g1"}.Build()},
 				}.Build(),
@@ -83,23 +84,23 @@ var _ = Describe("buildSpec", func() {
 		Expect(proto.Equal(spec, want)).To(BeTrue(), "spec should equal expected spec")
 	})
 
-	It("should set IsWindows when windows flag is true", func() {
+	It("should set disk_image when disk-image flag is provided", func() {
 		c := &runnerContext{}
-		c.args.windows = true
+		c.args.diskImage = "my-disk-image"
 		spec, err := c.buildSpec("tmpl", nil)
 		Expect(err).NotTo(HaveOccurred())
 
-		Expect(spec.HasIsWindows()).To(BeTrue())
-		Expect(spec.GetIsWindows()).To(BeTrue())
+		Expect(spec.HasDiskImage()).To(BeTrue())
+		Expect(spec.GetDiskImage().GetName()).To(Equal("my-disk-image"))
 	})
 
-	It("should leave IsWindows nil when windows flag is false", func() {
+	It("should leave disk_image unset when disk-image flag is empty", func() {
 		c := &runnerContext{}
-		c.args.windows = false
+		c.args.diskImage = ""
 		spec, err := c.buildSpec("tmpl", nil)
 		Expect(err).NotTo(HaveOccurred())
 
-		Expect(spec.HasIsWindows()).To(BeFalse())
+		Expect(spec.HasDiskImage()).To(BeFalse())
 	})
 })
 
@@ -112,9 +113,9 @@ var _ = Describe("buildSpecFromCatalogItem", func() {
 
 		want := publicv1.ComputeInstanceSpec_builder{
 			CatalogItem: publicv1.ComputeInstanceCatalogItemReference_builder{Id: "cat-001"}.Build(),
-			NetworkAttachments: []*publicv1.NetworkAttachment{
-				publicv1.NetworkAttachment_builder{Subnet: publicv1.SubnetLocalReference_builder{Id: "n1"}.Build()}.Build(),
-				publicv1.NetworkAttachment_builder{
+			NetworkAttachments: []*publicv1.ComputeNetworkAttachment{
+				publicv1.ComputeNetworkAttachment_builder{Subnet: publicv1.SubnetLocalReference_builder{Id: "n1"}.Build()}.Build(),
+				publicv1.ComputeNetworkAttachment_builder{
 					Subnet:         publicv1.SubnetLocalReference_builder{Id: "n2"}.Build(),
 					SecurityGroups: []*publicv1.SecurityGroupLocalReference{publicv1.SecurityGroupLocalReference_builder{Id: "g1"}.Build()},
 				}.Build(),
@@ -141,23 +142,23 @@ var _ = Describe("buildSpecFromCatalogItem", func() {
 		Expect(err).To(HaveOccurred())
 	})
 
-	It("should set IsWindows when windows flag is true", func() {
+	It("should set disk_image when disk-image flag is provided", func() {
 		c := &runnerContext{}
-		c.args.windows = true
+		c.args.diskImage = "my-disk-image"
 		spec, err := c.buildSpecFromCatalogItem("cat-004")
 		Expect(err).NotTo(HaveOccurred())
 
-		Expect(spec.HasIsWindows()).To(BeTrue())
-		Expect(spec.GetIsWindows()).To(BeTrue())
+		Expect(spec.HasDiskImage()).To(BeTrue())
+		Expect(spec.GetDiskImage().GetName()).To(Equal("my-disk-image"))
 	})
 
-	It("should leave IsWindows nil when windows flag is false", func() {
+	It("should leave disk_image unset when disk-image flag is empty", func() {
 		c := &runnerContext{}
-		c.args.windows = false
+		c.args.diskImage = ""
 		spec, err := c.buildSpecFromCatalogItem("cat-005")
 		Expect(err).NotTo(HaveOccurred())
 
-		Expect(spec.HasIsWindows()).To(BeFalse())
+		Expect(spec.HasDiskImage()).To(BeFalse())
 	})
 })
 
@@ -197,13 +198,12 @@ var _ = Describe("Create computeinstance flag registration", func() {
 		Expect(flag.Shorthand).To(Equal("t"))
 	})
 
-	It("should register --windows flag with default value false", func() {
+	It("should register --disk-image flag", func() {
 		cmd := Cmd()
 		cmd.SetOut(GinkgoWriter)
 		cmd.SetErr(GinkgoWriter)
-		flag := cmd.Flags().Lookup("windows")
+		flag := cmd.Flags().Lookup("disk-image")
 		Expect(flag).NotTo(BeNil())
-		Expect(flag.DefValue).To(Equal("false"))
 	})
 })
 
@@ -230,5 +230,48 @@ var _ = Describe("Create computeinstance flag validation", func() {
 		Expect(err.Error()).To(ContainSubstring("at least one of the flags"))
 		Expect(err.Error()).To(ContainSubstring("catalog-item"))
 		Expect(err.Error()).To(ContainSubstring("template"))
+	})
+})
+
+var _ = Describe("--additional-disk flag parsing", func() {
+	// rawDisks parses the given args on a fresh command and returns the
+	// --additional-disk values exactly as Cobra stored them. It reads through
+	// pflag's SliceValue interface, which both StringSlice and StringArray
+	// implement, so the assertions below can catch the difference in how those
+	// two types split (or preserve) the value during Parse().
+	rawDisks := func(args ...string) []string {
+		cmd := Cmd()
+		cmd.SetOut(GinkgoWriter)
+		cmd.SetErr(GinkgoWriter)
+		Expect(cmd.Flags().Parse(args)).To(Succeed())
+		val, ok := cmd.Flags().Lookup("additional-disk").Value.(pflag.SliceValue)
+		Expect(ok).To(BeTrue(), "additional-disk flag must expose a slice value")
+		return val.GetSlice()
+	}
+
+	It("should keep a single comma-joined key=value spec as one element", func() {
+		raw := rawDisks("--additional-disk", "size=50,storage-tier=e2e-x")
+		Expect(raw).To(Equal([]string{"size=50,storage-tier=e2e-x"}))
+
+		disks, err := parseAdditionalDisks(raw)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(disks).To(HaveLen(1))
+		Expect(disks[0].GetSizeGib()).To(Equal(int32(50)))
+		Expect(disks[0].GetStorageTier()).To(Equal("e2e-x"))
+	})
+
+	It("should treat each flag occurrence as a distinct disk", func() {
+		raw := rawDisks(
+			"--additional-disk", "size=50,storage-tier=e2e-x",
+			"--additional-disk", "100",
+		)
+		Expect(raw).To(Equal([]string{"size=50,storage-tier=e2e-x", "100"}))
+
+		disks, err := parseAdditionalDisks(raw)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(disks).To(HaveLen(2))
+		Expect(disks[0].GetSizeGib()).To(Equal(int32(50)))
+		Expect(disks[0].GetStorageTier()).To(Equal("e2e-x"))
+		Expect(disks[1].GetSizeGib()).To(Equal(int32(100)))
 	})
 })

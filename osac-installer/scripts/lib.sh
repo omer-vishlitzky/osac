@@ -102,7 +102,7 @@ http_retry() {
     local err_msg="$1" retries="$2" interval="$3"
     shift 3
     for attempt in $(seq 1 "$retries"); do
-        curl -ksS --fail-with-body "$@" && return 0
+        curl -sS --fail-with-body "$@" && return 0
         if (( attempt < retries )); then
             echo "  http_retry: attempt ${attempt}/${retries} failed, retrying in ${interval}s..." >&2
             sleep "$interval"
@@ -120,7 +120,7 @@ http_json() {
     shift 4
     local result
     for attempt in $(seq 1 "$retries"); do
-        if result=$(curl -ksS --fail-with-body "$@" | jq -r "$filter"); then
+        if result=$(curl -sS --fail-with-body "$@" | jq -r "$filter"); then
             printf '%s\n' "$result"
             return 0
         fi
@@ -133,30 +133,84 @@ http_json() {
     return 1
 }
 
-# Resolve the nearest real (non-nightly) osac/vX.Y.Z umbrella-chart release
-# tag reachable from a repo path's HEAD. --match narrows git describe's glob
-# search to tags shaped like "osac/vX.Y.Z" -- scoped by the "osac/" prefix,
-# not just a bare "vX.Y.Z", because git tags aren't path-scoped and a bare
-# vX.Y.Z pattern can match an unrelated component's old tag (e.g.
-# fulfillment-service tagged bare vX.Y.Z releases before OSAC-3529 moved it
-# to a component-scoped prefix; that history is still reachable from HEAD).
-# --match is still a glob, not a real anchor (its trailing '*' is needed to
-# allow multi-digit version segments, but that same '*' would also accept a
-# stray "-rc1"/".4" suffix), so the result is re-validated with a real regex
-# before being trusted. Fails loudly rather than silently guessing a
-# version: publishing a chart under a made-up placeholder tag would be worse
-# than failing the build outright, since it could get pushed to the
-# registry unnoticed.
-# Usage: resolve_release_tag <repo_path>
+# Resolve the nearest real (non-nightly) component release tag reachable from a
+# repo path's HEAD. --match narrows git describe's glob search to tags shaped
+# like "<prefix>/vX.Y.Z" -- scoped by the component prefix, not just a bare
+# "vX.Y.Z", because git tags aren't path-scoped and a bare vX.Y.Z pattern can
+# match an unrelated component's old tag (e.g. fulfillment-service tagged bare
+# vX.Y.Z releases before OSAC-3529 moved it to a component-scoped prefix; that
+# history is still reachable from HEAD). --match is still a glob, not a real
+# anchor (its trailing '*' is needed to allow multi-digit version segments,
+# but that same '*' would also accept a stray "-rc1"/".4" suffix), so the
+# result is re-validated with a real regex before being trusted. Fails loudly
+# rather than silently guessing a version: publishing a chart under a made-up
+# placeholder tag would be worse than failing the build outright, since it
+# could get pushed to the registry unnoticed.
+# Usage: resolve_release_tag <repo_path> [tag_prefix]
+# tag_prefix defaults to "osac" (umbrella chart tags: osac/vX.Y.Z).
 resolve_release_tag() {
     local path="$1"
+    local prefix="${2:-osac}"
     local tag
-    if ! tag=$(git -C "${path}" describe --tags --abbrev=0 --match 'osac/v[0-9]*.[0-9]*.[0-9]*' --exclude '*-nightly*' 2>/dev/null); then
-        echo "ERROR: no real (non-nightly) osac/vX.Y.Z release tag reachable from ${path} — refusing to guess a version" >&2
+    local match_pattern
+    local validate_regex
+
+    if [[ ! "${prefix}" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+        echo "ERROR: invalid tag prefix '${prefix}' — must match [a-zA-Z0-9_-]+" >&2
         return 1
     fi
-    if [[ ! "${tag}" =~ ^osac/v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-        echo "ERROR: nearest release tag '${tag}' reachable from ${path} is not a plain osac/vX.Y.Z tag — refusing to guess a version" >&2
+
+    match_pattern="${prefix}/v[0-9]*.[0-9]*.[0-9]*"
+    validate_regex="^${prefix}/v[0-9]+\\.[0-9]+\\.[0-9]+$"
+
+    if ! tag=$(git -C "${path}" describe --tags --abbrev=0 --match "${match_pattern}" --exclude '*-nightly*' 2>/dev/null); then
+        echo "ERROR: no real (non-nightly) ${prefix}/vX.Y.Z release tag reachable from ${path} — refusing to guess a version" >&2
+        return 1
+    fi
+    if [[ ! "${tag}" =~ ${validate_regex} ]]; then
+        echo "ERROR: nearest release tag '${tag}' reachable from ${path} is not a plain ${prefix}/vX.Y.Z tag — refusing to guess a version" >&2
+        return 1
+    fi
+    echo "${tag}"
+}
+
+# Resolve the nearest real (non-nightly) bare vX.Y.Z release tag reachable from an
+# external repo path (e.g. osac-ui, which tags v0.0.5 rather than osac-ui/v0.0.5).
+# Pre-release-only tags (e.g. v0.0.1-rc1) are ignored; repos with no stable tag fail loud.
+# Usage: resolve_bare_release_tag <repo_path>
+resolve_bare_release_tag() {
+    local path="$1"
+    local tag
+    local validate_regex='^v[0-9]+\.[0-9]+\.[0-9]+$'
+
+    while IFS= read -r tag; do
+        [[ -z "${tag}" ]] && continue
+        [[ "${tag}" == *-nightly* ]] && continue
+        if [[ "${tag}" =~ ${validate_regex} ]]; then
+            echo "${tag}"
+            return 0
+        fi
+    done < <(git -C "${path}" tag -l 'v[0-9]*.[0-9]*.[0-9]*' --merged HEAD --sort=-v:refname 2>/dev/null)
+
+    echo "ERROR: no real (non-nightly) vX.Y.Z release tag reachable from ${path} — refusing to guess a version" >&2
+    return 1
+}
+
+# Resolve the nearest real (non-nightly) bare vX.Y.Z tag that is an ancestor of ref
+# (e.g. a pinned osac-ui commit). Matches archived submodule git describe behavior.
+# Usage: resolve_bare_release_tag_at <repo_path> <ref>
+resolve_bare_release_tag_at() {
+    local path="$1" ref="$2"
+    local tag
+    local validate_regex='^v[0-9]+\.[0-9]+\.[0-9]+$'
+
+    if ! tag=$(git -C "${path}" describe --tags --match 'v[0-9]*.[0-9]*.[0-9]*' --abbrev=0 \
+        --exclude '*-nightly*' --exclude '*-*' "${ref}" 2>/dev/null); then
+        echo "ERROR: no vX.Y.Z release tag reachable from ${ref} in ${path}" >&2
+        return 1
+    fi
+    if [[ "${tag}" == *-nightly* ]] || [[ ! "${tag}" =~ ${validate_regex} ]]; then
+        echo "ERROR: nearest tag '${tag}' at ${ref} in ${path} is not a plain vX.Y.Z tag" >&2
         return 1
     fi
     echo "${tag}"
@@ -200,7 +254,7 @@ _parse_db_host_from_url() {
     echo "${hostport%%:*}"
 }
 
-# Resolve a PostgreSQL host from fulfillment-db URL to service and namespace.
+# Resolve a PostgreSQL host from osac-db-config URL to service and namespace.
 # Prints "service target_namespace" on stdout; returns 1 if unrecognized.
 _resolve_postgres_service() {
     local host="$1"
@@ -262,25 +316,25 @@ check_postgres_prerequisites() {
         return 0
     else
         echo "Checking in-cluster PostgreSQL prerequisites..."
-        oc get secret fulfillment-db -n "${namespace}" &>/dev/null || \
-            _postgres_prereq_error "Secret fulfillment-db not found in namespace ${namespace}."
-        oc get secret postgres-client-cert-service -n "${namespace}" &>/dev/null || \
-            _postgres_prereq_error "Secret postgres-client-cert-service not found in namespace ${namespace}."
+        oc get secret osac-db-config -n "${namespace}" &>/dev/null || \
+            _postgres_prereq_error "Secret osac-db-config not found in namespace ${namespace}."
+        oc get secret osac-db-client-cert -n "${namespace}" &>/dev/null || \
+            _postgres_prereq_error "Secret osac-db-client-cert not found in namespace ${namespace}."
 
-        db_url=$(oc get secret fulfillment-db -n "${namespace}" \
+        db_url=$(oc get secret osac-db-config -n "${namespace}" \
             -o jsonpath='{.data.url}' | base64 -d 2>/dev/null || true)
         [[ -n "${db_url}" ]] || \
-            _postgres_prereq_error "Secret fulfillment-db in ${namespace} has an empty url key."
+            _postgres_prereq_error "Secret osac-db-config in ${namespace} has an empty url key."
 
         db_host=$(_parse_db_host_from_url "${db_url}") || \
-            _postgres_prereq_error "Secret fulfillment-db in ${namespace} has an invalid PostgreSQL url."
+            _postgres_prereq_error "Secret osac-db-config in ${namespace} has an invalid PostgreSQL url."
         resolved=$(_resolve_postgres_service "${db_host}" "${namespace}") || \
-            _postgres_prereq_error "Unrecognized database hostname in fulfillment-db url."
+            _postgres_prereq_error "Unrecognized database hostname in osac-db-config url."
         read -r service target_namespace <<< "${resolved}"
     fi
 
     if ! _verify_postgres_endpoints "${service}" "${target_namespace}"; then
-        _postgres_prereq_error "PostgreSQL Service referenced by fulfillment-db has no ready endpoints."
+        _postgres_prereq_error "PostgreSQL Service referenced by osac-db-config has no ready endpoints."
     fi
 
     echo "PostgreSQL prerequisites satisfied."

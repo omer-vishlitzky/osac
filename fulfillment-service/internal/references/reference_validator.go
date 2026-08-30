@@ -140,11 +140,21 @@ func (v *ReferenceValidator) Register(fullName protoreflect.FullName, lookupFunc
 	v.registry[fullName] = lookupFunc
 }
 
+// HasLookup reports whether a lookup function is registered for the given reference message type.
+func (v *ReferenceValidator) HasLookup(fullName protoreflect.FullName) bool {
+	_, ok := v.registry[fullName]
+	return ok
+}
+
 // UnaryServer is the unary server interceptor function.
 func (v *ReferenceValidator) UnaryServer(ctx context.Context, request any, info *grpc.UnaryServerInfo,
 	handler grpc.UnaryHandler) (response any, err error) {
 	v.sealed.CompareAndSwap(false, true)
 	if !isCreateOrUpdate(info.FullMethod) {
+		return handler(ctx, request)
+	}
+
+	if isObjectBeingDeleted(request) {
 		return handler(ctx, request)
 	}
 
@@ -455,6 +465,26 @@ func isLocalReference(fullName protoreflect.FullName) bool {
 // isCreateOrUpdate checks if the gRPC method is a Create or Update operation.
 func isCreateOrUpdate(method string) bool {
 	return strings.HasSuffix(method, "/Create") || strings.HasSuffix(method, "/Update")
+}
+
+func isObjectBeingDeleted(request any) bool {
+	message, ok := request.(proto.Message)
+	if !ok {
+		return false
+	}
+	msg := message.ProtoReflect()
+	for _, name := range []protoreflect.Name{"object", "metadata"} {
+		fd := msg.Descriptor().Fields().ByName(name)
+		if fd == nil || fd.Kind() != protoreflect.MessageKind {
+			return false
+		}
+		msg = msg.Get(fd).Message()
+	}
+	fd := msg.Descriptor().Fields().ByName("deletion_timestamp")
+	if fd == nil {
+		return false
+	}
+	return msg.Has(fd)
 }
 
 // isNotFoundErr checks whether an error represents a "not found" condition.

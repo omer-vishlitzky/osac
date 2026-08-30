@@ -20,7 +20,7 @@ import "osac/public/v1/metadata_type.proto";
 import "osac/public/v1/baremetal_instance_template_type.proto";
 
 // A bare metal instance catalog item defines a curated hardware offering that references an underlying bare metal
-// instance template.
+// instance template. Admins control which fields users can set, enforce defaults, and validate input via JSON Schema.
 //
 // buf:lint:ignore OSAC_OBJECT_SHAPE
 message BareMetalInstanceCatalogItem {
@@ -38,7 +38,7 @@ message BareMetalInstanceCatalogItem {
   // Reference to the underlying bare metal instance template that this catalog item references.
   BareMetalInstanceTemplateReference template = 5;
 
-  // Whether this catalog item is published.
+  // Whether this catalog item is published and visible to tenants.
   bool published = 6;
 
   // Definitions of the fields that users can or cannot set when creating a resource from this catalog item.

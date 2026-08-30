@@ -1,15 +1,30 @@
 # AI workflows and skills (installed by tools/bootstrap.sh)
 skills/
 .ai-workflows/
-.claude/skills
-.claude/commands
-.claude/agents
+# Interactive clone populated by tools/bootstrap.sh. A later pin may occupy
+# this path and drop the ignore.
+.osac-ai-skills/
+
+# Harness output and osac-ai-skills fan-out. Keep repo-local Claude settings
+# and hook *scripts* tracked; fan-out only adds .claude/hooks/README.md.
+.claude/*
+!.claude/hooks/
+!.claude/settings.json
+.claude/hooks/README.md
 .cursor/
 .gemini/
+
+# Shared design/prd guidance (fan-out). No repo-local files in these trees —
+# ignore the directories so new shared names do not require a gitignore bump.
+.design/
+.prd/
 
 # graphify knowledge-graph output -- fetched from the published CI bundle
 # (see .github/workflows/graphify-brain-refresh.yaml), never committed.
 graphify-out/
+
+# Shared tool binaries (tools/golangci-lint.mk), downloaded once for all components
+/tools/bin/
 
 # Binaries for programs and plugins
 *.exe
@@ -75,6 +90,7 @@ __pycache__
 /fulfillment-service/logs
 /fulfillment-service/osac
 /fulfillment-service/osac-dev
+/fulfillment-service/.buf
 
 # osac-operator
 /osac-operator/bin/*
@@ -182,14 +198,13 @@ cython_debug/
 *.iml
 
 # osac-installer
-/osac-installer/kustomization-build/
 /osac-installer/dist/
 /osac-installer/local/
 /osac-installer/*.local.yaml
 /osac-installer/kubeconfig.hub-access
 /osac-installer/charts/*/charts/*.tgz
 /osac-installer/charts/*/Chart.lock
-/osac-installer/chart-versions.txt
+/chart-sources.txt
 /osac-installer/images.txt
 /osac-installer/images-raw.txt
 
@@ -200,3 +215,4 @@ cython_debug/
 **/osac-aap-secrets.env
 **/server-ssh-key
 **/server-ssh-bastion-key
+osac-installer/charts/osac/tmpcharts*/

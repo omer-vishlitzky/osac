@@ -383,8 +383,9 @@ message ThingsListResponse {
 ```
 
 - `offset` is the zero-based index of the first result to return. Defaults to zero.
-- `limit` is the maximum number of results. When omitted, the server returns all matching objects
-  (though it may cap the result set for performance reasons).
+- `limit` is the maximum number of results. When omitted, the server applies a default limit. When
+  set to zero, the server returns only the total count with an empty items list (useful for clients
+  that only need to know how many items match a filter). Negative values are rejected with an error.
 - `filter` is a [CEL](https://cel.dev) expression evaluated against each candidate object. See
   [docs/FILTER.md](FILTER.md) for the full details of the supported CEL subset.
 - `order` specifies the sort order using a syntax similar to SQL `ORDER BY`, for example
@@ -572,8 +573,7 @@ object; otherwise the server returns `InvalidArgument`. The server auto-populate
 is missing after a successful lookup.
 
 Full references are used when the target object may live outside the caller's project — for
-example, cluster templates, catalog items, host types, instance types, network classes, IP pools,
-roles, and users.
+example, cluster templates, catalog items, host types, instance types, IP pools, roles, and users.
 
 ### Local references
 
@@ -591,7 +591,7 @@ As with full references, callers may supply `id`, `name`, or both, and the serve
 the other.
 
 Local references are used when the target is always co-located — for example, a `Subnet`
-referencing its parent `VirtualNetwork`, or a `NetworkAttachment` referencing a `Subnet` and
+referencing its parent `VirtualNetwork`, or a `ComputeNetworkAttachment` referencing a `Subnet` and
 `SecurityGroup`.
 
 ### Naming convention

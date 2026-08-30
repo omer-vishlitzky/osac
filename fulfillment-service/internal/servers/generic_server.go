@@ -34,6 +34,7 @@ import (
 
 	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
+	"github.com/osac-project/osac/fulfillment-service/internal/collections"
 	"github.com/osac-project/osac/fulfillment-service/internal/database/dao"
 	"github.com/osac-project/osac/fulfillment-service/internal/events"
 	"github.com/osac-project/osac/fulfillment-service/internal/masks"
@@ -51,7 +52,9 @@ type GenericServerBuilder[O dao.Object] struct {
 	redactFunc        func(O) O
 	attributionLogic  auth.AttributionLogic
 	tenancyLogic      auth.TenancyLogic
+	allowedTenants    collections.Set[string]
 	metricsRegisterer prometheus.Registerer
+	filterDesc        protoreflect.MessageDescriptor
 }
 
 // GenericServer is a gRPC server that knows how to implement the List, Get, Create, Update and Delete operators for
@@ -62,6 +65,7 @@ type GenericServer[O dao.Object] struct {
 	dao              *dao.GenericDAO[O]
 	attributionLogic auth.AttributionLogic
 	tenancyLogic     auth.TenancyLogic
+	allowedTenants   collections.Set[string]
 	template         proto.Message
 	metadataField    protoreflect.FieldDescriptor
 	listRequest      proto.Message
@@ -101,7 +105,9 @@ type metadataIface interface {
 
 // NewGenericServer creates a builder that can then be used to configure and create a new generic server.
 func NewGenericServer[O dao.Object]() *GenericServerBuilder[O] {
-	return &GenericServerBuilder[O]{}
+	return &GenericServerBuilder[O]{
+		allowedTenants: auth.DefaultAllowedTenants,
+	}
 }
 
 // SetLogger sets the logger. This is mandatory.
@@ -166,10 +172,26 @@ func (b *GenericServerBuilder[O]) SetTenancyLogic(value auth.TenancyLogic) *Gene
 	return b
 }
 
+// AddAllowedTenants adds tenant names to the set of tenants where objects can be created or moved
+// into. By default the shared and system tenants are excluded. Use this to opt in platform-scoped
+// resource servers that legitimately need to create objects in those tenants.
+func (b *GenericServerBuilder[O]) AddAllowedTenants(values ...string) *GenericServerBuilder[O] {
+	b.allowedTenants = b.allowedTenants.Union(collections.NewSet(values...))
+	return b
+}
+
 // SetMetricsRegisterer sets the Prometheus registerer used to register the metrics. This is optional. If not set, no
 // metrics will be recorded.
 func (b *GenericServerBuilder[O]) SetMetricsRegisterer(value prometheus.Registerer) *GenericServerBuilder[O] {
 	b.metricsRegisterer = value
+	return b
+}
+
+// SetFilterDesc sets the protobuf message descriptor used to validate and translate CEL filter expressions. This is
+// optional. When unset, the descriptor of the O generic parameter is used. Forwarded to
+// [dao.GenericDAOBuilder.SetFilterDesc].
+func (b *GenericServerBuilder[O]) SetFilterDesc(value protoreflect.MessageDescriptor) *GenericServerBuilder[O] {
+	b.filterDesc = value
 	return b
 }
 
@@ -215,6 +237,7 @@ func (b *GenericServerBuilder[O]) Build() (result *GenericServer[O], err error) 
 		service:          b.service,
 		attributionLogic: b.attributionLogic,
 		tenancyLogic:     b.tenancyLogic,
+		allowedTenants:   b.allowedTenants,
 		notifier:         b.notifier,
 		pathCompiler:     pathCompiler,
 		pathCache:        map[string]*masks.Path[O]{},
@@ -231,6 +254,7 @@ func (b *GenericServerBuilder[O]) Build() (result *GenericServer[O], err error) 
 	if b.table != "" {
 		daoBuilder.SetTableName(b.table)
 	}
+	daoBuilder.SetFilterDesc(b.filterDesc)
 	daoBuilder.SetTenancyLogic(b.tenancyLogic)
 	if b.notifier != nil {
 		daoBuilder.AddEventCallback(s.notifyEvent)
@@ -379,17 +403,24 @@ func (s *GenericServer[O]) List(ctx context.Context, request any, response any) 
 	type requestIface interface {
 		GetOffset() int32
 		GetLimit() int32
+		HasLimit() bool
 		GetFilter() string
 	}
 	requestMsg := request.(requestIface)
 
 	// List the objects:
-	daoResponse, err := s.dao.List().
+	listRequest := s.dao.List().
 		SetFilter(requestMsg.GetFilter()).
-		SetOffset(requestMsg.GetOffset()).
-		SetLimit(requestMsg.GetLimit()).
-		Do(ctx)
+		SetOffset(requestMsg.GetOffset())
+	if requestMsg.HasLimit() {
+		listRequest.SetLimit(requestMsg.GetLimit())
+	}
+	daoResponse, err := listRequest.Do(ctx)
 	if err != nil {
+		var validationErr *dao.ErrValidation
+		if errors.As(err, &validationErr) {
+			return grpcstatus.Errorf(grpccodes.InvalidArgument, "%s", validationErr.Reason)
+		}
 		var deniedErr *dao.ErrDenied
 		if errors.As(err, &deniedErr) {
 			return grpcstatus.Errorf(grpccodes.PermissionDenied, "%s", deniedErr.Reason)
@@ -397,6 +428,10 @@ func (s *GenericServer[O]) List(ctx context.Context, request any, response any) 
 		var deadlockErr *dao.ErrDeadlock
 		if errors.As(err, &deadlockErr) {
 			return grpcstatus.Errorf(grpccodes.Aborted, "%s", deadlockErr.Error())
+		}
+		var invalidFilterErr *dao.ErrInvalidFilter
+		if errors.As(err, &invalidFilterErr) {
+			return grpcstatus.Errorf(grpccodes.InvalidArgument, "%s", invalidFilterErr.Error())
 		}
 		s.logger.ErrorContext(
 			ctx,
@@ -565,8 +600,22 @@ func (s *GenericServer[O]) prepareForCreate(ctx context.Context, request any) (O
 	if err = s.setTenant(ctx, requestObject, assignedTenant); err != nil {
 		return nilObject, err
 	}
+	if err = s.checkAllowedTenant(assignedTenant); err != nil {
+		return nilObject, err
+	}
 
 	return requestObject, nil
+}
+
+func (s *GenericServer[O]) checkAllowedTenant(tenant string) error {
+	if !s.allowedTenants.Contains(tenant) {
+		return grpcstatus.Errorf(
+			grpccodes.PermissionDenied,
+			"objects cannot be placed in the '%s' tenant",
+			tenant,
+		)
+	}
+	return nil
 }
 
 func (s *GenericServer[O]) createDryRun(ctx context.Context, request any, response any) error {
@@ -732,6 +781,14 @@ func (s *GenericServer[O]) Update(ctx context.Context, request any, response any
 	if err != nil {
 		return err
 	}
+	// Only check the tenant restriction when the tenant is changing — existing objects
+	// in reserved tenants can be updated in place but cannot be moved into them.
+	currentTenant := s.getMetadata(currentObject).GetTenant()
+	if assignedTenant != currentTenant {
+		if err = s.checkAllowedTenant(assignedTenant); err != nil {
+			return err
+		}
+	}
 
 	// Save the object only if there is any actual difference:
 	var responseObject O
@@ -740,45 +797,7 @@ func (s *GenericServer[O]) Update(ctx context.Context, request any, response any
 			SetObject(tmpObject).
 			Do(ctx)
 		if err != nil {
-			var conflictErr *dao.ErrConflict
-			if errors.As(err, &conflictErr) {
-				return grpcstatus.Errorf(grpccodes.Aborted, "%s", conflictErr.Error())
-			}
-			var alreadyExistsErr *dao.ErrAlreadyExists
-			if errors.As(err, &alreadyExistsErr) {
-				return grpcstatus.Errorf(grpccodes.AlreadyExists, "%s", alreadyExistsErr.Error())
-			}
-			var referenceErr *dao.ErrReference
-			if errors.As(err, &referenceErr) {
-				return grpcstatus.Errorf(grpccodes.FailedPrecondition, "%s", referenceErr.Error())
-			}
-			var notUniqueErr *dao.ErrNotUnique
-			if errors.As(err, &notUniqueErr) {
-				return grpcstatus.Errorf(grpccodes.AlreadyExists, "%s", notUniqueErr.Error())
-			}
-			var deniedErr *dao.ErrDenied
-			if errors.As(err, &deniedErr) {
-				return grpcstatus.Errorf(grpccodes.PermissionDenied, "%s", deniedErr.Error())
-			}
-			var immutableErr *dao.ErrImmutable
-			if errors.As(err, &immutableErr) {
-				return grpcstatus.Errorf(grpccodes.InvalidArgument, "%s", immutableErr.Error())
-			}
-			var deadlockErr *dao.ErrDeadlock
-			if errors.As(err, &deadlockErr) {
-				return grpcstatus.Errorf(grpccodes.Aborted, "%s", deadlockErr.Error())
-			}
-			s.logger.ErrorContext(
-				ctx,
-				"Failed to update object",
-				slog.String("id", requestId),
-				slog.Any("error", err),
-			)
-			return grpcstatus.Errorf(
-				grpccodes.Internal,
-				"failed to update object with identifier '%s'",
-				requestId,
-			)
+			return s.translateUpdateError(ctx, requestId, err)
 		}
 		responseObject = updateResponse.GetObject()
 	} else {
@@ -794,6 +813,52 @@ func (s *GenericServer[O]) Update(ctx context.Context, request any, response any
 	s.setPointer(response, responseMsg)
 
 	return nil
+}
+
+func (s *GenericServer[O]) translateUpdateError(ctx context.Context, requestId string, err error) error {
+	var conflictErr *dao.ErrConflict
+	if errors.As(err, &conflictErr) {
+		return grpcstatus.Errorf(grpccodes.Aborted, "%s", conflictErr.Error())
+	}
+	var alreadyExistsErr *dao.ErrAlreadyExists
+	if errors.As(err, &alreadyExistsErr) {
+		return grpcstatus.Errorf(grpccodes.AlreadyExists, "%s", alreadyExistsErr.Error())
+	}
+	var referenceErr *dao.ErrReference
+	if errors.As(err, &referenceErr) {
+		return grpcstatus.Errorf(grpccodes.FailedPrecondition, "%s", referenceErr.Error())
+	}
+	var inUseErr *dao.ErrInUse
+	if errors.As(err, &inUseErr) {
+		return grpcstatus.Errorf(grpccodes.FailedPrecondition, "%s", inUseErr.Error())
+	}
+	var notUniqueErr *dao.ErrNotUnique
+	if errors.As(err, &notUniqueErr) {
+		return grpcstatus.Errorf(grpccodes.AlreadyExists, "%s", notUniqueErr.Error())
+	}
+	var deniedErr *dao.ErrDenied
+	if errors.As(err, &deniedErr) {
+		return grpcstatus.Errorf(grpccodes.PermissionDenied, "%s", deniedErr.Error())
+	}
+	var immutableErr *dao.ErrImmutable
+	if errors.As(err, &immutableErr) {
+		return grpcstatus.Errorf(grpccodes.InvalidArgument, "%s", immutableErr.Error())
+	}
+	var deadlockErr *dao.ErrDeadlock
+	if errors.As(err, &deadlockErr) {
+		return grpcstatus.Errorf(grpccodes.Aborted, "%s", deadlockErr.Error())
+	}
+	s.logger.ErrorContext(
+		ctx,
+		"Failed to update object",
+		slog.String("id", requestId),
+		slog.Any("error", err),
+	)
+	return grpcstatus.Errorf(
+		grpccodes.Internal,
+		"failed to update object with identifier '%s'",
+		requestId,
+	)
 }
 
 func (s *GenericServer[O]) compilePaths(paths []string) (result []*masks.Path[O], err error) {

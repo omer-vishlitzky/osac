@@ -34,6 +34,7 @@ import (
 	mcreconcile "sigs.k8s.io/multicluster-runtime/pkg/reconcile"
 
 	"github.com/osac-project/osac/osac-operator/api/v1alpha1"
+	"github.com/osac-project/osac/osac-operator/pkg/dispatcher"
 	"github.com/osac-project/osac/osac-operator/pkg/provisioning"
 )
 
@@ -52,6 +53,10 @@ type NATGatewayReconciler struct {
 	StatusPollInterval   time.Duration
 	MaxJobHistory        int
 	targetCluster        mc.ClusterName
+	Resolver             *dispatcher.Resolver
+	// NetworkProvisioningEnabled controls whether the controller dispatches AAP
+	// provisioning jobs. When false, resources are set to Ready immediately.
+	NetworkProvisioningEnabled bool
 }
 
 // NewNATGatewayReconciler creates a new reconciler for NATGateway resources.
@@ -62,6 +67,7 @@ func NewNATGatewayReconciler(
 	statusPollInterval time.Duration,
 	maxJobHistory int,
 	targetCluster mc.ClusterName,
+	resolver *dispatcher.Resolver,
 ) *NATGatewayReconciler {
 	if mgr == nil {
 		panic("mgr must not be nil")
@@ -82,12 +88,15 @@ func NewNATGatewayReconciler(
 		StatusPollInterval:   statusPollInterval,
 		MaxJobHistory:        maxJobHistory,
 		targetCluster:        targetCluster,
+		Resolver:             resolver,
 	}
 }
 
 // +kubebuilder:rbac:groups=osac.openshift.io,resources=natgateways,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=osac.openshift.io,resources=natgateways/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=osac.openshift.io,resources=natgateways/finalizers,verbs=update
+// +kubebuilder:rbac:groups=osac.openshift.io,resources=virtualnetworks,verbs=get;list;watch
+// +kubebuilder:rbac:groups=osac.openshift.io,resources=externalips,verbs=get;list;watch
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -165,6 +174,14 @@ func (r *NATGatewayReconciler) handleUpdate(ctx context.Context, natgw *v1alpha1
 		natgw.Status.Phase = v1alpha1.NATGatewayPhaseProgressing
 	}
 
+	// When networking provisioning is disabled, skip AAP job dispatch and set Ready
+	// immediately.
+	if !r.NetworkProvisioningEnabled {
+		natgw.Status.Phase = v1alpha1.NATGatewayPhaseReady
+		setReadyConditionTrue(&natgw.Status.Conditions)
+		return ctrl.Result{}, nil
+	}
+
 	// Get parent VirtualNetwork by UUID label to read implementation strategy
 	vnetList := &v1alpha1.VirtualNetworkList{}
 	err := r.List(ctx, vnetList,
@@ -180,10 +197,37 @@ func (r *NATGatewayReconciler) handleUpdate(ctx context.Context, natgw *v1alpha1
 	}
 	vnet := &vnetList.Items[0]
 
-	// Read implementation strategy from parent VirtualNetwork spec
-	implementationStrategy := vnet.Spec.ImplementationStrategy
+	if vnet.Status.Phase != v1alpha1.VirtualNetworkPhaseReady {
+		log.Info("parent VirtualNetwork not Ready yet, requeueing",
+			"virtualNetwork", vnet.Name, "phase", vnet.Status.Phase)
+		return ctrl.Result{RequeueAfter: defaultPreconditionRequeueInterval}, nil
+	}
+
+	// Read implementation strategy from the annotation the parent VirtualNetwork's own
+	// controller has already resolved and written onto it.
+	implementationStrategy := vnet.Annotations[osacImplementationStrategyAnnotation]
 	if implementationStrategy == "" {
 		log.Info("implementation strategy not set on parent VirtualNetwork, requeueing", "virtualNetwork", vnet.Name)
+		return ctrl.Result{RequeueAfter: defaultPreconditionRequeueInterval}, nil
+	}
+
+	// Resolve the ExternalIP CR (by UUID label) for the SNAT source address; the AAP
+	// role reads its allocated address from the ExternalIP CR by name.
+	eipList := &v1alpha1.ExternalIPList{}
+	if err := r.List(ctx, eipList,
+		client.InNamespace(natgw.Namespace),
+		client.MatchingLabels{osacExternalIPIDLabel: natgw.Spec.ExternalIP},
+	); err != nil {
+		return ctrl.Result{}, err
+	}
+	if len(eipList.Items) == 0 {
+		log.Info("ExternalIP not found, requeueing", "uuid", natgw.Spec.ExternalIP)
+		return ctrl.Result{RequeueAfter: defaultPreconditionRequeueInterval}, nil
+	}
+	externalIP := &eipList.Items[0]
+
+	if externalIP.Status.Address == "" {
+		log.Info("ExternalIP address not allocated yet, requeueing", "externalIP", externalIP.Name)
 		return ctrl.Result{RequeueAfter: defaultPreconditionRequeueInterval}, nil
 	}
 
@@ -191,9 +235,29 @@ func (r *NATGatewayReconciler) handleUpdate(ctx context.Context, natgw *v1alpha1
 	if natgw.Annotations == nil {
 		natgw.Annotations = make(map[string]string)
 	}
+	annotationsChanged := false
 	if natgw.Annotations[osacImplementationStrategyAnnotation] != implementationStrategy {
 		natgw.Annotations[osacImplementationStrategyAnnotation] = implementationStrategy
 		log.Info("setting implementation-strategy annotation", "strategy", implementationStrategy)
+		annotationsChanged = true
+	}
+	// Pass the tenant VirtualNetwork name so the provisioning role creates the SNAT
+	// rule in the correct tenant network scope.
+	if natgw.Annotations[osacVirtualNetworkNameAnnotation] != vnet.Name {
+		natgw.Annotations[osacVirtualNetworkNameAnnotation] = vnet.Name
+		annotationsChanged = true
+	}
+	// Pass the ExternalIP CR name (SNAT source address is read from it) and the VN
+	// IPv4 CIDR (the SNAT rule's source network) for the AAP role.
+	if natgw.Annotations[osacExternalIPNameAnnotation] != externalIP.Name {
+		natgw.Annotations[osacExternalIPNameAnnotation] = externalIP.Name
+		annotationsChanged = true
+	}
+	if natgw.Annotations[osacVNIPv4CIDRAnnotation] != vnet.Spec.IPv4CIDR {
+		natgw.Annotations[osacVNIPv4CIDRAnnotation] = vnet.Spec.IPv4CIDR
+		annotationsChanged = true
+	}
+	if annotationsChanged {
 		if err := r.Update(ctx, natgw); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -230,13 +294,17 @@ func (r *NATGatewayReconciler) handleDelete(ctx context.Context, natgw *v1alpha1
 		return ctrl.Result{}, nil
 	}
 
-	result, err := r.handleDeprovisioning(ctx, natgw)
-	if err != nil {
-		return result, err
-	}
+	if natgw.Annotations[osacImplementationStrategyAnnotation] == "" {
+		log.Info("skipping deprovisioning — resource was never provisioned")
+	} else {
+		result, err := r.handleDeprovisioning(ctx, natgw)
+		if err != nil {
+			return result, err
+		}
 
-	if result.RequeueAfter > 0 {
-		return result, nil
+		if result.RequeueAfter > 0 {
+			return result, nil
+		}
 	}
 
 	if controllerutil.RemoveFinalizer(natgw, osacNATGatewayFinalizer) {

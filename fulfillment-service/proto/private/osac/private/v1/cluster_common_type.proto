@@ -15,8 +15,19 @@ syntax = "proto3";
 
 package osac.private.v1;
 
+import "cleanapi/cleanapi.proto";
+
+option (cleanapi.file).package = "osac.public.v1";
+
 // Networking configuration for a cluster.
 message ClusterNetwork {
+  // CIDR for the cluster's pod network.
+  //
+  // Must be valid CIDR notation. If not provided, defaults to `10.128.0.0/14`.
   optional string pod_cidr = 1;
+
+  // CIDR for the cluster's service network.
+  //
+  // Must be valid CIDR notation. If not provided, defaults to `172.30.0.0/16`.
   optional string service_cidr = 2;
 }

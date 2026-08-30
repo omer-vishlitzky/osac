@@ -21,6 +21,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	grpccodes "google.golang.org/grpc/codes"
 	grpcstatus "google.golang.org/grpc/status"
+	"google.golang.org/protobuf/reflect/protoreflect"
 
 	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
@@ -28,14 +29,13 @@ import (
 	"github.com/osac-project/osac/fulfillment-service/internal/events"
 )
 
-const securityGroupImplementationStrategy = "network_policy"
-
 type PrivateSecurityGroupsServerBuilder struct {
 	logger            *slog.Logger
 	notifier          events.Notifier
 	attributionLogic  auth.AttributionLogic
 	tenancyLogic      auth.TenancyLogic
 	metricsRegisterer prometheus.Registerer
+	filterDesc        protoreflect.MessageDescriptor
 }
 
 var _ privatev1.SecurityGroupsServer = (*PrivateSecurityGroupsServer)(nil)
@@ -79,6 +79,13 @@ func (b *PrivateSecurityGroupsServerBuilder) SetMetricsRegisterer(value promethe
 	return b
 }
 
+// SetFilterDesc sets the protobuf message descriptor used to validate and translate CEL filter
+// expressions. This is optional. When unset, the descriptor of this server's own private message type is used.
+func (b *PrivateSecurityGroupsServerBuilder) SetFilterDesc(value protoreflect.MessageDescriptor) *PrivateSecurityGroupsServerBuilder {
+	b.filterDesc = value
+	return b
+}
+
 func (b *PrivateSecurityGroupsServerBuilder) Build() (result *PrivateSecurityGroupsServer, err error) {
 	// Check parameters:
 	if b.logger == nil {
@@ -112,6 +119,7 @@ func (b *PrivateSecurityGroupsServerBuilder) Build() (result *PrivateSecurityGro
 		SetAttributionLogic(b.attributionLogic).
 		SetTenancyLogic(b.tenancyLogic).
 		SetMetricsRegisterer(b.metricsRegisterer).
+		SetFilterDesc(b.filterDesc).
 		Build()
 	if err != nil {
 		return
@@ -157,9 +165,6 @@ func (s *PrivateSecurityGroupsServer) Create(ctx context.Context,
 	}
 	securityGroup.Metadata.Annotations["osac.openshift.io/owner-reference"] = refKey(securityGroup.GetSpec().GetVirtualNetwork())
 
-	// Set implementation strategy (system-managed, immutable after creation)
-	securityGroup.GetSpec().SetImplementationStrategy(securityGroupImplementationStrategy)
-
 	err = s.generic.Create(ctx, request, &response)
 	return
 }
@@ -187,12 +192,6 @@ func (s *PrivateSecurityGroupsServer) Update(ctx context.Context,
 	err = s.validateSecurityGroup(ctx, request.GetObject(), existingSecurityGroup)
 	if err != nil {
 		return
-	}
-
-	// Preserve immutable implementation_strategy from existing object. Validation that the
-	// caller didn't attempt to change it is handled in validateImmutableFieldsSecurityGroup.
-	if request.GetObject().GetSpec() != nil && existingSecurityGroup.GetSpec() != nil {
-		request.GetObject().GetSpec().SetImplementationStrategy(existingSecurityGroup.GetSpec().GetImplementationStrategy())
 	}
 
 	err = s.generic.Update(ctx, request, &response)
@@ -386,15 +385,6 @@ func validateImmutableFieldsSecurityGroup(newSecurityGroup *privatev1.SecurityGr
 		return grpcstatus.Errorf(grpccodes.InvalidArgument,
 			"field 'spec.virtual_network' is immutable and cannot be changed from '%s' to '%s'",
 			refKey(existingSpec.GetVirtualNetwork()), refKey(newSpec.GetVirtualNetwork()))
-	}
-
-	// Check immutable implementation_strategy field. The field is OUTPUT_ONLY so well-behaved
-	// clients won't set it (it arrives as ""); only reject when the caller explicitly sends a
-	// non-empty value that differs from the stored one.
-	if newStrategy := newSpec.GetImplementationStrategy(); newStrategy != "" && newStrategy != existingSpec.GetImplementationStrategy() {
-		return grpcstatus.Errorf(grpccodes.InvalidArgument,
-			"field 'spec.implementation_strategy' is immutable and cannot be changed from '%s' to '%s'",
-			existingSpec.GetImplementationStrategy(), newStrategy)
 	}
 
 	return nil

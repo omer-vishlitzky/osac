@@ -38,7 +38,7 @@ const (
 // Contains the information that helps client know how authentication is managed by the server.
 type AuthnCapabilities struct {
 	state protoimpl.MessageState `protogen:"hybrid.v1"`
-	// A list of the OAuth issuers whose access tokens are accepted by the server.
+	// A list of the OAuth issuers whose access tokens are accepted by the server for authentication.
 	//
 	// This means that the client can select one of this and then use the OAuth discovery endpoint to find the details of
 	// the OAuth server. For example if the value is `https://my.oauth.com` then the client can obtain the details of the
@@ -94,7 +94,7 @@ func (x *AuthnCapabilities) SetTrustedTokenIssuers(v []string) {
 type AuthnCapabilities_builder struct {
 	_ [0]func() // Prevents comparability and use of unkeyed literals for the builder.
 
-	// A list of the OAuth issuers whose access tokens are accepted by the server.
+	// A list of the OAuth issuers whose access tokens are accepted by the server for authentication.
 	//
 	// This means that the client can select one of this and then use the OAuth discovery endpoint to find the details of
 	// the OAuth server. For example if the value is `https://my.oauth.com` then the client can obtain the details of the

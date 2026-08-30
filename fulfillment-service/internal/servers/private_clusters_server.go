@@ -29,6 +29,7 @@ import (
 	grpccodes "google.golang.org/grpc/codes"
 	grpcstatus "google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
 
@@ -37,6 +38,7 @@ import (
 	"github.com/osac-project/osac/fulfillment-service/internal/database"
 	"github.com/osac-project/osac/fulfillment-service/internal/database/dao"
 	"github.com/osac-project/osac/fulfillment-service/internal/events"
+	"github.com/osac-project/osac/fulfillment-service/internal/references"
 	"github.com/osac-project/osac/fulfillment-service/internal/utils"
 )
 
@@ -46,6 +48,7 @@ type PrivateClustersServerBuilder struct {
 	attributionLogic  auth.AttributionLogic
 	tenancyLogic      auth.TenancyLogic
 	metricsRegisterer prometheus.Registerer
+	filterDesc        protoreflect.MessageDescriptor
 }
 
 var _ privatev1.ClustersServer = (*PrivateClustersServer)(nil)
@@ -53,6 +56,7 @@ var _ privatev1.ClustersServer = (*PrivateClustersServer)(nil)
 type PrivateClustersServer struct {
 	privatev1.UnimplementedClustersServer
 	logger                  *slog.Logger
+	notifier                events.Notifier
 	tenancyLogic            auth.TenancyLogic
 	templatesDao            *dao.GenericDAO[*privatev1.ClusterTemplate]
 	catalogItemsDao         *dao.GenericDAO[*privatev1.ClusterCatalogItem]
@@ -63,6 +67,7 @@ type PrivateClustersServer struct {
 	externalIPPoolDao       *dao.GenericDAO[*privatev1.ExternalIPPool]
 	externalIPDao           *dao.GenericDAO[*privatev1.ExternalIP]
 	externalIPAttachmentDao *dao.GenericDAO[*privatev1.ExternalIPAttachment]
+	secretsDao              *dao.GenericDAO[*privatev1.Secret]
 	generic                 *GenericServer[*privatev1.Cluster]
 }
 
@@ -94,6 +99,13 @@ func (b *PrivateClustersServerBuilder) SetTenancyLogic(value auth.TenancyLogic) 
 // access objects. This is optional. If not set, no metrics will be recorded.
 func (b *PrivateClustersServerBuilder) SetMetricsRegisterer(value prometheus.Registerer) *PrivateClustersServerBuilder {
 	b.metricsRegisterer = value
+	return b
+}
+
+// SetFilterDesc sets the protobuf message descriptor used to validate and translate CEL filter
+// expressions. This is optional. When unset, the descriptor of this server's own private message type is used.
+func (b *PrivateClustersServerBuilder) SetFilterDesc(value protoreflect.MessageDescriptor) *PrivateClustersServerBuilder {
+	b.filterDesc = value
 	return b
 }
 
@@ -195,7 +207,21 @@ func (b *PrivateClustersServerBuilder) Build() (result *PrivateClustersServer, e
 		return
 	}
 
+	// Create the secrets DAO:
+	secretsDao, err := dao.NewGenericDAO[*privatev1.Secret]().
+		SetLogger(b.logger).
+		SetTenancyLogic(b.tenancyLogic).
+		SetMetricsRegisterer(b.metricsRegisterer).
+		Build()
+	if err != nil {
+		return
+	}
+
 	// Create the generic server:
+	// TODO(OSAC-1060): Remove AddAllowedTenants(auth.SharedTenant) once the osac-operator storage
+	// controller handles CaaS cluster deletion independently of tenant-level storage provisioning.
+	// CaaS e2e tests use SA auth → shared tenant to avoid cluster-storage finalizer blocking deletion
+	// when AAP storage provisioning jobs fail in test environments without configured backends.
 	generic, err := NewGenericServer[*privatev1.Cluster]().
 		SetLogger(b.logger).
 		SetService(privatev1.Clusters_ServiceDesc.ServiceName).
@@ -203,6 +229,8 @@ func (b *PrivateClustersServerBuilder) Build() (result *PrivateClustersServer, e
 		SetAttributionLogic(b.attributionLogic).
 		SetTenancyLogic(b.tenancyLogic).
 		SetMetricsRegisterer(b.metricsRegisterer).
+		SetFilterDesc(b.filterDesc).
+		AddAllowedTenants(auth.SharedTenant).
 		Build()
 	if err != nil {
 		return
@@ -211,6 +239,7 @@ func (b *PrivateClustersServerBuilder) Build() (result *PrivateClustersServer, e
 	// Create and populate the object:
 	result = &PrivateClustersServer{
 		logger:                  b.logger,
+		notifier:                b.notifier,
 		tenancyLogic:            b.tenancyLogic,
 		templatesDao:            templatesDao,
 		catalogItemsDao:         catalogItemsDao,
@@ -221,6 +250,7 @@ func (b *PrivateClustersServerBuilder) Build() (result *PrivateClustersServer, e
 		externalIPPoolDao:       externalIPPoolDao,
 		externalIPDao:           externalIPDao,
 		externalIPAttachmentDao: externalIPAttachmentDao,
+		secretsDao:              secretsDao,
 		generic:                 generic,
 	}
 	return
@@ -299,6 +329,15 @@ func (s *PrivateClustersServer) Create(ctx context.Context,
 	// Validate network attachment references (subnet READY, SGs same-VN):
 	if networkAttachmentErr == nil && request.GetObject().GetSpec().GetNetworkAttachment() != nil {
 		networkAttachmentErr = s.validateNetworkAttachmentState(ctx, request.GetObject())
+	}
+
+	// Resolve fabric_interface for each node set when the cluster has a
+	// network attachment. The HostType's interfaces list is searched for
+	// the first interface with role "fabric".
+	if spec.GetNetworkAttachment() != nil {
+		if err = s.resolveFabricInterfaces(ctx, spec); err != nil {
+			return
+		}
 	}
 
 	// Attempt to persist — generic.Create validates tenant existence, so if the
@@ -389,6 +428,12 @@ func (s *PrivateClustersServer) Update(ctx context.Context,
 	if err != nil {
 		return
 	}
+	if err = s.validatePullSecretMutualExclusionForUpdate(ctx, request); err != nil {
+		return
+	}
+	if err = s.validatePullSecretSecret(ctx, request.GetObject().GetSpec()); err != nil {
+		return
+	}
 	if err = utils.ValidateClusterSpecFields(request.GetObject().GetSpec()); err != nil {
 		return
 	}
@@ -398,8 +443,99 @@ func (s *PrivateClustersServer) Update(ctx context.Context,
 
 func (s *PrivateClustersServer) Delete(ctx context.Context,
 	request *privatev1.ClustersDeleteRequest) (response *privatev1.ClustersDeleteResponse, err error) {
+	id := request.GetId()
+	if id != "" {
+		getResponse, getErr := s.generic.dao.Get().SetId(id).Do(ctx)
+		if getErr != nil {
+			var notFoundErr *dao.ErrNotFound
+			if !errors.As(getErr, &notFoundErr) {
+				err = getErr
+				return
+			}
+		} else if getResponse.GetObject().GetSpec().GetAutoExternalIpAttachment() {
+			err = s.autoCleanupExternalIP(ctx, id)
+			if err != nil {
+				return
+			}
+		}
+	}
 	err = s.generic.Delete(ctx, request, &response)
 	return
+}
+
+func (s *PrivateClustersServer) autoCleanupExternalIP(ctx context.Context, clusterID string) error {
+	filter := fmt.Sprintf(
+		"this.metadata.labels['%s'] == '%s'",
+		autoCreatedForLabel, clusterID,
+	)
+	listResp, err := s.externalIPAttachmentDao.List().SetFilter(filter).Do(ctx)
+	if err != nil {
+		return fmt.Errorf("auto_external_ip_attachment cleanup: failed to list attachments: %w", err)
+	}
+
+	for _, attachment := range listResp.GetItems() {
+		attachmentID := attachment.GetId()
+		eipRef := attachment.GetSpec().GetExternalIp()
+		eipID := refKey(eipRef)
+
+		_, err = s.externalIPAttachmentDao.Delete().SetId(attachmentID).Do(ctx)
+		if err != nil {
+			return fmt.Errorf("auto_external_ip_attachment cleanup: failed to delete attachment: %w", err)
+		}
+
+		if s.notifier != nil {
+			attResp, getErr := s.externalIPAttachmentDao.Get().SetId(attachmentID).Do(ctx)
+			if getErr == nil {
+				attEvent := privatev1.Event_builder{
+					Type:                 privatev1.EventType_EVENT_TYPE_OBJECT_UPDATED,
+					ExternalIpAttachment: attResp.GetObject(),
+				}.Build()
+				if notifyErr := s.notifier.Notify(ctx, attEvent); notifyErr != nil {
+					s.logger.WarnContext(ctx, "Failed to notify ExternalIPAttachment deletion", "error", notifyErr)
+				}
+			}
+		}
+
+		if eipID != "" {
+			err = s.updateExternalIPAttachedFlag(ctx, eipID, false)
+			if err != nil {
+				return fmt.Errorf("auto_external_ip_attachment cleanup: %w", err)
+			}
+
+			eipResp, getErr := s.externalIPDao.Get().SetId(eipID).Do(ctx)
+			if getErr != nil {
+				return fmt.Errorf("auto_external_ip_attachment cleanup: failed to get ExternalIP: %w", getErr)
+			}
+			poolRef := eipResp.GetObject().GetSpec().GetPool()
+
+			_, err = s.externalIPDao.Delete().SetId(eipID).Do(ctx)
+			if err != nil {
+				return fmt.Errorf("auto_external_ip_attachment cleanup: failed to delete ExternalIP: %w", err)
+			}
+
+			if s.notifier != nil {
+				updatedEIP, getErr := s.externalIPDao.Get().SetId(eipID).Do(ctx)
+				if getErr == nil {
+					eipEvent := privatev1.Event_builder{
+						Type:       privatev1.EventType_EVENT_TYPE_OBJECT_UPDATED,
+						ExternalIp: updatedEIP.GetObject(),
+					}.Build()
+					if notifyErr := s.notifier.Notify(ctx, eipEvent); notifyErr != nil {
+						s.logger.WarnContext(ctx, "Failed to notify ExternalIP deletion", "error", notifyErr)
+					}
+				}
+			}
+
+			if poolRef != nil {
+				err = UpdatePoolCapacity(ctx, s.externalIPPoolDao, refKey(poolRef), -1)
+				if err != nil {
+					return fmt.Errorf("auto_external_ip_attachment cleanup: %w", err)
+				}
+			}
+		}
+	}
+
+	return nil
 }
 
 func (s *PrivateClustersServer) Signal(ctx context.Context,
@@ -433,7 +569,7 @@ func (s *PrivateClustersServer) lookupTemplate(ctx context.Context,
 		}
 		return
 	}
-	switch response.GetSize() {
+	switch response.GetTotal() {
 	case 0:
 		err = grpcstatus.Errorf(
 			grpccodes.InvalidArgument,
@@ -452,6 +588,88 @@ func (s *PrivateClustersServer) lookupTemplate(ctx context.Context,
 	return
 }
 
+// validatePullSecretMutualExclusion rejects specs that set both pull_secret and pull_secret_secret.
+func (s *PrivateClustersServer) validatePullSecretMutualExclusion(spec *privatev1.ClusterSpec) error {
+	if spec.HasPullSecret() && spec.GetPullSecretSecret() != nil {
+		return grpcstatus.Errorf(
+			grpccodes.InvalidArgument,
+			"pull_secret and pull_secret_secret are mutually exclusive",
+		)
+	}
+	return nil
+}
+
+// validatePullSecretMutualExclusionForUpdate checks for pull_secret / pull_secret_secret conflicts
+// on Update, accounting for the update mask. When only one of the two fields is in the mask, the
+// other retains its DB value, so a conflict can occur even if the request itself looks clean.
+func (s *PrivateClustersServer) validatePullSecretMutualExclusionForUpdate(
+	ctx context.Context, request *privatev1.ClustersUpdateRequest) error {
+	spec := request.GetObject().GetSpec()
+	mask := request.GetUpdateMask()
+
+	if err := s.validatePullSecretMutualExclusion(spec); err != nil {
+		return err
+	}
+
+	// With a nil/empty mask the entire object is replaced, so no DB state to consider.
+	if mask == nil || len(mask.GetPaths()) == 0 {
+		return nil
+	}
+
+	settingPullSecretSecret := spec.GetPullSecretSecret() != nil && updateIncludesField(mask, "spec.pull_secret_secret")
+	settingPullSecret := spec.HasPullSecret() && updateIncludesField(mask, "spec.pull_secret")
+
+	if !settingPullSecretSecret && !settingPullSecret {
+		return nil
+	}
+
+	existing, found, err := s.getExistingCluster(ctx, request)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return nil
+	}
+	existingSpec := existing.GetSpec()
+
+	if settingPullSecretSecret && existingSpec.HasPullSecret() && !updateIncludesField(mask, "spec.pull_secret") {
+		return grpcstatus.Errorf(grpccodes.InvalidArgument, "pull_secret and pull_secret_secret are mutually exclusive")
+	}
+	if settingPullSecret && existingSpec.GetPullSecretSecret() != nil && !updateIncludesField(mask, "spec.pull_secret_secret") {
+		return grpcstatus.Errorf(grpccodes.InvalidArgument, "pull_secret and pull_secret_secret are mutually exclusive")
+	}
+	return nil
+}
+
+func (s *PrivateClustersServer) validatePullSecretSecret(ctx context.Context, spec *privatev1.ClusterSpec) error {
+	ref := spec.GetPullSecretSecret()
+	if ref == nil {
+		return nil
+	}
+	if ref.GetId() == "" && ref.GetName() == "" {
+		return grpcstatus.Errorf(grpccodes.InvalidArgument, "pull_secret_secret must specify id or name")
+	}
+	resolved, err := references.NewDAOLookupFunc(s.secretsDao)(ctx, "", "", ref.GetId(), ref.GetName())
+	if err != nil {
+		var deniedErr *dao.ErrDenied
+		if errors.As(err, &deniedErr) {
+			return grpcstatus.Errorf(grpccodes.PermissionDenied, "%s", deniedErr.Reason)
+		}
+		var nf interface{ IsNotFound() bool }
+		if errors.As(err, &nf) && nf.IsNotFound() {
+			return grpcstatus.Errorf(grpccodes.InvalidArgument,
+				"there is no secret with identifier or name '%s'", refKey(ref))
+		}
+		s.logger.ErrorContext(ctx, "Failed to resolve pull_secret_secret reference", "error", err)
+		return grpcstatus.Errorf(grpccodes.Internal, "failed to resolve pull_secret_secret reference")
+	}
+	resolvedRef := &privatev1.SecretLocalReference{}
+	resolvedRef.SetId(resolved.ID)
+	resolvedRef.SetName(resolved.Name)
+	spec.SetPullSecretSecret(resolvedRef)
+	return nil
+}
+
 func (s *PrivateClustersServer) lookupHostType(ctx context.Context,
 	key string) (result *privatev1.HostType, err error) {
 	if key == "" {
@@ -468,7 +686,7 @@ func (s *PrivateClustersServer) lookupHostType(ctx context.Context,
 		}
 		return
 	}
-	switch response.GetSize() {
+	switch response.GetTotal() {
 	case 0:
 		err = grpcstatus.Errorf(
 			grpccodes.NotFound,
@@ -996,6 +1214,38 @@ func (s *PrivateClustersServer) validateAutoExternalIPImmutability(ctx context.C
 	return nil
 }
 
+// resolveFabricInterfaces populates fabric_interface on each node set by
+// looking up the HostType and selecting the first interface with role "fabric".
+func (s *PrivateClustersServer) resolveFabricInterfaces(ctx context.Context, spec *privatev1.ClusterSpec) error {
+	for name, nodeSet := range spec.GetNodeSets() {
+		hostTypeKey := refKey(nodeSet.GetHostType())
+		if hostTypeKey == "" {
+			continue
+		}
+		hostType, err := s.lookupHostType(ctx, hostTypeKey)
+		if err != nil {
+			return err
+		}
+		if hostType == nil {
+			continue
+		}
+		fabricInterface := ""
+		for _, ni := range hostType.GetInterfaces() {
+			if strings.EqualFold(ni.GetRole(), "fabric") {
+				fabricInterface = ni.GetName()
+				break
+			}
+		}
+		if fabricInterface == "" {
+			return grpcstatus.Errorf(grpccodes.FailedPrecondition,
+				"node_sets[%s]: host type '%s' has no interface with role 'fabric'",
+				name, hostTypeKey)
+		}
+		nodeSet.SetFabricInterface(fabricInterface)
+	}
+	return nil
+}
+
 // autoProvisionExternalIPs creates two ExternalIPs and two ExternalIPAttachments
 // (one for API, one for ingress) from the best available pool.
 func (s *PrivateClustersServer) autoProvisionExternalIPs(ctx context.Context, cluster *privatev1.Cluster) error {
@@ -1111,6 +1361,16 @@ func (s *PrivateClustersServer) validateAndTransformCluster(ctx context.Context,
 
 	// Apply spec defaults from the template (user values take precedence):
 	utils.ApplyClusterSpecDefaults(cluster.GetSpec(), template.GetSpecDefaults())
+
+	// Validate mutual exclusion of inline pull_secret and pull_secret_secret reference:
+	if err = s.validatePullSecretMutualExclusion(cluster.GetSpec()); err != nil {
+		return err
+	}
+
+	// Validate pull_secret_secret reference exists:
+	if err = s.validatePullSecretSecret(ctx, cluster.GetSpec()); err != nil {
+		return err
+	}
 
 	if err = s.ensureClusterVersion(ctx, cluster); err != nil {
 		return err
@@ -1348,6 +1608,13 @@ func (s *PrivateClustersServer) validateAndTransformCatalogItem(ctx context.Cont
 	// Apply spec defaults from the template (user and field_definition values take precedence):
 	utils.ApplyClusterSpecDefaults(cluster.GetSpec(), template.GetSpecDefaults())
 
+	if err := s.validatePullSecretMutualExclusion(cluster.GetSpec()); err != nil {
+		return err
+	}
+	if err := s.validatePullSecretSecret(ctx, cluster.GetSpec()); err != nil {
+		return err
+	}
+
 	// Version resolution (catalog-item path):
 	// user input > field_definition default > template spec_defaults > system default.
 	if err := s.ensureClusterVersion(ctx, cluster); err != nil {
@@ -1424,4 +1691,24 @@ func (s *PrivateClustersServer) lookupCatalogItem(ctx context.Context,
 	}
 	result = items[0]
 	return
+}
+
+func (s *PrivateClustersServer) updateExternalIPAttachedFlag(ctx context.Context, externalIPID string, attached bool) error {
+	getResponse, err := s.externalIPDao.Get().
+		SetId(externalIPID).
+		SetLock(true).
+		Do(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get ExternalIP for attached flag update: %w", err)
+	}
+
+	eip := getResponse.GetObject()
+	eip.GetStatus().SetAttached(attached)
+
+	_, err = s.externalIPDao.Update().SetObject(eip).Do(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to update ExternalIP attached flag: %w", err)
+	}
+
+	return nil
 }

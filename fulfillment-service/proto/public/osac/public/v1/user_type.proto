@@ -64,7 +64,7 @@ message UserCredentials {
 
 // UserStatus contains the observed state of the user.
 message UserStatus {
-  // The user's current state in the identity provider.
+  // The user's current state.
   string phase = 1;
 
   // Additional conditions about the user's state.

@@ -177,6 +177,23 @@ const (
 	// Set condition status True on success.
 	// Set condition status False with reason Progressing or TemplateFailed while not complete.
 	HostConditionDeprovisionTemplateComplete BareMetalInstanceConditionType = "DeprovisionTemplateComplete"
+
+	// HostConditionNetworkAttachmentsReady indicates all network attachments are provisioned.
+	HostConditionNetworkAttachmentsReady BareMetalInstanceConditionType = "NetworkAttachmentsReady"
+
+	// HostConditionIPDiscoveryComplete indicates DHCP lease discovery has completed.
+	HostConditionIPDiscoveryComplete BareMetalInstanceConditionType = "IPDiscoveryComplete"
+
+	// HostConditionNetworkHandoffComplete is set True once the fabric port has been
+	// moved to the tenant network AND the post-provision reboot has completed, so the
+	// OS has re-DHCPed on the tenant network. IP discovery and Ready gate on this.
+	HostConditionNetworkHandoffComplete BareMetalInstanceConditionType = "NetworkHandoffComplete"
+
+	// HostConditionNetworkOffboardComplete is set True during deletion once the
+	// host has been powered off (while still on the tenant network) and the fabric
+	// port has been moved back to the provisioning network. This ensures tenant
+	// workloads never run on the provisioning network.
+	HostConditionNetworkOffboardComplete BareMetalInstanceConditionType = "NetworkOffboardComplete"
 )
 
 // Host condition reason values
@@ -212,6 +229,20 @@ type HostSelectorSpec struct {
 	HostSelector map[string]string `json:"hostSelector,omitempty"`
 }
 
+// BareMetalNICStatus holds the MAC address of a single physical network interface.
+type BareMetalNICStatus struct {
+	// MAC is the hardware MAC address of this interface, lowercased (e.g. "aa:bb:cc:dd:ee:ff").
+	// +kubebuilder:validation:Pattern=`^[0-9a-f]{2}(:[0-9a-f]{2}){5}$`
+	MAC string `json:"mac"`
+}
+
+// BareMetalHardware holds physical hardware metadata discovered from the inventory backend.
+type BareMetalHardware struct {
+	// NICs lists the physical network interfaces reported by the inventory backend.
+	// +kubebuilder:validation:Optional
+	NICs []BareMetalNICStatus `json:"nics,omitempty"`
+}
+
 // BareMetalNetworkAttachmentStatus captures the runtime networking state for a single NIC.
 type BareMetalNetworkAttachmentStatus struct {
 	// Interface is the physical interface name from the spec's network attachment.
@@ -243,6 +274,12 @@ type BareMetalInstanceStatus struct {
 	// Limited to the last N jobs (configurable via OSAC_MAX_JOB_HISTORY, default 10)
 	// +kubebuilder:validation:Optional
 	ProvisioningJobs []opv1alpha1.JobStatus `json:"provisioningJobs,omitempty"`
+	// NetworkingJobs tracks the history of network attachment provisioning/deprovisioning.
+	// +kubebuilder:validation:Optional
+	NetworkingJobs []opv1alpha1.JobStatus `json:"networkingJobs,omitempty"`
+	// IPDiscoveryJobs tracks the history of DHCP lease discovery operations.
+	// +kubebuilder:validation:Optional
+	IPDiscoveryJobs []opv1alpha1.JobStatus `json:"ipDiscoveryJobs,omitempty"`
 	// Conditions holds an array of metav1.Condition describing host state.
 	// +kubebuilder:validation:Optional
 	Conditions []metav1.Condition `json:"conditions,omitempty" patchStrategy:"merge" patchMergeKey:"type" protobuf:"bytes,1,rep,name=conditions"`
@@ -260,6 +297,25 @@ type BareMetalInstanceStatus struct {
 	// Populated by the operator after DHCP lease discovery.
 	// +kubebuilder:validation:Optional
 	NetworkAttachmentStatuses []BareMetalNetworkAttachmentStatus `json:"networkAttachmentStatuses,omitempty"`
+	// Hardware holds physical hardware metadata fetched from the inventory backend at allocation time.
+	// Absent until the inventory backend provides data.
+	// +kubebuilder:validation:Optional
+	Hardware *BareMetalHardware `json:"hardware,omitempty"`
+}
+
+// PrimaryIPAddress returns the IP address of the primary network attachment,
+// or empty string if not yet discovered.
+func (h *BareMetalInstance) PrimaryIPAddress() string {
+	for _, nas := range h.Status.NetworkAttachmentStatuses {
+		if nas.Primary && nas.IPAddress != "" {
+			return nas.IPAddress
+		}
+	}
+	// Single attachment is implicitly primary
+	if len(h.Status.NetworkAttachmentStatuses) == 1 {
+		return h.Status.NetworkAttachmentStatuses[0].IPAddress
+	}
+	return ""
 }
 
 // GetPoolID returns the owning BareMetalPool UID if the BareMetalInstance is owned by a BareMetalPool.

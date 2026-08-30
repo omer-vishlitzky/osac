@@ -153,8 +153,8 @@ func ComputeInstanceBillingDimensions(ci *privatev1.ComputeInstance) map[string]
 	if it := spec.GetInstanceType(); it != nil {
 		dims["instance_type"] = it.GetName()
 	}
-	if img := spec.GetImage(); img != nil {
-		dims["image_ref"] = img.GetSourceRef()
+	if di := spec.GetDiskImage(); di != nil {
+		dims["image_ref"] = di.GetName()
 	}
 	if disk := spec.GetBootDisk(); disk != nil {
 		dims["boot_disk_size_gib"] = disk.GetSizeGib()
@@ -167,6 +167,14 @@ func ComputeInstanceBillingDimensions(ci *privatev1.ComputeInstance) map[string]
 // the Watch Consumer (via IsBillable) and the Reconciler.
 func IsBillableState(state string) bool {
 	return state == ComputeInstanceStateRunning
+}
+
+// IsTransientState returns whether a ComputeInstance state string represents
+// a transient state (STARTING/STOPPING). Single source of truth for transient
+// classification — used by both the Watch Consumer (via handleTransientState)
+// and the Reconciler (via isTransientForType).
+func IsTransientState(state string) bool {
+	return state == ComputeInstanceStateStarting || state == ComputeInstanceStateStopping
 }
 
 func (m *computeInstanceMapper) TenantID() string {

@@ -117,6 +117,7 @@ func (b *RolesServerBuilder) Build() (result *RolesServer, err error) {
 		SetAttributionLogic(b.attributionLogic).
 		SetTenancyLogic(b.tenancyLogic).
 		SetMetricsRegisterer(b.metricsRegisterer).
+		SetFilterDesc((*publicv1.Role)(nil).ProtoReflect().Descriptor()).
 		Build()
 	if err != nil {
 		return
@@ -135,7 +136,9 @@ func (s *RolesServer) List(ctx context.Context,
 	request *publicv1.RolesListRequest) (response *publicv1.RolesListResponse, err error) {
 	privateRequest := &privatev1.RolesListRequest{}
 	privateRequest.SetOffset(request.GetOffset())
-	privateRequest.SetLimit(request.GetLimit())
+	if request.HasLimit() {
+		privateRequest.SetLimit(request.GetLimit())
+	}
 	privateRequest.SetFilter(request.GetFilter())
 	privateRequest.SetOrder(request.GetOrder())
 

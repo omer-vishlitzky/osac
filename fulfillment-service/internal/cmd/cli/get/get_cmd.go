@@ -28,9 +28,11 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
 
+	publicv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/public/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/cmd/cli/get/externalippool"
 	"github.com/osac-project/osac/fulfillment-service/internal/cmd/cli/get/kubeconfig"
 	"github.com/osac-project/osac/fulfillment-service/internal/cmd/cli/get/password"
+	"github.com/osac-project/osac/fulfillment-service/internal/cmd/cli/get/storagetier"
 	"github.com/osac-project/osac/fulfillment-service/internal/cmd/cli/get/token"
 	"github.com/osac-project/osac/fulfillment-service/internal/config"
 	"github.com/osac-project/osac/fulfillment-service/internal/logging"
@@ -67,6 +69,7 @@ func Cmd() *cobra.Command {
 	result.AddCommand(externalippool.Cmd())
 	result.AddCommand(kubeconfig.Cmd())
 	result.AddCommand(password.Cmd())
+	result.AddCommand(storagetier.Cmd())
 	result.AddCommand(token.Cmd())
 	flags := result.Flags()
 	flags.StringVarP(
@@ -146,6 +149,7 @@ func (c *runnerContext) run(cmd *cobra.Command, args []string) error {
 		SetConnection(c.conn).
 		AddPackages(cfg.Packages()).
 		SetTenantFunc(config.TenantFromContext).
+		UseGetForStructuredOutput(&publicv1.Secret{}).
 		Build()
 	if err != nil {
 		return fmt.Errorf("failed to create reflection tool: %w", err)
@@ -182,8 +186,9 @@ func (c *runnerContext) run(cmd *cobra.Command, args []string) error {
 		return c.watch(ctx, args[1:])
 	}
 
-	// Get the objects using the list method, which will handle filtering by identifiers or names if provided.
-	objects, err := c.list(ctx, args[1:])
+	// Get the objects:
+	keys := args[1:]
+	objects, err := c.fetchObjects(ctx, keys)
 	if err != nil {
 		return err
 	}
@@ -199,6 +204,41 @@ func (c *runnerContext) run(cmd *cobra.Command, args []string) error {
 		render = c.renderTable
 	}
 	return render(ctx, objects)
+}
+
+// fetchObjects returns objects for the given keys.
+// For cases when:
+//  1. Object names or identifiers are provided
+//  2. The output format is specified as yaml or json
+//  3. The resource type is configured to use Get for structured output
+//
+// We fetch the objects individually via Get to obtain the full representation.
+//
+// Otherwise, we fetch the objects via List.
+// This can result in partial data for resources like secrets where the data field is redacted
+// when list is called and no names or identifiers are provided.
+func (c *runnerContext) fetchObjects(ctx context.Context, keys []string) ([]proto.Message, error) {
+	if len(keys) > 0 && c.args.format != outputFormatTable && c.objectHelper.UseGetForStructuredOutput() {
+		return c.getByKeys(ctx, keys)
+	}
+	return c.list(ctx, keys)
+}
+
+func (c *runnerContext) getByKeys(ctx context.Context, keys []string) ([]proto.Message, error) {
+	listResults, err := c.list(ctx, keys)
+	if err != nil {
+		return nil, err
+	}
+	results := make([]proto.Message, len(listResults))
+	for i, obj := range listResults {
+		id := c.objectHelper.GetId(obj)
+		result, err := c.objectHelper.Get(ctx, id)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get object: %w", err)
+		}
+		results[i] = result
+	}
+	return results, nil
 }
 
 func (c *runnerContext) list(ctx context.Context, keys []string) (results []proto.Message, err error) {

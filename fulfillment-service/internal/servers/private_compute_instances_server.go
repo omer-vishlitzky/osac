@@ -28,6 +28,7 @@ import (
 	grpccodes "google.golang.org/grpc/codes"
 	grpcstatus "google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
 
@@ -45,6 +46,7 @@ type PrivateComputeInstancesServerBuilder struct {
 	attributionLogic  auth.AttributionLogic
 	tenancyLogic      auth.TenancyLogic
 	metricsRegisterer prometheus.Registerer
+	filterDesc        protoreflect.MessageDescriptor
 }
 
 var _ privatev1.ComputeInstancesServer = (*PrivateComputeInstancesServer)(nil)
@@ -53,6 +55,7 @@ type PrivateComputeInstancesServer struct {
 	privatev1.UnimplementedComputeInstancesServer
 
 	logger                  *slog.Logger
+	notifier                events.Notifier
 	tenancyLogic            auth.TenancyLogic
 	generic                 *GenericServer[*privatev1.ComputeInstance]
 	templatesDao            *dao.GenericDAO[*privatev1.ComputeInstanceTemplate]
@@ -61,6 +64,7 @@ type PrivateComputeInstancesServer struct {
 	securityGroupsDao       *dao.GenericDAO[*privatev1.SecurityGroup]
 	instanceTypesDao        *dao.GenericDAO[*privatev1.InstanceType]
 	storageTiersDao         *dao.GenericDAO[*privatev1.StorageTier]
+	diskImagesDao           *dao.GenericDAO[*privatev1.DiskImage]
 	externalIPPoolDao       *dao.GenericDAO[*privatev1.ExternalIPPool]
 	externalIPDao           *dao.GenericDAO[*privatev1.ExternalIP]
 	externalIPAttachmentDao *dao.GenericDAO[*privatev1.ExternalIPAttachment]
@@ -94,6 +98,13 @@ func (b *PrivateComputeInstancesServerBuilder) SetTenancyLogic(value auth.Tenanc
 // access objects. This is optional. If not set, no metrics will be recorded.
 func (b *PrivateComputeInstancesServerBuilder) SetMetricsRegisterer(value prometheus.Registerer) *PrivateComputeInstancesServerBuilder {
 	b.metricsRegisterer = value
+	return b
+}
+
+// SetFilterDesc sets the protobuf message descriptor used to validate and translate CEL filter
+// expressions. This is optional. When unset, the descriptor of this server's own private message type is used.
+func (b *PrivateComputeInstancesServerBuilder) SetFilterDesc(value protoreflect.MessageDescriptor) *PrivateComputeInstancesServerBuilder {
+	b.filterDesc = value
 	return b
 }
 
@@ -168,6 +179,16 @@ func (b *PrivateComputeInstancesServerBuilder) Build() (result *PrivateComputeIn
 		return
 	}
 
+	// Create the DiskImages DAO for disk image validation:
+	diskImagesDao, err := dao.NewGenericDAO[*privatev1.DiskImage]().
+		SetLogger(b.logger).
+		SetTenancyLogic(b.tenancyLogic).
+		SetMetricsRegisterer(b.metricsRegisterer).
+		Build()
+	if err != nil {
+		return
+	}
+
 	externalIPPoolDao, err := dao.NewGenericDAO[*privatev1.ExternalIPPool]().
 		SetLogger(b.logger).
 		SetTenancyLogic(b.tenancyLogic).
@@ -203,6 +224,7 @@ func (b *PrivateComputeInstancesServerBuilder) Build() (result *PrivateComputeIn
 		SetAttributionLogic(b.attributionLogic).
 		SetTenancyLogic(b.tenancyLogic).
 		SetMetricsRegisterer(b.metricsRegisterer).
+		SetFilterDesc(b.filterDesc).
 		Build()
 	if err != nil {
 		return
@@ -211,6 +233,7 @@ func (b *PrivateComputeInstancesServerBuilder) Build() (result *PrivateComputeIn
 	// Create and populate the object:
 	result = &PrivateComputeInstancesServer{
 		logger:                  b.logger,
+		notifier:                b.notifier,
 		tenancyLogic:            b.tenancyLogic,
 		generic:                 generic,
 		templatesDao:            templatesDao,
@@ -219,6 +242,7 @@ func (b *PrivateComputeInstancesServerBuilder) Build() (result *PrivateComputeIn
 		securityGroupsDao:       securityGroupsDao,
 		instanceTypesDao:        instanceTypesDao,
 		storageTiersDao:         storageTiersDao,
+		diskImagesDao:           diskImagesDao,
 		externalIPPoolDao:       externalIPPoolDao,
 		externalIPDao:           externalIPDao,
 		externalIPAttachmentDao: externalIPAttachmentDao,
@@ -260,7 +284,7 @@ func (s *PrivateComputeInstancesServer) injectDefaultNetworkAttachments(ctx cont
 			"spec.network_attachments: at least one network attachment is required for new compute instances")
 	}
 
-	attachment := privatev1.NetworkAttachment_builder{
+	attachment := privatev1.ComputeNetworkAttachment_builder{
 		Subnet: privatev1.SubnetLocalReference_builder{Id: subnet.GetId()}.Build(),
 	}.Build()
 
@@ -275,7 +299,7 @@ func (s *PrivateComputeInstancesServer) injectDefaultNetworkAttachments(ctx cont
 		})
 	}
 
-	spec.SetNetworkAttachments([]*privatev1.NetworkAttachment{attachment})
+	spec.SetNetworkAttachments([]*privatev1.ComputeNetworkAttachment{attachment})
 
 	attrs := []slog.Attr{
 		slog.String("subnet_id", subnet.GetId()),
@@ -352,6 +376,14 @@ func (s *PrivateComputeInstancesServer) Create(ctx context.Context,
 	if err != nil {
 		return
 	}
+
+	// Validate disk image existence, lifecycle state, and backfill id+name.
+	var diskImageWarnings []string
+	diskImageWarnings, err = s.validateDiskImage(ctx, request.GetObject())
+	if err != nil {
+		return
+	}
+	warnings = append(warnings, diskImageWarnings...)
 
 	err = s.generic.Create(ctx, request, &response)
 	if err != nil {
@@ -599,6 +631,39 @@ func (s *PrivateComputeInstancesServer) validateStorageTiers(
 	return nil
 }
 
+// validateDiskImage resolves the disk_image reference via the shared
+// validateDiskImageState helper (catalog_item_validation.go), which performs the
+// id-or-name lookup and lifecycle validation shared with the Template and CatalogItem
+// servers. On success it backfills id/name/shared on the stored reference so it is
+// complete, and returns warnings for DEPRECATED images.
+func (s *PrivateComputeInstancesServer) validateDiskImage(
+	ctx context.Context,
+	ci *privatev1.ComputeInstance,
+) ([]string, error) {
+	spec := ci.GetSpec()
+	diskImageRef := spec.GetDiskImage()
+	if diskImageRef == nil {
+		return nil, nil
+	}
+
+	key := refKey(diskImageRef)
+	if key == "" {
+		return nil, nil
+	}
+
+	diskImage, warnings, err := validateDiskImageState(ctx, s.diskImagesDao, key, "", "")
+	if err != nil {
+		return nil, err
+	}
+
+	// Backfill id, name, and shared so the stored reference is complete.
+	diskImageRef.Id = diskImage.GetId()
+	diskImageRef.Name = diskImage.GetMetadata().GetName()
+	diskImageRef.Shared = diskImage.GetMetadata().GetTenant() == auth.SharedTenant
+
+	return warnings, nil
+}
+
 // validateTemplateImmutability ensures that the template and template_parameters fields
 // cannot be changed after compute instance creation.
 func (s *PrivateComputeInstancesServer) validateTemplateImmutability(ctx context.Context,
@@ -608,9 +673,10 @@ func (s *PrivateComputeInstancesServer) validateTemplateImmutability(ctx context
 	updatingTemplateParams := hasMaskPrefix(updateMask, "spec.template_parameters")
 	updatingCatalogItem := hasMaskPrefix(updateMask, "spec.catalog_item")
 	updatingInstanceType := hasMaskPrefix(updateMask, "spec.instance_type")
+	updatingDiskImage := hasMaskPrefix(updateMask, "spec.disk_image")
 	updatingAutoExternalIP := hasMaskPrefix(updateMask, "spec.auto_external_ip_attachment")
 
-	if !updatingTemplate && !updatingTemplateParams && !updatingCatalogItem && !updatingInstanceType && !updatingAutoExternalIP {
+	if !updatingTemplate && !updatingTemplateParams && !updatingCatalogItem && !updatingInstanceType && !updatingDiskImage && !updatingAutoExternalIP {
 		return nil
 	}
 
@@ -668,6 +734,15 @@ func (s *PrivateComputeInstancesServer) validateTemplateImmutability(ctx context
 			"cannot change spec.instance_type from '%s' to '%s': instance type is immutable",
 			refKey(existingSpec.GetInstanceType()),
 			refKey(newSpec.GetInstanceType()),
+		)
+	}
+
+	if updatingDiskImage && refKey(existingSpec.GetDiskImage()) != refKey(newSpec.GetDiskImage()) {
+		return grpcstatus.Errorf(
+			grpccodes.InvalidArgument,
+			"cannot change spec.disk_image from '%s' to '%s': disk image is immutable",
+			refKey(existingSpec.GetDiskImage()),
+			refKey(newSpec.GetDiskImage()),
 		)
 	}
 
@@ -1139,9 +1214,14 @@ func (s *PrivateComputeInstancesServer) autoProvisionExternalIP(
 
 	tenant := ci.GetMetadata().GetTenant()
 	ciID := ci.GetId()
+	shortID := ciID
+	if len(shortID) > 8 {
+		shortID = shortID[:8]
+	}
 
 	eip := privatev1.ExternalIP_builder{
 		Metadata: privatev1.Metadata_builder{
+			Name:   fmt.Sprintf("auto-eip-%s", shortID),
 			Tenant: tenant,
 			Labels: map[string]string{
 				autoCreatedLabel:    "true",
@@ -1173,6 +1253,7 @@ func (s *PrivateComputeInstancesServer) autoProvisionExternalIP(
 
 	attachment := privatev1.ExternalIPAttachment_builder{
 		Metadata: privatev1.Metadata_builder{
+			Name:   fmt.Sprintf("auto-eipa-%s", shortID),
 			Tenant: tenant,
 			Labels: map[string]string{
 				autoCreatedLabel:    "true",
@@ -1216,12 +1297,26 @@ func (s *PrivateComputeInstancesServer) autoCleanupExternalIP(ctx context.Contex
 	}
 
 	for _, attachment := range listResp.GetItems() {
+		attachmentID := attachment.GetId()
 		eipRef := attachment.GetSpec().GetExternalIp()
 		eipID := refKey(eipRef)
 
-		_, err = s.externalIPAttachmentDao.Delete().SetId(attachment.GetId()).Do(ctx)
+		_, err = s.externalIPAttachmentDao.Delete().SetId(attachmentID).Do(ctx)
 		if err != nil {
 			return fmt.Errorf("auto_external_ip_attachment cleanup: failed to delete attachment: %w", err)
+		}
+
+		if s.notifier != nil {
+			attResp, getErr := s.externalIPAttachmentDao.Get().SetId(attachmentID).Do(ctx)
+			if getErr == nil {
+				attEvent := privatev1.Event_builder{
+					Type:                 privatev1.EventType_EVENT_TYPE_OBJECT_UPDATED,
+					ExternalIpAttachment: attResp.GetObject(),
+				}.Build()
+				if notifyErr := s.notifier.Notify(ctx, attEvent); notifyErr != nil {
+					s.logger.WarnContext(ctx, "Failed to notify ExternalIPAttachment deletion", "error", notifyErr)
+				}
+			}
 		}
 
 		if eipID != "" {
@@ -1239,6 +1334,19 @@ func (s *PrivateComputeInstancesServer) autoCleanupExternalIP(ctx context.Contex
 			_, err = s.externalIPDao.Delete().SetId(eipID).Do(ctx)
 			if err != nil {
 				return fmt.Errorf("auto_external_ip_attachment cleanup: failed to delete ExternalIP: %w", err)
+			}
+
+			if s.notifier != nil {
+				updatedEIP, getErr := s.externalIPDao.Get().SetId(eipID).Do(ctx)
+				if getErr == nil {
+					eipEvent := privatev1.Event_builder{
+						Type:       privatev1.EventType_EVENT_TYPE_OBJECT_UPDATED,
+						ExternalIp: updatedEIP.GetObject(),
+					}.Build()
+					if notifyErr := s.notifier.Notify(ctx, eipEvent); notifyErr != nil {
+						s.logger.WarnContext(ctx, "Failed to notify ExternalIP deletion", "error", notifyErr)
+					}
+				}
 			}
 
 			if poolRef != nil {

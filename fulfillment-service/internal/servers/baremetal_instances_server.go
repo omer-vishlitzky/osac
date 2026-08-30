@@ -113,6 +113,7 @@ func (b *BareMetalInstancesServerBuilder) Build() (result *BareMetalInstancesSer
 		SetAttributionLogic(b.attributionLogic).
 		SetTenancyLogic(b.tenancyLogic).
 		SetMetricsRegisterer(b.metricsRegisterer).
+		SetFilterDesc((*publicv1.BareMetalInstance)(nil).ProtoReflect().Descriptor()).
 		Build()
 	if err != nil {
 		return
@@ -131,7 +132,9 @@ func (s *BareMetalInstancesServer) List(ctx context.Context,
 	request *publicv1.BareMetalInstancesListRequest) (response *publicv1.BareMetalInstancesListResponse, err error) {
 	privateRequest := &privatev1.BareMetalInstancesListRequest{}
 	privateRequest.SetOffset(request.GetOffset())
-	privateRequest.SetLimit(request.GetLimit())
+	if request.HasLimit() {
+		privateRequest.SetLimit(request.GetLimit())
+	}
 	privateRequest.SetFilter(request.GetFilter())
 
 	privateResponse, err := s.delegate.List(ctx, privateRequest)

@@ -50,7 +50,7 @@ cliff==4.13.2
     #   python-openstackclient
 cmd2==3.4.0
     # via cliff
-cryptography==46.0.5
+cryptography==46.0.7
     # via
     #   ansible-core
     #   openstacksdk
@@ -303,7 +303,7 @@ resolvelib==1.2.1
     # via ansible-core
 rfc3986==2.0.0
     # via oslo-config
-rich==14.3.3
+rich==14.3.4
     # via
     #   cmd2
     #   rich-argparse
@@ -348,7 +348,7 @@ typing-extensions==4.15.0
     #   pydantic-core
     #   referencing
     #   typing-inspection
-typing-inspection==0.4.2
+typing-inspection==0.4.4
     # via pydantic
 urllib3==2.6.3
     # via

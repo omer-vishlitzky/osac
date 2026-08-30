@@ -15,13 +15,33 @@ syntax = "proto3";
 
 package osac.private.v1;
 
+import "cleanapi/cleanapi.proto";
 import "osac/private/v1/metadata_type.proto";
 
+option (cleanapi.file).package = "osac.public.v1";
+
+// Describes a set of hosts that share characteristics.
+//
+// For example there could be a host type `acme_1tb` to describe the set of hosts manufactured by ACME and with 1 TiB
+// of RAM, and another `ibm_mi300x` to describe the set of hosts manufactured by IBM and with a MI300X GPU.
+//
+// This is similar to the _instance type_ concept used by many cloud providers.
+//
+// The detailed characteristics of the host (CPU, memory, GPU, etc) will be in the `description` field.
+//
 // buf:lint:ignore OSAC_OBJECT_SHAPE
 message HostType {
+  // Unique identifier of the type.
   string id = 1;
+
+  // Metadata of the host type.
   Metadata metadata = 2;
+
+  // Human friendly short description of the host type, only a few words, suitable for displaying in one single
+  // line on a UI or CLI.
   string title = 3;
+
+  // Human friendly long description of the host type, using Markdown format.
   string description = 4;
 
   // Physical network interfaces available on hosts of this type.

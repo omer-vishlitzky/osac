@@ -62,6 +62,9 @@ type ExternalIPPoolReconciler struct {
 	StatusPollInterval   time.Duration
 	MaxJobHistory        int
 	targetCluster        mc.ClusterName
+	// NetworkProvisioningEnabled controls whether the controller dispatches AAP
+	// provisioning jobs. When false, resources are set to Ready immediately.
+	NetworkProvisioningEnabled bool
 }
 
 // NewExternalIPPoolReconciler creates a new reconciler for ExternalIPPool resources.
@@ -98,6 +101,7 @@ func NewExternalIPPoolReconciler(
 // +kubebuilder:rbac:groups=osac.openshift.io,resources=externalippools,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=osac.openshift.io,resources=externalippools/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=osac.openshift.io,resources=externalippools/finalizers,verbs=update
+// +kubebuilder:rbac:groups=osac.openshift.io,resources=externalips,verbs=list
 
 // Reconcile handles create/update/delete for a ExternalIPPool CR.
 // On create/update it ensures a finalizer, reads the implementation strategy from spec,
@@ -158,6 +162,14 @@ func (r *ExternalIPPoolReconciler) handleUpdate(ctx context.Context, pool *v1alp
 	// Set initial phase to Progressing
 	if pool.Status.Phase == "" {
 		pool.Status.Phase = v1alpha1.ExternalIPPoolPhaseProgressing
+	}
+
+	// When networking provisioning is disabled, skip AAP job dispatch and set Ready
+	// immediately.
+	if !r.NetworkProvisioningEnabled {
+		pool.Status.Phase = v1alpha1.ExternalIPPoolPhaseReady
+		setReadyConditionTrue(&pool.Status.Conditions)
+		return ctrl.Result{}, nil
 	}
 
 	// Read implementation strategy from spec
@@ -222,6 +234,24 @@ func (r *ExternalIPPoolReconciler) handleDelete(ctx context.Context, pool *v1alp
 	// Finalizer already removed, cleanup complete
 	if !controllerutil.ContainsFinalizer(pool, osacExternalIPPoolFinalizer) {
 		return ctrl.Result{}, nil
+	}
+
+	// Gate: wait for all ExternalIP CRs allocated from this pool to be fully removed.
+	// Child ExternalIPs reference the parent pool by its fulfillment-service UUID
+	// (stored in the osac.openshift.io/externalippool-uuid label), not by K8s name.
+	poolUUID := pool.Labels[osacExternalIPPoolIDLabel]
+	ns := pool.Namespace
+
+	eipList := &v1alpha1.ExternalIPList{}
+	if err := r.List(ctx, eipList, client.InNamespace(ns)); err != nil {
+		return ctrl.Result{}, fmt.Errorf("listing ExternalIPs: %w", err)
+	}
+	for i := range eipList.Items {
+		if eipList.Items[i].Spec.Pool == poolUUID {
+			log.Info("waiting for child ExternalIP to be deleted before deprovisioning ExternalIPPool",
+				"externalIP", eipList.Items[i].Name)
+			return ctrl.Result{RequeueAfter: defaultPreconditionRequeueInterval}, nil
+		}
 	}
 
 	// Handle deprovisioning

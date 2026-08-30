@@ -89,7 +89,7 @@ target Hub cluster.
 | **Storage** | Dynamic storage class available (e.g., `ocs-storagecluster-cephfs`, `lvms-storage`) | Required for persistence of operator and AAP components. |
 | **Permissions** | Cluster-admin access to deploy operators and create CRDs | Limited access users can only deploy into namespaces configured by the admin. |
 | **License Files** | `license.zip` (AAP subscription) | Must be placed in your values directory (e.g., `values/<env>/license.zip`). |
-| **Internet Access** | Outbound access to GitHub (for fetching submodules, releases) | Required during installation and updates. |
+| **Internet Access** | Outbound access to GitHub and `ghcr.io` (for fetching chart dependencies, OCI charts, and releases) | Required during installation and updates. |
 
 
 ## Installation
@@ -107,16 +107,17 @@ obtain it:
    and add your Ansible Automation Platform subscriptions.
 5. **Download:** Click **Export Manifest** to download the `.zip` file.
 
-Place the downloaded `license.zip` file in your values directory (e.g., `values/development/license.zip`).
+Place the downloaded `license.zip` file in your values directory (e.g., `values/dev/license.zip`).
 
 ### Pre-Installation Steps
 
-#### 1. Initialize Submodules
+#### 1. Build Chart Dependencies
 
-The OSAC installer uses Git submodules for version tracking:
+In the `osac` mono-repo, component charts are sibling directories referenced via
+`file://` in the umbrella `Chart.yaml`. Build dependencies before installing:
 
 ```bash
-$ git submodule update --init --recursive
+make helm-deps
 ```
 
 #### 2. Populate Local Secrets
@@ -135,28 +136,29 @@ phases create. See [docs/helm-deployment-guide.md](docs/helm-deployment-guide.md
 for a detailed explanation.
 
 ```bash
-# Full install (all 3 phases)
-make install VALUES_FILE=values/<env>/values.yaml
+# Full install (infra + osac)
+make install PLATFORM=openshift PROFILE=<profile> NS=<namespace>
 
 # Or run phases individually:
-make install-operators VALUES_FILE=values/<env>/values.yaml   # Phase 1: OLM operators
-make install-prereqs VALUES_FILE=values/<env>/values.yaml     # Phase 2: CRD instances, Keycloak, certs
-make install-osac VALUES_FILE=values/<env>/values.yaml        # Phase 3: OSAC application
+make install-infra PLATFORM=openshift PROFILE=<profile> NS=<namespace>   # Infrastructure (operators, certs, Keycloak)
+make install-osac  PLATFORM=openshift PROFILE=<profile> NS=<namespace>   # OSAC application
 ```
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `INSTALLER_NAMESPACE` | `osac` | Target namespace for the OSAC deployment |
-| `VALUES_FILE` | `values/development/values.yaml` | Helm values file to use |
-| `EXTRA_HELM_ARGS` | (empty) | Extra `--set`/`--set-string` args appended to `install-osac`'s helm command, e.g. `EXTRA_HELM_ARGS='--set-string aap.bootstrap.image=my-image:tag'` |
+| Variable | Description |
+|----------|-------------|
+| `PLATFORM` | `kind` or `openshift` (required) |
+| `PROFILE` | `dev`, `vmaas-ci`, `bmaas-ci`, `caas-ci`, or `full-ci` (required) |
+| `NS` | Target namespace (required) |
+| `EXTRA_HELM_ARGS` | Extra `--set`/`--set-string` args appended to helm commands |
 
 #### Configure Values
 
-Copy and customize a values file for your environment:
+Each profile has two values files under `values/<profile>/`:
 
 ```bash
 mkdir -p values/<project-name>
-cp values/development/values.yaml values/<project-name>/values.yaml
+cp values/dev/infra.yaml values/<project-name>/infra.yaml
+cp values/dev/instance.yaml values/<project-name>/instance.yaml
 # Edit to match your cluster (see values file comments for guidance)
 ```
 
@@ -222,16 +224,15 @@ make uninstall
 #### Makefile Targets
 
 ```bash
-make install             # Full install (all 3 phases)
-make install-operators   # Phase 1: OLM operators
-make install-prereqs     # Phase 2: Prerequisites
-make install-osac        # Phase 3: OSAC application
-make uninstall           # Full uninstall (reverse order)
-make helm-deps           # Build chart dependencies
-make helm-lint           # Lint all charts
+make install       PLATFORM=... PROFILE=... NS=...  # Full install (infra + osac)
+make install-infra PLATFORM=... PROFILE=... NS=...  # Infrastructure only
+make install-osac  PLATFORM=... PROFILE=... NS=...  # OSAC application only
+make uninstall     PLATFORM=... PROFILE=... NS=...  # Full uninstall
+make test          PLATFORM=... PROFILE=... NS=... SUITE=...  # Integration tests
+make helm-lint                                       # Lint all charts
 make helm-template       # Dry-run render all templates
-make helm-validate       # Lint + template (full validation)
-make sync-charts         # Update submodules + rebuild dependencies
+make helm-validate                                   # Lint + template (full validation)
+make sync-charts         # Rebuild chart dependencies (legacy alias; runs helm dependency build)
 ```
 
 ### Monitor Progress

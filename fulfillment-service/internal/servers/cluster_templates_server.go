@@ -116,6 +116,7 @@ func (b *ClusterTemplatesServerBuilder) Build() (result *ClusterTemplatesServer,
 		SetAttributionLogic(b.attributionLogic).
 		SetTenancyLogic(b.tenancyLogic).
 		SetMetricsRegisterer(b.metricsRegisterer).
+		SetFilterDesc((*publicv1.ClusterTemplate)(nil).ProtoReflect().Descriptor()).
 		Build()
 	if err != nil {
 		return
@@ -136,7 +137,9 @@ func (s *ClusterTemplatesServer) List(ctx context.Context,
 	// Create private request with same parameters:
 	privateRequest := &privatev1.ClusterTemplatesListRequest{}
 	privateRequest.SetOffset(request.GetOffset())
-	privateRequest.SetLimit(request.GetLimit())
+	if request.HasLimit() {
+		privateRequest.SetLimit(request.GetLimit())
+	}
 	privateRequest.SetFilter(request.GetFilter())
 
 	// Delegate to private server:

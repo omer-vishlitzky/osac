@@ -99,6 +99,8 @@ spec:
           - name: OSAC_AAP_INSECURE_SKIP_VERIFY
             value: {{ .Values.env.aapInsecureSkipVerify | quote }}
           {{- end }}
+          - name: OSAC_ENABLE_NETWORKING_PROVISIONING
+            value: {{ .Values.env.enableNetworkingProvisioning | default "false" | quote }}
         volumeMounts:
           - name: inventory-config
             mountPath: /etc/osac/inventory/
@@ -108,6 +110,11 @@ spec:
             mountPath: /etc/openstack/
           - name: profiles
             mountPath: /etc/osac/profile/
+          {{- if .Values.bcm.enabled }}
+          - name: bcm-certs
+            mountPath: /etc/osac/certs/{{ .Values.secrets.bcmCerts }}/
+            readOnly: true
+          {{- end }}
       volumes:
         - name: inventory-config
           secret:
@@ -123,5 +130,10 @@ spec:
           configMap:
             name: {{ .Values.configMaps.profiles }}
             optional: true
+        {{- if .Values.bcm.enabled }}
+        - name: bcm-certs
+          secret:
+            secretName: {{ .Values.secrets.bcmCerts }}
+        {{- end }}
       serviceAccountName: {{ include "bare-metal-fulfillment-operator.serviceAccountName" . }}
       terminationGracePeriodSeconds: 10

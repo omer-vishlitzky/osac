@@ -22,10 +22,13 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	grpccodes "google.golang.org/grpc/codes"
 	grpcstatus "google.golang.org/grpc/status"
+	"google.golang.org/protobuf/reflect/protoreflect"
 
 	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
 	"github.com/osac-project/osac/fulfillment-service/internal/database/dao"
+	"github.com/osac-project/osac/fulfillment-service/internal/events"
+	"github.com/osac-project/osac/fulfillment-service/internal/uuid"
 )
 
 const defaultLabel = "osac.openshift.io/default"
@@ -43,6 +46,7 @@ type DefaultNetworkingProvisionerBuilder struct {
 	logger            *slog.Logger
 	tenancyLogic      auth.TenancyLogic
 	metricsRegisterer prometheus.Registerer
+	notifier          events.Notifier
 }
 
 type DefaultNetworkingProvisioner struct {
@@ -76,6 +80,47 @@ func (b *DefaultNetworkingProvisionerBuilder) SetMetricsRegisterer(value prometh
 	return b
 }
 
+func (b *DefaultNetworkingProvisionerBuilder) SetNotifier(value events.Notifier) *DefaultNetworkingProvisionerBuilder {
+	b.notifier = value
+	return b
+}
+
+// makeNotifyCallback returns a dao.EventCallback that publishes events for resources created
+// by the DefaultNetworkingProvisioner. It finds the correct privatev1.Event payload field for
+// type O at construction time using proto reflection, mirroring the generic server's notifyEvent.
+func makeNotifyCallback[O dao.Object](notifier events.Notifier) dao.EventCallback {
+	var zero O
+	objDesc := zero.ProtoReflect().Descriptor()
+	eventDesc := (&privatev1.Event{}).ProtoReflect().Descriptor()
+	var payloadField protoreflect.FieldDescriptor
+	fields := eventDesc.Fields()
+	for i := range fields.Len() {
+		fd := fields.Get(i)
+		if fd.Kind() == protoreflect.MessageKind && fd.Message().FullName() == objDesc.FullName() {
+			payloadField = fd
+			break
+		}
+	}
+	return func(ctx context.Context, e dao.Event) error {
+		event := &privatev1.Event{}
+		event.SetId(uuid.New())
+		switch e.Type {
+		case dao.EventTypeCreated:
+			event.SetType(privatev1.EventType_EVENT_TYPE_OBJECT_CREATED)
+		case dao.EventTypeUpdated:
+			event.SetType(privatev1.EventType_EVENT_TYPE_OBJECT_UPDATED)
+		case dao.EventTypeDeleted:
+			event.SetType(privatev1.EventType_EVENT_TYPE_OBJECT_DELETED)
+		default:
+			return fmt.Errorf("unknown event type '%s'", e.Type)
+		}
+		if payloadField != nil {
+			event.ProtoReflect().Set(payloadField, protoreflect.ValueOfMessage(e.Object.ProtoReflect()))
+		}
+		return notifier.Notify(ctx, event)
+	}
+}
+
 func (b *DefaultNetworkingProvisionerBuilder) Build() (result *DefaultNetworkingProvisioner, err error) {
 	if b.logger == nil {
 		err = errors.New("logger is mandatory")
@@ -95,38 +140,50 @@ func (b *DefaultNetworkingProvisionerBuilder) Build() (result *DefaultNetworking
 		return
 	}
 
-	virtualNetworkDao, err := dao.NewGenericDAO[*privatev1.VirtualNetwork]().
+	vnDaoBuilder := dao.NewGenericDAO[*privatev1.VirtualNetwork]().
 		SetLogger(b.logger).
 		SetTenancyLogic(b.tenancyLogic).
-		SetMetricsRegisterer(b.metricsRegisterer).
-		Build()
+		SetMetricsRegisterer(b.metricsRegisterer)
+	if b.notifier != nil {
+		vnDaoBuilder.AddEventCallback(makeNotifyCallback[*privatev1.VirtualNetwork](b.notifier))
+	}
+	virtualNetworkDao, err := vnDaoBuilder.Build()
 	if err != nil {
 		return
 	}
 
-	subnetDao, err := dao.NewGenericDAO[*privatev1.Subnet]().
+	subnetDaoBuilder := dao.NewGenericDAO[*privatev1.Subnet]().
 		SetLogger(b.logger).
 		SetTenancyLogic(b.tenancyLogic).
-		SetMetricsRegisterer(b.metricsRegisterer).
-		Build()
+		SetMetricsRegisterer(b.metricsRegisterer)
+	if b.notifier != nil {
+		subnetDaoBuilder.AddEventCallback(makeNotifyCallback[*privatev1.Subnet](b.notifier))
+	}
+	subnetDao, err := subnetDaoBuilder.Build()
 	if err != nil {
 		return
 	}
 
-	securityGroupDao, err := dao.NewGenericDAO[*privatev1.SecurityGroup]().
+	sgDaoBuilder := dao.NewGenericDAO[*privatev1.SecurityGroup]().
 		SetLogger(b.logger).
 		SetTenancyLogic(b.tenancyLogic).
-		SetMetricsRegisterer(b.metricsRegisterer).
-		Build()
+		SetMetricsRegisterer(b.metricsRegisterer)
+	if b.notifier != nil {
+		sgDaoBuilder.AddEventCallback(makeNotifyCallback[*privatev1.SecurityGroup](b.notifier))
+	}
+	securityGroupDao, err := sgDaoBuilder.Build()
 	if err != nil {
 		return
 	}
 
-	externalIPDao, err := dao.NewGenericDAO[*privatev1.ExternalIP]().
+	eipDaoBuilder := dao.NewGenericDAO[*privatev1.ExternalIP]().
 		SetLogger(b.logger).
 		SetTenancyLogic(b.tenancyLogic).
-		SetMetricsRegisterer(b.metricsRegisterer).
-		Build()
+		SetMetricsRegisterer(b.metricsRegisterer)
+	if b.notifier != nil {
+		eipDaoBuilder.AddEventCallback(makeNotifyCallback[*privatev1.ExternalIP](b.notifier))
+	}
+	externalIPDao, err := eipDaoBuilder.Build()
 	if err != nil {
 		return
 	}
@@ -140,11 +197,14 @@ func (b *DefaultNetworkingProvisionerBuilder) Build() (result *DefaultNetworking
 		return
 	}
 
-	natGatewayDao, err := dao.NewGenericDAO[*privatev1.NATGateway]().
+	ngDaoBuilder := dao.NewGenericDAO[*privatev1.NATGateway]().
 		SetLogger(b.logger).
 		SetTenancyLogic(b.tenancyLogic).
-		SetMetricsRegisterer(b.metricsRegisterer).
-		Build()
+		SetMetricsRegisterer(b.metricsRegisterer)
+	if b.notifier != nil {
+		ngDaoBuilder.AddEventCallback(makeNotifyCallback[*privatev1.NATGateway](b.notifier))
+	}
+	natGatewayDao, err := ngDaoBuilder.Build()
 	if err != nil {
 		return
 	}
@@ -253,9 +313,8 @@ func (p *DefaultNetworkingProvisioner) createDefaultVirtualNetwork(
 			Creator: "system",
 		}.Build(),
 		Spec: privatev1.VirtualNetworkSpec_builder{
-			Region:                 "default",
-			NetworkClass:           privatev1.NetworkClassReference_builder{Id: nc.GetId()}.Build(),
-			ImplementationStrategy: nc.GetImplementationStrategy(),
+			Region:       "default",
+			NetworkClass: privatev1.NetworkClassReference_builder{Id: nc.GetId()}.Build(),
 		}.Build(),
 		Status: privatev1.VirtualNetworkStatus_builder{
 			State: privatev1.VirtualNetworkState_VIRTUAL_NETWORK_STATE_PENDING,
@@ -332,10 +391,9 @@ func (p *DefaultNetworkingProvisioner) createDefaultSecurityGroup(
 			Creator: "system",
 		}.Build(),
 		Spec: privatev1.SecurityGroupSpec_builder{
-			VirtualNetwork:         privatev1.VirtualNetworkLocalReference_builder{Id: vnID}.Build(),
-			Ingress:                defaults.GetIngressRules(),
-			Egress:                 defaults.GetEgressRules(),
-			ImplementationStrategy: "network_policy",
+			VirtualNetwork: privatev1.VirtualNetworkLocalReference_builder{Id: vnID}.Build(),
+			Ingress:        defaults.GetIngressRules(),
+			Egress:         defaults.GetEgressRules(),
 		}.Build(),
 		Status: privatev1.SecurityGroupStatus_builder{
 			State: privatev1.SecurityGroupState_SECURITY_GROUP_STATE_PENDING,
@@ -487,4 +545,193 @@ func (p *DefaultNetworkingProvisioner) updateExternalIPAttachedFlag(ctx context.
 		return fmt.Errorf("failed to update ExternalIP attached flag: %w", err)
 	}
 	return nil
+}
+
+// Deprovision removes the default networking resources previously created by Provision for the
+// given tenant. It is idempotent: if no default VirtualNetwork exists for the tenant, it returns
+// nil immediately.
+//
+// This bypasses the "default resources are system-managed" protection enforced by
+// validateNotDefault() in the private servers' Delete() handlers, because it operates on the DAOs
+// directly rather than going through those handlers — it is the system removing what it itself
+// created, not a user request going through the normal API path.
+func (p *DefaultNetworkingProvisioner) Deprovision(ctx context.Context, tenantName string) error {
+	vn, err := p.findDefaultVirtualNetwork(ctx, tenantName)
+	if err != nil {
+		return fmt.Errorf("failed to find default VirtualNetwork: %w", err)
+	}
+	if vn == nil {
+		p.logger.InfoContext(ctx, "No default networking resources to deprovision")
+		return nil
+	}
+	vnID := vn.GetId()
+
+	if err := p.deprovisionDefaultNATGateway(ctx, vnID); err != nil {
+		return fmt.Errorf("failed to deprovision default NATGateway: %w", err)
+	}
+
+	if err := deleteByVirtualNetwork(ctx, p.securityGroupDao, vnID); err != nil {
+		return fmt.Errorf("failed to delete default SecurityGroup: %w", err)
+	}
+
+	if err := deleteByVirtualNetwork(ctx, p.subnetDao, vnID); err != nil {
+		return fmt.Errorf("failed to delete default Subnets: %w", err)
+	}
+
+	if _, err := p.virtualNetworkDao.Delete().SetId(vnID).Do(ctx); err != nil {
+		return fmt.Errorf("failed to delete default VirtualNetwork: %w", err)
+	}
+
+	p.logger.InfoContext(ctx, "Default networking resources deprovisioned successfully")
+	return nil
+}
+
+// findDefaultVirtualNetwork returns the default VirtualNetwork for the given tenant, or nil if
+// none exists. Provision always names it "default", so matching on tenant + name is sufficient
+// and avoids depending on CEL map-literal syntax for label lookups.
+func (p *DefaultNetworkingProvisioner) findDefaultVirtualNetwork(
+	ctx context.Context, tenantName string,
+) (*privatev1.VirtualNetwork, error) {
+	filter := fmt.Sprintf(`this.metadata.tenant == %q && this.metadata.name == "default"`, tenantName)
+	listResponse, err := p.virtualNetworkDao.List().SetFilter(filter).Do(ctx)
+	if err != nil {
+		return nil, err
+	}
+	items := listResponse.GetItems()
+	if len(items) == 0 {
+		return nil, nil
+	}
+	return items[0], nil
+}
+
+// deprovisionDefaultNATGateway deletes every default-labeled NATGateway attached to the given
+// VirtualNetwork, along with each one's ExternalIP and the corresponding pool capacity release.
+// Only resources labeled osac.openshift.io/default are matched: a tenant is free to attach its
+// own NATGateways to its default VirtualNetwork, and those must not be swept up here — if any
+// remain, the subsequent VirtualNetwork delete correctly fails with a foreign key violation
+// instead of silently destroying tenant-owned resources. It pages through matches rather than
+// relying on a single List() call, since the list defaults to a 100-item page.
+//
+// Delete() only archives (fully removes) an object once its finalizers are empty; if the
+// NATGateway controller has already attached its finalizer, Delete() just sets
+// deletion_timestamp and the row keeps matching this filter. Real removal then depends on that
+// controller's own, asynchronous cleanup — which cannot complete within this single request's
+// transaction — so each matching id is attempted at most once per call, and if a pass makes no
+// further progress, this returns an in-use error instead of looping forever.
+func (p *DefaultNetworkingProvisioner) deprovisionDefaultNATGateway(ctx context.Context, vnID string) error {
+	filter := fmt.Sprintf(
+		`this.metadata.labels["%s"] == "true" && this.spec.virtual_network.id == %q`,
+		defaultLabel, vnID,
+	)
+	attempted := map[string]bool{}
+	for {
+		listResponse, err := p.natGatewayDao.List().SetFilter(filter).Do(ctx)
+		if err != nil {
+			return err
+		}
+		items := listResponse.GetItems()
+		if len(items) == 0 {
+			return nil
+		}
+		progress := false
+		for _, ng := range items {
+			id := ng.GetId()
+			if attempted[id] {
+				continue
+			}
+			attempted[id] = true
+			progress = true
+			// If the NATGateway already has a finalizer, Delete() below only soft-deletes it —
+			// its ExternalIP must be left alone until the NATGateway is actually archived, or the
+			// ExternalIP would be released while the NATGateway still references it.
+			archived := len(ng.GetMetadata().GetFinalizers()) == 0
+			externalIPID := ng.GetSpec().GetExternalIp().GetId()
+			if _, err := p.natGatewayDao.Delete().SetId(id).Do(ctx); err != nil {
+				return err
+			}
+			if !archived || externalIPID == "" {
+				continue
+			}
+			if err := p.deprovisionDefaultExternalIP(ctx, externalIPID); err != nil {
+				return err
+			}
+		}
+		if !progress {
+			return &dao.ErrInUse{
+				Reason: fmt.Sprintf(
+					"%d default NATGateway(s) still awaiting asynchronous controller cleanup, retry later",
+					len(items),
+				),
+			}
+		}
+	}
+}
+
+// deprovisionDefaultExternalIP deletes the given ExternalIP and releases its pool capacity.
+func (p *DefaultNetworkingProvisioner) deprovisionDefaultExternalIP(ctx context.Context, externalIPID string) error {
+	getResponse, err := p.externalIPDao.Get().SetId(externalIPID).Do(ctx)
+	if err != nil {
+		return err
+	}
+	poolID := getResponse.GetObject().GetSpec().GetPool().GetId()
+	if _, err := p.externalIPDao.Delete().SetId(externalIPID).Do(ctx); err != nil {
+		return err
+	}
+	if poolID == "" {
+		return nil
+	}
+	return p.updatePoolCapacity(ctx, poolID, int64(-1))
+}
+
+// deleteByVirtualNetwork deletes every default-labeled object of type O whose spec references the
+// given VirtualNetwork by id. Used to clean up the default Subnets and SecurityGroup attached to a
+// default VirtualNetwork before deleting the VirtualNetwork itself. Only resources labeled
+// osac.openshift.io/default are matched: a tenant is free to attach its own Subnets/SecurityGroups
+// to its default VirtualNetwork, and those must not be swept up here — if any remain, the
+// subsequent VirtualNetwork delete correctly fails with a foreign key violation instead of
+// silently destroying tenant-owned resources. It pages through matches rather than relying on a
+// single List() call, since the list defaults to a 100-item page.
+//
+// Delete() only archives (fully removes) an object once its finalizers are empty; if the owning
+// controller has already attached its finalizer, Delete() just sets deletion_timestamp and the row
+// keeps matching this filter. Real removal then depends on that controller's own, asynchronous
+// cleanup — which cannot complete within this single request's transaction — so each matching id
+// is attempted at most once per call, and if a pass makes no further progress, this returns an
+// in-use error instead of looping forever.
+func deleteByVirtualNetwork[O dao.Object](ctx context.Context, d *dao.GenericDAO[O], vnID string) error {
+	filter := fmt.Sprintf(
+		`this.metadata.labels["%s"] == "true" && this.spec.virtual_network.id == %q`,
+		defaultLabel, vnID,
+	)
+	attempted := map[string]bool{}
+	for {
+		listResponse, err := d.List().SetFilter(filter).Do(ctx)
+		if err != nil {
+			return err
+		}
+		items := listResponse.GetItems()
+		if len(items) == 0 {
+			return nil
+		}
+		progress := false
+		for _, item := range items {
+			id := item.GetId()
+			if attempted[id] {
+				continue
+			}
+			attempted[id] = true
+			progress = true
+			if _, err := d.Delete().SetId(id).Do(ctx); err != nil {
+				return err
+			}
+		}
+		if !progress {
+			return &dao.ErrInUse{
+				Reason: fmt.Sprintf(
+					"%d default networking object(s) still awaiting asynchronous controller cleanup, retry later",
+					len(items),
+				),
+			}
+		}
+	}
 }

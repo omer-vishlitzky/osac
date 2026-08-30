@@ -15,8 +15,11 @@ syntax = "proto3";
 
 package osac.private.v1;
 
+import "cleanapi/cleanapi.proto";
 import "osac/private/v1/metadata_type.proto";
 import "osac/private/v1/user_type.proto";
+
+option (cleanapi.file).package = "osac.public.v1";
 
 // ProjectMembership represents a member's association with a project and their role within it.
 message ProjectMembership {
@@ -66,7 +69,7 @@ message ProjectMembershipStatus {
   // List of users that have been successfully synced to the identity provider. This tracks which users
   // currently have the role assigned, allowing the controller to detect when users are added or removed from
   // the membership.
-  repeated UserReference users = 3;
+  repeated UserReference users = 3 [(cleanapi.field).private = true];
 }
 
 // Describes the state of a project membership.

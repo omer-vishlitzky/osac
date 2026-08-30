@@ -15,16 +15,21 @@ syntax = "proto3";
 
 package osac.private.v1;
 
+import "cleanapi/cleanapi.proto";
 import "osac/private/v1/cluster_template_type.proto";
 import "osac/private/v1/field_definition_type.proto";
 import "osac/private/v1/metadata_type.proto";
+
+option (cleanapi.file).package = "osac.public.v1";
 
 // A cluster catalog item defines a curated infrastructure offering that references an underlying cluster template.
 // Admins control which fields users can set, enforce defaults, and validate input via JSON Schema.
 //
 // buf:lint:ignore OSAC_OBJECT_SHAPE
 message ClusterCatalogItem {
+  // Unique identifier of the catalog item.
   string id = 1;
+
   Metadata metadata = 2;
 
   // Human friendly short description of the catalog item, suitable for displaying in one single line on a UI or CLI.
@@ -36,13 +41,15 @@ message ClusterCatalogItem {
   // Reference to the underlying cluster template that this catalog item references.
   ClusterTemplateReference template = 5;
 
-  // Whether this catalog item is visible in the public API. Only published items are returned by the public List and
-  // Get endpoints (with the exception of unpublished items already referenced by an existing resource).
+  // Whether this catalog item is published.
   bool published = 6;
+
+  // Field 7 is omitted: `tenant` is an internal field managed by the server, not exposed through the public API.
+
 
   // Tenant scope for this catalog item. An empty string means the item is global and visible to all tenants. A
   // non-empty string scopes the item to that specific tenant.
-  string tenant = 7;
+  string tenant = 7 [(cleanapi.field).private = true];
 
   // Definitions of the fields that users can or cannot set when creating a resource from this catalog item.
   repeated FieldDefinition field_definitions = 8;

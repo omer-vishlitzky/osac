@@ -22,6 +22,8 @@ import (
 	. "github.com/onsi/gomega"
 	"go.uber.org/mock/gomock"
 	"google.golang.org/grpc"
+	grpccodes "google.golang.org/grpc/codes"
+	grpcstatus "google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
@@ -30,6 +32,56 @@ import (
 	"github.com/osac-project/osac/fulfillment-service/internal/idp"
 	"github.com/osac-project/osac/fulfillment-service/internal/vault"
 )
+
+// Fixture credentials for tenant reconciler tests; test* prefix marks them non-production.
+const (
+	testPreGeneratedPassword = "pre-generated-password"
+	testInlinePassword       = "inline-password"
+	testSecretPassword       = "from-secret"
+)
+
+type mockSecretsClient struct {
+	getFunc    func(ctx context.Context, req *privatev1.SecretsGetRequest) (*privatev1.SecretsGetResponse, error)
+	createFunc func(ctx context.Context, req *privatev1.SecretsCreateRequest) (*privatev1.SecretsCreateResponse, error)
+	listFunc   func(ctx context.Context, req *privatev1.SecretsListRequest) (*privatev1.SecretsListResponse, error)
+	deleteFunc func(ctx context.Context, req *privatev1.SecretsDeleteRequest) (*privatev1.SecretsDeleteResponse, error)
+}
+
+func (m *mockSecretsClient) Get(ctx context.Context, req *privatev1.SecretsGetRequest, _ ...grpc.CallOption) (*privatev1.SecretsGetResponse, error) {
+	if m.getFunc != nil {
+		return m.getFunc(ctx, req)
+	}
+	return nil, fmt.Errorf("unexpected Get")
+}
+
+func (m *mockSecretsClient) List(ctx context.Context, req *privatev1.SecretsListRequest, _ ...grpc.CallOption) (*privatev1.SecretsListResponse, error) {
+	if m.listFunc != nil {
+		return m.listFunc(ctx, req)
+	}
+	return nil, fmt.Errorf("unexpected List")
+}
+
+func (m *mockSecretsClient) Create(ctx context.Context, req *privatev1.SecretsCreateRequest, _ ...grpc.CallOption) (*privatev1.SecretsCreateResponse, error) {
+	if m.createFunc != nil {
+		return m.createFunc(ctx, req)
+	}
+	return nil, fmt.Errorf("unexpected Create")
+}
+
+func (m *mockSecretsClient) Update(context.Context, *privatev1.SecretsUpdateRequest, ...grpc.CallOption) (*privatev1.SecretsUpdateResponse, error) {
+	return nil, fmt.Errorf("unexpected Update")
+}
+
+func (m *mockSecretsClient) Delete(ctx context.Context, req *privatev1.SecretsDeleteRequest, _ ...grpc.CallOption) (*privatev1.SecretsDeleteResponse, error) {
+	if m.deleteFunc != nil {
+		return m.deleteFunc(ctx, req)
+	}
+	return nil, fmt.Errorf("unexpected Delete")
+}
+
+func (m *mockSecretsClient) Signal(context.Context, *privatev1.SecretsSignalRequest, ...grpc.CallOption) (*privatev1.SecretsSignalResponse, error) {
+	return nil, fmt.Errorf("unexpected Signal")
+}
 
 var _ = Describe("Tenant Validation", func() {
 	It("should succeed with a tenant assigned", func() {
@@ -208,7 +260,7 @@ var _ = Describe("IDP Sync", func() {
 			Status: privatev1.TenantStatus_builder{
 				BreakGlassCredentials: privatev1.BreakGlassCredentials_builder{
 					Username: "test-org-osac-break-glass",
-					Password: "pre-generated-password",
+					Password: testPreGeneratedPassword,
 				}.Build(),
 			}.Build(),
 		}.Build()
@@ -231,7 +283,7 @@ var _ = Describe("IDP Sync", func() {
 				Expect(user.Username).To(Equal("test-org-osac-break-glass"))
 				Expect(user.Email).To(Equal("break-glass@test-org.osac.local"))
 				Expect(user.Credentials).To(HaveLen(1))
-				Expect(user.Credentials[0].Value).To(Equal("pre-generated-password"))
+				Expect(user.Credentials[0].Value).To(Equal(testPreGeneratedPassword))
 				user.ID = "user-123"
 				return user, nil
 			}).
@@ -266,7 +318,7 @@ var _ = Describe("IDP Sync", func() {
 			Status: privatev1.TenantStatus_builder{
 				BreakGlassCredentials: privatev1.BreakGlassCredentials_builder{
 					Username: "test-org-osac-break-glass",
-					Password: "pre-generated-password",
+					Password: testPreGeneratedPassword,
 				}.Build(),
 			}.Build(),
 		}.Build()
@@ -361,7 +413,7 @@ var _ = Describe("IDP Sync", func() {
 			Status: privatev1.TenantStatus_builder{
 				BreakGlassCredentials: privatev1.BreakGlassCredentials_builder{
 					Username: auth.SharedTenant + "-osac-break-glass",
-					Password: "pre-generated-password",
+					Password: testPreGeneratedPassword,
 				}.Build(),
 			}.Build(),
 		}.Build()
@@ -409,7 +461,7 @@ var _ = Describe("IDP Sync", func() {
 			Status: privatev1.TenantStatus_builder{
 				BreakGlassCredentials: privatev1.BreakGlassCredentials_builder{
 					Username: auth.SystemTenant + "-osac-break-glass",
-					Password: "pre-generated-password",
+					Password: testPreGeneratedPassword,
 				}.Build(),
 			}.Build(),
 		}.Build()
@@ -495,7 +547,7 @@ var _ = Describe("IDP Sync", func() {
 			Status: privatev1.TenantStatus_builder{
 				BreakGlassCredentials: privatev1.BreakGlassCredentials_builder{
 					Username: "domain-org-osac-break-glass",
-					Password: "pre-generated-password",
+					Password: testPreGeneratedPassword,
 				}.Build(),
 			}.Build(),
 		}.Build()
@@ -592,6 +644,338 @@ var _ = Describe("IDP Sync", func() {
 		Expect(tenant.GetStatus().GetState()).To(
 			Equal(privatev1.TenantState_TENANT_STATE_SYNCED),
 		)
+	})
+})
+
+var _ = Describe("Break-glass credentials secret resolution", func() {
+	var (
+		ctx        context.Context
+		ctrl       *gomock.Controller
+		mockClient *idp.MockClientInterface
+		idpManager *idp.TenantManager
+		reconciler *function
+	)
+
+	BeforeEach(func() {
+		var err error
+		ctx = context.Background()
+		ctrl = gomock.NewController(GinkgoT())
+		mockClient = idp.NewMockClientInterface(ctrl)
+
+		idpManager, err = idp.NewTenantManager().
+			SetLogger(logger).
+			SetClient(mockClient).
+			Build()
+		Expect(err).ToNot(HaveOccurred())
+	})
+
+	It("should resolve the password from the referenced Secret", func() {
+		secrets := &mockSecretsClient{
+			getFunc: func(_ context.Context, req *privatev1.SecretsGetRequest) (*privatev1.SecretsGetResponse, error) {
+				Expect(req.GetId()).To(Equal("secret-id"))
+				return privatev1.SecretsGetResponse_builder{
+					Object: privatev1.Secret_builder{
+						Id: "secret-id",
+						Data: map[string][]byte{
+							"username": []byte("test-org-osac-break-glass"),
+							"password": []byte(testSecretPassword),
+						},
+					}.Build(),
+				}.Build(), nil
+			},
+		}
+		reconciler = &function{
+			logger:        logger,
+			idpManager:    idpManager,
+			secretsClient: secrets,
+		}
+
+		tenant := privatev1.Tenant_builder{
+			Id: "org-123",
+			Metadata: privatev1.Metadata_builder{
+				Name:       "test-org",
+				Finalizers: []string{finalizers.Controller},
+				Tenant:     "tenant-1",
+			}.Build(),
+			Spec: privatev1.TenantSpec_builder{
+				BreakGlassCredentialsSecret: privatev1.SecretLocalReference_builder{
+					Id:   "secret-id",
+					Name: "break-glass-credentials",
+				}.Build(),
+			}.Build(),
+		}.Build()
+
+		mockClient.EXPECT().
+			CreateTenant(gomock.Any(), gomock.Any()).
+			Return(&idp.Tenant{Name: "test-org", Enabled: true}, nil)
+		mockClient.EXPECT().
+			CreateUser(gomock.Any(), "test-org", gomock.Any()).
+			DoAndReturn(func(_ context.Context, _ string, user *idp.User) (*idp.User, error) {
+				Expect(user.Credentials).To(HaveLen(1))
+				Expect(user.Credentials[0].Value).To(Equal(testSecretPassword))
+				user.ID = "user-123"
+				return user, nil
+			})
+		mockClient.EXPECT().
+			AssignIdpManagerPermissions(gomock.Any(), "user-123").
+			Return(nil)
+
+		task := &task{r: reconciler, tenant: tenant}
+		Expect(task.update(ctx)).To(Succeed())
+		Expect(tenant.GetStatus().GetBreakGlassUserId()).To(Equal("user-123"))
+	})
+
+	It("should prefer inline status credentials over the Secret reference", func() {
+		reconciler = &function{
+			logger:     logger,
+			idpManager: idpManager,
+			secretsClient: &mockSecretsClient{
+				getFunc: func(context.Context, *privatev1.SecretsGetRequest) (*privatev1.SecretsGetResponse, error) {
+					Fail("Secrets.Get should not be called when status credentials are present")
+					return nil, nil
+				},
+			},
+		}
+
+		tenant := privatev1.Tenant_builder{
+			Id: "org-123",
+			Metadata: privatev1.Metadata_builder{
+				Name:       "test-org",
+				Finalizers: []string{finalizers.Controller},
+				Tenant:     "tenant-1",
+			}.Build(),
+			Spec: privatev1.TenantSpec_builder{
+				BreakGlassCredentialsSecret: privatev1.SecretLocalReference_builder{
+					Id: "secret-id",
+				}.Build(),
+			}.Build(),
+			Status: privatev1.TenantStatus_builder{
+				BreakGlassCredentials: privatev1.BreakGlassCredentials_builder{
+					Username: "test-org-osac-break-glass",
+					Password: testInlinePassword,
+				}.Build(),
+			}.Build(),
+		}.Build()
+
+		mockClient.EXPECT().
+			CreateTenant(gomock.Any(), gomock.Any()).
+			Return(&idp.Tenant{Name: "test-org", Enabled: true}, nil)
+		mockClient.EXPECT().
+			CreateUser(gomock.Any(), "test-org", gomock.Any()).
+			DoAndReturn(func(_ context.Context, _ string, user *idp.User) (*idp.User, error) {
+				Expect(user.Credentials[0].Value).To(Equal(testInlinePassword))
+				user.ID = "user-123"
+				return user, nil
+			})
+		mockClient.EXPECT().
+			AssignIdpManagerPermissions(gomock.Any(), "user-123").
+			Return(nil)
+
+		task := &task{r: reconciler, tenant: tenant}
+		Expect(task.update(ctx)).To(Succeed())
+	})
+
+	It("should return an error when the Secret is missing data[\"password\"]", func() {
+		reconciler = &function{
+			logger:     logger,
+			idpManager: idpManager,
+			secretsClient: &mockSecretsClient{
+				getFunc: func(context.Context, *privatev1.SecretsGetRequest) (*privatev1.SecretsGetResponse, error) {
+					return privatev1.SecretsGetResponse_builder{
+						Object: privatev1.Secret_builder{
+							Id:   "secret-id",
+							Data: map[string][]byte{"username": []byte("only-user")},
+						}.Build(),
+					}.Build(), nil
+				},
+			},
+		}
+
+		tenant := privatev1.Tenant_builder{
+			Metadata: privatev1.Metadata_builder{
+				Name:       "test-org",
+				Finalizers: []string{finalizers.Controller},
+				Tenant:     "tenant-1",
+			}.Build(),
+			Spec: privatev1.TenantSpec_builder{
+				BreakGlassCredentialsSecret: privatev1.SecretLocalReference_builder{
+					Id: "secret-id",
+				}.Build(),
+			}.Build(),
+		}.Build()
+
+		task := &task{r: reconciler, tenant: tenant}
+		err := task.update(ctx)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring(`missing data["password"]`))
+	})
+
+	It("should store generated credentials as a Secret after IDP sync", func() {
+		secrets := &mockSecretsClient{
+			createFunc: func(_ context.Context, req *privatev1.SecretsCreateRequest) (*privatev1.SecretsCreateResponse, error) {
+				secret := req.GetObject()
+				Expect(secret.GetMetadata().GetName()).To(Equal("break-glass-credentials"))
+				Expect(secret.GetMetadata().GetTenant()).To(Equal("test-org"))
+				Expect(secret.GetData()).To(HaveKeyWithValue("password", []byte(testPreGeneratedPassword)))
+				secret.SetId("created-secret-id")
+				return privatev1.SecretsCreateResponse_builder{Object: secret}.Build(), nil
+			},
+		}
+		reconciler = &function{
+			logger:        logger,
+			idpManager:    idpManager,
+			secretsClient: secrets,
+		}
+
+		tenant := privatev1.Tenant_builder{
+			Id: "org-123",
+			Metadata: privatev1.Metadata_builder{
+				Name:       "test-org",
+				Finalizers: []string{finalizers.Controller},
+				Tenant:     "tenant-1",
+			}.Build(),
+			Status: privatev1.TenantStatus_builder{
+				BreakGlassCredentials: privatev1.BreakGlassCredentials_builder{
+					Username: "test-org-osac-break-glass",
+					Password: testPreGeneratedPassword,
+				}.Build(),
+			}.Build(),
+		}.Build()
+
+		mockClient.EXPECT().
+			CreateTenant(gomock.Any(), gomock.Any()).
+			Return(&idp.Tenant{Name: "test-org", Enabled: true}, nil)
+		mockClient.EXPECT().
+			CreateUser(gomock.Any(), "test-org", gomock.Any()).
+			DoAndReturn(func(_ context.Context, _ string, user *idp.User) (*idp.User, error) {
+				user.ID = "user-123"
+				return user, nil
+			})
+		mockClient.EXPECT().
+			AssignIdpManagerPermissions(gomock.Any(), "user-123").
+			Return(nil)
+
+		task := &task{r: reconciler, tenant: tenant}
+		Expect(task.update(ctx)).To(Succeed())
+		ref := tenant.GetSpec().GetBreakGlassCredentialsSecret()
+		Expect(ref).ToNot(BeNil())
+		Expect(ref.GetId()).To(Equal("created-secret-id"))
+		Expect(ref.GetName()).To(Equal("break-glass-credentials"))
+		Expect(tenant.GetStatus().HasBreakGlassCredentials()).To(BeFalse())
+	})
+
+	It("should adopt an existing Secret when Create returns AlreadyExists", func() {
+		secrets := &mockSecretsClient{
+			createFunc: func(context.Context, *privatev1.SecretsCreateRequest) (*privatev1.SecretsCreateResponse, error) {
+				return nil, grpcstatus.Error(grpccodes.AlreadyExists,
+					"secret with name 'break-glass-credentials' already exists")
+			},
+			listFunc: func(_ context.Context, req *privatev1.SecretsListRequest) (*privatev1.SecretsListResponse, error) {
+				Expect(req.GetFilter()).To(ContainSubstring("break-glass-credentials"))
+				Expect(req.GetFilter()).To(ContainSubstring("test-org"))
+				return privatev1.SecretsListResponse_builder{
+					Items: []*privatev1.Secret{
+						privatev1.Secret_builder{
+							Id: "existing-secret-id",
+							Metadata: privatev1.Metadata_builder{
+								Name:   "break-glass-credentials",
+								Tenant: "test-org",
+							}.Build(),
+						}.Build(),
+					},
+				}.Build(), nil
+			},
+		}
+		reconciler = &function{
+			logger:        logger,
+			idpManager:    idpManager,
+			secretsClient: secrets,
+		}
+
+		tenant := privatev1.Tenant_builder{
+			Id: "org-123",
+			Metadata: privatev1.Metadata_builder{
+				Name:       "test-org",
+				Finalizers: []string{finalizers.Controller},
+				Tenant:     "tenant-1",
+			}.Build(),
+			Status: privatev1.TenantStatus_builder{
+				BreakGlassCredentials: privatev1.BreakGlassCredentials_builder{
+					Username: "test-org-osac-break-glass",
+					Password: testPreGeneratedPassword,
+				}.Build(),
+			}.Build(),
+		}.Build()
+
+		mockClient.EXPECT().
+			CreateTenant(gomock.Any(), gomock.Any()).
+			Return(&idp.Tenant{Name: "test-org", Enabled: true}, nil)
+		mockClient.EXPECT().
+			CreateUser(gomock.Any(), "test-org", gomock.Any()).
+			DoAndReturn(func(_ context.Context, _ string, user *idp.User) (*idp.User, error) {
+				user.ID = "user-123"
+				return user, nil
+			})
+		mockClient.EXPECT().
+			AssignIdpManagerPermissions(gomock.Any(), "user-123").
+			Return(nil)
+
+		task := &task{r: reconciler, tenant: tenant}
+		Expect(task.update(ctx)).To(Succeed())
+		ref := tenant.GetSpec().GetBreakGlassCredentialsSecret()
+		Expect(ref).ToNot(BeNil())
+		Expect(ref.GetId()).To(Equal("existing-secret-id"))
+		Expect(ref.GetName()).To(Equal("break-glass-credentials"))
+		Expect(tenant.GetStatus().GetIdpTenantName()).To(Equal("test-org"))
+		Expect(tenant.GetStatus().GetState()).To(Equal(privatev1.TenantState_TENANT_STATE_SYNCED))
+	})
+
+	It("should keep idpTenantName when persist fails so CreateTenant is not retried", func() {
+		secrets := &mockSecretsClient{
+			createFunc: func(context.Context, *privatev1.SecretsCreateRequest) (*privatev1.SecretsCreateResponse, error) {
+				return nil, fmt.Errorf("secrets service unavailable")
+			},
+		}
+		reconciler = &function{
+			logger:        logger,
+			idpManager:    idpManager,
+			secretsClient: secrets,
+		}
+
+		tenant := privatev1.Tenant_builder{
+			Id: "org-123",
+			Metadata: privatev1.Metadata_builder{
+				Name:       "test-org",
+				Finalizers: []string{finalizers.Controller},
+				Tenant:     "tenant-1",
+			}.Build(),
+			Status: privatev1.TenantStatus_builder{
+				BreakGlassCredentials: privatev1.BreakGlassCredentials_builder{
+					Username: "test-org-osac-break-glass",
+					Password: testPreGeneratedPassword,
+				}.Build(),
+			}.Build(),
+		}.Build()
+
+		mockClient.EXPECT().
+			CreateTenant(gomock.Any(), gomock.Any()).
+			Return(&idp.Tenant{Name: "test-org", Enabled: true}, nil)
+		mockClient.EXPECT().
+			CreateUser(gomock.Any(), "test-org", gomock.Any()).
+			DoAndReturn(func(_ context.Context, _ string, user *idp.User) (*idp.User, error) {
+				user.ID = "user-123"
+				return user, nil
+			})
+		mockClient.EXPECT().
+			AssignIdpManagerPermissions(gomock.Any(), "user-123").
+			Return(nil)
+
+		task := &task{r: reconciler, tenant: tenant}
+		Expect(task.update(ctx)).To(Succeed())
+		Expect(tenant.GetStatus().GetIdpTenantName()).To(Equal("test-org"))
+		Expect(tenant.GetStatus().GetBreakGlassUserId()).To(Equal("user-123"))
+		Expect(tenant.GetStatus().GetState()).To(Equal(privatev1.TenantState_TENANT_STATE_PENDING))
+		Expect(tenant.GetSpec().GetBreakGlassCredentialsSecret()).To(BeNil())
 	})
 })
 
@@ -696,7 +1080,7 @@ var _ = Describe("Deletion", func() {
 		Expect(tenant.GetMetadata().GetFinalizers()).ToNot(ContainElement(finalizers.Controller))
 	})
 
-	It("should skip IDP deletion and remove finalizer when tenant not synced", func() {
+	It("should delete IDP tenant by metadata name when not synced", func() {
 		deletionTimestamp := timestamppb.New(time.Now())
 		tenant := privatev1.Tenant_builder{
 			Id: "org-123",
@@ -715,6 +1099,11 @@ var _ = Describe("Deletion", func() {
 			Return(privatev1.ProjectsListResponse_builder{Total: 0}.Build(), nil).
 			Times(1)
 
+		mockClient.EXPECT().
+			DeleteTenant(gomock.Any(), "test-org").
+			Return(nil).
+			Times(1)
+
 		task := &task{
 			r:      reconciler,
 			tenant: tenant,
@@ -725,7 +1114,7 @@ var _ = Describe("Deletion", func() {
 		Expect(tenant.GetMetadata().GetFinalizers()).ToNot(ContainElement(finalizers.Controller))
 	})
 
-	It("should skip IDP deletion and remove finalizer when idp_tenant_name is empty", func() {
+	It("should delete IDP tenant by metadata name when idp_tenant_name is empty", func() {
 		deletionTimestamp := timestamppb.New(time.Now())
 		tenant := privatev1.Tenant_builder{
 			Id: "org-123",
@@ -745,6 +1134,11 @@ var _ = Describe("Deletion", func() {
 			Return(privatev1.ProjectsListResponse_builder{Total: 0}.Build(), nil).
 			Times(1)
 
+		mockClient.EXPECT().
+			DeleteTenant(gomock.Any(), "test-org").
+			Return(nil).
+			Times(1)
+
 		task := &task{
 			r:      reconciler,
 			tenant: tenant,
@@ -752,6 +1146,109 @@ var _ = Describe("Deletion", func() {
 
 		err := task.delete(ctx)
 		Expect(err).ToNot(HaveOccurred())
+		Expect(tenant.GetMetadata().GetFinalizers()).ToNot(ContainElement(finalizers.Controller))
+	})
+
+	It("should delete the break-glass secret before waiting for remaining projects", func() {
+		deletionTimestamp := timestamppb.New(time.Now())
+		tenant := privatev1.Tenant_builder{
+			Id: "org-123",
+			Metadata: privatev1.Metadata_builder{
+				Name:              "test-org",
+				Finalizers:        []string{finalizers.Controller},
+				DeletionTimestamp: deletionTimestamp,
+			}.Build(),
+			Spec: privatev1.TenantSpec_builder{
+				BreakGlassCredentialsSecret: privatev1.SecretLocalReference_builder{
+					Id:   "bg-secret-id",
+					Name: breakGlassSecretName,
+				}.Build(),
+			}.Build(),
+			Status: privatev1.TenantStatus_builder{
+				State:            privatev1.TenantState_TENANT_STATE_SYNCED,
+				IdpTenantName:    "test-org",
+				BreakGlassUserId: "user-123",
+			}.Build(),
+		}.Build()
+
+		deleted := false
+		secrets := &mockSecretsClient{
+			deleteFunc: func(_ context.Context, req *privatev1.SecretsDeleteRequest) (*privatev1.SecretsDeleteResponse, error) {
+				Expect(req.GetId()).To(Equal("bg-secret-id"))
+				deleted = true
+				return &privatev1.SecretsDeleteResponse{}, nil
+			},
+		}
+		reconciler.secretsClient = secrets
+
+		mockProjectsClient.EXPECT().
+			List(gomock.Any(), gomock.Any()).
+			Return(privatev1.ProjectsListResponse_builder{
+				Total: 1,
+			}.Build(), nil).
+			Times(1)
+
+		task := &task{
+			r:      reconciler,
+			tenant: tenant,
+		}
+
+		err := task.delete(ctx)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("project(s) pending deletion"))
+		Expect(deleted).To(BeTrue())
+		Expect(tenant.GetSpec().GetBreakGlassCredentialsSecret()).To(BeNil())
+		Expect(tenant.GetMetadata().GetFinalizers()).To(ContainElement(finalizers.Controller))
+	})
+
+	It("should clear the break-glass secret ref so finalizer removal can persist", func() {
+		deletionTimestamp := timestamppb.New(time.Now())
+		tenant := privatev1.Tenant_builder{
+			Id: "org-123",
+			Metadata: privatev1.Metadata_builder{
+				Name:              "test-org",
+				Finalizers:        []string{finalizers.Controller},
+				DeletionTimestamp: deletionTimestamp,
+			}.Build(),
+			Spec: privatev1.TenantSpec_builder{
+				BreakGlassCredentialsSecret: privatev1.SecretLocalReference_builder{
+					Id:   "bg-secret-id",
+					Name: breakGlassSecretName,
+				}.Build(),
+			}.Build(),
+			Status: privatev1.TenantStatus_builder{
+				State:            privatev1.TenantState_TENANT_STATE_SYNCED,
+				IdpTenantName:    "test-org",
+				BreakGlassUserId: "user-123",
+			}.Build(),
+		}.Build()
+
+		secrets := &mockSecretsClient{
+			deleteFunc: func(_ context.Context, req *privatev1.SecretsDeleteRequest) (*privatev1.SecretsDeleteResponse, error) {
+				Expect(req.GetId()).To(Equal("bg-secret-id"))
+				return &privatev1.SecretsDeleteResponse{}, nil
+			},
+		}
+		reconciler.secretsClient = secrets
+
+		mockProjectsClient.EXPECT().
+			List(gomock.Any(), gomock.Any()).
+			Return(privatev1.ProjectsListResponse_builder{Total: 0}.Build(), nil).
+			Times(1)
+
+		mockClient.EXPECT().
+			DeleteTenant(gomock.Any(), "test-org").
+			Return(nil).
+			Times(1)
+
+		task := &task{
+			r:      reconciler,
+			tenant: tenant,
+		}
+
+		err := task.delete(ctx)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(tenant.GetSpec().GetBreakGlassCredentialsSecret()).To(BeNil())
 		Expect(tenant.GetMetadata().GetFinalizers()).ToNot(ContainElement(finalizers.Controller))
 	})
 
@@ -1152,7 +1649,16 @@ var _ = Describe("Default networking readiness", func() {
 				},
 			}.Build(), nil)
 		mockSGs.EXPECT().List(gomock.Any(), gomock.Any()).Return(
-			privatev1.SecurityGroupsListResponse_builder{}.Build(), nil)
+			privatev1.SecurityGroupsListResponse_builder{
+				Items: []*privatev1.SecurityGroup{
+					privatev1.SecurityGroup_builder{
+						Metadata: privatev1.Metadata_builder{Name: "default"}.Build(),
+						Status: privatev1.SecurityGroupStatus_builder{
+							State: privatev1.SecurityGroupState_SECURITY_GROUP_STATE_READY,
+						}.Build(),
+					}.Build(),
+				},
+			}.Build(), nil)
 		mockNGs.EXPECT().List(gomock.Any(), gomock.Any()).Return(
 			privatev1.NATGatewaysListResponse_builder{}.Build(), nil)
 
@@ -1184,9 +1690,27 @@ var _ = Describe("Default networking readiness", func() {
 				},
 			}.Build(), nil)
 		mockSubnets.EXPECT().List(gomock.Any(), gomock.Any()).Return(
-			privatev1.SubnetsListResponse_builder{}.Build(), nil)
+			privatev1.SubnetsListResponse_builder{
+				Items: []*privatev1.Subnet{
+					privatev1.Subnet_builder{
+						Metadata: privatev1.Metadata_builder{Name: "default-ipv4"}.Build(),
+						Status: privatev1.SubnetStatus_builder{
+							State: privatev1.SubnetState_SUBNET_STATE_READY,
+						}.Build(),
+					}.Build(),
+				},
+			}.Build(), nil)
 		mockSGs.EXPECT().List(gomock.Any(), gomock.Any()).Return(
-			privatev1.SecurityGroupsListResponse_builder{}.Build(), nil)
+			privatev1.SecurityGroupsListResponse_builder{
+				Items: []*privatev1.SecurityGroup{
+					privatev1.SecurityGroup_builder{
+						Metadata: privatev1.Metadata_builder{Name: "default"}.Build(),
+						Status: privatev1.SecurityGroupStatus_builder{
+							State: privatev1.SecurityGroupState_SECURITY_GROUP_STATE_READY,
+						}.Build(),
+					}.Build(),
+				},
+			}.Build(), nil)
 		mockNGs.EXPECT().List(gomock.Any(), gomock.Any()).Return(
 			privatev1.NATGatewaysListResponse_builder{}.Build(), nil)
 
@@ -1229,7 +1753,16 @@ var _ = Describe("Default networking readiness", func() {
 				},
 			}.Build(), nil)
 		mockSGs.EXPECT().List(gomock.Any(), gomock.Any()).Return(
-			privatev1.SecurityGroupsListResponse_builder{}.Build(), nil)
+			privatev1.SecurityGroupsListResponse_builder{
+				Items: []*privatev1.SecurityGroup{
+					privatev1.SecurityGroup_builder{
+						Metadata: privatev1.Metadata_builder{Name: "default"}.Build(),
+						Status: privatev1.SecurityGroupStatus_builder{
+							State: privatev1.SecurityGroupState_SECURITY_GROUP_STATE_READY,
+						}.Build(),
+					}.Build(),
+				},
+			}.Build(), nil)
 		mockNGs.EXPECT().List(gomock.Any(), gomock.Any()).Return(
 			privatev1.NATGatewaysListResponse_builder{}.Build(), nil)
 
@@ -1293,8 +1826,6 @@ var _ = Describe("Default networking provisioning", func() {
 		mockSGs     *MockSecurityGroupsClient
 		mockNGs     *MockNATGatewaysClient
 		mockNCs     *MockNetworkClassesClient
-		mockEIPPs   *MockExternalIPPoolsClient
-		mockEIPs    *MockExternalIPsClient
 		reconciler  *function
 	)
 
@@ -1347,7 +1878,7 @@ var _ = Describe("Default networking provisioning", func() {
 					SubnetIpv4Cidr:         "10.0.1.0/24",
 				}.Build(),
 			}.Build(),
-			ImplementationStrategy: "test-strategy",
+			FabricManager: new("test-strategy"),
 		}.Build()
 	}
 
@@ -1359,8 +1890,6 @@ var _ = Describe("Default networking provisioning", func() {
 		mockSGs = NewMockSecurityGroupsClient(ctrl)
 		mockNGs = NewMockNATGatewaysClient(ctrl)
 		mockNCs = NewMockNetworkClassesClient(ctrl)
-		mockEIPPs = NewMockExternalIPPoolsClient(ctrl)
-		mockEIPs = NewMockExternalIPsClient(ctrl)
 
 		mockClient := idp.NewMockClientInterface(ctrl)
 		idpManager, err := idp.NewTenantManager().
@@ -1377,12 +1906,10 @@ var _ = Describe("Default networking provisioning", func() {
 			securityGroupsClient:  mockSGs,
 			natGatewaysClient:     mockNGs,
 			networkClassesClient:  mockNCs,
-			externalIPPoolsClient: mockEIPPs,
-			externalIPsClient:     mockEIPs,
 		}
 	})
 
-	It("provisions default networking when default NetworkClass exists", func() {
+	It("sets ResourcesPending when resources are missing and NC exists", func() {
 		tenant := newSyncedTenant("prov-tenant")
 		expectEmptyLists()
 
@@ -1390,41 +1917,6 @@ var _ = Describe("Default networking provisioning", func() {
 			privatev1.NetworkClassesListResponse_builder{
 				Items: []*privatev1.NetworkClass{defaultNC()},
 			}.Build(), nil)
-
-		mockVNs.EXPECT().Create(gomock.Any(), gomock.Any()).DoAndReturn(
-			func(_ context.Context, req *privatev1.VirtualNetworksCreateRequest, _ ...grpc.CallOption) (*privatev1.VirtualNetworksCreateResponse, error) {
-				vn := req.GetObject()
-				Expect(vn.GetMetadata().GetName()).To(Equal("default"))
-				Expect(vn.GetMetadata().GetTenant()).To(Equal("prov-tenant"))
-				Expect(vn.GetMetadata().GetLabels()).To(HaveKeyWithValue("osac.openshift.io/default", "true"))
-				Expect(vn.GetMetadata().GetCreator()).To(Equal("system"))
-				Expect(vn.GetSpec().GetNetworkClass().GetId()).To(Equal("nc-1"))
-				Expect(vn.GetSpec().GetIpv4Cidr()).To(Equal("10.0.0.0/16"))
-				return privatev1.VirtualNetworksCreateResponse_builder{
-					Object: privatev1.VirtualNetwork_builder{
-						Id: "vn-1",
-					}.Build(),
-				}.Build(), nil
-			})
-
-		mockSubnets.EXPECT().Create(gomock.Any(), gomock.Any()).DoAndReturn(
-			func(_ context.Context, req *privatev1.SubnetsCreateRequest, _ ...grpc.CallOption) (*privatev1.SubnetsCreateResponse, error) {
-				s := req.GetObject()
-				Expect(s.GetMetadata().GetName()).To(Equal("default-ipv4"))
-				Expect(s.GetMetadata().GetTenant()).To(Equal("prov-tenant"))
-				Expect(s.GetSpec().GetVirtualNetwork().GetId()).To(Equal("vn-1"))
-				Expect(s.GetSpec().GetIpv4Cidr()).To(Equal("10.0.1.0/24"))
-				return privatev1.SubnetsCreateResponse_builder{}.Build(), nil
-			})
-
-		mockSGs.EXPECT().Create(gomock.Any(), gomock.Any()).DoAndReturn(
-			func(_ context.Context, req *privatev1.SecurityGroupsCreateRequest, _ ...grpc.CallOption) (*privatev1.SecurityGroupsCreateResponse, error) {
-				sg := req.GetObject()
-				Expect(sg.GetMetadata().GetName()).To(Equal("default"))
-				Expect(sg.GetMetadata().GetTenant()).To(Equal("prov-tenant"))
-				Expect(sg.GetSpec().GetVirtualNetwork().GetId()).To(Equal("vn-1"))
-				return privatev1.SecurityGroupsCreateResponse_builder{}.Build(), nil
-			})
 
 		t := &task{r: reconciler, tenant: tenant}
 		t.setDefaults()
@@ -1435,6 +1927,7 @@ var _ = Describe("Default networking provisioning", func() {
 		cond := findCondition(tenant)
 		Expect(cond).ToNot(BeNil())
 		Expect(cond.GetStatus()).To(Equal(privatev1.ConditionStatus_CONDITION_STATUS_FALSE))
+		Expect(cond.GetReason()).To(Equal("ResourcesPending"))
 	})
 
 	It("sets NoDefaultNetworking when NetworkClass has no defaults", func() {
@@ -1482,227 +1975,6 @@ var _ = Describe("Default networking provisioning", func() {
 		Expect(cond.GetReason()).To(Equal("NoDefaultNetworking"))
 	})
 
-	It("sets ProvisioningFailed condition when VN creation fails", func() {
-		tenant := newSyncedTenant("fail-tenant")
-		expectEmptyLists()
-
-		mockNCs.EXPECT().List(gomock.Any(), gomock.Any()).Return(
-			privatev1.NetworkClassesListResponse_builder{
-				Items: []*privatev1.NetworkClass{defaultNC()},
-			}.Build(), nil)
-
-		mockVNs.EXPECT().Create(gomock.Any(), gomock.Any()).Return(
-			nil, fmt.Errorf("database error"))
-
-		t := &task{r: reconciler, tenant: tenant}
-		t.setDefaults()
-		t.setConditionDefaults()
-		err := t.checkDefaultNetworkingReadiness(ctx)
-		Expect(err).ToNot(HaveOccurred())
-
-		cond := findCondition(tenant)
-		Expect(cond).ToNot(BeNil())
-		Expect(cond.GetStatus()).To(Equal(privatev1.ConditionStatus_CONDITION_STATUS_FALSE))
-		Expect(cond.GetReason()).To(Equal("ProvisioningFailed"))
-		Expect(cond.GetMessage()).To(ContainSubstring("VirtualNetwork"))
-	})
-
-	It("creates NATGateway when ExternalIP becomes ALLOCATED", func() {
-		tenant := newSyncedTenant("nat-tenant")
-
-		ncWithNAT := privatev1.NetworkClass_builder{
-			Id: "nc-nat",
-			Spec: privatev1.NetworkClassSpec_builder{
-				Defaults: privatev1.NetworkDefaults_builder{
-					VirtualNetworkIpv4Cidr: "10.0.0.0/16",
-					SubnetIpv4Cidr:         "10.0.1.0/24",
-					EnableNatGateway:       true,
-				}.Build(),
-			}.Build(),
-		}.Build()
-
-		mockNCs.EXPECT().List(gomock.Any(), gomock.Any()).Return(
-			privatev1.NetworkClassesListResponse_builder{
-				Items: []*privatev1.NetworkClass{ncWithNAT},
-			}.Build(), nil)
-
-		mockVNs.EXPECT().List(gomock.Any(), gomock.Any()).Return(
-			privatev1.VirtualNetworksListResponse_builder{
-				Items: []*privatev1.VirtualNetwork{
-					privatev1.VirtualNetwork_builder{
-						Id:       "vn-1",
-						Metadata: privatev1.Metadata_builder{Name: "default"}.Build(),
-						Status: privatev1.VirtualNetworkStatus_builder{
-							State: privatev1.VirtualNetworkState_VIRTUAL_NETWORK_STATE_READY,
-						}.Build(),
-					}.Build(),
-				},
-			}.Build(), nil)
-		mockSubnets.EXPECT().List(gomock.Any(), gomock.Any()).Return(
-			privatev1.SubnetsListResponse_builder{
-				Items: []*privatev1.Subnet{
-					privatev1.Subnet_builder{
-						Metadata: privatev1.Metadata_builder{Name: "default-ipv4"}.Build(),
-						Status: privatev1.SubnetStatus_builder{
-							State: privatev1.SubnetState_SUBNET_STATE_READY,
-						}.Build(),
-					}.Build(),
-				},
-			}.Build(), nil)
-		mockSGs.EXPECT().List(gomock.Any(), gomock.Any()).Return(
-			privatev1.SecurityGroupsListResponse_builder{
-				Items: []*privatev1.SecurityGroup{
-					privatev1.SecurityGroup_builder{
-						Metadata: privatev1.Metadata_builder{Name: "default"}.Build(),
-						Status: privatev1.SecurityGroupStatus_builder{
-							State: privatev1.SecurityGroupState_SECURITY_GROUP_STATE_READY,
-						}.Build(),
-					}.Build(),
-				},
-			}.Build(), nil)
-		mockNGs.EXPECT().List(gomock.Any(), gomock.Any()).Return(
-			privatev1.NATGatewaysListResponse_builder{}.Build(), nil)
-
-		mockEIPs.EXPECT().List(gomock.Any(), gomock.Any()).Return(
-			privatev1.ExternalIPsListResponse_builder{
-				Items: []*privatev1.ExternalIP{
-					privatev1.ExternalIP_builder{
-						Id:       "eip-1",
-						Metadata: privatev1.Metadata_builder{Name: "default-nat"}.Build(),
-						Status: privatev1.ExternalIPStatus_builder{
-							State: privatev1.ExternalIPState_EXTERNAL_IP_STATE_ALLOCATED,
-						}.Build(),
-					}.Build(),
-				},
-			}.Build(), nil)
-
-		mockNGs.EXPECT().Create(gomock.Any(), gomock.Any()).DoAndReturn(
-			func(_ context.Context, req *privatev1.NATGatewaysCreateRequest, _ ...grpc.CallOption) (*privatev1.NATGatewaysCreateResponse, error) {
-				ng := req.GetObject()
-				Expect(ng.GetMetadata().GetName()).To(Equal("default"))
-				Expect(ng.GetMetadata().GetTenant()).To(Equal("nat-tenant"))
-				Expect(ng.GetSpec().GetVirtualNetwork().GetId()).To(Equal("vn-1"))
-				Expect(ng.GetSpec().GetExternalIp().GetId()).To(Equal("eip-1"))
-				return privatev1.NATGatewaysCreateResponse_builder{}.Build(), nil
-			})
-
-		t := &task{r: reconciler, tenant: tenant}
-		t.setDefaults()
-		t.setConditionDefaults()
-		err := t.checkDefaultNetworkingReadiness(ctx)
-		Expect(err).ToNot(HaveOccurred())
-	})
-
-	It("provisions ExternalIP when NAT gateway is enabled", func() {
-		tenant := newSyncedTenant("nat-prov-tenant")
-		expectEmptyLists()
-
-		ncWithNAT := privatev1.NetworkClass_builder{
-			Id: "nc-nat",
-			Spec: privatev1.NetworkClassSpec_builder{
-				Defaults: privatev1.NetworkDefaults_builder{
-					VirtualNetworkIpv4Cidr: "10.0.0.0/16",
-					SubnetIpv4Cidr:         "10.0.1.0/24",
-					EnableNatGateway:       true,
-				}.Build(),
-			}.Build(),
-		}.Build()
-
-		mockNCs.EXPECT().List(gomock.Any(), gomock.Any()).Return(
-			privatev1.NetworkClassesListResponse_builder{
-				Items: []*privatev1.NetworkClass{ncWithNAT},
-			}.Build(), nil)
-
-		mockVNs.EXPECT().Create(gomock.Any(), gomock.Any()).Return(
-			privatev1.VirtualNetworksCreateResponse_builder{
-				Object: privatev1.VirtualNetwork_builder{Id: "vn-1"}.Build(),
-			}.Build(), nil)
-		mockSubnets.EXPECT().Create(gomock.Any(), gomock.Any()).Return(
-			privatev1.SubnetsCreateResponse_builder{}.Build(), nil)
-		mockSGs.EXPECT().Create(gomock.Any(), gomock.Any()).Return(
-			privatev1.SecurityGroupsCreateResponse_builder{}.Build(), nil)
-
-		mockEIPs.EXPECT().List(gomock.Any(), gomock.Any()).Return(
-			privatev1.ExternalIPsListResponse_builder{}.Build(), nil)
-
-		mockEIPPs.EXPECT().List(gomock.Any(), gomock.Any()).Return(
-			privatev1.ExternalIPPoolsListResponse_builder{
-				Items: []*privatev1.ExternalIPPool{
-					privatev1.ExternalIPPool_builder{
-						Id: "pool-1",
-						Status: privatev1.ExternalIPPoolStatus_builder{
-							State:     privatev1.ExternalIPPoolState_EXTERNAL_IP_POOL_STATE_READY,
-							Available: 5,
-						}.Build(),
-					}.Build(),
-				},
-			}.Build(), nil)
-
-		mockEIPs.EXPECT().Create(gomock.Any(), gomock.Any()).DoAndReturn(
-			func(_ context.Context, req *privatev1.ExternalIPsCreateRequest, _ ...grpc.CallOption) (*privatev1.ExternalIPsCreateResponse, error) {
-				eip := req.GetObject()
-				Expect(eip.GetMetadata().GetName()).To(Equal("default-nat"))
-				Expect(eip.GetSpec().GetPool().GetId()).To(Equal("pool-1"))
-				return privatev1.ExternalIPsCreateResponse_builder{}.Build(), nil
-			})
-
-		t := &task{r: reconciler, tenant: tenant}
-		t.setDefaults()
-		t.setConditionDefaults()
-		err := t.checkDefaultNetworkingReadiness(ctx)
-		Expect(err).ToNot(HaveOccurred())
-	})
-
-	It("creates missing subnet when VN already exists (self-healing)", func() {
-		tenant := newSyncedTenant("heal-tenant")
-
-		mockNCs.EXPECT().List(gomock.Any(), gomock.Any()).Return(
-			privatev1.NetworkClassesListResponse_builder{
-				Items: []*privatev1.NetworkClass{defaultNC()},
-			}.Build(), nil)
-
-		mockVNs.EXPECT().List(gomock.Any(), gomock.Any()).Return(
-			privatev1.VirtualNetworksListResponse_builder{
-				Items: []*privatev1.VirtualNetwork{
-					privatev1.VirtualNetwork_builder{
-						Id:       "vn-1",
-						Metadata: privatev1.Metadata_builder{Name: "default"}.Build(),
-						Status: privatev1.VirtualNetworkStatus_builder{
-							State: privatev1.VirtualNetworkState_VIRTUAL_NETWORK_STATE_READY,
-						}.Build(),
-					}.Build(),
-				},
-			}.Build(), nil)
-		mockSubnets.EXPECT().List(gomock.Any(), gomock.Any()).Return(
-			privatev1.SubnetsListResponse_builder{}.Build(), nil)
-		mockSGs.EXPECT().List(gomock.Any(), gomock.Any()).Return(
-			privatev1.SecurityGroupsListResponse_builder{
-				Items: []*privatev1.SecurityGroup{
-					privatev1.SecurityGroup_builder{
-						Metadata: privatev1.Metadata_builder{Name: "default"}.Build(),
-						Status: privatev1.SecurityGroupStatus_builder{
-							State: privatev1.SecurityGroupState_SECURITY_GROUP_STATE_READY,
-						}.Build(),
-					}.Build(),
-				},
-			}.Build(), nil)
-		mockNGs.EXPECT().List(gomock.Any(), gomock.Any()).Return(
-			privatev1.NATGatewaysListResponse_builder{}.Build(), nil)
-
-		mockSubnets.EXPECT().Create(gomock.Any(), gomock.Any()).DoAndReturn(
-			func(_ context.Context, req *privatev1.SubnetsCreateRequest, _ ...grpc.CallOption) (*privatev1.SubnetsCreateResponse, error) {
-				s := req.GetObject()
-				Expect(s.GetMetadata().GetName()).To(Equal("default-ipv4"))
-				Expect(s.GetSpec().GetVirtualNetwork().GetId()).To(Equal("vn-1"))
-				return privatev1.SubnetsCreateResponse_builder{}.Build(), nil
-			})
-
-		t := &task{r: reconciler, tenant: tenant}
-		t.setDefaults()
-		t.setConditionDefaults()
-		err := t.checkDefaultNetworkingReadiness(ctx)
-		Expect(err).ToNot(HaveOccurred())
-	})
 })
 
 var _ = Describe("Vault namespace provisioning", func() {
@@ -2104,6 +2376,10 @@ var _ = Describe("Vault namespace cleanup during deletion", func() {
 			List(gomock.Any(), gomock.Any()).
 			Return(privatev1.ProjectsListResponse_builder{Total: 0}.Build(), nil)
 
+		mockIDPClient.EXPECT().
+			DeleteTenant(gomock.Any(), "vault-only-org").
+			Return(nil)
+
 		mockVaultClient.EXPECT().
 			DeleteTenantNamespace(gomock.Any(), "vault-only-org").
 			Return(nil)
@@ -2137,6 +2413,10 @@ var _ = Describe("Vault namespace cleanup during deletion", func() {
 		mockProjectsClient.EXPECT().
 			List(gomock.Any(), gomock.Any()).
 			Return(privatev1.ProjectsListResponse_builder{Total: 0}.Build(), nil)
+
+		mockIDPClient.EXPECT().
+			DeleteTenant(gomock.Any(), "failed-org").
+			Return(nil)
 
 		mockVaultClient.EXPECT().
 			DeleteTenantNamespace(gomock.Any(), "failed-org").

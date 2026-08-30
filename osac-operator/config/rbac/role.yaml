@@ -33,6 +33,24 @@ rules:
   verbs:
   - get
 - apiGroups:
+  - agent-install.openshift.io
+  resources:
+  - agents
+  verbs:
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - coordination.k8s.io
+  resources:
+  - leases
+  verbs:
+  - create
+  - get
+  - update
+- apiGroups:
   - events.k8s.io
   resources:
   - events
@@ -109,6 +127,7 @@ rules:
   - subnets/finalizers
   - tenants/finalizers
   - virtualnetworks/finalizers
+  - volumes/finalizers
   verbs:
   - update
 - apiGroups:
@@ -124,6 +143,7 @@ rules:
   - subnets
   - tenants
   - virtualnetworks
+  - volumes
   verbs:
   - create
   - delete
@@ -145,6 +165,7 @@ rules:
   - subnets/status
   - tenants/status
   - virtualnetworks/status
+  - volumes/status
   verbs:
   - get
   - patch

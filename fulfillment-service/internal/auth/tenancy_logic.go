@@ -35,6 +35,9 @@ type TenancyLogic interface {
 	// to see. Database queries will be filtered to only return objects where the tenants column has a non-empty
 	// intersection with the values returned by this method.
 	DetermineVisibleTenants(ctx context.Context) (collections.Set[string], error)
+
+	// DetermineVisibility calculates and returns the visibility of the current user.
+	DetermineVisibility(ctx context.Context) (*Visibility, error)
 }
 
 // SystemTenant is the tenant that is assigned to objects that are only visible to the system.
@@ -51,3 +54,8 @@ var SharedTenants = collections.NewSet(SharedTenant)
 
 // AllTenants is the set of all tenants that are possible.
 var AllTenants = collections.NewUniversalSet[string]()
+
+// DefaultAllowedTenants is the set of tenants where objects can normally be created. It excludes
+// the system and shared tenants, which are reserved for platform-level concerns. Servers that
+// manage platform-scoped resources should opt in to the shared tenant explicitly.
+var DefaultAllowedTenants = AllTenants.Difference(collections.NewSet(SystemTenant, SharedTenant))

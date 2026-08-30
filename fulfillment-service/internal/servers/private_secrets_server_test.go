@@ -27,8 +27,8 @@ import (
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
 
 	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
-	"github.com/osac-project/osac/fulfillment-service/internal/auth"
 	"github.com/osac-project/osac/fulfillment-service/internal/database"
+	"github.com/osac-project/osac/fulfillment-service/internal/database/dao"
 	"github.com/osac-project/osac/fulfillment-service/internal/events"
 	"github.com/osac-project/osac/fulfillment-service/internal/vault"
 )
@@ -115,9 +115,9 @@ var _ = Describe("Private secrets server", func() {
 					}.Build(),
 					Backend: privatev1.SecretBackend_SECRET_BACKEND_HUB,
 					Coordinates: map[string]string{
-						"cluster":   "hub-1",
-						"namespace": "default",
-						"name":      "my-k8s-secret",
+						"hub_id":      "hub-1",
+						"namespace":   "default",
+						"secret_name": "my-k8s-secret",
 					},
 				}.Build(),
 			}.Build())
@@ -155,7 +155,7 @@ var _ = Describe("Private secrets server", func() {
 			Expect(created.GetId()).ToNot(BeEmpty())
 			Expect(created.GetBackend()).To(Equal(
 				privatev1.SecretBackend_SECRET_BACKEND_HUB))
-			Expect(created.GetCoordinates()).To(HaveKeyWithValue("cluster", "hub-1"))
+			Expect(created.GetCoordinates()).To(HaveKeyWithValue("hub_id", "hub-1"))
 			Expect(created.GetData()).To(BeEmpty())
 		})
 
@@ -369,7 +369,9 @@ var _ = Describe("Private secrets server", func() {
 						}.Build(),
 						Backend: privatev1.SecretBackend_SECRET_BACKEND_HUB,
 						Coordinates: map[string]string{
-							"cluster": "hub-1",
+							"hub_id":      "hub-1",
+							"namespace":   "default",
+							"secret_name": "my-k8s-secret",
 						},
 						Data: map[string][]byte{
 							"key": []byte("value"),
@@ -381,6 +383,66 @@ var _ = Describe("Private secrets server", func() {
 				Expect(ok).To(BeTrue())
 				Expect(st.Code()).To(Equal(codes.InvalidArgument))
 				Expect(st.Message()).To(ContainSubstring("data"))
+			})
+
+			It("Create Hub secret missing hub_id fails", func() {
+				_, err := server.Create(ctx, privatev1.SecretsCreateRequest_builder{
+					Object: privatev1.Secret_builder{
+						Metadata: privatev1.Metadata_builder{
+							Name: "my-secret",
+						}.Build(),
+						Backend: privatev1.SecretBackend_SECRET_BACKEND_HUB,
+						Coordinates: map[string]string{
+							"namespace":   "default",
+							"secret_name": "my-k8s-secret",
+						},
+					}.Build(),
+				}.Build())
+				Expect(err).To(HaveOccurred())
+				st, ok := status.FromError(err)
+				Expect(ok).To(BeTrue())
+				Expect(st.Code()).To(Equal(codes.InvalidArgument))
+				Expect(st.Message()).To(ContainSubstring("hub_id"))
+			})
+
+			It("Create Hub secret missing namespace fails", func() {
+				_, err := server.Create(ctx, privatev1.SecretsCreateRequest_builder{
+					Object: privatev1.Secret_builder{
+						Metadata: privatev1.Metadata_builder{
+							Name: "my-secret",
+						}.Build(),
+						Backend: privatev1.SecretBackend_SECRET_BACKEND_HUB,
+						Coordinates: map[string]string{
+							"hub_id":      "hub-1",
+							"secret_name": "my-k8s-secret",
+						},
+					}.Build(),
+				}.Build())
+				Expect(err).To(HaveOccurred())
+				st, ok := status.FromError(err)
+				Expect(ok).To(BeTrue())
+				Expect(st.Code()).To(Equal(codes.InvalidArgument))
+				Expect(st.Message()).To(ContainSubstring("namespace"))
+			})
+
+			It("Create Hub secret missing secret_name fails", func() {
+				_, err := server.Create(ctx, privatev1.SecretsCreateRequest_builder{
+					Object: privatev1.Secret_builder{
+						Metadata: privatev1.Metadata_builder{
+							Name: "my-secret",
+						}.Build(),
+						Backend: privatev1.SecretBackend_SECRET_BACKEND_HUB,
+						Coordinates: map[string]string{
+							"hub_id":    "hub-1",
+							"namespace": "default",
+						},
+					}.Build(),
+				}.Build())
+				Expect(err).To(HaveOccurred())
+				st, ok := status.FromError(err)
+				Expect(ok).To(BeTrue())
+				Expect(st.Code()).To(Equal(codes.InvalidArgument))
+				Expect(st.Message()).To(ContainSubstring("secret_name"))
 			})
 		})
 
@@ -496,18 +558,21 @@ var _ = Describe("Private secrets server", func() {
 
 	Describe("Vault integration", func() {
 		var (
-			mockStore *vault.MockSecretStore
-			server    *PrivateSecretsServer
+			mockStore            *vault.MockSecretStore
+			mockHubSecretFetcher *MockHubSecretFetcher
+			server               *PrivateSecretsServer
 		)
 
 		BeforeEach(func() {
 			mockStore = vault.NewMockSecretStore(ctrl)
+			mockHubSecretFetcher = NewMockHubSecretFetcher(ctrl)
 			var err error
 			server, err = NewPrivateSecretsServer().
 				SetLogger(logger).
 				SetAttributionLogic(attribution).
 				SetTenancyLogic(tenancy).
 				SetSecretStore(mockStore).
+				SetHubSecretFetcher(mockHubSecretFetcher).
 				Build()
 			Expect(err).ToNot(HaveOccurred())
 		})
@@ -515,7 +580,7 @@ var _ = Describe("Private secrets server", func() {
 		Describe("Create", func() {
 			It("Stores data in vault and clears data before DB write", func() {
 				mockStore.EXPECT().
-					Store(gomock.Any(), auth.SystemTenant, "", "my-secret",
+					Store(gomock.Any(), testTenant, "", "my-secret",
 						map[string][]byte{"key": []byte("value")}).
 					Return(nil)
 
@@ -567,9 +632,9 @@ var _ = Describe("Private secrets server", func() {
 						}.Build(),
 						Backend: privatev1.SecretBackend_SECRET_BACKEND_HUB,
 						Coordinates: map[string]string{
-							"cluster":   "hub-1",
-							"namespace": "default",
-							"name":      "my-k8s-secret",
+							"hub_id":      "hub-1",
+							"namespace":   "default",
+							"secret_name": "my-k8s-secret",
 						},
 					}.Build(),
 				}.Build())
@@ -598,7 +663,7 @@ var _ = Describe("Private secrets server", func() {
 				Expect(err).ToNot(HaveOccurred())
 
 				mockStore.EXPECT().
-					Fetch(gomock.Any(), auth.SystemTenant, "", "get-secret").
+					Fetch(gomock.Any(), testTenant, "", "get-secret").
 					Return(map[string][]byte{"password": []byte("secret-value")}, nil)
 
 				getResponse, err := server.Get(ctx, privatev1.SecretsGetRequest_builder{
@@ -647,11 +712,17 @@ var _ = Describe("Private secrets server", func() {
 						}.Build(),
 						Backend: privatev1.SecretBackend_SECRET_BACKEND_HUB,
 						Coordinates: map[string]string{
-							"cluster": "hub-1",
+							"hub_id":      "hub-1",
+							"namespace":   "default",
+							"secret_name": "my-k8s-secret",
 						},
 					}.Build(),
 				}.Build())
 				Expect(err).ToNot(HaveOccurred())
+
+				mockHubSecretFetcher.EXPECT().
+					Fetch(gomock.Any(), map[string]string{"hub_id": "hub-1", "namespace": "default", "secret_name": "my-k8s-secret"}).
+					Return(map[string][]byte{"secret-key": []byte("secret-value")}, nil)
 
 				getResponse, err := server.Get(ctx, privatev1.SecretsGetRequest_builder{
 					Id: created.GetObject().GetId(),
@@ -682,7 +753,7 @@ var _ = Describe("Private secrets server", func() {
 				Expect(err).ToNot(HaveOccurred())
 
 				mockStore.EXPECT().
-					Store(gomock.Any(), auth.SystemTenant, "", "update-secret",
+					Store(gomock.Any(), testTenant, "", "update-secret",
 						map[string][]byte{"key": []byte("new-value")}).
 					Return(nil)
 
@@ -752,7 +823,7 @@ var _ = Describe("Private secrets server", func() {
 				Expect(err).ToNot(HaveOccurred())
 
 				mockStore.EXPECT().
-					Delete(gomock.Any(), auth.SystemTenant, "", "delete-secret").
+					Delete(gomock.Any(), testTenant, "", "delete-secret").
 					Return(nil)
 
 				_, err = server.Delete(ctx, privatev1.SecretsDeleteRequest_builder{
@@ -803,6 +874,26 @@ var _ = Describe("Private secrets server", func() {
 				createCtx := database.TxIntoContext(context.Background(), createTx)
 				DeferCleanup(func() { _ = createTx.End(createCtx) })
 
+				// Create a tenant for this separate transaction. We can't reuse
+				// testTenant because the suite-level seed holds an uncommitted row
+				// lock on it, which would block this transaction.
+				const secretsTestTenant = "secrets-test-tenant"
+				tenantsDao, seedErr := dao.NewGenericDAO[*privatev1.Tenant]().
+					SetLogger(logger).
+					SetTenancyLogic(tenancy).
+					Build()
+				Expect(seedErr).ToNot(HaveOccurred())
+				_, seedErr = tenantsDao.Create().
+					SetObject(privatev1.Tenant_builder{
+						Id: secretsTestTenant,
+						Metadata: privatev1.Metadata_builder{
+							Name:   secretsTestTenant,
+							Tenant: secretsTestTenant,
+						}.Build(),
+					}.Build()).
+					Do(createCtx)
+				Expect(seedErr).ToNot(HaveOccurred())
+
 				mockStore.EXPECT().
 					Store(gomock.Any(), gomock.Any(), gomock.Any(), "rollback-secret", gomock.Any()).
 					Return(nil)
@@ -810,7 +901,8 @@ var _ = Describe("Private secrets server", func() {
 				created, err := server.Create(createCtx, privatev1.SecretsCreateRequest_builder{
 					Object: privatev1.Secret_builder{
 						Metadata: privatev1.Metadata_builder{
-							Name: "rollback-secret",
+							Name:   "rollback-secret",
+							Tenant: secretsTestTenant,
 						}.Build(),
 						Data: map[string][]byte{
 							"key": []byte("value"),
@@ -831,7 +923,7 @@ var _ = Describe("Private secrets server", func() {
 				DeferCleanup(func() { _ = deleteTx.End(deleteCtx) })
 
 				mockStore.EXPECT().
-					Delete(gomock.Any(), auth.SystemTenant, "", "rollback-secret").
+					Delete(gomock.Any(), secretsTestTenant, "", "rollback-secret").
 					Return(fmt.Errorf("vault unavailable"))
 
 				_, err = server.Delete(deleteCtx, privatev1.SecretsDeleteRequest_builder{
@@ -849,7 +941,7 @@ var _ = Describe("Private secrets server", func() {
 				DeferCleanup(func() { _ = verifyTx.End(verifyCtx) })
 
 				mockStore.EXPECT().
-					Fetch(gomock.Any(), auth.SystemTenant, "", "rollback-secret").
+					Fetch(gomock.Any(), secretsTestTenant, "", "rollback-secret").
 					Return(map[string][]byte{"key": []byte("value")}, nil)
 
 				getResponse, err := server.Get(verifyCtx, privatev1.SecretsGetRequest_builder{
@@ -867,7 +959,9 @@ var _ = Describe("Private secrets server", func() {
 						}.Build(),
 						Backend: privatev1.SecretBackend_SECRET_BACKEND_HUB,
 						Coordinates: map[string]string{
-							"cluster": "hub-1",
+							"hub_id":      "hub-1",
+							"namespace":   "default",
+							"secret_name": "my-k8s-secret",
 						},
 					}.Build(),
 				}.Build())

@@ -81,7 +81,19 @@ const (
 	envComputeInstanceNamespace   = "OSAC_COMPUTE_INSTANCE_NAMESPACE"
 	envNetworkingNamespace        = "OSAC_NETWORKING_NAMESPACE"
 	envClusterOrderNamespace      = "OSAC_CLUSTER_ORDER_NAMESPACE"
+	envAgentNamespace             = "OSAC_AGENT_NAMESPACE"
 	envBareMetalInstanceNamespace = "OSAC_BARE_METAL_INSTANCE_NAMESPACE"
+	envVolumeNamespace            = "OSAC_VOLUME_NAMESPACE"
+	// envStorageConfigNamespace is the namespace holding the per-tenant
+	// "lvms-tenant-config-<tenant>" Secrets the storage controller reads.
+	envStorageConfigNamespace = "OSAC_STORAGE_CONFIG_NAMESPACE"
+	// envVendorControllers maps StorageBackend names to vendor CSI controller
+	// gRPC endpoints, comma-separated (e.g.
+	// "vast=vast-csi-controller.osac-csi-backends.svc:50051").
+	envVendorControllers = "OSAC_VENDOR_CONTROLLERS"
+	// defaultStorageConfigNamespace mirrors the osac-aap/storage controller
+	// default used when OSAC_STORAGE_CONFIG_NAMESPACE is unset.
+	defaultStorageConfigNamespace = "osac-system"
 
 	// AAP configuration
 	envAAPURL                 = "OSAC_AAP_URL"
@@ -117,10 +129,14 @@ const (
 	// Controller enable flags (defaults when flag is not set)
 	envEnableTenantController            = "OSAC_ENABLE_TENANT_CONTROLLER"
 	envEnableStorageController           = "OSAC_ENABLE_STORAGE_CONTROLLER"
+	envEnableVolumeController            = "OSAC_ENABLE_VOLUME_CONTROLLER"
 	envEnableComputeInstanceController   = "OSAC_ENABLE_COMPUTE_INSTANCE_CONTROLLER"
 	envEnableClusterController           = "OSAC_ENABLE_CLUSTER_CONTROLLER"
 	envEnableNetworkingController        = "OSAC_ENABLE_NETWORKING_CONTROLLER"
 	envEnableBareMetalInstanceController = "OSAC_ENABLE_BAREMETAL_INSTANCE_CONTROLLER"
+
+	// Networking provisioning feature gate
+	envEnableNetworkingProvisioning = "OSAC_ENABLE_NETWORKING_PROVISIONING"
 
 	remoteClusterName = "remote"
 
@@ -135,6 +151,7 @@ const (
 type controllerFlags struct {
 	Tenant            bool
 	Storage           bool
+	Volume            bool
 	ComputeInstance   bool
 	Cluster           bool
 	Networking        bool
@@ -150,7 +167,10 @@ func registerControllerFlags() *controllerFlags {
 		"Enable the tenant controller.")
 	flag.BoolVar(&flags.Storage, "enable-storage-controller",
 		helpers.GetEnvWithDefault(envEnableStorageController, false),
-		"Enable the storage controller.")
+		"Enable the storage controller (tenant StorageClass management, ClusterOrder storage provisioning).")
+	flag.BoolVar(&flags.Volume, "enable-volume-controller",
+		helpers.GetEnvWithDefault(envEnableVolumeController, false),
+		"Enable the volume controller (block volume provisioning via vendor CSI).")
 	flag.BoolVar(&flags.ComputeInstance, "enable-compute-instance-controller",
 		helpers.GetEnvWithDefault(envEnableComputeInstanceController, false),
 		"Enable the compute-instance controller.")
@@ -167,10 +187,17 @@ func registerControllerFlags() *controllerFlags {
 }
 
 // enableAllIfNoneSet enables all controllers if none are explicitly enabled.
+//
+// The Volume controller is included now that it has a real vendor provisioner.
+// When no vendor controllers are configured (OSAC_VENDOR_CONTROLLERS unset), the
+// controller still starts but runs with provisioning disabled: it never fails
+// the operator startup, so an unconfigured vendor backend cannot take down the
+// operator or the other controllers.
 func (f *controllerFlags) enableAllIfNoneSet() {
-	if !f.Tenant && !f.Storage && !f.ComputeInstance && !f.Cluster && !f.Networking && !f.BareMetalInstance {
+	if !f.Tenant && !f.Storage && !f.Volume && !f.ComputeInstance && !f.Cluster && !f.Networking && !f.BareMetalInstance {
 		f.Tenant = true
 		f.Storage = true
+		f.Volume = true
 		f.ComputeInstance = true
 		f.Cluster = true
 		f.Networking = true
@@ -334,6 +361,8 @@ func setupClusterControllers(
 			return controller.NewClusterOrderReconciler(
 				localMgr.GetClient(), localMgr.GetAPIReader(), localMgr.GetScheme(),
 				os.Getenv(envClusterOrderNamespace),
+				os.Getenv(envAgentNamespace),
+				os.Getenv(envNetworkingNamespace),
 				provider, pollInterval, maxJobHistory,
 			).SetupWithManager(mgr)
 		},
@@ -378,6 +407,7 @@ func setupComputeInstanceControllers(
 	if grpcConn != nil {
 		ciReconciler.TiersClient = privatev1.NewStorageTiersClient(grpcConn)
 		ciReconciler.BackendsClient = privatev1.NewStorageBackendsClient(grpcConn)
+		ciReconciler.SecretsClient = privatev1.NewSecretsClient(grpcConn)
 	}
 	if err := ciReconciler.SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("computeinstance controller: %w", err)
@@ -464,11 +494,144 @@ func setupStorageController(mgr mcmanager.Manager, grpcConn *grpc.ClientConn, ma
 	if grpcConn != nil {
 		reconciler.BackendsClient = privatev1.NewStorageBackendsClient(grpcConn)
 		reconciler.TiersClient = privatev1.NewStorageTiersClient(grpcConn)
+		reconciler.SecretsClient = privatev1.NewSecretsClient(grpcConn)
 	}
 	if err := reconciler.SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("storage controller: %w", err)
 	}
 	return nil
+}
+
+// setupControllers registers all enabled controllers with the manager.
+func setupControllers(
+	mgr mcmanager.Manager, grpcConn *grpc.ClientConn,
+	flags *controllerFlags, maxJobHistory int,
+) error {
+	if flags.Cluster {
+		if err := setupClusterControllers(mgr, grpcConn, maxJobHistory); err != nil {
+			return fmt.Errorf("cluster controllers: %w", err)
+		}
+	}
+	if flags.ComputeInstance {
+		if err := setupComputeInstanceControllers(mgr, grpcConn, maxJobHistory); err != nil {
+			return fmt.Errorf("computeinstance controllers: %w", err)
+		}
+	}
+	if flags.Tenant {
+		if err := setupTenantController(mgr); err != nil {
+			return fmt.Errorf("tenant controller: %w", err)
+		}
+	}
+	if flags.Storage {
+		if err := setupStorageController(mgr, grpcConn, maxJobHistory); err != nil {
+			return fmt.Errorf("storage controller: %w", err)
+		}
+	}
+	if flags.Volume {
+		if err := setupVolumeControllers(mgr, grpcConn); err != nil {
+			return fmt.Errorf("volume controllers: %w", err)
+		}
+	}
+	if flags.Networking {
+		if err := setupNetworkingControllers(mgr, grpcConn, maxJobHistory); err != nil {
+			return fmt.Errorf("networking controllers: %w", err)
+		}
+	}
+	if flags.BareMetalInstance {
+		if err := setupBareMetalInstanceControllers(mgr, grpcConn); err != nil {
+			return fmt.Errorf("baremetalinstance controllers: %w", err)
+		}
+	}
+	return nil
+}
+
+// setupVolumeControllers registers the Volume resource controller and, when
+// grpcConn is set, the Volume feedback controller. The Volume controller uses
+// a VendorProvisioner interface instead of AAP; for now no real vendor is
+// configured (nil provisioner), so the controller sets Progressing and waits
+// for the vendor CSI integration in a follow-up PR.
+func setupVolumeControllers(mgr mcmanager.Manager, grpcConn *grpc.ClientConn) error {
+	localMgr := mgr.GetLocalManager()
+	volumeNamespace := os.Getenv(envVolumeNamespace)
+
+	if grpcConn != nil {
+		if err := controller.NewVolumeFeedbackReconciler(
+			localMgr.GetClient(),
+			grpcConn,
+			volumeNamespace,
+		).SetupWithManager(mgr); err != nil {
+			return fmt.Errorf("volume feedback controller: %w", err)
+		}
+	}
+
+	// Construct the vendor provisioner from OSAC_VENDOR_CONTROLLERS. A missing or
+	// invalid configuration is deliberately NOT fatal: the operator runs with
+	// volume provisioning disabled (nil provisioner) rather than crashing, so an
+	// unconfigured or misconfigured vendor backend can never take down the
+	// operator or the other controllers. Most setups (including LVMS/dev) have no
+	// vendor backend configured; their Volumes stay in Progressing until one is.
+	var provisioner controller.VendorProvisioner
+	endpoints, err := parseVendorControllers(os.Getenv(envVendorControllers))
+	switch {
+	case err != nil:
+		setupLog.Error(err, "invalid vendor controller config; volume provisioning disabled",
+			"env", envVendorControllers)
+	case len(endpoints) == 0:
+		setupLog.Info("no vendor controllers configured; volume provisioning disabled",
+			"env", envVendorControllers)
+	default:
+		configNamespace := os.Getenv(envStorageConfigNamespace)
+		if configNamespace == "" {
+			configNamespace = defaultStorageConfigNamespace
+		}
+		p, perr := controller.NewVastVendorProvisioner(
+			localMgr.GetAPIReader(),
+			configNamespace,
+			endpoints,
+		)
+		if perr != nil {
+			setupLog.Error(perr, "vendor provisioner init failed; volume provisioning disabled")
+		} else {
+			provisioner = p
+		}
+	}
+
+	if err := controller.NewVolumeReconciler(
+		mgr,
+		volumeNamespace,
+		provisioner,
+	).SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("volume controller: %w", err)
+	}
+	return nil
+}
+
+// parseVendorControllers parses a comma-separated list of backend=endpoint pairs
+// (e.g. "vast=vast-csi-controller.osac-csi-backends.svc:50051") into a map from
+// StorageBackend name to vendor CSI controller gRPC endpoint. An empty input
+// yields an empty map, which the provisioner rejects at startup.
+func parseVendorControllers(s string) (map[string]string, error) {
+	result := make(map[string]string)
+	if s == "" {
+		return result, nil
+	}
+	for _, pair := range strings.Split(s, ",") {
+		pair = strings.TrimSpace(pair)
+		if pair == "" {
+			continue
+		}
+		parts := strings.SplitN(pair, "=", 2)
+		if len(parts) != 2 {
+			return nil, fmt.Errorf("invalid pair %q: expected format backend=endpoint", pair)
+		}
+		backend := strings.TrimSpace(parts[0])
+		endpoint := strings.TrimSpace(parts[1])
+		if backend == "" || endpoint == "" {
+			return nil, fmt.Errorf("invalid pair %q: backend and endpoint must not be empty", pair)
+		}
+		result[backend] = endpoint
+	}
+	return result, nil
 }
 
 // setupNetworkingControllers registers all networking controllers along with their
@@ -485,6 +648,9 @@ func setupNetworkingControllers(
 	computeInstanceNamespace := os.Getenv(envComputeInstanceNamespace)
 	clusterOrderNamespace := os.Getenv(envClusterOrderNamespace)
 	bareMetalInstanceNamespace := os.Getenv(envBareMetalInstanceNamespace)
+
+	networkProvisioningEnabled := helpers.GetEnvWithDefault(envEnableNetworkingProvisioning, false)
+	setupLog.Info("networking provisioning feature gate", "enabled", networkProvisioningEnabled)
 
 	aapURL := os.Getenv(envAAPURL)
 	aapToken := os.Getenv(envAAPToken)
@@ -527,7 +693,7 @@ func setupNetworkingControllers(
 		resolver = dispatcher.NewResolver(networkClassAdapter, disc)
 
 		if err := setupNetworkClassCapabilitiesController(
-			mgr, localMgr, grpcConn, networkingNamespace, resolver,
+			mgr, localMgr, networkClassesClient, networkingNamespace, resolver,
 		); err != nil {
 			return err
 		}
@@ -536,6 +702,7 @@ func setupNetworkingControllers(
 	if err := setupVirtualNetworkControllers(
 		mgr, localMgr, grpcConn, networkingNamespace,
 		networkingProvider, statusPollInterval, maxJobHistory, targetCluster, resolver,
+		networkProvisioningEnabled,
 	); err != nil {
 		return err
 	}
@@ -543,25 +710,28 @@ func setupNetworkingControllers(
 	if err := setupSubnetControllers(
 		mgr, localMgr, grpcConn, networkingNamespace,
 		networkingProvider, statusPollInterval, maxJobHistory, targetCluster, resolver,
-		networkClassesClient,
+		networkClassesClient, networkProvisioningEnabled,
 	); err != nil {
 		return err
 	}
 	if err := setupSecurityGroupControllers(
 		mgr, localMgr, grpcConn, networkingNamespace,
 		networkingProvider, statusPollInterval, maxJobHistory, targetCluster, resolver,
+		networkProvisioningEnabled,
 	); err != nil {
 		return err
 	}
 	if err := setupExternalIPPoolControllers(
 		mgr, localMgr, grpcConn, networkingNamespace,
 		networkingProvider, statusPollInterval, maxJobHistory, targetCluster,
+		networkProvisioningEnabled,
 	); err != nil {
 		return err
 	}
 	if err := setupExternalIPControllers(
 		mgr, localMgr, grpcConn, networkingNamespace,
 		networkingProvider, statusPollInterval, maxJobHistory, targetCluster,
+		networkProvisioningEnabled,
 	); err != nil {
 		return err
 	}
@@ -569,12 +739,14 @@ func setupNetworkingControllers(
 		mgr, localMgr, grpcConn,
 		networkingNamespace, computeInstanceNamespace, clusterOrderNamespace, bareMetalInstanceNamespace,
 		externalIPAttachmentProvider, statusPollInterval, maxJobHistory, targetCluster,
+		networkProvisioningEnabled,
 	); err != nil {
 		return err
 	}
 	if err := setupNATGatewayControllers(
 		mgr, localMgr, grpcConn, networkingNamespace,
-		networkingProvider, statusPollInterval, maxJobHistory, targetCluster,
+		networkingProvider, statusPollInterval, maxJobHistory, targetCluster, resolver,
+		networkProvisioningEnabled,
 	); err != nil {
 		return err
 	}
@@ -584,14 +756,14 @@ func setupNetworkingControllers(
 
 // setupNetworkClassCapabilitiesController registers the NetworkClass capabilities
 // reconciler (ConfigMap-triggered) and its periodic resync runnable. Both require the
-// gRPC connection and a manager resolver built from ConfigMap-based discovery, so this
-// is only called when grpcConn is set and a networking namespace is configured.
+// gRPC connection (via networkClassesClient) and a manager resolver built from
+// ConfigMap-based discovery, so this is only called when grpcConn is set and a
+// networking namespace is configured. networkClassesClient is passed in rather than
+// constructed here since the caller already builds one from the same grpcConn for resolver.
 func setupNetworkClassCapabilitiesController(
-	mgr mcmanager.Manager, localMgr ctrl.Manager, grpcConn *grpc.ClientConn, networkingNamespace string,
-	resolver *dispatcher.Resolver,
+	mgr mcmanager.Manager, localMgr ctrl.Manager, networkClassesClient privatev1.NetworkClassesClient,
+	networkingNamespace string, resolver *dispatcher.Resolver,
 ) error {
-	networkClassesClient := privatev1.NewNetworkClassesClient(grpcConn)
-
 	ncReconciler := controller.NewNetworkClassCapabilitiesReconciler(
 		networkClassesClient, resolver, networkingNamespace,
 	)
@@ -614,7 +786,7 @@ func setupVirtualNetworkControllers(
 	mgr mcmanager.Manager, localMgr ctrl.Manager, grpcConn *grpc.ClientConn,
 	networkingNamespace string, provider provisioning.ProvisioningProvider,
 	statusPollInterval time.Duration, maxJobHistory int, targetCluster multicluster.ClusterName,
-	resolver *dispatcher.Resolver,
+	resolver *dispatcher.Resolver, networkProvisioningEnabled bool,
 ) error {
 	if grpcConn != nil {
 		if err := controller.NewVirtualNetworkFeedbackReconciler(
@@ -623,9 +795,11 @@ func setupVirtualNetworkControllers(
 			return fmt.Errorf("virtualnetwork feedback controller: %w", err)
 		}
 	}
-	if err := controller.NewVirtualNetworkReconciler(
+	reconciler := controller.NewVirtualNetworkReconciler(
 		mgr, networkingNamespace, provider, statusPollInterval, maxJobHistory, targetCluster, resolver,
-	).SetupWithManager(mgr); err != nil {
+	)
+	reconciler.NetworkProvisioningEnabled = networkProvisioningEnabled
+	if err := reconciler.SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("virtualnetwork controller: %w", err)
 	}
 	return nil
@@ -636,7 +810,7 @@ func setupSubnetControllers(
 	networkingNamespace string, provider provisioning.ProvisioningProvider,
 	statusPollInterval time.Duration, maxJobHistory int, targetCluster multicluster.ClusterName,
 	resolver *dispatcher.Resolver,
-	networkClassesClient privatev1.NetworkClassesClient,
+	networkClassesClient privatev1.NetworkClassesClient, networkProvisioningEnabled bool,
 ) error {
 	if grpcConn != nil {
 		if err := controller.NewSubnetFeedbackReconciler(
@@ -645,10 +819,12 @@ func setupSubnetControllers(
 			return fmt.Errorf("subnet feedback controller: %w", err)
 		}
 	}
-	if err := controller.NewSubnetReconciler(
+	reconciler := controller.NewSubnetReconciler(
 		mgr, networkingNamespace, provider, statusPollInterval, maxJobHistory, targetCluster, resolver,
 		networkClassesClient,
-	).SetupWithManager(mgr); err != nil {
+	)
+	reconciler.NetworkProvisioningEnabled = networkProvisioningEnabled
+	if err := reconciler.SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("subnet controller: %w", err)
 	}
 	return nil
@@ -658,7 +834,7 @@ func setupSecurityGroupControllers(
 	mgr mcmanager.Manager, localMgr ctrl.Manager, grpcConn *grpc.ClientConn,
 	networkingNamespace string, provider provisioning.ProvisioningProvider,
 	statusPollInterval time.Duration, maxJobHistory int, targetCluster multicluster.ClusterName,
-	resolver *dispatcher.Resolver,
+	resolver *dispatcher.Resolver, networkProvisioningEnabled bool,
 ) error {
 	if grpcConn != nil {
 		if err := controller.NewSecurityGroupFeedbackReconciler(
@@ -667,9 +843,11 @@ func setupSecurityGroupControllers(
 			return fmt.Errorf("securitygroup feedback controller: %w", err)
 		}
 	}
-	if err := controller.NewSecurityGroupReconciler(
+	reconciler := controller.NewSecurityGroupReconciler(
 		mgr, networkingNamespace, provider, statusPollInterval, maxJobHistory, targetCluster, resolver,
-	).SetupWithManager(mgr); err != nil {
+	)
+	reconciler.NetworkProvisioningEnabled = networkProvisioningEnabled
+	if err := reconciler.SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("securitygroup controller: %w", err)
 	}
 	return nil
@@ -679,6 +857,7 @@ func setupExternalIPPoolControllers(
 	mgr mcmanager.Manager, localMgr ctrl.Manager, grpcConn *grpc.ClientConn,
 	networkingNamespace string, provider provisioning.ProvisioningProvider,
 	statusPollInterval time.Duration, maxJobHistory int, targetCluster multicluster.ClusterName,
+	networkProvisioningEnabled bool,
 ) error {
 	if grpcConn != nil {
 		if err := controller.NewExternalIPPoolFeedbackReconciler(
@@ -687,9 +866,11 @@ func setupExternalIPPoolControllers(
 			return fmt.Errorf("externalippool feedback controller: %w", err)
 		}
 	}
-	if err := controller.NewExternalIPPoolReconciler(
+	reconciler := controller.NewExternalIPPoolReconciler(
 		mgr, networkingNamespace, provider, statusPollInterval, maxJobHistory, targetCluster,
-	).SetupWithManager(mgr); err != nil {
+	)
+	reconciler.NetworkProvisioningEnabled = networkProvisioningEnabled
+	if err := reconciler.SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("externalippool controller: %w", err)
 	}
 	return nil
@@ -699,10 +880,13 @@ func setupExternalIPControllers(
 	mgr mcmanager.Manager, localMgr ctrl.Manager, grpcConn *grpc.ClientConn,
 	networkingNamespace string, provider provisioning.ProvisioningProvider,
 	statusPollInterval time.Duration, maxJobHistory int, targetCluster multicluster.ClusterName,
+	networkProvisioningEnabled bool,
 ) error {
-	if err := controller.NewExternalIPReconciler(
+	reconciler := controller.NewExternalIPReconciler(
 		mgr, networkingNamespace, provider, statusPollInterval, maxJobHistory, targetCluster,
-	).SetupWithManager(mgr); err != nil {
+	)
+	reconciler.NetworkProvisioningEnabled = networkProvisioningEnabled
+	if err := reconciler.SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("externalip controller: %w", err)
 	}
 	if grpcConn != nil {
@@ -720,12 +904,15 @@ func setupExternalIPAttachmentControllers(
 	networkingNamespace, computeInstanceNamespace, clusterOrderNamespace, baremetalInstanceNamespace string,
 	provider provisioning.ProvisioningProvider,
 	statusPollInterval time.Duration, maxJobHistory int, targetCluster multicluster.ClusterName,
+	networkProvisioningEnabled bool,
 ) error {
-	if err := controller.NewExternalIPAttachmentReconciler(
+	reconciler := controller.NewExternalIPAttachmentReconciler(
 		mgr, networkingNamespace, computeInstanceNamespace,
 		clusterOrderNamespace, baremetalInstanceNamespace,
 		provider, statusPollInterval, maxJobHistory, targetCluster,
-	).SetupWithManager(mgr); err != nil {
+	)
+	reconciler.NetworkProvisioningEnabled = networkProvisioningEnabled
+	if err := reconciler.SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("externalipattachment controller: %w", err)
 	}
 	if grpcConn != nil {
@@ -742,6 +929,7 @@ func setupNATGatewayControllers(
 	mgr mcmanager.Manager, localMgr ctrl.Manager, grpcConn *grpc.ClientConn,
 	networkingNamespace string, provider provisioning.ProvisioningProvider,
 	statusPollInterval time.Duration, maxJobHistory int, targetCluster multicluster.ClusterName,
+	resolver *dispatcher.Resolver, networkProvisioningEnabled bool,
 ) error {
 	if grpcConn != nil {
 		if err := controller.NewNATGatewayFeedbackReconciler(
@@ -750,9 +938,11 @@ func setupNATGatewayControllers(
 			return fmt.Errorf("natgateway feedback controller: %w", err)
 		}
 	}
-	if err := controller.NewNATGatewayReconciler(
-		mgr, networkingNamespace, provider, statusPollInterval, maxJobHistory, targetCluster,
-	).SetupWithManager(mgr); err != nil {
+	reconciler := controller.NewNATGatewayReconciler(
+		mgr, networkingNamespace, provider, statusPollInterval, maxJobHistory, targetCluster, resolver,
+	)
+	reconciler.NetworkProvisioningEnabled = networkProvisioningEnabled
+	if err := reconciler.SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("natgateway controller: %w", err)
 	}
 	return nil
@@ -974,41 +1164,9 @@ func main() {
 	})
 	setupLog.Info("job history configuration", "maxJobs", maxJobHistory)
 
-	if ctrlFlags.Cluster {
-		if err := setupClusterControllers(mgr, grpcConn, maxJobHistory); err != nil {
-			setupLog.Error(err, "unable to setup cluster controllers")
-			os.Exit(1)
-		}
-	}
-	if ctrlFlags.ComputeInstance {
-		if err := setupComputeInstanceControllers(mgr, grpcConn, maxJobHistory); err != nil {
-			setupLog.Error(err, "unable to setup computeinstance controllers")
-			os.Exit(1)
-		}
-	}
-	if ctrlFlags.Tenant {
-		if err := setupTenantController(mgr); err != nil {
-			setupLog.Error(err, "unable to setup tenant controller")
-			os.Exit(1)
-		}
-	}
-	if ctrlFlags.Storage {
-		if err := setupStorageController(mgr, grpcConn, maxJobHistory); err != nil {
-			setupLog.Error(err, "unable to setup storage controller")
-			os.Exit(1)
-		}
-	}
-	if ctrlFlags.Networking {
-		if err := setupNetworkingControllers(mgr, grpcConn, maxJobHistory); err != nil {
-			setupLog.Error(err, "unable to setup networking controllers")
-			os.Exit(1)
-		}
-	}
-	if ctrlFlags.BareMetalInstance {
-		if err := setupBareMetalInstanceControllers(mgr, grpcConn); err != nil {
-			setupLog.Error(err, "unable to setup baremetalinstance controllers")
-			os.Exit(1)
-		}
+	if err := setupControllers(mgr, grpcConn, ctrlFlags, maxJobHistory); err != nil {
+		setupLog.Error(err, "unable to setup controllers")
+		os.Exit(1)
 	}
 
 	// +kubebuilder:scaffold:builder

@@ -394,7 +394,7 @@ func (b0 UserCredentials_builder) Build() *UserCredentials {
 // UserStatus contains the observed state of the user.
 type UserStatus struct {
 	state protoimpl.MessageState `protogen:"hybrid.v1"`
-	// The user's current state in the identity provider.
+	// The user's current state.
 	Phase string `protobuf:"bytes,1,opt,name=phase,proto3" json:"phase,omitempty"`
 	// Additional conditions about the user's state.
 	Conditions    []*UserCondition `protobuf:"bytes,2,rep,name=conditions,proto3" json:"conditions,omitempty"`
@@ -452,7 +452,7 @@ func (x *UserStatus) SetConditions(v []*UserCondition) {
 type UserStatus_builder struct {
 	_ [0]func() // Prevents comparability and use of unkeyed literals for the builder.
 
-	// The user's current state in the identity provider.
+	// The user's current state.
 	Phase string
 	// Additional conditions about the user's state.
 	Conditions []*UserCondition

@@ -36,7 +36,7 @@ const (
 )
 
 // A compute instance catalog item defines a curated infrastructure offering that references an underlying compute
-// instance template.
+// instance template. Admins control which fields users can set, enforce defaults, and validate input via JSON Schema.
 //
 // buf:lint:ignore OSAC_OBJECT_SHAPE
 type ComputeInstanceCatalogItem struct {

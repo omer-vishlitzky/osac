@@ -15,6 +15,7 @@ package cluster
 
 //go:generate mockgen -source=../../api/osac/private/v1/clusters_service_grpc.pb.go -destination=clusters_client_mock.go -package=cluster ClustersClient
 //go:generate mockgen -source=../../api/osac/private/v1/cluster_versions_service_grpc.pb.go -destination=cluster_versions_client_mock.go -package=cluster ClusterVersionsClient
+//go:generate mockgen -source=../../api/osac/private/v1/secrets_service_grpc.pb.go -destination=secrets_client_mock.go -package=cluster SecretsClient
 
 import (
 	"context"
@@ -25,10 +26,14 @@ import (
 	"slices"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	clnt "sigs.k8s.io/controller-runtime/pkg/client"
 
 	osacv1alpha1 "github.com/osac-project/osac/osac-operator/api/v1alpha1"
@@ -37,6 +42,7 @@ import (
 	"github.com/osac-project/osac/fulfillment-service/internal/controllers"
 	"github.com/osac-project/osac/fulfillment-service/internal/controllers/finalizers"
 	"github.com/osac-project/osac/fulfillment-service/internal/kubernetes/annotations"
+	"github.com/osac-project/osac/fulfillment-service/internal/kubernetes/gvks"
 	"github.com/osac-project/osac/fulfillment-service/internal/kubernetes/labels"
 	"github.com/osac-project/osac/fulfillment-service/internal/masks"
 	"github.com/osac-project/osac/fulfillment-service/internal/utils"
@@ -45,8 +51,24 @@ import (
 // objectPrefix is the prefix that will be used in the `generateName` field of the resources created in the hub.
 const objectPrefix = "order-"
 
+// dockerConfigJSONKey is the Secret data key that holds a Kubernetes dockerconfigjson payload.
+const dockerConfigJSONKey = ".dockerconfigjson"
+
+// Coordinate keys for hub secrets.
+const (
+	coordinateHubID      = "hub_id"
+	coordinateNamespace  = "namespace"
+	coordinateSecretName = "secret_name"
+	coordinateKey        = "key"
+)
+
+const systemCreator = "system"
+
 // errClusterVersionNotFound indicates the requested ClusterVersion does not exist.
 var errClusterVersionNotFound = errors.New("cluster version not found")
+
+// errPullSecretResolution indicates the cluster's pull_secret_secret could not be resolved.
+var errPullSecretResolution = errors.New("failed to resolve pull secret reference")
 
 // FunctionBuilder contains the data and logic needed to build a function that reconciles clustes.
 type FunctionBuilder struct {
@@ -61,6 +83,7 @@ type function struct {
 	clustersClient        privatev1.ClustersClient
 	hubsClient            privatev1.HubsClient
 	clusterVersionsClient privatev1.ClusterVersionsClient
+	secretsClient         privatev1.SecretsClient
 	maskCalculator        *masks.Calculator
 }
 
@@ -117,6 +140,7 @@ func (b *FunctionBuilder) Build() (result controllers.ReconcilerFunction[*privat
 		clustersClient:        privatev1.NewClustersClient(b.connection),
 		hubsClient:            privatev1.NewHubsClient(b.connection),
 		clusterVersionsClient: privatev1.NewClusterVersionsClient(b.connection),
+		secretsClient:         privatev1.NewSecretsClient(b.connection),
 		hubCache:              b.hubCache,
 		maskCalculator:        masks.NewCalculator().Build(),
 	}
@@ -228,6 +252,23 @@ func (t *task) update(ctx context.Context) error {
 			)
 			return nil
 		}
+		if errors.Is(err, errPullSecretResolution) {
+			t.r.logger.ErrorContext(
+				ctx,
+				"Failed to resolve pull secret reference",
+				slog.String("error", err.Error()),
+			)
+			t.updateCondition(
+				privatev1.ClusterConditionType_CLUSTER_CONDITION_TYPE_PROGRESSING,
+				privatev1.ConditionStatus_CONDITION_STATUS_FALSE,
+				"SecretResolutionFailed",
+				fmt.Sprintf(
+					"The cluster cannot be provisioned: %s.",
+					err,
+				),
+			)
+			return nil
+		}
 		return err
 	}
 
@@ -269,6 +310,15 @@ func (t *task) update(ctx context.Context) error {
 			slog.String("namespace", object.GetNamespace()),
 			slog.String("name", object.GetName()),
 		)
+	}
+
+	if state == privatev1.ClusterState_CLUSTER_STATE_READY && object != nil {
+		if secretErr := t.ensureClusterSecrets(ctx, object); secretErr != nil {
+			t.r.logger.ErrorContext(ctx, "Failed to ensure cluster secrets",
+				slog.String("cluster_id", t.cluster.GetId()),
+				slog.Any("error", secretErr),
+			)
+		}
 	}
 
 	return err
@@ -337,7 +387,13 @@ func (t *task) buildSpec(ctx context.Context) (osacv1alpha1.ClusterOrderSpec, er
 
 func (t *task) addExplicitFields(ctx context.Context, spec *osacv1alpha1.ClusterOrderSpec) error {
 	clusterSpec := t.cluster.GetSpec()
-	if clusterSpec.HasPullSecret() {
+	if clusterSpec.HasPullSecretSecret() {
+		pullSecret, err := t.resolvePullSecret(ctx, clusterSpec.GetPullSecretSecret())
+		if err != nil {
+			return err
+		}
+		spec.PullSecret = pullSecret
+	} else if clusterSpec.HasPullSecret() {
 		spec.PullSecret = clusterSpec.GetPullSecret()
 	}
 	if clusterSpec.HasSshPublicKey() {
@@ -367,6 +423,41 @@ func (t *task) addExplicitFields(ctx context.Context, spec *osacv1alpha1.Cluster
 		}
 	}
 	return nil
+}
+
+// resolvePullSecret fetches the referenced Secret via the private API and returns the
+// dockerconfigjson payload. Controller credentials on the gRPC connection provide auth.
+func (t *task) resolvePullSecret(ctx context.Context, ref *privatev1.SecretLocalReference) (string, error) {
+	id := ref.GetId()
+	if id == "" {
+		return "", fmt.Errorf("%w: pull_secret_secret has no id", errPullSecretResolution)
+	}
+	response, err := t.r.secretsClient.Get(ctx, privatev1.SecretsGetRequest_builder{
+		Id: id,
+	}.Build())
+	if err != nil {
+		if st, ok := status.FromError(err); ok {
+			switch st.Code() {
+			case codes.NotFound:
+				return "", fmt.Errorf("%w: secret '%s' not found", errPullSecretResolution, id)
+			case codes.Unauthenticated, codes.PermissionDenied:
+				return "", fmt.Errorf("%w: not authorized to read secret '%s'", errPullSecretResolution, id)
+			}
+		}
+		return "", fmt.Errorf("%w: failed to get secret '%s': %w", errPullSecretResolution, id, err)
+	}
+	object := response.GetObject()
+	if object == nil {
+		return "", fmt.Errorf("%w: secret '%s' not found", errPullSecretResolution, id)
+	}
+	raw, ok := object.GetData()[dockerConfigJSONKey]
+	if !ok || len(raw) == 0 {
+		return "", fmt.Errorf(
+			"%w: secret '%s' is missing %s key",
+			errPullSecretResolution, id, dockerConfigJSONKey,
+		)
+	}
+	return string(raw), nil
 }
 
 // resolveVersionImage looks up a ClusterVersion by name and returns its release image.
@@ -427,6 +518,12 @@ func (t *task) delete(ctx context.Context) (err error) {
 	if t.hubId == "" {
 		return
 	}
+
+	err = t.deleteClusterSecrets(ctx)
+	if err != nil {
+		return
+	}
+
 	err = t.getHub(ctx)
 	if err != nil {
 		// Check if the hub has been decommissioned (deleted from database)
@@ -592,4 +689,185 @@ func (t *task) removeFinalizer() {
 		})
 		t.cluster.GetMetadata().SetFinalizers(list)
 	}
+}
+
+func (t *task) ensureClusterSecrets(ctx context.Context, order *osacv1alpha1.ClusterOrder) error {
+	clusterRef := order.Status.ClusterReference
+	if clusterRef == nil || clusterRef.HostedClusterName == "" {
+		return nil
+	}
+
+	hc, err := t.getHostedCluster(ctx, clusterRef.Namespace, clusterRef.HostedClusterName)
+	if err != nil {
+		return err
+	}
+	if hc == nil {
+		return nil
+	}
+
+	clusterName := t.cluster.GetMetadata().GetName()
+
+	if t.cluster.GetStatus().GetKubeconfigSecret().GetId() == "" {
+		kubeconfigSecretName, found, err := unstructured.NestedString(hc.Object, "status", "kubeconfig", "name")
+		if err != nil {
+			return err
+		}
+		if found && kubeconfigSecretName != "" {
+			kubeconfigID, err := t.createHubSecret(ctx, clusterName+"-kubeconfig", "cluster-kubeconfig",
+				clusterRef.Namespace, kubeconfigSecretName, "kubeconfig")
+			if err != nil {
+				return err
+			}
+			t.cluster.GetStatus().SetKubeconfigSecret(&privatev1.SecretLocalReference{
+				Id:   kubeconfigID,
+				Name: clusterName + "-kubeconfig",
+			})
+		}
+	}
+
+	if t.cluster.GetStatus().GetPasswordSecret().GetId() == "" {
+		passwordSecretName, found, err := unstructured.NestedString(hc.Object, "status", "kubeadminPassword", "name")
+		if err != nil {
+			return err
+		}
+		if found && passwordSecretName != "" {
+			passwordID, err := t.createHubSecret(ctx, clusterName+"-password", "cluster-password",
+				clusterRef.Namespace, passwordSecretName, "password")
+			if err != nil {
+				return err
+			}
+			t.cluster.GetStatus().SetPasswordSecret(&privatev1.SecretLocalReference{
+				Id:   passwordID,
+				Name: clusterName + "-password",
+			})
+		}
+	}
+
+	return nil
+}
+
+func (t *task) getHostedCluster(ctx context.Context, namespace, name string) (*unstructured.Unstructured, error) {
+	object := &unstructured.Unstructured{}
+	object.SetGroupVersionKind(gvks.HostedCluster)
+	err := t.hubClient.Get(ctx, clnt.ObjectKey{
+		Namespace: namespace,
+		Name:      name,
+	}, object)
+	if apierrors.IsNotFound(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return object, nil
+}
+
+func (t *task) createHubSecret(ctx context.Context, secretName, secretTypeLabel,
+	k8sNamespace, k8sSecretName, k8sKey string) (string, error) {
+	secret := privatev1.Secret_builder{
+		Metadata: privatev1.Metadata_builder{
+			Name:    secretName,
+			Tenant:  t.cluster.GetMetadata().GetTenant(),
+			Project: t.cluster.GetMetadata().GetProject(),
+			Labels: map[string]string{
+				labels.SecretType: secretTypeLabel,
+			},
+			Creator: systemCreator,
+		}.Build(),
+		Backend: privatev1.SecretBackend_SECRET_BACKEND_HUB,
+		Coordinates: map[string]string{
+			coordinateHubID:      t.hubId,
+			coordinateNamespace:  k8sNamespace,
+			coordinateSecretName: k8sSecretName,
+			coordinateKey:        k8sKey,
+		},
+	}.Build()
+
+	resp, err := t.r.secretsClient.Create(ctx, privatev1.SecretsCreateRequest_builder{
+		Object: secret,
+	}.Build())
+	if err != nil {
+		if isAlreadyExists(err) {
+			return t.fetchExistingSecretID(ctx, secretName)
+		}
+		return "", fmt.Errorf("failed to create hub secret '%s': %w", secretName, err)
+	}
+
+	createdID := resp.GetObject().GetId()
+	t.r.logger.DebugContext(ctx, "Created hub secret",
+		slog.String("secret_name", secretName),
+		slog.String("project", t.cluster.GetMetadata().GetProject()),
+		slog.String("cluster_id", t.cluster.GetId()),
+	)
+	return createdID, nil
+}
+
+// fetchExistingSecretID fetches the ID of an existing secret with the given name, tenant, and project.
+// This is a bit of a "loose" relationship that can exist as a transient state from a previously
+// failed reconciler run.  Name + tenant + project should be unique and then we can persist
+// the secret ID in the cluster status.
+func (t *task) fetchExistingSecretID(ctx context.Context, secretName string) (string, error) {
+	filter := fmt.Sprintf(
+		`this.metadata.name == %q && this.metadata.tenant == %q && this.metadata.project == %q`,
+		secretName, t.cluster.GetMetadata().GetTenant(), t.cluster.GetMetadata().GetProject(),
+	)
+	listResp, listErr := t.r.secretsClient.List(ctx, privatev1.SecretsListRequest_builder{
+		Filter: &filter,
+		Limit:  new(int32(1)),
+	}.Build())
+	if listErr != nil {
+		return "", fmt.Errorf("failed to resolve existing secret '%s': %w", secretName, listErr)
+	}
+	if len(listResp.GetItems()) == 0 {
+		return "", fmt.Errorf("secret '%s' exists but could not be found", secretName)
+	}
+	existingID := listResp.GetItems()[0].GetId()
+	t.r.logger.DebugContext(ctx, "Hub secret already exists",
+		slog.String("secret_name", secretName),
+		slog.String("project", t.cluster.GetMetadata().GetProject()),
+		slog.String("cluster_id", t.cluster.GetId()),
+	)
+	return existingID, nil
+}
+
+func (t *task) deleteClusterSecrets(ctx context.Context) error {
+	refs := []*privatev1.SecretLocalReference{
+		t.cluster.GetStatus().GetKubeconfigSecret(),
+		t.cluster.GetStatus().GetPasswordSecret(),
+	}
+
+	for _, ref := range refs {
+		if ref == nil || ref.GetId() == "" {
+			continue
+		}
+
+		_, err := t.r.secretsClient.Delete(ctx, privatev1.SecretsDeleteRequest_builder{
+			Id: ref.GetId(),
+		}.Build())
+		if err != nil {
+			// Treat NotFound as success (idempotent cleanup)
+			if st, ok := status.FromError(err); ok && st.Code() == codes.NotFound {
+				t.r.logger.DebugContext(ctx, "Hub secret already deleted",
+					slog.String("secret_id", ref.GetId()),
+					slog.String("secret_name", ref.GetName()),
+					slog.String("cluster_id", t.cluster.GetId()),
+				)
+				continue
+			}
+			return fmt.Errorf("failed to delete hub secret '%s' for cluster '%s': %w",
+				ref.GetId(), t.cluster.GetId(), err)
+		}
+		t.r.logger.DebugContext(ctx, "Deleted hub secret",
+			slog.String("secret_id", ref.GetId()),
+			slog.String("secret_name", ref.GetName()),
+			slog.String("cluster_id", t.cluster.GetId()),
+		)
+	}
+
+	return nil
+}
+
+func isAlreadyExists(err error) bool {
+	st, ok := status.FromError(err)
+	return ok && st.Code() == codes.AlreadyExists
 }

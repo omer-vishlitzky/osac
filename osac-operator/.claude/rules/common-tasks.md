@@ -15,12 +15,12 @@
 3. Update controller logic in `internal/controller/{resource}_controller.go`
 4. Update feedback controller if field needs sync to fulfillment-service
 
-## Cross-Repo Change Order
+## Cross-Component Change Order
 
 1. **fulfillment-service**: Update proto definitions, regenerate
 2. **osac-operator**: Update CRD types, controller logic, `buf generate`
 3. **osac-aap**: Update Ansible roles/playbooks
-4. **osac-installer**: Update submodules, add RBAC if needed
+4. **osac-installer**: Update Helm values/RBAC if needed
 
 ## RBAC Changes
 
@@ -37,5 +37,5 @@ Update osac-installer hub-access Role if fulfillment controller needs access.
 ```bash
 kubectl describe subnet my-subnet -n osac-networking
 kubectl logs -n osac-system deployment/osac-operator-controller-manager -f
-# Enable debug: add --zap-log-level=debug to config/manager/manager.yaml args
+# Enable debug: add --zap-log-level=debug to charts/operator/values.yaml args
 ```

@@ -9,6 +9,8 @@ rules:
   resources:
   - baremetalhosts
   verbs:
+  - create
+  - delete
   - get
   - list
   - patch
@@ -43,6 +45,16 @@ rules:
   - get
   - patch
   - update
+- apiGroups:
+  - osac.openshift.io
+  resources:
+  - externalipattachments
+  - externalips
+  verbs:
+  - delete
+  - get
+  - list
+  - watch
 - apiGroups:
   - osac.openshift.io
   resources:

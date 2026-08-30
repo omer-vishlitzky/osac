@@ -68,6 +68,7 @@ type TokenSourceBuilder struct {
 	username     string
 	password     string
 	scopes       []string
+	audience     string
 	insecure     bool
 	caPool       *x509.CertPool
 	interactive  bool
@@ -89,6 +90,7 @@ type TokenSource struct {
 	username         string
 	password         string
 	scopes           []string
+	audience         string
 	insecure         bool
 	caPool           *x509.CertPool
 	interactive      bool
@@ -111,6 +113,7 @@ type flowRunner interface {
 }
 
 type tokenEndpointRequest struct {
+	Audience     string   `json:"audience,omitempty" url:"audience,omitempty"`
 	ClientId     string   `json:"client_id,omitempty" url:"client_id,omitempty"`
 	ClientSecret string   `json:"client_secret,omitempty" url:"client_secret,omitempty"`
 	Code         string   `json:"code,omitempty" url:"code,omitempty"`
@@ -203,6 +206,14 @@ func (b *TokenSourceBuilder) SetPassword(value string) *TokenSourceBuilder {
 // SetScopes sets the scopes to request. This is optional.
 func (b *TokenSourceBuilder) SetScopes(value ...string) *TokenSourceBuilder {
 	b.scopes = value
+	return b
+}
+
+// SetAudience sets the audience to request in the token. This is optional but required for some
+// OAuth providers (e.g., when using JWT auth with Vault). The audience identifies the intended
+// recipient of the token.
+func (b *TokenSourceBuilder) SetAudience(value string) *TokenSourceBuilder {
+	b.audience = value
 	return b
 }
 
@@ -321,6 +332,7 @@ func (b *TokenSourceBuilder) Build() (result *TokenSource, err error) {
 		username:         b.username,
 		password:         b.password,
 		scopes:           resolved.scopes,
+		audience:         b.audience,
 		insecure:         b.insecure,
 		caPool:           resolved.caPool,
 		interactive:      b.interactive,

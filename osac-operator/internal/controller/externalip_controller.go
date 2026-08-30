@@ -64,6 +64,10 @@ type ExternalIPReconciler struct {
 	StatusPollInterval   time.Duration
 	MaxJobHistory        int
 	targetCluster        mc.ClusterName
+	// NetworkProvisioningEnabled controls whether the controller dispatches AAP
+	// provisioning jobs. When false, resources are set to Ready immediately
+	// with a placeholder address.
+	NetworkProvisioningEnabled bool
 }
 
 // NewExternalIPReconciler creates a new reconciler for ExternalIP resources.
@@ -101,6 +105,8 @@ func NewExternalIPReconciler(
 // +kubebuilder:rbac:groups=osac.openshift.io,resources=externalips/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=osac.openshift.io,resources=externalips/finalizers,verbs=update
 // +kubebuilder:rbac:groups=osac.openshift.io,resources=externalippools,verbs=get;list;watch
+// +kubebuilder:rbac:groups=osac.openshift.io,resources=externalipattachments,verbs=list
+// +kubebuilder:rbac:groups=osac.openshift.io,resources=natgateways,verbs=list
 // +kubebuilder:rbac:groups="",resources=services,verbs=get
 
 // Reconcile handles create/update/delete for a ExternalIP CR.
@@ -176,6 +182,17 @@ func (r *ExternalIPReconciler) handleUpdate(ctx context.Context, externalIP *v1a
 	if externalIP.Status.Phase == "" {
 		externalIP.Status.Phase = v1alpha1.ExternalIPPhaseProgressing
 		externalIP.Status.State = v1alpha1.ExternalIPStatePending
+	}
+
+	// When networking provisioning is disabled, skip AAP job dispatch and set Ready
+	// immediately with a placeholder address. The placeholder ensures
+	// ExternalIPAttachment's address check doesn't block.
+	if !r.NetworkProvisioningEnabled {
+		externalIP.Status.State = v1alpha1.ExternalIPStateAllocated
+		externalIP.Status.Address = "0.0.0.0"
+		externalIP.Status.Phase = v1alpha1.ExternalIPPhaseReady
+		setReadyConditionTrue(&externalIP.Status.Conditions)
+		return ctrl.Result{}, nil
 	}
 
 	// Resolve the parent ExternalIPPool by the fulfillment-service UUID stored in spec.pool.
@@ -270,9 +287,15 @@ func (r *ExternalIPReconciler) handleUpdate(ctx context.Context, externalIP *v1a
 	return result, nil
 }
 
-// populateAddressIfMissing sets status.address from the MetalLB LoadBalancer Service
+// populateAddressIfMissing sets status.address from the allocated-address annotation
 // after initial provisioning succeeds, and transitions to Ready once the address
 // is known.
+//
+// The AAP provisioning role for each implementation strategy writes the allocated
+// address to the osac.openshift.io/allocated-address annotation on the ExternalIP
+// CR. This function reads it. As a fallback for strategies that haven't been
+// updated to write the annotation, it also checks the legacy
+// LoadBalancer Service as a fallback.
 //
 // State == Allocated is set exclusively by OnSuccess after the AAP provisioning
 // job reports success, so this guard ensures address population happens strictly
@@ -282,16 +305,27 @@ func (r *ExternalIPReconciler) populateAddressIfMissing(ctx context.Context, ext
 		return
 	}
 	log := ctrllog.FromContext(ctx)
+
+	if addr, ok := externalIP.Annotations[osacExternalIPAllocatedAddressAnnotation]; ok && addr != "" {
+		externalIP.Status.Address = addr
+		externalIP.Status.Phase = v1alpha1.ExternalIPPhaseReady
+		log.Info("populated ExternalIP address from allocated-address annotation", "address", addr)
+		return
+	}
+
+	// Fallback: check LoadBalancer Service for strategies that write the address
+	// there instead of the annotation. Remove once all strategies use the
+	// allocated-address annotation.
 	targetClient, err := getTargetClient(ctx, r.mgr, r.targetCluster)
 	if err != nil {
-		log.Error(err, "failed to get target cluster client for address lookup")
+		log.V(1).Info("allocated-address annotation not set and target client unavailable, will retry")
 		return
 	}
 	ipAddress := r.getExternalIPAddress(ctx, targetClient, externalIP.Name)
 	if ipAddress != "" {
 		externalIP.Status.Address = ipAddress
 		externalIP.Status.Phase = v1alpha1.ExternalIPPhaseReady
-		log.Info("populated ExternalIP address from LoadBalancer Service", "address", ipAddress)
+		log.Info("populated ExternalIP address from LoadBalancer Service (fallback)", "address", ipAddress)
 	}
 }
 
@@ -307,9 +341,41 @@ func (r *ExternalIPReconciler) handleDelete(ctx context.Context, externalIP *v1a
 		return ctrl.Result{}, nil
 	}
 
-	result, err := r.handleDeprovisioning(ctx, externalIP)
-	if err != nil || result.RequeueAfter > 0 {
-		return result, err
+	// Gate: wait for all child resources referencing this ExternalIP to be fully removed.
+	eipName := externalIP.Name
+	ns := externalIP.Namespace
+
+	attachmentList := &v1alpha1.ExternalIPAttachmentList{}
+	if err := r.List(ctx, attachmentList, client.InNamespace(ns)); err != nil {
+		return ctrl.Result{}, fmt.Errorf("listing ExternalIPAttachments: %w", err)
+	}
+	for i := range attachmentList.Items {
+		if attachmentList.Items[i].Spec.ExternalIP == eipName {
+			log.Info("waiting for child ExternalIPAttachment to be deleted before deprovisioning ExternalIP",
+				"attachment", attachmentList.Items[i].Name)
+			return ctrl.Result{RequeueAfter: defaultPreconditionRequeueInterval}, nil
+		}
+	}
+
+	natgwList := &v1alpha1.NATGatewayList{}
+	if err := r.List(ctx, natgwList, client.InNamespace(ns)); err != nil {
+		return ctrl.Result{}, fmt.Errorf("listing NATGateways: %w", err)
+	}
+	for i := range natgwList.Items {
+		if natgwList.Items[i].Spec.ExternalIP == eipName {
+			log.Info("waiting for child NATGateway to be deleted before deprovisioning ExternalIP",
+				"natGateway", natgwList.Items[i].Name)
+			return ctrl.Result{RequeueAfter: defaultPreconditionRequeueInterval}, nil
+		}
+	}
+
+	if externalIP.Annotations[osacImplementationStrategyAnnotation] == "" {
+		log.Info("skipping deprovisioning — resource was never provisioned")
+	} else {
+		result, err := r.handleDeprovisioning(ctx, externalIP)
+		if err != nil || result.RequeueAfter > 0 {
+			return result, err
+		}
 	}
 
 	// Deprovisioning complete, remove finalizer to allow K8s garbage collection
@@ -344,10 +410,12 @@ func (r *ExternalIPReconciler) handleProvisioning(ctx context.Context, externalI
 			OnSuccess: func(_ provisioning.ProvisionStatus) {
 				externalIP.Status.State = v1alpha1.ExternalIPStateAllocated
 				if externalIP.Status.Address == "" {
-					if targetClient, err := getTargetClient(ctx, r.mgr, r.targetCluster); err != nil {
-						log.Error(err, "failed to get target cluster client for address lookup on allocation")
-					} else if ip := r.getExternalIPAddress(ctx, targetClient, externalIP.Name); ip != "" {
-						externalIP.Status.Address = ip
+					if addr, ok := externalIP.Annotations[osacExternalIPAllocatedAddressAnnotation]; ok && addr != "" {
+						externalIP.Status.Address = addr
+					} else if targetClient, err := getTargetClient(ctx, r.mgr, r.targetCluster); err == nil {
+						if ip := r.getExternalIPAddress(ctx, targetClient, externalIP.Name); ip != "" {
+							externalIP.Status.Address = ip
+						}
 					}
 				}
 				if externalIP.Status.Address != "" {
@@ -384,31 +452,24 @@ func (r *ExternalIPReconciler) handleDeprovisioning(ctx context.Context, externa
 	return ctrl.Result{}, nil
 }
 
-// getExternalIPAddress fetches the LoadBalancer Service created by the AAP create_public_ip
-// playbook and returns the assigned IP from status.loadBalancer.ingress[0].ip.
-// Returns "" on any error or if no IP is assigned yet (best-effort).
+// getExternalIPAddress fetches the LoadBalancer Service created by the AAP provisioning
+// role and returns the assigned IP. This is a fallback for strategies that haven't been
+// updated to write the allocated-address annotation.
 func (r *ExternalIPReconciler) getExternalIPAddress(ctx context.Context, targetClient client.Client, externalIPName string) string {
 	log := ctrllog.FromContext(ctx)
 
 	svc := &corev1.Service{}
 	serviceName := externalIPServiceNamePrefix + externalIPName
 	if err := targetClient.Get(ctx, types.NamespacedName{Namespace: externalIPDefaultMetalLBNamespace, Name: serviceName}, svc); err != nil {
-		log.Error(err, "failed to get LoadBalancer Service", "namespace", externalIPDefaultMetalLBNamespace, "name", serviceName)
+		log.V(1).Info("LoadBalancer Service not found (may not be a MetalLB strategy)", "name", serviceName)
 		return ""
 	}
 
 	if len(svc.Status.LoadBalancer.Ingress) == 0 {
-		log.Info("LoadBalancer Service has no ingress IP yet", "name", serviceName)
 		return ""
 	}
 
-	ip := svc.Status.LoadBalancer.Ingress[0].IP
-	if ip == "" {
-		log.Info("LoadBalancer Service ingress IP is empty", "name", serviceName)
-		return ""
-	}
-
-	return ip
+	return svc.Status.LoadBalancer.Ingress[0].IP
 }
 
 // SetupWithManager registers this controller with the multicluster manager.

@@ -31,6 +31,21 @@ controllers:
   networking: true
   bareMetalInstance: true
   storage: true
+  # The Volume controller provisions volumes via the vendor CSI controllers.
+  # Safe to leave enabled even without a vendor backend: when vendorControllers
+  # is empty the controller starts with provisioning disabled (Volumes stay in
+  # Progressing) and never fails operator startup.
+  volume: true
+  networkingProvisioning: true
+
+# vendorControllers maps StorageBackend names to their vendor CSI controller
+# gRPC endpoints, rendered into OSAC_VENDOR_CONTROLLERS for the Volume
+# controller. Optional: leave empty on setups with no vendor storage backend
+# (e.g. LVMS/dev) — provisioning is disabled until a backend is configured.
+# Example:
+#   vendorControllers:
+#     vast: vast-csi-controller.osac-csi-backends.svc:50051
+vendorControllers: {}
 
 configSecret:
   name: "osac-config"
@@ -41,6 +56,7 @@ serviceAccount:
   name: ""
 
 consoleProxy:
+  disabled: false
   vmClusterMode: auto
   resources:
     limits:
@@ -54,6 +70,8 @@ certs:
   issuerRef:
     kind: ClusterIssuer
     name: default-ca
+
+remoteClusterKubeconfig: ""
 
 hubAccess:
   enabled: false
@@ -84,4 +102,12 @@ networkManagers:
         VirtualNetwork/Subnet provisioning with no separate physical fabric to
         bridge into — used as the platform default NetworkClass.
       capabilities: "ipv4,ipv6,dualStack"
-  k8sManagers: {}
+  k8sManagers:
+    k8s_only:
+      enabled: false
+      description: >-
+        Composite k8s-native networking (CUDN, Kubernetes NetworkPolicy, MetalLB
+        L2) with no separate physical fabric. Delegates each resource type to an
+        existing k8s-native implementation — see osac-aap's osac.templates.k8s_only
+        role.
+      capabilities: "ipv4,ipv6"

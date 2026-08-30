@@ -59,7 +59,7 @@ func (m *Metal3Client) TestClient() client.Client {
 }
 
 func NewMetal3ManagementClient(ctx context.Context, cfg *Config) (Client, error) {
-	namespace, err := parseMetal3ManagementNamespace(cfg)
+	namespace, err := ParseMetal3ManagementNamespace(cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -85,7 +85,7 @@ func NewMetal3ManagementClient(ctx context.Context, cfg *Config) (Client, error)
 	}, nil
 }
 
-func parseMetal3ManagementNamespace(cfg *Config) (string, error) {
+func ParseMetal3ManagementNamespace(cfg *Config) (string, error) {
 	metal3Opts, ok := cfg.Options["metal3"]
 	if !ok {
 		return "", fmt.Errorf("metal3 options not found in management config")
@@ -208,6 +208,35 @@ func (m *Metal3Client) IsRestartComplete(ctx context.Context, hostID string) (bo
 	// sent to Ironic, before the host finishes rebooting.
 	_, hasRebootAnnotation := bmh.Annotations[metal3api.RebootAnnotationPrefix]
 	return !hasRebootAnnotation && bmh.Status.PoweredOn, nil
+}
+
+// HostInterfaceMACsAnnotation records, on a BareMetalHost, the mapping from OSAC
+// interface names to their MAC addresses as a JSON object, e.g.
+// {"eth9":"52:54:00:16:04:83"}. IP discovery uses it to match a DHCP lease by MAC
+// when the fabric records leases without a server name (the BMaaS case, where the
+// host is not registered as a named fabric server).
+const HostInterfaceMACsAnnotation = "osac.openshift.io/interface-macs"
+
+// GetHostInterfaceMACs returns the interface-name → MAC-address map recorded on the
+// host's BareMetalHost annotation. Returns an empty map when the annotation is absent
+// or empty.
+func (m *Metal3Client) GetHostInterfaceMACs(ctx context.Context, hostID string) (map[string]string, error) {
+	bmh, err := m.getBMH(ctx, hostID)
+	if err != nil {
+		return nil, err
+	}
+
+	raw, ok := bmh.Annotations[HostInterfaceMACsAnnotation]
+	if !ok || raw == "" {
+		return map[string]string{}, nil
+	}
+
+	macs := map[string]string{}
+	if err := json.Unmarshal([]byte(raw), &macs); err != nil {
+		return nil, fmt.Errorf("host %s: failed to parse %s annotation: %w", hostID, HostInterfaceMACsAnnotation, err)
+	}
+
+	return macs, nil
 }
 
 func (m *Metal3Client) getBMH(ctx context.Context, hostID string) (*metal3api.BareMetalHost, error) {

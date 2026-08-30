@@ -448,7 +448,7 @@ func (x *UserStatus) SetConditions(v []*UserCondition) {
 type UserStatus_builder struct {
 	_ [0]func() // Prevents comparability and use of unkeyed literals for the builder.
 
-	// The user's current state in the identity provider.
+	// The user's current state.
 	Phase string
 	// Additional conditions about the user's state.
 	Conditions []*UserCondition

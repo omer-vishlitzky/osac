@@ -15,7 +15,10 @@ syntax = "proto3";
 
 package osac.private.v1;
 
+import "cleanapi/cleanapi.proto";
 import "google/protobuf/struct.proto";
+
+option (cleanapi.file).package = "osac.public.v1";
 
 // Defines a single field on the resource spec that a catalog item controls. Each field definition specifies whether
 // the user can set the field, what default value to apply, and optional JSON Schema validation constraints.

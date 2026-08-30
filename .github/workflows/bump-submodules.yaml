@@ -17,15 +17,13 @@ jobs:
           token: ${{ secrets.OSAC_BOT_PAT }}
 
       # osac-operator, fulfillment-service, osac-aap,
-      # bare-metal-fulfillment-operator, and osac-ui are all either part
-      # of this mono-repo's own commit history or a real released OCI
-      # chart/image dependency now -- there is no submodule left under
-      # base/ to bump a commit pin toward (only osac-csi-driver remains a
-      # submodule, and it isn't bumped by this workflow). The "check
-      # published images, checkout submodule, sync-image-tags --fix"
-      # steps that used to live here were removed for that reason, not
-      # just trimmed -- there's nothing left for them to do. Only the
-      # osac-test-infra pin bump below still applies.
+      # bare-metal-fulfillment-operator, osac-csi-driver, and osac-ui are
+      # all part of this mono-repo's own commit history or a real released
+      # OCI chart/image dependency now -- there are no submodules left to
+      # bump. The "check published images, checkout submodule,
+      # sync-image-tags --fix" steps that used to live here were removed for
+      # that reason, not just trimmed -- there's nothing left for them to
+      # do. Only the osac-test-infra pin bump below still applies.
       - name: Bump pinned osac-test-infra reusable-workflow SHA(s)
         id: pins
         env:

@@ -36,7 +36,7 @@ const (
 )
 
 // A bare metal instance catalog item defines a curated hardware offering that references an underlying bare metal
-// instance template.
+// instance template. Admins control which fields users can set, enforce defaults, and validate input via JSON Schema.
 //
 // buf:lint:ignore OSAC_OBJECT_SHAPE
 type BareMetalInstanceCatalogItem struct {
@@ -50,7 +50,7 @@ type BareMetalInstanceCatalogItem struct {
 	Description string `protobuf:"bytes,4,opt,name=description,proto3" json:"description,omitempty"`
 	// Reference to the underlying bare metal instance template that this catalog item references.
 	Template *BareMetalInstanceTemplateReference `protobuf:"bytes,5,opt,name=template,proto3" json:"template,omitempty"`
-	// Whether this catalog item is published.
+	// Whether this catalog item is published and visible to tenants.
 	Published bool `protobuf:"varint,6,opt,name=published,proto3" json:"published,omitempty"`
 	// Definitions of the fields that users can or cannot set when creating a resource from this catalog item.
 	FieldDefinitions []*FieldDefinition `protobuf:"bytes,8,rep,name=field_definitions,json=fieldDefinitions,proto3" json:"field_definitions,omitempty"`
@@ -194,7 +194,7 @@ type BareMetalInstanceCatalogItem_builder struct {
 	Description string
 	// Reference to the underlying bare metal instance template that this catalog item references.
 	Template *BareMetalInstanceTemplateReference
-	// Whether this catalog item is published.
+	// Whether this catalog item is published and visible to tenants.
 	Published bool
 	// Definitions of the fields that users can or cannot set when creating a resource from this catalog item.
 	FieldDefinitions []*FieldDefinition

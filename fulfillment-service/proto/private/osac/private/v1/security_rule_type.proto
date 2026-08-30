@@ -15,6 +15,10 @@ syntax = "proto3";
 
 package osac.private.v1;
 
+import "cleanapi/cleanapi.proto";
+
+option (cleanapi.file).package = "osac.public.v1";
+
 // Defines a single firewall rule for network traffic filtering.
 //
 // SecurityRule specifies which traffic to allow based on protocol, port ranges (for TCP/UDP), and source/

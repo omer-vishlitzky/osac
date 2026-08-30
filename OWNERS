@@ -27,6 +27,13 @@ filters:
     - amito
     - danielerez
     - htayrie-rh
+    - minmzzhang
+    - slintes
+    - clobrano
+    - Tzif-Morgen
+    - udis
+    - ItzikEzra-rh
+    - carbonin
     reviewers:
     - jhernand
     - adriengentil
@@ -54,3 +61,10 @@ filters:
     - amito
     - danielerez
     - htayrie-rh
+    - minmzzhang
+    - slintes
+    - clobrano
+    - Tzif-Morgen
+    - udis
+    - ItzikEzra-rh
+    - carbonin

@@ -101,8 +101,8 @@ var _ = Describe("buildSpec", func() {
 							"memory":    memory,
 						},
 						RestartRequestedAt: timestamppb.New(requestedAt),
-						NetworkAttachments: []*privatev1.NetworkAttachment{
-							privatev1.NetworkAttachment_builder{Subnet: &privatev1.SubnetLocalReference{Id: subnetID}}.Build(),
+						NetworkAttachments: []*privatev1.ComputeNetworkAttachment{
+							privatev1.ComputeNetworkAttachment_builder{Subnet: &privatev1.SubnetLocalReference{Id: subnetID}}.Build(),
 						},
 					}.Build(),
 				}.Build(),
@@ -160,10 +160,25 @@ var _ = Describe("buildSpec", func() {
 					}.Build(),
 				}.Build(), nil)
 
+			mockDiskImagesClient := NewMockDiskImagesClient(ctrl)
+			mockDiskImagesClient.EXPECT().
+				Get(gomock.Any(), gomock.Any()).
+				Return(privatev1.DiskImagesGetResponse_builder{
+					Object: privatev1.DiskImage_builder{
+						Id: "test-disk-image",
+						Spec: privatev1.DiskImageSpec_builder{
+							SourceType:    privatev1.SourceType_SOURCE_TYPE_REGISTRY,
+							SourceRef:     "quay.io/osac/rhel9:latest",
+							GuestOsFamily: privatev1.GuestOSFamily_GUEST_OS_FAMILY_LINUX,
+						}.Build(),
+					}.Build(),
+				}.Build(), nil)
+
 			task := &task{
 				r: &function{
 					logger:              logger,
 					instanceTypesClient: mockInstanceTypesClient,
+					diskImagesClient:    mockDiskImagesClient,
 				},
 				computeInstance: privatev1.ComputeInstance_builder{
 					Id: "test-explicit-fields",
@@ -172,10 +187,7 @@ var _ = Describe("buildSpec", func() {
 						InstanceType: &privatev1.InstanceTypeReference{Name: "standard-4-8"},
 						RunStrategy:  new("Always"),
 						SshPublicKey: new("ssh-rsa AAAA..."),
-						Image: privatev1.ComputeInstanceImage_builder{
-							SourceType: "registry",
-							SourceRef:  "quay.io/fedora/fedora:latest",
-						}.Build(),
+						DiskImage:    &privatev1.DiskImageReference{Id: "test-disk-image"},
 						BootDisk: privatev1.ComputeInstanceDisk_builder{
 							SizeGib:     20,
 							StorageTier: new("fast"),
@@ -190,8 +202,8 @@ var _ = Describe("buildSpec", func() {
 								StorageTier: new("archive"),
 							}.Build(),
 						},
-						NetworkAttachments: []*privatev1.NetworkAttachment{
-							privatev1.NetworkAttachment_builder{Subnet: &privatev1.SubnetLocalReference{Id: subnetID}}.Build(),
+						NetworkAttachments: []*privatev1.ComputeNetworkAttachment{
+							privatev1.ComputeNetworkAttachment_builder{Subnet: &privatev1.SubnetLocalReference{Id: subnetID}}.Build(),
 						},
 					}.Build(),
 				}.Build(),
@@ -208,8 +220,9 @@ var _ = Describe("buildSpec", func() {
 			Expect(spec.RunStrategy).To(Equal(osacv1alpha1.RunStrategyType("Always")))
 			Expect(spec.SSHKey).To(Equal("ssh-rsa AAAA..."))
 
-			Expect(string(spec.Image.SourceType)).To(Equal("registry"))
-			Expect(spec.Image.SourceRef).To(Equal("quay.io/fedora/fedora:latest"))
+			Expect(spec.Image.SourceType).To(Equal(osacv1alpha1.ImageSourceTypeRegistry))
+			Expect(spec.Image.SourceRef).To(Equal("quay.io/osac/rhel9:latest"))
+			Expect(spec.GuestOSFamily).To(Equal("linux"))
 
 			Expect(spec.BootDisk.SizeGiB).To(Equal(int32(20)))
 			Expect(spec.BootDisk.StorageTier).To(Equal("fast"))
@@ -224,185 +237,145 @@ var _ = Describe("buildSpec", func() {
 			Expect(spec.UserDataSecretRef.Name).To(Equal("test-explicit-fields-user-data"))
 		})
 
-		Describe("Guest OS Family Mapping", func() {
-			It("Maps is_windows=true to GuestOSFamily='windows'", func() {
-				ctx := context.Background()
-				ctrl := gomock.NewController(GinkgoT())
-				DeferCleanup(ctrl.Finish)
-				template := "osac.templates.ocp_virt_vm"
+		It("Maps GuestOSFamily WINDOWS to 'windows' on CRD spec", func() {
+			ctx := context.Background()
+			ctrl := gomock.NewController(GinkgoT())
+			DeferCleanup(ctrl.Finish)
+			template := "osac.templates.ocp_virt_vm"
 
-				// Set up fake client with subnet CR
-				hubNamespace := "test-hub"
-				subnetID := "test-subnet"
-				subnetCR := &osacv1alpha1.Subnet{
-					ObjectMeta: metav1.ObjectMeta{
-						Namespace: hubNamespace,
-						Name:      "test-sn",
-						Labels:    map[string]string{labels.SubnetUuid: subnetID},
-					},
-				}
-				scheme := runtime.NewScheme()
-				Expect(osacv1alpha1.AddToScheme(scheme)).To(Succeed())
-				Expect(corev1.AddToScheme(scheme)).To(Succeed())
-				fakeClient := fake.NewClientBuilder().
-					WithScheme(scheme).
-					WithObjects(subnetCR).
-					Build()
+			hubNamespace := "test-hub"
+			subnetID := "test-subnet"
+			subnetCR := &osacv1alpha1.Subnet{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: hubNamespace,
+					Name:      "test-sn",
+					Labels:    map[string]string{labels.SubnetUuid: subnetID},
+				},
+			}
+			scheme := runtime.NewScheme()
+			Expect(osacv1alpha1.AddToScheme(scheme)).To(Succeed())
+			Expect(corev1.AddToScheme(scheme)).To(Succeed())
+			fakeClient := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(subnetCR).
+				Build()
 
-				mockInstanceTypesClient := NewMockInstanceTypesClient(ctrl)
-				mockInstanceTypesClient.EXPECT().
-					Get(gomock.Any(), gomock.Any()).
-					Return(privatev1.InstanceTypesGetResponse_builder{
-						Object: privatev1.InstanceType_builder{
-							Spec: privatev1.InstanceTypeSpec_builder{}.Build(),
-						}.Build(),
-					}.Build(), nil)
-
-				// Create task with is_windows=true
-				isWindows := true
-				task := &task{
-					r: &function{
-						logger:              logger,
-						instanceTypesClient: mockInstanceTypesClient,
-					},
-					computeInstance: privatev1.ComputeInstance_builder{
-						Id: "test-windows-vm",
-						Spec: privatev1.ComputeInstanceSpec_builder{
-							Template:     &privatev1.ComputeInstanceTemplateReference{Name: template},
-							InstanceType: &privatev1.InstanceTypeReference{Name: "test-type"},
-							IsWindows:    &isWindows,
-							NetworkAttachments: []*privatev1.NetworkAttachment{
-								privatev1.NetworkAttachment_builder{Subnet: &privatev1.SubnetLocalReference{Id: subnetID}}.Build(),
-							},
+			mockInstanceTypesClient := NewMockInstanceTypesClient(ctrl)
+			mockInstanceTypesClient.EXPECT().
+				Get(gomock.Any(), gomock.Any()).
+				Return(privatev1.InstanceTypesGetResponse_builder{
+					Object: privatev1.InstanceType_builder{
+						Spec: privatev1.InstanceTypeSpec_builder{
+							Cores:     4,
+							MemoryGib: 8,
 						}.Build(),
 					}.Build(),
-					hubNamespace: hubNamespace,
-					hubClient:    fakeClient,
-				}
+				}.Build(), nil)
 
-				spec, err := task.buildSpec(ctx)
-				Expect(err).ToNot(HaveOccurred())
-				Expect(spec.GuestOSFamily).To(Equal("windows"))
-			})
-
-			It("Maps is_windows=false to GuestOSFamily='linux'", func() {
-				ctx := context.Background()
-				ctrl := gomock.NewController(GinkgoT())
-				DeferCleanup(ctrl.Finish)
-				template := "osac.templates.ocp_virt_vm"
-
-				// Set up fake client with subnet CR
-				hubNamespace := "test-hub"
-				subnetID := "test-subnet"
-				subnetCR := &osacv1alpha1.Subnet{
-					ObjectMeta: metav1.ObjectMeta{
-						Namespace: hubNamespace,
-						Name:      "test-sn",
-						Labels:    map[string]string{labels.SubnetUuid: subnetID},
-					},
-				}
-				scheme := runtime.NewScheme()
-				Expect(osacv1alpha1.AddToScheme(scheme)).To(Succeed())
-				Expect(corev1.AddToScheme(scheme)).To(Succeed())
-				fakeClient := fake.NewClientBuilder().
-					WithScheme(scheme).
-					WithObjects(subnetCR).
-					Build()
-
-				mockInstanceTypesClient := NewMockInstanceTypesClient(ctrl)
-				mockInstanceTypesClient.EXPECT().
-					Get(gomock.Any(), gomock.Any()).
-					Return(privatev1.InstanceTypesGetResponse_builder{
-						Object: privatev1.InstanceType_builder{
-							Spec: privatev1.InstanceTypeSpec_builder{}.Build(),
-						}.Build(),
-					}.Build(), nil)
-
-				// Create task with is_windows=false
-				isWindows := false
-				task := &task{
-					r: &function{
-						logger:              logger,
-						instanceTypesClient: mockInstanceTypesClient,
-					},
-					computeInstance: privatev1.ComputeInstance_builder{
-						Id: "test-linux-vm",
-						Spec: privatev1.ComputeInstanceSpec_builder{
-							Template:     &privatev1.ComputeInstanceTemplateReference{Name: template},
-							InstanceType: &privatev1.InstanceTypeReference{Name: "test-type"},
-							IsWindows:    &isWindows,
-							NetworkAttachments: []*privatev1.NetworkAttachment{
-								privatev1.NetworkAttachment_builder{Subnet: &privatev1.SubnetLocalReference{Id: subnetID}}.Build(),
-							},
+			mockDiskImagesClient := NewMockDiskImagesClient(ctrl)
+			mockDiskImagesClient.EXPECT().
+				Get(gomock.Any(), gomock.Any()).
+				Return(privatev1.DiskImagesGetResponse_builder{
+					Object: privatev1.DiskImage_builder{
+						Id: "windows-image",
+						Spec: privatev1.DiskImageSpec_builder{
+							SourceType:    privatev1.SourceType_SOURCE_TYPE_REGISTRY,
+							SourceRef:     "quay.io/osac/win2022:latest",
+							GuestOsFamily: privatev1.GuestOSFamily_GUEST_OS_FAMILY_WINDOWS,
 						}.Build(),
 					}.Build(),
-					hubNamespace: hubNamespace,
-					hubClient:    fakeClient,
-				}
+				}.Build(), nil)
 
-				spec, err := task.buildSpec(ctx)
-				Expect(err).ToNot(HaveOccurred())
-				Expect(spec.GuestOSFamily).To(Equal("linux"))
-			})
-
-			It("Maps is_windows not set (omitted) to GuestOSFamily='linux'", func() {
-				ctx := context.Background()
-				ctrl := gomock.NewController(GinkgoT())
-				DeferCleanup(ctrl.Finish)
-				template := "osac.templates.ocp_virt_vm"
-
-				// Set up fake client with subnet CR
-				hubNamespace := "test-hub"
-				subnetID := "test-subnet"
-				subnetCR := &osacv1alpha1.Subnet{
-					ObjectMeta: metav1.ObjectMeta{
-						Namespace: hubNamespace,
-						Name:      "test-sn",
-						Labels:    map[string]string{labels.SubnetUuid: subnetID},
-					},
-				}
-				scheme := runtime.NewScheme()
-				Expect(osacv1alpha1.AddToScheme(scheme)).To(Succeed())
-				Expect(corev1.AddToScheme(scheme)).To(Succeed())
-				fakeClient := fake.NewClientBuilder().
-					WithScheme(scheme).
-					WithObjects(subnetCR).
-					Build()
-
-				mockInstanceTypesClient := NewMockInstanceTypesClient(ctrl)
-				mockInstanceTypesClient.EXPECT().
-					Get(gomock.Any(), gomock.Any()).
-					Return(privatev1.InstanceTypesGetResponse_builder{
-						Object: privatev1.InstanceType_builder{
-							Spec: privatev1.InstanceTypeSpec_builder{}.Build(),
-						}.Build(),
-					}.Build(), nil)
-
-				// Create task WITHOUT is_windows field (omitted entirely)
-				task := &task{
-					r: &function{
-						logger:              logger,
-						instanceTypesClient: mockInstanceTypesClient,
-					},
-					computeInstance: privatev1.ComputeInstance_builder{
-						Id: "test-default-linux-vm",
-						Spec: privatev1.ComputeInstanceSpec_builder{
-							Template:     &privatev1.ComputeInstanceTemplateReference{Name: template},
-							InstanceType: &privatev1.InstanceTypeReference{Name: "test-type"},
-							// IsWindows is NOT set - omitted
-							NetworkAttachments: []*privatev1.NetworkAttachment{
-								privatev1.NetworkAttachment_builder{Subnet: &privatev1.SubnetLocalReference{Id: subnetID}}.Build(),
-							},
-						}.Build(),
+			task := &task{
+				r: &function{
+					logger:              logger,
+					instanceTypesClient: mockInstanceTypesClient,
+					diskImagesClient:    mockDiskImagesClient,
+				},
+				computeInstance: privatev1.ComputeInstance_builder{
+					Id: "test-windows-guest",
+					Spec: privatev1.ComputeInstanceSpec_builder{
+						Template:     &privatev1.ComputeInstanceTemplateReference{Name: template},
+						InstanceType: &privatev1.InstanceTypeReference{Name: "standard-4-8"},
+						DiskImage:    &privatev1.DiskImageReference{Id: "windows-image"},
+						NetworkAttachments: []*privatev1.ComputeNetworkAttachment{
+							privatev1.ComputeNetworkAttachment_builder{Subnet: &privatev1.SubnetLocalReference{Id: subnetID}}.Build(),
+						},
 					}.Build(),
-					hubNamespace: hubNamespace,
-					hubClient:    fakeClient,
-				}
+				}.Build(),
+				hubNamespace: hubNamespace,
+				hubClient:    fakeClient,
+			}
 
-				spec, err := task.buildSpec(ctx)
-				Expect(err).ToNot(HaveOccurred())
-				Expect(spec.GuestOSFamily).To(Equal("linux"))
-			})
+			spec, err := task.buildSpec(ctx)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(spec.GuestOSFamily).To(Equal("windows"))
+			Expect(spec.Image.SourceType).To(Equal(osacv1alpha1.ImageSourceTypeRegistry))
+			Expect(spec.Image.SourceRef).To(Equal("quay.io/osac/win2022:latest"))
+		})
+
+		It("Returns error when DiskImage Get fails", func() {
+			ctx := context.Background()
+			ctrl := gomock.NewController(GinkgoT())
+			DeferCleanup(ctrl.Finish)
+			template := "osac.templates.ocp_virt_vm"
+
+			hubNamespace := "test-hub"
+			subnetID := "test-subnet"
+			subnetCR := &osacv1alpha1.Subnet{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: hubNamespace,
+					Name:      "test-sn",
+					Labels:    map[string]string{labels.SubnetUuid: subnetID},
+				},
+			}
+			scheme := runtime.NewScheme()
+			Expect(osacv1alpha1.AddToScheme(scheme)).To(Succeed())
+			Expect(corev1.AddToScheme(scheme)).To(Succeed())
+			fakeClient := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(subnetCR).
+				Build()
+
+			mockInstanceTypesClient := NewMockInstanceTypesClient(ctrl)
+			mockInstanceTypesClient.EXPECT().
+				Get(gomock.Any(), gomock.Any()).
+				Return(privatev1.InstanceTypesGetResponse_builder{
+					Object: privatev1.InstanceType_builder{
+						Spec: privatev1.InstanceTypeSpec_builder{}.Build(),
+					}.Build(),
+				}.Build(), nil)
+
+			mockDiskImagesClient := NewMockDiskImagesClient(ctrl)
+			mockDiskImagesClient.EXPECT().
+				Get(gomock.Any(), gomock.Any()).
+				Return(nil, errors.New("not found"))
+
+			task := &task{
+				r: &function{
+					logger:              logger,
+					instanceTypesClient: mockInstanceTypesClient,
+					diskImagesClient:    mockDiskImagesClient,
+				},
+				computeInstance: privatev1.ComputeInstance_builder{
+					Id: "test-disk-image-error",
+					Spec: privatev1.ComputeInstanceSpec_builder{
+						Template:     &privatev1.ComputeInstanceTemplateReference{Name: template},
+						InstanceType: &privatev1.InstanceTypeReference{Name: "test-type"},
+						DiskImage:    &privatev1.DiskImageReference{Id: "missing-image"},
+						NetworkAttachments: []*privatev1.ComputeNetworkAttachment{
+							privatev1.ComputeNetworkAttachment_builder{Subnet: &privatev1.SubnetLocalReference{Id: subnetID}}.Build(),
+						},
+					}.Build(),
+				}.Build(),
+				hubNamespace: hubNamespace,
+				hubClient:    fakeClient,
+			}
+
+			_, err := task.buildSpec(ctx)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("failed to resolve disk image 'missing-image'"))
+			Expect(err.Error()).To(ContainSubstring("not found"))
 		})
 
 		It("Excludes explicit fields from spec map when not set", func() {
@@ -448,8 +421,8 @@ var _ = Describe("buildSpec", func() {
 					Spec: privatev1.ComputeInstanceSpec_builder{
 						Template:     &privatev1.ComputeInstanceTemplateReference{Name: template},
 						InstanceType: &privatev1.InstanceTypeReference{Name: "test-type"},
-						NetworkAttachments: []*privatev1.NetworkAttachment{
-							privatev1.NetworkAttachment_builder{Subnet: &privatev1.SubnetLocalReference{Id: subnetID}}.Build(),
+						NetworkAttachments: []*privatev1.ComputeNetworkAttachment{
+							privatev1.ComputeNetworkAttachment_builder{Subnet: &privatev1.SubnetLocalReference{Id: subnetID}}.Build(),
 						},
 					}.Build(),
 				}.Build(),
@@ -521,8 +494,8 @@ var _ = Describe("buildSpec", func() {
 							"cpu_cores": cpuCores,
 							"memory":    memory,
 						},
-						NetworkAttachments: []*privatev1.NetworkAttachment{
-							privatev1.NetworkAttachment_builder{Subnet: &privatev1.SubnetLocalReference{Id: subnetID}}.Build(),
+						NetworkAttachments: []*privatev1.ComputeNetworkAttachment{
+							privatev1.ComputeNetworkAttachment_builder{Subnet: &privatev1.SubnetLocalReference{Id: subnetID}}.Build(),
 						},
 						// No RestartRequestedAt set
 					}.Build(),
@@ -1006,8 +979,8 @@ var _ = Describe("buildSpec with subnetRef", func() {
 				Spec: privatev1.ComputeInstanceSpec_builder{
 					Template:     &privatev1.ComputeInstanceTemplateReference{Name: template},
 					InstanceType: &privatev1.InstanceTypeReference{Name: "test-type"},
-					NetworkAttachments: []*privatev1.NetworkAttachment{
-						privatev1.NetworkAttachment_builder{Subnet: &privatev1.SubnetLocalReference{Id: subnetID}}.Build(),
+					NetworkAttachments: []*privatev1.ComputeNetworkAttachment{
+						privatev1.ComputeNetworkAttachment_builder{Subnet: &privatev1.SubnetLocalReference{Id: subnetID}}.Build(),
 					},
 				}.Build(),
 			}.Build(),
@@ -1059,9 +1032,9 @@ var _ = Describe("buildSpec with subnetRef", func() {
 				Spec: privatev1.ComputeInstanceSpec_builder{
 					Template:     &privatev1.ComputeInstanceTemplateReference{Name: template},
 					InstanceType: &privatev1.InstanceTypeReference{Name: "test-type"},
-					NetworkAttachments: []*privatev1.NetworkAttachment{
-						privatev1.NetworkAttachment_builder{Subnet: &privatev1.SubnetLocalReference{Id: sid1}}.Build(),
-						privatev1.NetworkAttachment_builder{Subnet: &privatev1.SubnetLocalReference{Id: sid2}}.Build(),
+					NetworkAttachments: []*privatev1.ComputeNetworkAttachment{
+						privatev1.ComputeNetworkAttachment_builder{Subnet: &privatev1.SubnetLocalReference{Id: sid1}}.Build(),
+						privatev1.ComputeNetworkAttachment_builder{Subnet: &privatev1.SubnetLocalReference{Id: sid2}}.Build(),
 					},
 				}.Build(),
 			}.Build(),
@@ -1114,8 +1087,8 @@ var _ = Describe("buildSpec with subnetRef", func() {
 				Spec: privatev1.ComputeInstanceSpec_builder{
 					Template:     &privatev1.ComputeInstanceTemplateReference{Name: template},
 					InstanceType: &privatev1.InstanceTypeReference{Name: "test-type"},
-					NetworkAttachments: []*privatev1.NetworkAttachment{
-						privatev1.NetworkAttachment_builder{
+					NetworkAttachments: []*privatev1.ComputeNetworkAttachment{
+						privatev1.ComputeNetworkAttachment_builder{
 							Subnet:         &privatev1.SubnetLocalReference{Id: sid},
 							SecurityGroups: []*privatev1.SecurityGroupLocalReference{{Id: sgid}},
 						}.Build(),
@@ -1172,8 +1145,8 @@ var _ = Describe("buildSpec with subnetRef", func() {
 				Spec: privatev1.ComputeInstanceSpec_builder{
 					Template:     &privatev1.ComputeInstanceTemplateReference{Name: template},
 					InstanceType: &privatev1.InstanceTypeReference{Name: "test-type"},
-					NetworkAttachments: []*privatev1.NetworkAttachment{
-						privatev1.NetworkAttachment_builder{
+					NetworkAttachments: []*privatev1.ComputeNetworkAttachment{
+						privatev1.ComputeNetworkAttachment_builder{
 							Subnet:         &privatev1.SubnetLocalReference{Id: "subnet-id"},
 							SecurityGroups: []*privatev1.SecurityGroupLocalReference{{Id: "sg-id"}},
 						}.Build(),
@@ -1219,8 +1192,8 @@ var _ = Describe("buildSpec with subnetRef", func() {
 				Spec: privatev1.ComputeInstanceSpec_builder{
 					Template:     &privatev1.ComputeInstanceTemplateReference{Name: template},
 					InstanceType: &privatev1.InstanceTypeReference{Name: "test-type"},
-					NetworkAttachments: []*privatev1.NetworkAttachment{
-						privatev1.NetworkAttachment_builder{
+					NetworkAttachments: []*privatev1.ComputeNetworkAttachment{
+						privatev1.ComputeNetworkAttachment_builder{
 							Subnet:         &privatev1.SubnetLocalReference{Id: "subnet-id"},
 							SecurityGroups: []*privatev1.SecurityGroupLocalReference{{Id: "missing-sg"}},
 						}.Build(),
@@ -1900,8 +1873,8 @@ var _ = Describe("instance_type resolution in reconciler", func() {
 				Spec: privatev1.ComputeInstanceSpec_builder{
 					Template:     &privatev1.ComputeInstanceTemplateReference{Name: "osac.templates.ocp_virt_vm"},
 					InstanceType: &privatev1.InstanceTypeReference{Name: "test-type"},
-					NetworkAttachments: []*privatev1.NetworkAttachment{
-						privatev1.NetworkAttachment_builder{Subnet: &privatev1.SubnetLocalReference{Id: subnetID}}.Build(),
+					NetworkAttachments: []*privatev1.ComputeNetworkAttachment{
+						privatev1.ComputeNetworkAttachment_builder{Subnet: &privatev1.SubnetLocalReference{Id: subnetID}}.Build(),
 					},
 				}.Build(),
 			}.Build(),
@@ -1944,8 +1917,8 @@ var _ = Describe("instance_type resolution in reconciler", func() {
 				Spec: privatev1.ComputeInstanceSpec_builder{
 					Template:     &privatev1.ComputeInstanceTemplateReference{Name: "osac.templates.ocp_virt_vm"},
 					InstanceType: &privatev1.InstanceTypeReference{Name: "gpu-a100-8core"},
-					NetworkAttachments: []*privatev1.NetworkAttachment{
-						privatev1.NetworkAttachment_builder{Subnet: &privatev1.SubnetLocalReference{Id: subnetID}}.Build(),
+					NetworkAttachments: []*privatev1.ComputeNetworkAttachment{
+						privatev1.ComputeNetworkAttachment_builder{Subnet: &privatev1.SubnetLocalReference{Id: subnetID}}.Build(),
 					},
 				}.Build(),
 			}.Build(),
@@ -1987,8 +1960,8 @@ var _ = Describe("instance_type resolution in reconciler", func() {
 				Spec: privatev1.ComputeInstanceSpec_builder{
 					Template:     &privatev1.ComputeInstanceTemplateReference{Name: "osac.templates.ocp_virt_vm"},
 					InstanceType: &privatev1.InstanceTypeReference{Name: "standard-4-8"},
-					NetworkAttachments: []*privatev1.NetworkAttachment{
-						privatev1.NetworkAttachment_builder{Subnet: &privatev1.SubnetLocalReference{Id: subnetID}}.Build(),
+					NetworkAttachments: []*privatev1.ComputeNetworkAttachment{
+						privatev1.ComputeNetworkAttachment_builder{Subnet: &privatev1.SubnetLocalReference{Id: subnetID}}.Build(),
 					},
 				}.Build(),
 			}.Build(),
@@ -2033,8 +2006,8 @@ var _ = Describe("instance_type resolution in reconciler", func() {
 				Spec: privatev1.ComputeInstanceSpec_builder{
 					Template:     &privatev1.ComputeInstanceTemplateReference{Name: "osac.templates.ocp_virt_vm"},
 					InstanceType: &privatev1.InstanceTypeReference{Name: "gpu-a100-8core"},
-					NetworkAttachments: []*privatev1.NetworkAttachment{
-						privatev1.NetworkAttachment_builder{Subnet: &privatev1.SubnetLocalReference{Id: subnetID}}.Build(),
+					NetworkAttachments: []*privatev1.ComputeNetworkAttachment{
+						privatev1.ComputeNetworkAttachment_builder{Subnet: &privatev1.SubnetLocalReference{Id: subnetID}}.Build(),
 					},
 				}.Build(),
 			}.Build(),
@@ -2062,8 +2035,8 @@ var _ = Describe("instance_type resolution in reconciler", func() {
 				Id: "test-empty-it",
 				Spec: privatev1.ComputeInstanceSpec_builder{
 					Template: &privatev1.ComputeInstanceTemplateReference{Name: "osac.templates.ocp_virt_vm"},
-					NetworkAttachments: []*privatev1.NetworkAttachment{
-						privatev1.NetworkAttachment_builder{Subnet: &privatev1.SubnetLocalReference{Id: subnetID}}.Build(),
+					NetworkAttachments: []*privatev1.ComputeNetworkAttachment{
+						privatev1.ComputeNetworkAttachment_builder{Subnet: &privatev1.SubnetLocalReference{Id: subnetID}}.Build(),
 					},
 				}.Build(),
 			}.Build(),
@@ -2118,8 +2091,8 @@ var _ = Describe("instance_type resolution in reconciler", func() {
 			Spec: privatev1.ComputeInstanceSpec_builder{
 				Template:     &privatev1.ComputeInstanceTemplateReference{Name: "osac.templates.ocp_virt_vm"},
 				InstanceType: &privatev1.InstanceTypeReference{Name: "test-type"},
-				NetworkAttachments: []*privatev1.NetworkAttachment{
-					privatev1.NetworkAttachment_builder{Subnet: &privatev1.SubnetLocalReference{Id: subnetID}}.Build(),
+				NetworkAttachments: []*privatev1.ComputeNetworkAttachment{
+					privatev1.ComputeNetworkAttachment_builder{Subnet: &privatev1.SubnetLocalReference{Id: subnetID}}.Build(),
 				},
 			}.Build(),
 			Status: privatev1.ComputeInstanceStatus_builder{
@@ -2164,8 +2137,8 @@ var _ = Describe("instance_type resolution in reconciler", func() {
 				Spec: privatev1.ComputeInstanceSpec_builder{
 					Template:     &privatev1.ComputeInstanceTemplateReference{Name: "osac.templates.ocp_virt_vm"},
 					InstanceType: &privatev1.InstanceTypeReference{Name: "failing-type"},
-					NetworkAttachments: []*privatev1.NetworkAttachment{
-						privatev1.NetworkAttachment_builder{Subnet: &privatev1.SubnetLocalReference{Id: subnetID}}.Build(),
+					NetworkAttachments: []*privatev1.ComputeNetworkAttachment{
+						privatev1.ComputeNetworkAttachment_builder{Subnet: &privatev1.SubnetLocalReference{Id: subnetID}}.Build(),
 					},
 				}.Build(),
 			}.Build(),
@@ -2239,8 +2212,8 @@ var _ = Describe("Kubernetes validation error handling", func() {
 			Spec: privatev1.ComputeInstanceSpec_builder{
 				Template:     &privatev1.ComputeInstanceTemplateReference{Name: "osac.templates.ocp_virt_vm"},
 				InstanceType: &privatev1.InstanceTypeReference{Name: "test-type"},
-				NetworkAttachments: []*privatev1.NetworkAttachment{
-					privatev1.NetworkAttachment_builder{Subnet: &privatev1.SubnetLocalReference{Id: subnetID}}.Build(),
+				NetworkAttachments: []*privatev1.ComputeNetworkAttachment{
+					privatev1.ComputeNetworkAttachment_builder{Subnet: &privatev1.SubnetLocalReference{Id: subnetID}}.Build(),
 				},
 			}.Build(),
 			Status: privatev1.ComputeInstanceStatus_builder{

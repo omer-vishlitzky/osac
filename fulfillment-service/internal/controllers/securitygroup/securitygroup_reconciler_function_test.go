@@ -37,7 +37,7 @@ import (
 )
 
 var _ = Describe("buildSpec", func() {
-	It("Includes virtualNetwork, implementationStrategy, and rules", func() {
+	It("Includes virtualNetwork and rules", func() {
 		portFrom := int32(80)
 		portTo := int32(443)
 		ipv4 := "10.0.0.0/8"
@@ -47,8 +47,7 @@ var _ = Describe("buildSpec", func() {
 			securityGroup: privatev1.SecurityGroup_builder{
 				Id: "sg-test-123",
 				Spec: privatev1.SecurityGroupSpec_builder{
-					VirtualNetwork:         privatev1.VirtualNetworkLocalReference_builder{Id: "vnet-123"}.Build(),
-					ImplementationStrategy: "network_policy",
+					VirtualNetwork: privatev1.VirtualNetworkLocalReference_builder{Id: "vnet-123"}.Build(),
 					Ingress: []*privatev1.SecurityRule{
 						privatev1.SecurityRule_builder{
 							Protocol: privatev1.Protocol_PROTOCOL_TCP,
@@ -70,7 +69,6 @@ var _ = Describe("buildSpec", func() {
 		spec := t.buildSpec()
 
 		Expect(spec.VirtualNetwork).To(Equal("vnet-123"))
-		Expect(spec.ImplementationStrategy).To(Equal("network_policy"))
 
 		Expect(spec.IngressRules).To(HaveLen(1))
 		Expect(string(spec.IngressRules[0].Protocol)).To(Equal("tcp"))
@@ -85,7 +83,7 @@ var _ = Describe("buildSpec", func() {
 		Expect(spec.EgressRules[0].PortTo).To(BeNil())
 	})
 
-	It("Omits empty rule lists and empty implementationStrategy", func() {
+	It("Omits empty rule lists", func() {
 		t := &task{
 			securityGroup: privatev1.SecurityGroup_builder{
 				Id: "sg-test-456",
@@ -98,7 +96,6 @@ var _ = Describe("buildSpec", func() {
 		spec := t.buildSpec()
 
 		Expect(spec.VirtualNetwork).To(Equal("vnet-456"))
-		Expect(spec.ImplementationStrategy).To(BeEmpty())
 		Expect(spec.IngressRules).To(BeEmpty())
 		Expect(spec.EgressRules).To(BeEmpty())
 	})
@@ -294,17 +291,12 @@ var _ = Describe("delete", func() {
 		// This test verifies the core behavior: when a hub is decommissioned/deleted,
 		// the reconciler removes its finalizer to allow the security group to be archived.
 
-		// Mock VirtualNetworksClient to return a parent VN with hub assignment
-		mockVNClient := NewMockVirtualNetworksClient(ctrl)
-		mockVNClient.EXPECT().
-			Get(gomock.Any(), gomock.Any()).
-			Return(&privatev1.VirtualNetworksGetResponse{
-				Object: privatev1.VirtualNetwork_builder{
-					Id: vnetID,
-					Status: privatev1.VirtualNetworkStatus_builder{
-						Hub: hubID,
-					}.Build(),
-				}.Build(),
+		// Mock HubsClient to return a hub
+		hubsClient := controllers.NewMockHubsClient(ctrl)
+		hubsClient.EXPECT().
+			List(gomock.Any(), gomock.Any()).
+			Return(&privatev1.HubsListResponse{
+				Items: []*privatev1.Hub{privatev1.Hub_builder{Id: hubID}.Build()},
 			}, nil)
 
 		// Mock HubCache to return ErrHubNotFound (hub decommissioned)
@@ -324,9 +316,9 @@ var _ = Describe("delete", func() {
 		}.Build()
 
 		f := &function{
-			logger:                logger,
-			virtualNetworksClient: mockVNClient,
-			hubCache:              mockHubCache,
+			logger:     logger,
+			hubsClient: hubsClient,
+			hubCache:   mockHubCache,
 		}
 
 		t := &task{
@@ -430,17 +422,12 @@ var _ = Describe("Kubernetes validation error handling", func() {
 			}).
 			Build()
 
-		vnClient := NewMockVirtualNetworksClient(ctrl)
-		vnClient.EXPECT().
-			Get(gomock.Any(), gomock.Any()).
-			Return(privatev1.VirtualNetworksGetResponse_builder{
-				Object: privatev1.VirtualNetwork_builder{
-					Id: "vnet-1",
-					Status: privatev1.VirtualNetworkStatus_builder{
-						Hub: "hub-1",
-					}.Build(),
-				}.Build(),
-			}.Build(), nil)
+		hubsClient := controllers.NewMockHubsClient(ctrl)
+		hubsClient.EXPECT().
+			List(gomock.Any(), gomock.Any()).
+			Return(&privatev1.HubsListResponse{
+				Items: []*privatev1.Hub{privatev1.Hub_builder{Id: "hub-1"}.Build()},
+			}, nil)
 
 		hubCache := controllers.NewMockHubCache(ctrl)
 		hubCache.EXPECT().
@@ -471,11 +458,11 @@ var _ = Describe("Kubernetes validation error handling", func() {
 		}.Build()
 
 		f := &function{
-			logger:                logger,
-			hubCache:              hubCache,
-			securityGroupsClient:  securityGroupsClient,
-			virtualNetworksClient: vnClient,
-			maskCalculator:        masks.NewCalculator().Build(),
+			logger:               logger,
+			hubCache:             hubCache,
+			securityGroupsClient: securityGroupsClient,
+			hubsClient:           hubsClient,
+			maskCalculator:       masks.NewCalculator().Build(),
 		}
 
 		err := f.run(ctx, sg)

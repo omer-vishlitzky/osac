@@ -38,7 +38,7 @@ const (
 
 // Lifecycle states for ExternalIP resources.
 //
-// State transitions: UNSPECIFIED -> PENDING -> ALLOCATED.
+// State transitions: UNSPECIFIED -> PENDING -> ALLOCATED. On deletion: ALLOCATED -> DELETING.
 // FAILED is a terminal error state for provisioning failures.
 type ExternalIPState int32
 
@@ -58,8 +58,8 @@ const (
 	ExternalIPState_EXTERNAL_IP_STATE_ALLOCATED ExternalIPState = 2
 	// Provisioning failed. Check status.message for error details.
 	//
-	// This is a terminal error state. The ExternalIP may require deletion and recreation,
-	// or an administrator can retry via the private API Signal RPC.
+	// This is a terminal error state. The ExternalIP may require manual intervention
+	// (e.g., deleting and recreating) or a Signal RPC to retry the operation.
 	ExternalIPState_EXTERNAL_IP_STATE_FAILED ExternalIPState = 3
 	// The external IP is being deprovisioned and will be removed.
 	//
@@ -122,7 +122,7 @@ func (x ExternalIPState) Number() protoreflect.EnumNumber {
 // ExternalIPAttachment currently exists for this ExternalIP.
 //
 // The lifecycle follows: PENDING (awaiting allocation) -> ALLOCATED (IP assigned).
-// FAILED is a terminal error state for provisioning failures.
+// FAILED is a terminal error state for provisioning failures. DELETING is set during deprovisioning.
 type ExternalIP struct {
 	state               protoimpl.MessageState `protogen:"opaque.v1"`
 	xxx_hidden_Id       string                 `protobuf:"bytes,1,opt,name=id,proto3"`

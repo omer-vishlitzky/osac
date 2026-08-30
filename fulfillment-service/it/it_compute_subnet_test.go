@@ -38,6 +38,7 @@ var _ = Describe("ComputeInstance with Subnet attachment", func() {
 		instanceTypesClient            privatev1.InstanceTypesClient
 		storageTiersClient             privatev1.StorageTiersClient
 		storageBackendsClient          privatev1.StorageBackendsClient
+		diskImagesClient               privatev1.DiskImagesClient
 
 		networkClassId            string
 		virtualNetworkId          string
@@ -47,6 +48,7 @@ var _ = Describe("ComputeInstance with Subnet attachment", func() {
 		instanceTypeId            string
 		storageBackendId          string
 		storageTierId             string
+		diskImageId               string
 	)
 
 	BeforeEach(func() {
@@ -61,6 +63,7 @@ var _ = Describe("ComputeInstance with Subnet attachment", func() {
 		instanceTypesClient = privatev1.NewInstanceTypesClient(tool.InternalView().AdminConn())
 		storageTiersClient = privatev1.NewStorageTiersClient(tool.InternalView().AdminConn())
 		storageBackendsClient = privatev1.NewStorageBackendsClient(tool.InternalView().AdminConn())
+		diskImagesClient = privatev1.NewDiskImagesClient(tool.InternalView().AdminConn())
 
 		// Create StorageBackend
 		sbResp, err := storageBackendsClient.Create(ctx, privatev1.StorageBackendsCreateRequest_builder{
@@ -90,6 +93,7 @@ var _ = Describe("ComputeInstance with Subnet attachment", func() {
 				}.Build(),
 				Spec: privatev1.StorageTierSpec_builder{
 					Description: "Test storage tier for subnet tests",
+					Protocol:    privatev1.StorageProtocol_STORAGE_PROTOCOL_BLOCK,
 					Backends: []*privatev1.BackendAssociation{
 						privatev1.BackendAssociation_builder{
 							BackendId: storageBackendId,
@@ -116,6 +120,25 @@ var _ = Describe("ComputeInstance with Subnet attachment", func() {
 		}.Build())
 		Expect(err).ToNot(HaveOccurred())
 
+		// Create DiskImage
+		diResp, err := diskImagesClient.Create(ctx, privatev1.DiskImagesCreateRequest_builder{
+			Object: privatev1.DiskImage_builder{
+				Metadata: privatev1.Metadata_builder{
+					Name: fmt.Sprintf("test-di-%s", uuid.New()[24:32]),
+				}.Build(),
+				Spec: privatev1.DiskImageSpec_builder{
+					SourceType:    privatev1.SourceType_SOURCE_TYPE_REGISTRY,
+					SourceRef:     "quay.io/containerdisks/fedora:41",
+					GuestOsFamily: privatev1.GuestOSFamily_GUEST_OS_FAMILY_LINUX,
+					Architecture: []privatev1.Architecture{
+						privatev1.Architecture_ARCHITECTURE_AMD64,
+					},
+				}.Build(),
+			}.Build(),
+		}.Build())
+		Expect(err).ToNot(HaveOccurred())
+		diskImageId = diResp.GetObject().GetId()
+
 		// Create ComputeInstanceTemplate
 		computeInstanceTemplateId = fmt.Sprintf("test-ci-template-%s", uuid.New())
 		_, err = computeInstanceTemplatesClient.Create(ctx, privatev1.ComputeInstanceTemplatesCreateRequest_builder{
@@ -134,10 +157,9 @@ var _ = Describe("ComputeInstance with Subnet attachment", func() {
 		ncName := fmt.Sprintf("cudn-subnet-%s", uuid.New())
 		ncResp, err := networkClassesClient.Create(ctx, privatev1.NetworkClassesCreateRequest_builder{
 			Object: privatev1.NetworkClass_builder{
-				Metadata:               privatev1.Metadata_builder{Name: ncName}.Build(),
-				Title:                  "Test CUDN Network Class",
-				ImplementationStrategy: "cudn",
-				FabricManager:          new("netris"),
+				Metadata:      privatev1.Metadata_builder{Name: ncName}.Build(),
+				Title:         "Test CUDN Network Class",
+				FabricManager: new("netris"),
 			}.Build(),
 		}.Build())
 		Expect(err).ToNot(HaveOccurred())
@@ -148,7 +170,8 @@ var _ = Describe("ComputeInstance with Subnet attachment", func() {
 		_, err = virtualNetworksClient.Create(ctx, privatev1.VirtualNetworksCreateRequest_builder{
 			Object: privatev1.VirtualNetwork_builder{
 				Metadata: privatev1.Metadata_builder{
-					Name: fmt.Sprintf("test-vnet-%s", uuid.New()[24:32]),
+					Name:   fmt.Sprintf("test-vnet-%s", uuid.New()[24:32]),
+					Tenant: usersGroup,
 				}.Build(),
 				Id: virtualNetworkId,
 				Spec: privatev1.VirtualNetworkSpec_builder{
@@ -192,7 +215,8 @@ var _ = Describe("ComputeInstance with Subnet attachment", func() {
 		_, err = subnetsClient.Create(ctx, privatev1.SubnetsCreateRequest_builder{
 			Object: privatev1.Subnet_builder{
 				Metadata: privatev1.Metadata_builder{
-					Name: fmt.Sprintf("test-subnet-%s", uuid.New()[24:32]),
+					Name:   fmt.Sprintf("test-subnet-%s", uuid.New()[24:32]),
+					Tenant: usersGroup,
 				}.Build(),
 				Id: subnetId,
 				Spec: privatev1.SubnetSpec_builder{
@@ -287,6 +311,13 @@ var _ = Describe("ComputeInstance with Subnet attachment", func() {
 				Id: storageBackendId,
 			}.Build())
 		}
+
+		// Clean up DiskImage
+		if diskImageId != "" {
+			diskImagesClient.Delete(ctx, privatev1.DiskImagesDeleteRequest_builder{
+				Id: diskImageId,
+			}.Build())
+		}
 	})
 
 	It("creates ComputeInstance with network attachments", func() {
@@ -306,12 +337,9 @@ var _ = Describe("ComputeInstance with Subnet attachment", func() {
 						SizeGib:     20,
 						StorageTier: &storageTierId,
 					}.Build(),
-					Image: publicv1.ComputeInstanceImage_builder{
-						SourceType: "registry",
-						SourceRef:  "quay.io/containerdisks/fedora:latest",
-					}.Build(),
-					NetworkAttachments: []*publicv1.NetworkAttachment{
-						publicv1.NetworkAttachment_builder{
+					DiskImage: &publicv1.DiskImageReference{Id: diskImageId},
+					NetworkAttachments: []*publicv1.ComputeNetworkAttachment{
+						publicv1.ComputeNetworkAttachment_builder{
 							Subnet: publicv1.SubnetLocalReference_builder{Id: subnetId}.Build(),
 						}.Build(),
 					},
@@ -347,12 +375,9 @@ var _ = Describe("ComputeInstance with Subnet attachment", func() {
 						SizeGib:     20,
 						StorageTier: &storageTierId,
 					}.Build(),
-					Image: publicv1.ComputeInstanceImage_builder{
-						SourceType: "registry",
-						SourceRef:  "quay.io/containerdisks/fedora:latest",
-					}.Build(),
-					NetworkAttachments: []*publicv1.NetworkAttachment{
-						publicv1.NetworkAttachment_builder{
+					DiskImage: &publicv1.DiskImageReference{Id: diskImageId},
+					NetworkAttachments: []*publicv1.ComputeNetworkAttachment{
+						publicv1.ComputeNetworkAttachment_builder{
 							Subnet: publicv1.SubnetLocalReference_builder{Name: "non-existent-subnet"}.Build(),
 						}.Build(),
 					},

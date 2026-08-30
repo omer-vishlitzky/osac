@@ -111,6 +111,7 @@ func (b *ExternalIPsServerBuilder) Build() (result *ExternalIPsServer, err error
 		SetAttributionLogic(b.attributionLogic).
 		SetTenancyLogic(b.tenancyLogic).
 		SetMetricsRegisterer(b.metricsRegisterer).
+		SetFilterDesc((*publicv1.ExternalIP)(nil).ProtoReflect().Descriptor()).
 		Build()
 	if err != nil {
 		return
@@ -129,7 +130,9 @@ func (s *ExternalIPsServer) List(ctx context.Context,
 	request *publicv1.ExternalIPsListRequest) (response *publicv1.ExternalIPsListResponse, err error) {
 	privateRequest := &privatev1.ExternalIPsListRequest{}
 	privateRequest.SetOffset(request.GetOffset())
-	privateRequest.SetLimit(request.GetLimit())
+	if request.HasLimit() {
+		privateRequest.SetLimit(request.GetLimit())
+	}
 	privateRequest.SetFilter(request.GetFilter())
 	privateRequest.SetOrder(request.GetOrder())
 

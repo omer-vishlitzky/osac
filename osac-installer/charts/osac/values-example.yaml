@@ -176,13 +176,13 @@ service:
     # Production: external Postgres with mTLS.
     # Provide a secret with the connection URL and client certificates.
     - secret:
-        name: fulfillment-db
+        name: osac-db-config
         items:
         - key: url
           # Format: postgresql://<user>:<password>@<host>:5432/<dbname>?sslmode=verify-full
           param: url
     - secret:
-        name: postgres-client-cert-service
+        name: osac-db-client-cert
         items:
         - key: tls.crt
           param: sslcert
@@ -193,7 +193,7 @@ service:
   # Development: for non-TLS Postgres, replace the connection block above with:
   #   connection:
   #   - secret:
-  #       name: fulfillment-db
+  #       name: osac-db-config
   #       items:
   #       - key: url
   #         param: url
@@ -298,18 +298,63 @@ aap:
     key: ""
 
 # ---------------------
+# Bare Metal Fulfillment Operator — BCM Backend
+# ---------------------
+# BCM (NVIDIA Base Command Manager) inventory backend configuration for BMaaS.
+# When enabled, the chart creates osac-inventory-config, osac-management-config,
+# and osac-bcm-certs Secrets with BCM backend configuration.
+# The cert volume mount is handled by the operator wiring and sync script.
+bmf:
+  bcm:
+    # Set to true to create BCM config secrets via Helm and mount mTLS certs.
+    # When false (default), secrets must be created manually.
+    enabled: false
+    # [REQUIRED when enabled] BCM head node API endpoint.
+    # Example: "https://bcm-head.example.com:8081"
+    url: ""
+    # [REQUIRED when enabled] PEM-encoded client certificate for BCM mTLS
+    # authentication. The chart creates a Secret from this value.
+    cert: ""
+    # [REQUIRED when enabled] PEM-encoded client private key for BCM mTLS
+    # authentication.
+    key: ""
+    # [OPTIONAL] PEM-encoded CA certificate for verifying BCM server cert.
+    # When empty, system root CAs are used (or InsecureSkipVerify if enabled).
+    caCert: ""
+    # Skip TLS verification of BCM server certificate. Test environments only.
+    insecureSkipVerify: false
+    # Host class identifier written to the inventory config.
+    hostClass: "bcm"
+    # [REQUIRED when enabled] Namespace where BareMetalHost CRs are created.
+    # BCM uses Metal3 for power management via BareMetalHost CRs.
+    # Example: "hardware-inventory"
+    bmhNamespace: ""
+
+# ---------------------
+# Bare Metal Fulfillment Operator — Metal3 Backend
+# ---------------------
+# Metal3 inventory and management backend configuration for the BMF operator.
+# When enabled, the chart creates osac-inventory-config and osac-management-config
+# Secrets with Metal3 backend type. The BMF operator mounts these at
+# /etc/osac/inventory/inventory.yaml and /etc/osac/management/management.yaml.
+# NOTE: metal3 nests under the same top-level bmf: key as bcm above — bcm and
+# metal3 are mutually exclusive backends, not separate bmf: blocks.
+  metal3:
+    # Set to true to create Metal3 config secrets via Helm.
+    # When false (default), secrets must be created manually.
+    enabled: false
+    # [REQUIRED when enabled] Namespace where BareMetalHost CRs are located.
+    # This is the namespace Metal3 uses for bare metal host management.
+    # Example: "hardware-inventory"
+    namespace: ""
+    # Host class identifier written to the inventory config.
+    hostClass: "metal3"
+
+# ---------------------
 # Bundled PostgreSQL (dev/test)
 # ---------------------
-bundledPostgres:
-  # When true, auto-creates fulfillment-db secret and postgres-client-cert-service
-  # Certificate. Deploy in-cluster PostgreSQL via an operator per
-  # ../fulfillment-service/docs/INSTALL.md first. With bundledPostgres
-  # enabled, the chart assumes a postgres Service at postgres:5432 in the
-  # install namespace.
-  enabled: false
-  database:
-    name: service
-    user: service
+# NOTE: bundledPostgres has moved to the osac-infra chart. Configure it
+# in the osac-infra values instead.
 
 # ---------------------
 # Hub Access

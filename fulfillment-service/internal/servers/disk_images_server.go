@@ -119,6 +119,7 @@ func (b *DiskImagesServerBuilder) Build() (result *DiskImagesServer, err error) 
 		SetAttributionLogic(b.attributionLogic).
 		SetTenancyLogic(b.tenancyLogic).
 		SetMetricsRegisterer(b.metricsRegisterer).
+		SetFilterDesc((*publicv1.DiskImage)(nil).ProtoReflect().Descriptor()).
 		Build()
 	if err != nil {
 		return
@@ -137,7 +138,9 @@ func (s *DiskImagesServer) List(ctx context.Context,
 	request *publicv1.DiskImagesListRequest) (response *publicv1.DiskImagesListResponse, err error) {
 	privateRequest := &privatev1.DiskImagesListRequest{}
 	privateRequest.SetOffset(request.GetOffset())
-	privateRequest.SetLimit(request.GetLimit())
+	if request.HasLimit() {
+		privateRequest.SetLimit(request.GetLimit())
+	}
 	composedFilter, err := composeFilterDefaults(request.GetFilter(), diskImageFilterDefaults)
 	if err != nil {
 		return nil, grpcstatus.Errorf(grpccodes.InvalidArgument, "%v", err)

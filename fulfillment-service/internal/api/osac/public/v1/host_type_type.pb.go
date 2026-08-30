@@ -37,12 +37,12 @@ const (
 
 // Describes a set of hosts that share characteristics.
 //
-// For example there could be a host type `acme_1tb` to describe the set of hosts manifactured by ACME and with 1 TiB
-// of RAM, and another `ibm_mi300x` to describe the set of hosts manufactured IBM and with a MI300X GPU.
+// For example there could be a host type `acme_1tb` to describe the set of hosts manufactured by ACME and with 1 TiB
+// of RAM, and another `ibm_mi300x` to describe the set of hosts manufactured by IBM and with a MI300X GPU.
 //
 // This is similar to the _instance type_ concept used by many cloud providers.
 //
-// The detailed chracteristics of the host (CPU, memory, GPU, etc) will be in the `description` field.
+// The detailed characteristics of the host (CPU, memory, GPU, etc) will be in the `description` field.
 //
 // buf:lint:ignore OSAC_OBJECT_SHAPE
 type HostType struct {

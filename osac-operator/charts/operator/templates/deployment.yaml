@@ -94,6 +94,10 @@ spec:
             valueFrom:
               fieldRef:
                 fieldPath: metadata.namespace
+          - name: OSAC_VOLUME_NAMESPACE
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.namespace
           - name: OSAC_ENABLE_CLUSTER_CONTROLLER
             value: {{ .Values.controllers.clusterOrder | quote }}
           - name: OSAC_ENABLE_COMPUTE_INSTANCE_CONTROLLER
@@ -106,6 +110,18 @@ spec:
             value: {{ .Values.controllers.bareMetalInstance | quote }}
           - name: OSAC_ENABLE_STORAGE_CONTROLLER
             value: {{ .Values.controllers.storage | quote }}
+          - name: OSAC_ENABLE_VOLUME_CONTROLLER
+            value: {{ .Values.controllers.volume | quote }}
+          - name: OSAC_ENABLE_NETWORKING_PROVISIONING
+            value: {{ .Values.controllers.networkingProvisioning | default false | quote }}
+{{- if .Values.vendorControllers }}
+{{- $pairs := list }}
+{{- range $k, $v := .Values.vendorControllers }}
+{{- $pairs = append $pairs (printf "%s=%s" $k $v) }}
+{{- end }}
+          - name: OSAC_VENDOR_CONTROLLERS
+            value: {{ join "," $pairs | quote }}
+{{- end }}
         securityContext:
           allowPrivilegeEscalation: false
           readOnlyRootFilesystem: true

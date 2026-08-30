@@ -41,9 +41,9 @@ type IPFamily int32
 const (
 	// IP family is unknown or has not been specified.
 	IPFamily_IP_FAMILY_UNSPECIFIED IPFamily = 0
-	// IPv4 address family.
+	// IPv4 address family. CIDRs must be valid IPv4 CIDR notation.
 	IPFamily_IP_FAMILY_IPV4 IPFamily = 1
-	// IPv6 address family.
+	// IPv6 address family. CIDRs must be valid IPv6 CIDR notation.
 	IPFamily_IP_FAMILY_IPV6 IPFamily = 2
 )
 

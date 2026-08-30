@@ -4,6 +4,7 @@ on:
   pull_request:
     branches:
     - main
+  merge_group:
   workflow_dispatch:
   # 2x/day (every 12h). Offset 47 minutes past the hour, not on the hour --
   # GitHub Actions' shared cron scheduler queues everyone's on-the-hour
@@ -13,6 +14,8 @@ on:
   # don't all land on the same offset simultaneously.
   schedule:
     - cron: '47 */12 * * *'
+  # Invoked as a parallel "box" by nightly-build.yaml.
+  workflow_call:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
@@ -26,12 +29,23 @@ jobs:
   changes:
     runs-on: ubuntu-latest
     permissions:
+      contents: read
       pull-requests: read
     outputs:
-      should-run: ${{ github.event_name != 'pull_request' || steps.filter.outputs.code == 'true' }}
+      # Same ignore list for pull_request and merge_group. schedule /
+      # workflow_dispatch always run. Job-level `if:` skip reports success
+      # so docs-only PRs (and merge groups) are not blocked.
+      should-run: ${{ (github.event_name != 'pull_request' && github.event_name != 'merge_group') || steps.filter.outputs.code == 'true' }}
     steps:
-      - uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706  # v4.0.2
-        if: github.event_name == 'pull_request'
+      # dorny/paths-filter uses git diff on merge_group (not the PR Files API),
+      # so the repo must be checked out with enough history for base..head.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        if: github.event_name == 'merge_group'
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d  # v4.0.3
+        if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
         id: filter
         with:
           predicate-quantifier: 'every'
@@ -49,16 +63,19 @@ jobs:
               - '!.skillsaw.yaml'
               - '!.pre-commit-config.yaml'
 
-  # fulfillment-service, osac-operator, and osac-aap use genuinely different
-  # integration test mechanisms (ginkgo directly, a Kind cluster + Makefile
-  # target, and a Kind cluster + uv/pytest respectively), so these stay
-  # separate jobs rather than a matrix -- there's no shared step sequence to
-  # parameterize, only the workflow-level trigger/name were duplicated before.
+  # fulfillment-service, osac-operator, and bare-metal-fulfillment-operator now
+  # all follow the same Kind cluster + root Makefile step sequence (only the
+  # go-version-file, integration-test-* target, and diagnostic label selector
+  # differ per component); osac-aap uses a distinct Kind cluster + uv/pytest
+  # mechanism. These stay separate jobs rather than a matrix for now -- not
+  # because there's no shared sequence to parameterize (there increasingly is,
+  # for the first three), but that wasn't done here; worth revisiting.
   fulfillment-service:
     name: Run integration test (fulfillment-service)
     needs: changes
     if: needs.changes.outputs.should-run == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 75  # ginkgo --timeout 1h (Makefile) + ~15m for install/setup/log-collection
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       with:
@@ -66,12 +83,40 @@ jobs:
     - uses: ./.github/actions/setup-go
       with:
         working-directory: fulfillment-service
-    - working-directory: fulfillment-service
+    - name: Install Kind
+      uses: helm/kind-action@v1
+      with:
+        install_only: true
+    - name: Install Helm
+      uses: azure/setup-helm@v4
+    - name: Install ginkgo
+      run: go install github.com/onsi/ginkgo/v2/ginkgo@v2.32.0  # keep in sync with go.mod's github.com/onsi/ginkgo/v2 version
+    - name: Install infrastructure on Kind
+      env:
+        CONTAINER_TOOL: docker
+      run: make -C osac-installer install-infra PLATFORM=kind PROFILE=dev NS=osac
+    - name: Run integration tests
+      env:
+        CONTAINER_TOOL: docker
       run: |
         echo '127.0.0.1 fulfillment-api.osac.svc.cluster.local' | sudo tee -a /etc/hosts
         echo '127.0.0.1 fulfillment-internal-api.osac.svc.cluster.local' | sudo tee -a /etc/hosts
         echo '127.0.0.1 keycloak.keycloak.svc.cluster.local' | sudo tee -a /etc/hosts
-        IT_DEPLOY_MODE=helm ginkgo run --timeout 1h -v it
+        make -C osac-installer test PLATFORM=kind PROFILE=dev NS=osac SUITE=fulfillment
+    - name: Collect diagnostic logs
+      if: always()
+      run: |
+        export KUBECONFIG="$HOME/.kube/osac-dev-kind.kubeconfig"
+        echo "=== Pods ==="
+        kubectl get pods -n osac -o wide
+        echo "=== Deployments ==="
+        kubectl get deployments -n osac
+        echo "=== Operator logs ==="
+        kubectl logs -n osac -l control-plane=controller-manager --tail=100
+        echo "=== Fulfillment logs ==="
+        kubectl logs -n osac -l 'app in (fulfillment-console-proxy,fulfillment-controller,fulfillment-grpc-server,fulfillment-rest-gateway,fulfillment-ingress-proxy)' --tail=100 --all-containers
+        echo "=== Events ==="
+        kubectl get events -n osac --sort-by='.lastTimestamp' | tail -50
     - if: always()
       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
       with:
@@ -84,7 +129,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.should-run == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45  # ginkgo --timeout 30m (Makefile) + ~15m for install/setup/log-collection
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -96,16 +141,96 @@ jobs:
         with:
           go-version-file: 'osac-operator/go.mod'
 
-      - name: Create Kind cluster
+      - name: Install Kind
         uses: helm/kind-action@v1
         with:
-          cluster_name: kind
+          install_only: true
 
-      - name: Run integration tests
-        timeout-minutes: 15
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+
+      - name: Install ginkgo
+        run: go install github.com/onsi/ginkgo/v2/ginkgo@v2.32.0  # keep in sync with go.mod's github.com/onsi/ginkgo/v2 version
+
+      - name: Install infrastructure on Kind
         env:
           CONTAINER_TOOL: docker
-        run: make -C osac-operator test-integration-kind
+        run: make -C osac-installer install-infra PLATFORM=kind PROFILE=dev NS=osac
+
+      - name: Run integration tests
+        env:
+          CONTAINER_TOOL: docker
+        run: make -C osac-installer test PLATFORM=kind PROFILE=dev NS=osac SUITE=operator
+
+      - name: Collect diagnostic logs
+        if: always()
+        run: |
+          export KUBECONFIG="$HOME/.kube/osac-dev-kind.kubeconfig"
+          echo "=== Pods ==="
+          kubectl get pods -n osac -o wide
+          echo "=== Deployments ==="
+          kubectl get deployments -n osac
+          echo "=== Operator logs ==="
+          kubectl logs -n osac -l control-plane=controller-manager --tail=100
+          echo "=== Events ==="
+          kubectl get events -n osac --sort-by='.lastTimestamp' | tail -50
+
+  bare-metal-fulfillment-operator:
+    name: Run integration test (bare-metal-fulfillment-operator)
+    needs: changes
+    if: needs.changes.outputs.should-run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45  # ginkgo --timeout 30m (Makefile) + ~15m for install/setup/log-collection
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: 'bare-metal-fulfillment-operator/go.mod'
+
+      - name: Install Kind
+        uses: helm/kind-action@v1
+        with:
+          install_only: true
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+
+      - name: Install ginkgo
+        run: go install github.com/onsi/ginkgo/v2/ginkgo@v2.32.0  # keep in sync with go.mod's github.com/onsi/ginkgo/v2 version
+
+      - name: Install infrastructure on Kind
+        env:
+          CONTAINER_TOOL: docker
+        run: make -C osac-installer install-infra PLATFORM=kind PROFILE=dev NS=osac
+
+      - name: Run integration tests
+        env:
+          CONTAINER_TOOL: docker
+        run: make -C osac-installer test PLATFORM=kind PROFILE=dev NS=osac SUITE=bmf
+
+      - name: Collect diagnostic logs
+        if: always()
+        run: |
+          export KUBECONFIG="$HOME/.kube/osac-dev-kind.kubeconfig"
+          echo "=== Pods ==="
+          kubectl get pods -n osac -o wide
+          echo "=== Deployments ==="
+          kubectl get deployments -n osac
+          echo "=== BMF operator logs ==="
+          kubectl logs -n osac -l app.kubernetes.io/name=bmf --tail=100
+          echo "=== BareMetalPools ==="
+          kubectl get baremetalpools -n osac -o yaml
+          echo "=== BareMetalInstances ==="
+          kubectl get baremetalinstances -n osac -o yaml
+          echo "=== BareMetalHosts ==="
+          kubectl get baremetalhosts -n osac -o yaml
+          echo "=== Events ==="
+          kubectl get events -n osac --sort-by='.lastTimestamp' | tail -50
 
   osac-aap:
     name: Run integration test (osac-aap)
@@ -147,7 +272,7 @@ jobs:
 
   # osac-installer's own smoke test: deploy the umbrella chart (which
   # composes every other component's chart via file:// dependencies, plus
-  # osac-ui/osac-csi-driver's submodule/OCI dependencies) to a local Kind
+  # osac-ui's OCI chart dependency) to a local Kind
   # cluster and verify it installs and upgrades idempotently. Distinct from
   # the jobs above, which test one component in isolation -- this is the
   # only place that exercises the umbrella chart's composition of all of
@@ -160,92 +285,101 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - name: Checkout repository
-      uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v6
+      uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
       with:
-        submodules: recursive
         persist-credentials: false
-
-    - name: Update submodules to pinned commits
-      working-directory: osac-installer
-      run: git submodule update --init --recursive
 
     - name: Set up Helm
       uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310  # v5.0.1
       with:
         version: v3.17.0
 
-    - name: Create Kind cluster
+    - name: Install Kind
       uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc  # v1
       with:
-        cluster_name: osac-integration
+        install_only: true
 
-    - name: Install cert-manager
-      run: |
-        kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.17.1/cert-manager.yaml
-        kubectl wait --for=condition=Available deployment/cert-manager -n cert-manager --timeout=120s
-        kubectl wait --for=condition=Available deployment/cert-manager-webhook -n cert-manager --timeout=120s
-        kubectl wait --for=condition=Available deployment/cert-manager-cainjector -n cert-manager --timeout=120s
-
-    - name: Build chart dependencies
-      working-directory: osac-installer
-      run: helm dependency build charts/osac/
-
-    - name: Lint chart
+    - name: Lint charts
       working-directory: osac-installer
       run: |
-        helm lint charts/osac/ --values values/development/values.yaml \
-          --set service.externalHostname=fulfillment-api.osac.svc.cluster.local \
-          --set service.internalHostname=fulfillment-internal-api.osac.svc.cluster.local
+        helm dependency build charts/osac/
+        helm lint charts/osac-deps/
+        helm lint charts/osac-infra/ --values values/dev/infra.yaml
+        helm lint charts/osac/ --values values/dev/kind-instance.yaml
 
-    - name: Template chart (dry-run validation)
+    - name: Template charts (dry-run validation)
       working-directory: osac-installer
       run: |
-        helm template osac charts/osac/ --values values/development/values.yaml \
-          --set service.externalHostname=fulfillment-api.osac.svc.cluster.local \
-          --set service.internalHostname=fulfillment-internal-api.osac.svc.cluster.local \
-          > /dev/null
+        helm template osac-deps charts/osac-deps/ --values values/dev/infra.yaml
+        helm template osac-infra charts/osac-infra/ --values values/dev/infra.yaml \
+          --set trustManager.upstream.enabled=true
+        helm template osac charts/osac/ --values values/dev/kind-instance.yaml
 
-    - name: Deploy umbrella chart
-      continue-on-error: true
-      working-directory: osac-installer
-      run: |
-        helm install osac charts/osac/ \
-          --namespace osac \
-          --create-namespace \
-          --values values/development/values.yaml \
-          --set service.externalHostname=fulfillment-api.osac.svc.cluster.local \
-          --set service.internalHostname=fulfillment-internal-api.osac.svc.cluster.local \
-          --set validation.enabled=false \
-          --set aap.bootstrap.enabled=false \
-          --set aap.aap.instance.enabled=false \
-          --set dbMigrate.enabled=false \
-          --timeout 10m \
-          --wait
+    # Same real command (and cluster: `make install-infra` creates its own
+    # Kind cluster, config, cert-manager/trust-manager/envoy-gateway/osac-infra
+    # install in one shot) fulfillment-service's and osac-operator's jobs in
+    # this same file already use successfully -- rather than hand-reimplementing
+    # the same sequence in workflow YAML, which is exactly how this job drifted
+    # out of sync with the real deployment path in the first place (missing
+    # trust-manager/envoy-gateway installs, wrong values file).
+    - name: Install infrastructure on Kind
+      env:
+        CONTAINER_TOOL: docker
+      run: make -C osac-installer install-infra PLATFORM=kind PROFILE=dev NS=osac
 
-    - name: Check deployed resources
+    - name: Deploy charts
+      env:
+        CONTAINER_TOOL: docker
+      run: make -C osac-installer install-osac PLATFORM=kind PROFILE=dev NS=osac
+
+    - name: Collect diagnostic logs
       if: always()
       run: |
-        echo "=== Pods ==="
-        kubectl get pods -n osac 2>/dev/null || true
-        echo "=== Deployments ==="
-        kubectl get deployments -n osac 2>/dev/null || true
-        echo "=== Services ==="
-        kubectl get services -n osac 2>/dev/null || true
-        echo "=== Helm status ==="
-        helm status osac -n osac 2>/dev/null || true
+        export KUBECONFIG="$HOME/.kube/osac-dev-kind.kubeconfig"
+        mkdir -p osac-installer/logs
 
+        echo "=== Pods ==="
+        kubectl get pods -n osac -o wide | tee osac-installer/logs/pods.txt
+        echo ""
+
+        echo "=== Collecting pod logs to files ==="
+        for pod in $(kubectl get pods -n osac -o jsonpath='{.items[*].metadata.name}'); do
+          echo "Collecting logs for $pod..."
+          kubectl logs -n osac "$pod" --all-containers --tail=500 --prefix > "osac-installer/logs/${pod}.log" 2>&1 || echo "Failed to get logs for $pod"
+          # Also get previous container logs if pod crashed
+          kubectl logs -n osac "$pod" --all-containers --previous --tail=500 --prefix > "osac-installer/logs/${pod}-previous.log" 2>&1 || true
+        done
+
+        echo "=== Deployments ==="
+        kubectl get deployments -n osac -o wide | tee osac-installer/logs/deployments.txt
+        echo ""
+
+        echo "=== Services ==="
+        kubectl get services -n osac | tee osac-installer/logs/services.txt
+        echo ""
+
+        echo "=== Events ==="
+        kubectl get events -n osac --sort-by='.lastTimestamp' | tee osac-installer/logs/events.txt
+        echo ""
+
+        echo "=== Helm releases ==="
+        helm list -n osac | tee osac-installer/logs/helm-releases.txt
+
+        echo "=== Pod descriptions ==="
+        kubectl describe pods -n osac > osac-installer/logs/pod-descriptions.txt 2>&1
+
+    - if: always()
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
+      with:
+        name: osac-installer-logs
+        path: osac-installer/logs
+        retention-days: 1
+
+    # make install-osac is `helm upgrade --install` -- invoking it again
+    # against an unchanged values file/chart IS the real idempotency test,
+    # using the same real command as the initial deploy above rather than a
+    # hand-copied `helm upgrade` invocation that could drift from it.
     - name: Test idempotency (helm upgrade with no changes)
-      continue-on-error: true
-      working-directory: osac-installer
-      run: |
-        helm upgrade osac charts/osac/ \
-          --namespace osac \
-          --values values/development/values.yaml \
-          --set service.externalHostname=fulfillment-api.osac.svc.cluster.local \
-          --set service.internalHostname=fulfillment-internal-api.osac.svc.cluster.local \
-          --set validation.enabled=false \
-          --set aap.bootstrap.enabled=false \
-          --set aap.aap.instance.enabled=false \
-          --set dbMigrate.enabled=false \
-          --timeout 10m \
-          --wait
+      env:
+        CONTAINER_TOOL: docker
+      run: make -C osac-installer install-osac PLATFORM=kind PROFILE=dev NS=osac

@@ -22,10 +22,12 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	grpccodes "google.golang.org/grpc/codes"
 	grpcstatus "google.golang.org/grpc/status"
+	"google.golang.org/protobuf/reflect/protoreflect"
 
 	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
 	"github.com/osac-project/osac/fulfillment-service/internal/database"
+	"github.com/osac-project/osac/fulfillment-service/internal/database/dao"
 )
 
 // PrivateProjectsServerBuilder contains the data and logic needed to create a private projects server.
@@ -35,6 +37,8 @@ type PrivateProjectsServerBuilder struct {
 	attributionLogic  auth.AttributionLogic
 	tenancyLogic      auth.TenancyLogic
 	metricsRegisterer prometheus.Registerer
+	filterDesc        protoreflect.MessageDescriptor
+	defaultNetworking *DefaultNetworkingProvisioner
 }
 
 var _ privatev1.ProjectsServer = (*PrivateProjectsServer)(nil)
@@ -42,8 +46,9 @@ var _ privatev1.ProjectsServer = (*PrivateProjectsServer)(nil)
 // PrivateProjectsServer is the implementation of the private projects gRPC service.
 type PrivateProjectsServer struct {
 	privatev1.UnimplementedProjectsServer
-	logger  *slog.Logger
-	generic *GenericServer[*privatev1.Project]
+	logger            *slog.Logger
+	generic           *GenericServer[*privatev1.Project]
+	defaultNetworking *DefaultNetworkingProvisioner
 }
 
 // NewPrivateProjectsServer creates a new builder for the private projects server.
@@ -82,6 +87,23 @@ func (b *PrivateProjectsServerBuilder) SetMetricsRegisterer(value prometheus.Reg
 	return b
 }
 
+// SetFilterDesc sets the protobuf message descriptor used to validate and translate CEL filter
+// expressions. This is optional. When unset, the descriptor of this server's own private message type is used.
+func (b *PrivateProjectsServerBuilder) SetFilterDesc(value protoreflect.MessageDescriptor) *PrivateProjectsServerBuilder {
+	b.filterDesc = value
+	return b
+}
+
+// SetDefaultNetworkingProvisioner sets the provisioner used to deprovision a tenant's default
+// networking resources when its root project is deleted. This is optional; if unset, root project
+// deletion will fail whenever default networking resources still exist for the tenant.
+func (b *PrivateProjectsServerBuilder) SetDefaultNetworkingProvisioner(
+	value *DefaultNetworkingProvisioner,
+) *PrivateProjectsServerBuilder {
+	b.defaultNetworking = value
+	return b
+}
+
 // Build creates the private projects server.
 func (b *PrivateProjectsServerBuilder) Build() (result *PrivateProjectsServer, err error) {
 	// Check parameters:
@@ -96,7 +118,8 @@ func (b *PrivateProjectsServerBuilder) Build() (result *PrivateProjectsServer, e
 
 	// Create the server early, so that we can use its methods:
 	s := &PrivateProjectsServer{
-		logger: b.logger,
+		logger:            b.logger,
+		defaultNetworking: b.defaultNetworking,
 	}
 
 	// Create the generic server:
@@ -107,6 +130,7 @@ func (b *PrivateProjectsServerBuilder) Build() (result *PrivateProjectsServer, e
 		SetAttributionLogic(b.attributionLogic).
 		SetTenancyLogic(b.tenancyLogic).
 		SetMetricsRegisterer(b.metricsRegisterer).
+		SetFilterDesc(b.filterDesc).
 		Build()
 	if err != nil {
 		return
@@ -144,16 +168,6 @@ func (s *PrivateProjectsServer) Create(ctx context.Context,
 		return
 	}
 
-	// Projects are scoped to a specific tenant.
-	// Validate that the tenant will not be set to 'shared' or 'system'.
-	if tenant := metadata.GetTenant(); tenant == auth.SharedTenant || tenant == auth.SystemTenant {
-		err = grpcstatus.Errorf(
-			grpccodes.InvalidArgument,
-			"project cannot belong to '%s' tenant - must be scoped to a specific tenant",
-			tenant,
-		)
-		return
-	}
 	name := metadata.GetName()
 	path := strings.Split(name, ".")
 	count := len(path)
@@ -187,41 +201,6 @@ func (s *PrivateProjectsServer) Create(ctx context.Context,
 
 	// Call the generic server to create the project:
 	err = s.generic.Create(ctx, request, &response)
-	if err != nil {
-		return
-	}
-
-	// Report any post-create errors to the transaction so the write is rolled back.
-	if tx, txErr := database.TxFromContext(ctx); txErr == nil {
-		defer tx.ReportError(&err)
-	}
-
-	// Check if the assigned tenant is 'shared' or 'system' and reject if so.
-	// This can happen if the user is an admin and didn't specify a tenant explicitly.
-	if response == nil || response.Object == nil || !response.Object.HasMetadata() {
-		s.logger.WarnContext(
-			ctx,
-			"Post-create tenant validation skipped: response missing expected object or metadata",
-		)
-		err = grpcstatus.Errorf(
-			grpccodes.Internal,
-			"post-create tenant validation failed: response missing expected object or metadata",
-		)
-		return
-	}
-	if tenant := response.Object.GetMetadata().GetTenant(); tenant == auth.SharedTenant || tenant == auth.SystemTenant {
-		s.logger.WarnContext(
-			ctx,
-			"Attempted to create project with invalid tenant",
-			slog.String("tenant", tenant),
-		)
-		err = grpcstatus.Errorf(
-			grpccodes.InvalidArgument,
-			"project must be assigned to a specific tenant - please specify metadata.tenant in the request",
-		)
-		return
-	}
-
 	return
 }
 
@@ -234,8 +213,46 @@ func (s *PrivateProjectsServer) Update(ctx context.Context,
 
 func (s *PrivateProjectsServer) Delete(ctx context.Context,
 	request *privatev1.ProjectsDeleteRequest) (response *privatev1.ProjectsDeleteResponse, err error) {
+	// The root project (empty name) owns whatever default networking resources Provision created
+	// for the tenant. Those are protected from direct deletion via the API (see
+	// validateNotDefault), so nothing else ever removes them — deprovision them here, before the
+	// root project's own deletion is attempted, or that deletion will fail with a foreign key
+	// violation.
+	if s.defaultNetworking != nil {
+		getRequest := &privatev1.ProjectsGetRequest{}
+		getRequest.SetId(request.GetId())
+		var getResponse *privatev1.ProjectsGetResponse
+		if err = s.generic.Get(ctx, getRequest, &getResponse); err != nil {
+			return
+		}
+		project := getResponse.GetObject()
+		if project.GetMetadata().GetName() == "" {
+			tenantName := project.GetMetadata().GetTenant()
+			if deprovisionErr := s.defaultNetworking.Deprovision(ctx, tenantName); deprovisionErr != nil {
+				err = s.translateDeprovisionError(ctx, tenantName, deprovisionErr)
+				return
+			}
+		}
+	}
 	err = s.generic.Delete(ctx, request, &response)
 	return
+}
+
+// translateDeprovisionError translates an error from deprovisioning default networking resources
+// into a gRPC status. It mirrors GenericServer.Delete's translation so that, for example, a
+// Subnet still in use by a live ComputeInstance surfaces as an actionable FailedPrecondition
+// instead of an opaque Internal error.
+func (s *PrivateProjectsServer) translateDeprovisionError(ctx context.Context, tenantName string, err error) error {
+	if inUseErr, ok := errors.AsType[*dao.ErrInUse](err); ok {
+		return grpcstatus.Errorf(grpccodes.FailedPrecondition, "%s", inUseErr.Error())
+	}
+	if _, ok := errors.AsType[*dao.ErrDeadlock](err); ok {
+		return grpcstatus.Errorf(grpccodes.Aborted, "concurrent modification detected, please retry")
+	}
+	s.logger.ErrorContext(ctx, "Failed to deprovision default networking",
+		slog.String("tenant", tenantName),
+		slog.Any("error", err))
+	return grpcstatus.Errorf(grpccodes.Internal, "failed to deprovision default networking resources")
 }
 
 func (s *PrivateProjectsServer) Signal(ctx context.Context,

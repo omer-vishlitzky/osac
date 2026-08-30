@@ -36,15 +36,15 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
-// Contains the details about the bare metal instance type that are available only for the system.
+// Describes a pre-configured bare metal hardware type that can be referenced by name when provisioning
+// bare metal instances.
 //
-// BareMetalInstanceTypes are admin-managed catalog resources that define pre-configured bare metal
-// hardware types referenced by name when provisioning bare metal instances. Cloud Provider Admins
-// control the available configurations through this private API.
+// BareMetalInstanceTypes are admin-managed catalog resources. Tenant users select a type by name instead
+// of specifying raw hardware requirements. Cloud Provider Admins control the available configurations
+// through the private API.
 //
-// The `spec` contains the hardware specifications and host label selector. The `status` contains
-// the current state of the bare metal instance type, is provided by the system and can't be
-// modified by the user.
+// The `spec` contains the hardware specifications. The `status` contains the current state of the
+// bare metal instance type, is provided by the system and can't be modified by the user.
 type BareMetalInstanceType struct {
 	state protoimpl.MessageState `protogen:"hybrid.v1"`
 	// Unique identifier of the bare metal instance type.
@@ -179,7 +179,7 @@ func (b0 BareMetalInstanceType_builder) Build() *BareMetalInstanceType {
 	return m0
 }
 
-// Defines the hardware specifications and host label selector for a BareMetalInstanceType.
+// Defines the hardware specifications for a BareMetalInstanceType.
 type BareMetalInstanceTypeSpec struct {
 	state protoimpl.MessageState `protogen:"hybrid.v1"`
 	// Hardware specifications for this bare metal instance type.

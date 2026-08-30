@@ -15,16 +15,19 @@ syntax = "proto3";
 
 package osac.private.v1;
 
+import "cleanapi/cleanapi.proto";
 import "google/protobuf/timestamp.proto";
 import "osac/private/v1/condition_status_type.proto";
 import "osac/private/v1/metadata_type.proto";
+
+option (cleanapi.file).package = "osac.public.v1";
 
 // A user in a tenant's identity provider.
 message User {
   // Unique identifier of the user.
   string id = 1;
 
-  osac.private.v1.Metadata metadata = 2;
+  Metadata metadata = 2;
 
   // Specification of the user.
   UserSpec spec = 3;
@@ -51,9 +54,14 @@ message UserSpec {
 // UserCredentials contains the authentication credentials for a user.
 message UserCredentials {
   // Password for the user.
+  //
+  // SECURITY: This field contains sensitive data:
+  // - Only transmitted over TLS
+  // - Never returned in responses
+  // - Clear from memory after use
   optional string password = 1;
 
-  // Whether the password is temporary and must be changed on first login.
+  // Whether the password is temporary and must be changed on first login. Only applicable when password is provided.
   bool temporary_password = 2;
 }
 
@@ -62,20 +70,29 @@ message UserStatus {
   // The user's current state.
   string phase = 1;
 
-  // Additional conditions.
+  // Additional conditions about the user's state.
   repeated UserCondition conditions = 2;
 
   // The Keycloak user ID for this user in the identity provider.
   // This is set when the user is created or imported and is used for role assignments.
-  string keycloak_user_id = 3;
+  string keycloak_user_id = 3 [(cleanapi.field).private = true];
 }
 
 // UserCondition represents a condition of a user.
 message UserCondition {
+  // Type of the condition.
   string type = 1;
-  osac.private.v1.ConditionStatus status = 2;
+
+  // Status of the condition.
+  ConditionStatus status = 2;
+
+  // Last time the condition was updated.
   google.protobuf.Timestamp last_transition_time = 3;
+
+  // Reason for the condition's last transition.
   optional string reason = 4;
+
+  // Human-readable message about the transition.
   optional string message = 5;
 }
 

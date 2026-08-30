@@ -16,8 +16,11 @@ syntax = "proto3";
 package osac.private.v1;
 
 import "buf/validate/validate.proto";
+import "cleanapi/cleanapi.proto";
 import "google/protobuf/timestamp.proto";
 import "osac/private/v1/metadata_type.proto";
+
+option (cleanapi.file).package = "osac.public.v1";
 
 // Lifecycle states for DiskImage resources.
 enum DiskImageLifecycle {
@@ -138,3 +141,11 @@ message DiskImageSpec {
 //
 // Currently empty. Reserved for future use.
 message DiskImageStatus {}
+
+// Full reference to a DiskImage resource.
+message DiskImageReference {
+  string id = 1;
+  string name = 2;
+  string project = 3;
+  bool shared = 4;
+}

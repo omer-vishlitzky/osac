@@ -83,16 +83,22 @@ List available templates with `osac get clustertemplates` or
 `osac get computeinstancetemplates`.
 
 The VM catalog items reference **instance types** (e.g., `u1-medium`) that
-must also exist before VMs can be provisioned. On a kind-dev cluster these
-are seeded automatically by `kind-dev/setup.sh`. On a fresh cluster
+must also exist before VMs can be provisioned. Catalog seeding is not yet
+automated (`make seed-catalog` is currently a stub), so on any cluster
 `osac get instancetypes` is empty — create the required instance types first,
 or update the `instance_type` default in the YAML files to match your
 environment.
 
+The VM catalog items also reference **disk images** (e.g., `fedora`) by name.
+DiskImage resources must be created before VMs can be provisioned — they map a
+human-readable name to a container disk OCI reference. On a fresh cluster
+`osac get diskimages` is empty — create the required disk images first, or
+update the `disk_image` default in the YAML files to match your environment.
+
 Catalog items also assume the relevant **artifacts** are already available:
 
-- **VM images** — container disk images for tenant VMs (e.g.,
-  `quay.io/containerdisks/fedora:latest`)
+- **Container disk images** — OCI artifacts referenced by DiskImage resources
+  (e.g., `quay.io/containerdisks/fedora:latest`)
 - **OpenShift artifacts** — release images and operators required for
   provisioning tenant clusters
 

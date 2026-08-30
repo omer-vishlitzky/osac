@@ -21,6 +21,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	grpccodes "google.golang.org/grpc/codes"
 	grpcstatus "google.golang.org/grpc/status"
+	"google.golang.org/protobuf/reflect/protoreflect"
 
 	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
@@ -36,6 +37,8 @@ type PrivateSecretsServerBuilder struct {
 	tenancyLogic      auth.TenancyLogic
 	metricsRegisterer prometheus.Registerer
 	secretStore       vault.SecretStore
+	filterDesc        protoreflect.MessageDescriptor
+	hubSecretFetcher  HubSecretFetcher
 }
 
 var _ privatev1.SecretsServer = (*PrivateSecretsServer)(nil)
@@ -43,10 +46,11 @@ var _ privatev1.SecretsServer = (*PrivateSecretsServer)(nil)
 type PrivateSecretsServer struct {
 	privatev1.UnimplementedSecretsServer
 
-	logger       *slog.Logger
-	generic      *GenericServer[*privatev1.Secret]
-	secretStore  vault.SecretStore
-	tenancyLogic auth.TenancyLogic
+	logger           *slog.Logger
+	generic          *GenericServer[*privatev1.Secret]
+	secretStore      vault.SecretStore
+	hubSecretFetcher HubSecretFetcher
+	tenancyLogic     auth.TenancyLogic
 }
 
 func NewPrivateSecretsServer() *PrivateSecretsServerBuilder {
@@ -83,6 +87,20 @@ func (b *PrivateSecretsServerBuilder) SetSecretStore(value vault.SecretStore) *P
 	return b
 }
 
+// SetFilterDesc sets the protobuf message descriptor used to validate and translate CEL filter
+// expressions. This is optional. When unset, the descriptor of this server's own private message type is used.
+func (b *PrivateSecretsServerBuilder) SetFilterDesc(value protoreflect.MessageDescriptor) *PrivateSecretsServerBuilder {
+	b.filterDesc = value
+	return b
+}
+
+// SetHubSecretFetcher sets the hub secret fetcher used to retrieve secrets from hub clusters.
+// This is optional. When unset, hub secrets cannot be retrieved.
+func (b *PrivateSecretsServerBuilder) SetHubSecretFetcher(value HubSecretFetcher) *PrivateSecretsServerBuilder {
+	b.hubSecretFetcher = value
+	return b
+}
+
 func (b *PrivateSecretsServerBuilder) Build() (result *PrivateSecretsServer, err error) {
 	if b.logger == nil {
 		err = errors.New("logger is mandatory")
@@ -94,9 +112,10 @@ func (b *PrivateSecretsServerBuilder) Build() (result *PrivateSecretsServer, err
 	}
 
 	s := &PrivateSecretsServer{
-		logger:       b.logger,
-		secretStore:  b.secretStore,
-		tenancyLogic: b.tenancyLogic,
+		logger:           b.logger,
+		secretStore:      b.secretStore,
+		hubSecretFetcher: b.hubSecretFetcher,
+		tenancyLogic:     b.tenancyLogic,
 	}
 
 	s.generic, err = NewGenericServer[*privatev1.Secret]().
@@ -107,6 +126,7 @@ func (b *PrivateSecretsServerBuilder) Build() (result *PrivateSecretsServer, err
 		SetAttributionLogic(b.attributionLogic).
 		SetTenancyLogic(b.tenancyLogic).
 		SetMetricsRegisterer(b.metricsRegisterer).
+		SetFilterDesc(b.filterDesc).
 		Build()
 	if err != nil {
 		return
@@ -149,6 +169,20 @@ func (s *PrivateSecretsServer) Get(ctx context.Context,
 			return
 		}
 
+		obj.SetData(data)
+	}
+
+	if obj.GetBackend() == privatev1.SecretBackend_SECRET_BACKEND_HUB {
+		if s.hubSecretFetcher == nil {
+			err = grpcstatus.Errorf(grpccodes.FailedPrecondition,
+				"hub secret retrieval is not configured")
+			return
+		}
+		data, fetchErr := s.hubSecretFetcher.Fetch(ctx, obj.GetCoordinates())
+		if fetchErr != nil {
+			err = fetchErr
+			return
+		}
 		obj.SetData(data)
 	}
 
@@ -311,6 +345,12 @@ func (s *PrivateSecretsServer) validateHubSecretCreate(secret *privatev1.Secret)
 	if len(secret.GetCoordinates()) == 0 {
 		return grpcstatus.Errorf(grpccodes.InvalidArgument,
 			"field 'coordinates' is required when backend is HUB")
+	}
+	for _, key := range []string{CoordinateHubID, CoordinateNamespace, CoordinateSecretName} {
+		if secret.GetCoordinates()[key] == "" {
+			return grpcstatus.Errorf(grpccodes.InvalidArgument,
+				"coordinate %q is required when backend is HUB", key)
+		}
 	}
 	if len(secret.GetData()) > 0 {
 		return grpcstatus.Errorf(grpccodes.InvalidArgument,

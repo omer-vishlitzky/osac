@@ -36,18 +36,23 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
-// Defines a single field on the resource spec that a catalog item controls.
+// Defines a single field on the resource spec that a catalog item controls. Each field definition specifies whether
+// the user can set the field, what default value to apply, and optional JSON Schema validation constraints.
 type FieldDefinition struct {
 	state protoimpl.MessageState `protogen:"hybrid.v1"`
-	// Dot-notation path referencing a field in the resource spec.
+	// Dot-notation path referencing a field in the resource spec. For example: "spec.network.pod_cidr" or
+	// "spec.node_sets.workers.size". Wildcards are not supported.
 	Path string `protobuf:"bytes,1,opt,name=path,proto3" json:"path,omitempty"`
 	// Human friendly label for this field, suitable for displaying in a UI.
 	DisplayName string `protobuf:"bytes,2,opt,name=display_name,json=displayName,proto3" json:"display_name,omitempty"`
-	// Whether the user is allowed to set this field.
+	// Whether the user is allowed to set this field. When false, the field value is always taken from the default and
+	// any user-provided value is overridden.
 	Editable bool `protobuf:"varint,3,opt,name=editable,proto3" json:"editable,omitempty"`
-	// Default value for this field.
+	// Default value for this field. Applied when the user does not provide a value (for editable fields) or always
+	// applied (for non-editable fields).
 	Default *structpb.Value `protobuf:"bytes,4,opt,name=default,proto3" json:"default,omitempty"`
-	// Optional JSON Schema (draft 2020-12) for validating user-provided values of editable fields.
+	// Optional JSON Schema (draft 2020-12) for validating user-provided values of editable fields. The schema is stored
+	// as a JSON string. When empty, no validation is performed beyond type checking.
 	ValidationSchema string `protobuf:"bytes,5,opt,name=validation_schema,json=validationSchema,proto3" json:"validation_schema,omitempty"`
 	unknownFields    protoimpl.UnknownFields
 	sizeCache        protoimpl.SizeCache
@@ -147,15 +152,19 @@ func (x *FieldDefinition) ClearDefault() {
 type FieldDefinition_builder struct {
 	_ [0]func() // Prevents comparability and use of unkeyed literals for the builder.
 
-	// Dot-notation path referencing a field in the resource spec.
+	// Dot-notation path referencing a field in the resource spec. For example: "spec.network.pod_cidr" or
+	// "spec.node_sets.workers.size". Wildcards are not supported.
 	Path string
 	// Human friendly label for this field, suitable for displaying in a UI.
 	DisplayName string
-	// Whether the user is allowed to set this field.
+	// Whether the user is allowed to set this field. When false, the field value is always taken from the default and
+	// any user-provided value is overridden.
 	Editable bool
-	// Default value for this field.
+	// Default value for this field. Applied when the user does not provide a value (for editable fields) or always
+	// applied (for non-editable fields).
 	Default *structpb.Value
-	// Optional JSON Schema (draft 2020-12) for validating user-provided values of editable fields.
+	// Optional JSON Schema (draft 2020-12) for validating user-provided values of editable fields. The schema is stored
+	// as a JSON string. When empty, no validation is performed beyond type checking.
 	ValidationSchema string
 }
 

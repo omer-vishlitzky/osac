@@ -60,10 +60,9 @@ var _ = Describe("NATGateway lifecycle", func() {
 		ncName := fmt.Sprintf("cudn-natgw-%s", uuid.New())
 		ncResp, err := networkClassesClient.Create(ctx, privatev1.NetworkClassesCreateRequest_builder{
 			Object: privatev1.NetworkClass_builder{
-				Metadata:               privatev1.Metadata_builder{Name: ncName}.Build(),
-				Title:                  "Test CUDN Network Class",
-				ImplementationStrategy: "cudn",
-				FabricManager:          new("netris"),
+				Metadata:      privatev1.Metadata_builder{Name: ncName}.Build(),
+				Title:         "Test CUDN Network Class",
+				FabricManager: new("netris"),
 			}.Build(),
 		}.Build())
 		Expect(err).ToNot(HaveOccurred())
@@ -75,7 +74,8 @@ var _ = Describe("NATGateway lifecycle", func() {
 			Object: privatev1.VirtualNetwork_builder{
 				Id: virtualNetworkId,
 				Metadata: privatev1.Metadata_builder{
-					Name: fmt.Sprintf("test-vnet-%s", uuid.New()[24:32]),
+					Name:   fmt.Sprintf("test-vnet-%s", uuid.New()[24:32]),
+					Tenant: usersGroup,
 				}.Build(),
 				Spec: privatev1.VirtualNetworkSpec_builder{
 					NetworkClass: privatev1.NetworkClassReference_builder{Id: networkClassId}.Build(),
@@ -351,7 +351,8 @@ var _ = Describe("NATGateway lifecycle", func() {
 			Object: privatev1.VirtualNetwork_builder{
 				Id: vn2Id,
 				Metadata: privatev1.Metadata_builder{
-					Name: fmt.Sprintf("test-vnet-%s", uuid.New()[24:32]),
+					Name:   fmt.Sprintf("test-vnet-%s", uuid.New()[24:32]),
+					Tenant: usersGroup,
 				}.Build(),
 				Spec: privatev1.VirtualNetworkSpec_builder{
 					NetworkClass: privatev1.NetworkClassReference_builder{Id: networkClassId}.Build(),
@@ -388,9 +389,8 @@ var _ = Describe("NATGateway lifecycle", func() {
 		// Create a k8s-only NetworkClass (no fabric_manager):
 		k8sOnlyNC, err := networkClassesClient.Create(ctx, privatev1.NetworkClassesCreateRequest_builder{
 			Object: privatev1.NetworkClass_builder{
-				Title:                  "Test k8s-only Network Class",
-				ImplementationStrategy: "cudn",
-				K8SManager:             new("cudn_localnet"),
+				Title:      "Test k8s-only Network Class",
+				K8SManager: new("cudn_localnet"),
 			}.Build(),
 		}.Build())
 		Expect(err).ToNot(HaveOccurred())
@@ -406,7 +406,8 @@ var _ = Describe("NATGateway lifecycle", func() {
 			Object: privatev1.VirtualNetwork_builder{
 				Id: k8sOnlyVNId,
 				Metadata: privatev1.Metadata_builder{
-					Name: fmt.Sprintf("test-vnet-%s", uuid.New()[24:32]),
+					Name:   fmt.Sprintf("test-vnet-%s", uuid.New()[24:32]),
+					Tenant: usersGroup,
 				}.Build(),
 				Spec: privatev1.VirtualNetworkSpec_builder{
 					NetworkClass: privatev1.NetworkClassReference_builder{Id: k8sOnlyNC.GetObject().GetId()}.Build(),

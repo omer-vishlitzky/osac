@@ -544,6 +544,128 @@ var _ = Describe("Rego authorization interceptor", func() {
 			),
 		)
 
+		// The CSI driver's Keycloak service account is granted the dedicated
+		// 'osac-csi-driver' realm role. Authorization keys on that role -
+		// assigned only by a realm administrator - not on the username, so an
+		// ordinary user cannot obtain CSI permissions by choosing a matching
+		// username (OSAC-3279). TEMPORARY (OSAC-4109): the driver uses a single
+		// shared client, so the identity is granted universal tenant scope; the
+		// tenant is carried on the request. Reverts to per-tenant scope when
+		// per-tenant 'osac-csi-driver-<tenant>' clients land (OSAC-4197).
+		createCSIToken := func() *jwt.Token {
+			return createKeycloakServiceAccountToken("osac-csi-driver", jwt.MapClaims{
+				"realm_access": map[string]any{
+					"roles": []any{"osac-csi-driver"},
+				},
+			})
+		}
+
+		DescribeTable(
+			"Allows the CSI service account on the permitted private Volume methods",
+			func(ctx context.Context, method string) {
+				ctx = ContextWithToken(ctx, createCSIToken())
+				handled := false
+				_, err := interceptor.UnaryServer(
+					ctx,
+					nil,
+					&grpc.UnaryServerInfo{
+						FullMethod: method,
+					},
+					func(ctx context.Context, req any) (any, error) {
+						subject := SubjectFromContext(ctx)
+						Expect(subject.User).To(Equal("service-account-osac-csi-driver"))
+						// TEMPORARY (OSAC-4109): the shared CSI client is granted
+						// universal tenant scope; the tenant is carried on the
+						// request rather than enforced by identity. Reverts to
+						// tenant-scoped with per-tenant clients (OSAC-4197).
+						Expect(subject.Tenants.Universal()).To(BeTrue())
+						handled = true
+						return nil, nil
+					},
+				)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(handled).To(BeTrue())
+			},
+			Entry("Create", "/osac.private.v1.Volumes/Create"),
+			Entry("Get", "/osac.private.v1.Volumes/Get"),
+			Entry("Delete", "/osac.private.v1.Volumes/Delete"),
+			Entry("List", "/osac.private.v1.Volumes/List"),
+		)
+
+		DescribeTable(
+			"Denies the CSI service account outside the permitted Volume methods",
+			func(ctx context.Context, method string) {
+				ctx = ContextWithToken(ctx, createCSIToken())
+				handled := false
+				_, err := interceptor.UnaryServer(
+					ctx,
+					nil,
+					&grpc.UnaryServerInfo{
+						FullMethod: method,
+					},
+					func(ctx context.Context, req any) (any, error) {
+						handled = true
+						return nil, nil
+					},
+				)
+				Expect(err).To(HaveOccurred())
+				status, ok := grpcstatus.FromError(err)
+				Expect(ok).To(BeTrue())
+				Expect(status.Code()).To(Equal(grpccodes.PermissionDenied))
+				Expect(status.Message()).To(Equal("permission denied"))
+				Expect(handled).To(BeFalse())
+			},
+			// Volume methods NOT granted to the CSI identity:
+			Entry("Volumes Update", "/osac.private.v1.Volumes/Update"),
+			Entry("Volumes Signal", "/osac.private.v1.Volumes/Signal"),
+			// Other private services must be denied:
+			Entry("Hubs Create", "/osac.private.v1.Hubs/Create"),
+			Entry("StorageBackends Create", "/osac.private.v1.StorageBackends/Create"),
+			// The CSI identity is not a general client: the public API is denied
+			// even for methods a normal client could call.
+			Entry("Public Clusters Create", "/osac.public.v1.Clusters/Create"),
+			Entry("Public Clusters Get", "/osac.public.v1.Clusters/Get"),
+		)
+
+		// Authorization must key on the 'osac-csi-driver' realm role, not the
+		// username. An identity that merely looks like a CSI service account -
+		// whether a regular user with a CSI-shaped username or a service account
+		// without the role - must be denied.
+		DescribeTable(
+			"Denies identities that lack the osac-csi-driver realm role on the Volume API",
+			func(ctx context.Context, token *jwt.Token) {
+				ctx = ContextWithToken(ctx, token)
+				handled := false
+				_, err := interceptor.UnaryServer(
+					ctx,
+					nil,
+					&grpc.UnaryServerInfo{
+						FullMethod: "/osac.private.v1.Volumes/Create",
+					},
+					func(ctx context.Context, req any) (any, error) {
+						handled = true
+						return nil, nil
+					},
+				)
+				Expect(err).To(HaveOccurred())
+				status, ok := grpcstatus.FromError(err)
+				Expect(ok).To(BeTrue())
+				Expect(status.Code()).To(Equal(grpccodes.PermissionDenied))
+				Expect(status.Message()).To(Equal("permission denied"))
+				Expect(handled).To(BeFalse())
+			},
+			Entry(
+				"Regular user with a CSI-shaped username but no role",
+				createKeycloakUserToken("acme", "service-account-osac-csi-acme", nil),
+			),
+			Entry(
+				"Service account with a CSI-shaped name but no role",
+				createKeycloakServiceAccountToken("osac-csi-acme", jwt.MapClaims{
+					"organization": []any{"acme"},
+				}),
+			),
+		)
+
 		DescribeTable(
 			"Allows Keycloak users on the public API",
 			func(ctx context.Context, tenant, name string) {

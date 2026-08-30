@@ -25,7 +25,6 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
-	"github.com/osac-project/osac/fulfillment-service/internal/auth"
 	"github.com/osac-project/osac/fulfillment-service/internal/events"
 )
 
@@ -139,6 +138,31 @@ var _ = Describe("Generic server", func() {
 	})
 })
 
+var _ = Describe("Generic server filtering", func() {
+	It("Classifies a filter-translate failure as InvalidArgument, not Internal", func() {
+		// Build a server whose filter descriptor is restricted to a message that doesn't have a 'title' field.
+		server, err := NewGenericServer[*privatev1.HostType]().
+			SetLogger(logger).
+			SetService(privatev1.HostTypes_ServiceDesc.ServiceName).
+			SetAttributionLogic(attribution).
+			SetTenancyLogic(tenancy).
+			SetFilterDesc((*privatev1.Tenant)(nil).ProtoReflect().Descriptor()).
+			Build()
+		Expect(err).ToNot(HaveOccurred())
+
+		response := &privatev1.HostTypesListResponse{}
+		err = server.List(
+			ctx,
+			privatev1.HostTypesListRequest_builder{
+				Filter: new("this.title == 'x'"),
+			}.Build(),
+			&response,
+		)
+		Expect(err).To(HaveOccurred())
+		Expect(status.Code(err)).To(Equal(codes.InvalidArgument))
+	})
+})
+
 var _ = Describe("Generic server dry run", func() {
 	var server *GenericServer[*privatev1.HostType]
 
@@ -172,7 +196,7 @@ var _ = Describe("Generic server dry run", func() {
 		Expect(response.GetObject()).ToNot(BeNil())
 		Expect(response.GetObject().GetMetadata().GetName()).To(Equal("my-dry-run-object"))
 		Expect(response.GetObject().GetMetadata().GetCreator()).To(Equal("system"))
-		Expect(response.GetObject().GetMetadata().GetTenant()).To(Equal(auth.SystemTenant))
+		Expect(response.GetObject().GetMetadata().GetTenant()).To(Equal(testTenant))
 	})
 
 	It("Validates metadata and rejects invalid labels", func() {

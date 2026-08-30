@@ -111,6 +111,7 @@ func (b *ExternalIPAttachmentsServerBuilder) Build() (result *ExternalIPAttachme
 		SetAttributionLogic(b.attributionLogic).
 		SetTenancyLogic(b.tenancyLogic).
 		SetMetricsRegisterer(b.metricsRegisterer).
+		SetFilterDesc((*publicv1.ExternalIPAttachment)(nil).ProtoReflect().Descriptor()).
 		Build()
 	if err != nil {
 		return
@@ -129,7 +130,9 @@ func (s *ExternalIPAttachmentsServer) List(ctx context.Context,
 	request *publicv1.ExternalIPAttachmentsListRequest) (*publicv1.ExternalIPAttachmentsListResponse, error) {
 	privateRequest := &privatev1.ExternalIPAttachmentsListRequest{}
 	privateRequest.SetOffset(request.GetOffset())
-	privateRequest.SetLimit(request.GetLimit())
+	if request.HasLimit() {
+		privateRequest.SetLimit(request.GetLimit())
+	}
 	privateRequest.SetFilter(request.GetFilter())
 	privateRequest.SetOrder(request.GetOrder())
 
