@@ -59,7 +59,7 @@ spec:
       {{- if eq (default "names" .Values.caBundle.selectorMode) "labels" }}
       matchLabels:
         {{- range $key, $value := .Values.caBundle.extraMatchLabels }}
-        {{ $key }}: {{ $value }}
+        {{ $key }}: {{ $value | quote }}
         {{- end }}
       {{- else }}
       matchExpressions:
