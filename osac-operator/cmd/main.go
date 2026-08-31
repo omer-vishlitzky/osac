@@ -220,7 +220,7 @@ func addSchemesForLocalControllers(
 	if enableTenant {
 		utilruntime.Must(ovnv1.AddToScheme(localScheme))
 	}
-	if enableBareMetalInstance {
+	if enableBareMetalInstance || enableNetworking {
 		utilruntime.Must(bmfov1alpha1.AddToScheme(localScheme))
 	}
 	// +kubebuilder:scaffold:scheme
