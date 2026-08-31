@@ -169,7 +169,9 @@ aap:
     # gateway.hostname / controller.hostname: --set by the workflow from
     # AAP_GATEWAY_HOSTNAME / AAP_CONTROLLER_HOSTNAME.
   configAsCode:
-    # --set by the workflow: aapHostname=$AAP_GATEWAY_URL,
+    # --set by the workflow: aapHostname=http://$AAP_GATEWAY_HOSTNAME (base
+    # URL WITHOUT /api/controller — the ansible.controller collection adds
+    # that prefix itself; including it causes a double-prefix 404),
     # aapUsername=admin, aapValidateCerts=false, aapPrefix=osac-<runid>,
     # aapOrganizationName=osac-<runid>-org, projectGitUri/Branch=the PR
     # checkout. No defaults here: a pool install that forgets them must fail.
