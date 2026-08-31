@@ -1,0 +1,8 @@
+---
+- name: Query DHCP lease (stub)
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: No-op — query-dhcp-lease not yet implemented
+      ansible.builtin.debug:
+        msg: "query-dhcp-lease is a stub playbook"
