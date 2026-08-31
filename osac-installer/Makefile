@@ -216,7 +216,7 @@ endif
 		-f $(INSTANCE_VALUES) \
 		--namespace $(NS) --create-namespace \
 		$(if $(DOMAIN),--set service.externalHostname=fulfillment-api-$(NS).$(DOMAIN) --set service.internalHostname=fulfillment-internal-api-$(NS).$(DOMAIN) --set service.auth.issuerUrl=https://keycloak-keycloak.$(DOMAIN)/realms/osac --set service.idp.url=https://keycloak-keycloak.$(DOMAIN)) \
-		$(if $(KEYCLOAK_HOST),--set keycloak.enabled=true --set keycloak.routeHost=$(KEYCLOAK_HOST) --set service.auth.issuerUrl=https://$(KEYCLOAK_HOST)/realms/osac --set service.idp.url=https://$(KEYCLOAK_HOST) --set service.vault.keycloakIssuerUrl=https://$(KEYCLOAK_HOST)/realms/osac) \
+		$(if $(KEYCLOAK_HOST),--set keycloak.enabled=true --set keycloak.routeHost=$(KEYCLOAK_HOST) --set service.auth.issuerUrl=https://keycloak.$(NS).svc.cluster.local/realms/osac --set service.idp.url=https://keycloak.$(NS).svc.cluster.local --set service.vault.keycloakIssuerUrl=https://keycloak.$(NS).svc.cluster.local/realms/osac) \
 		$(EXTRA_HELM_ARGS) \
 		--wait --timeout 40m
 
