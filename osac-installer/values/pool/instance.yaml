@@ -43,9 +43,11 @@ operator:
   controllers:
     clusterOrder: false
     computeInstance: true
+    bareMetalInstance: false
     tenant: true
     networking: true
     storage: true
+    volume: true
   # The console-proxy APIService is registered cluster-wide by the stamped
   # install; a second registration would conflict, so it stays off.
   consoleProxy:
