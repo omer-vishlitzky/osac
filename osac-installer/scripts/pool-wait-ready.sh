@@ -49,6 +49,13 @@ for i in $(seq 1 60); do
     sleep 5
 done
 
+# 2b. Restart fulfillment-controller so its OIDC discovery runs against a
+#     live Keycloak. The controller's token source uses sync.Once for
+#     discovery; if the initial attempt hit a not-yet-ready Keycloak the
+#     token endpoint is cached as "" for the container's lifetime.
+log "restarting fulfillment-controller for OIDC re-discovery..."
+oc rollout restart deploy/fulfillment-controller -n "${NS}"
+
 # 3. All Deployments
 log "waiting for all Deployments..."
 for deploy in $(oc get deploy -n "${NS}" -o name 2>/dev/null); do
