@@ -6,6 +6,7 @@
     publish_templates_namespace: "{{ lookup('env', 'OSAC_PUBLISH_TEMPLATES_NAMESPACE') | default(publish_templates_namespace_default, true) }}"
     publish_templates_service_account: "{{ lookup('env', 'OSAC_PUBLISH_TEMPLATES_SERVICE_ACCOUNT', default='template-publisher') }}"
     osac_fulfillment_service_uri: "{{ lookup('env', 'OSAC_FULFILLMENT_SERVICE_URI', default='https://fulfillment-api:8000') }}"
+    publish_templates_validate_certs: "{{ lookup('env', 'OSAC_FULFILLMENT_VALIDATE_CERTS') | default(true, true) | bool }}"
     osac_template_collections: "{{ lookup('env', 'OSAC_TEMPLATE_COLLECTIONS') | default('osac.templates', true) | split(',') }}"
   tasks:
     - name: Display configuration values

@@ -59,6 +59,7 @@ configAsCode:
   aapPrefix: ""
   aapOrganizationName: ""
   aapProjectName: ""
+  fulfillmentServiceUri: ""
   # Pool installs must not leave recurring project-sync/config-as-code
   # schedules polling a shared AAP; setting these to false renders
   # OSAC_*_ENABLED=false into the config-as-code-ig Secret, which makes the

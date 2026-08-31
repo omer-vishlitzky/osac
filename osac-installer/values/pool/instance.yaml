@@ -175,6 +175,8 @@ aap:
     # aapUsername=admin, aapValidateCerts=false, aapPrefix=osac-<runid>,
     # aapOrganizationName=osac-<runid>-org, projectGitUri/Branch=the PR
     # checkout. No defaults here: a pool install that forgets them must fail.
+    fulfillmentServiceUri: "https://fulfillment-api:8000"
+    fulfillmentValidateCerts: "false"
     projectSyncEnabled: false
     configAsCodeEnabled: false
   remote:
