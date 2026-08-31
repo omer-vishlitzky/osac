@@ -180,8 +180,11 @@ aap:
   remote:
     rbacEnabled: true
     # controllerServiceAccount / controllerNamespace / gatewayURL: --set by
-    # the workflow. rbacEnabled=true without them fails helm rendering (the
-    # chart requires them together), so a misconfigured workflow is loud.
+    # the workflow. gatewayURL is the BASE URL (http://<hostname>, no
+    # /api/controller suffix — the publish-templates hook and config-as-code
+    # both add the path themselves). operator.aap.url takes the full URL
+    # with /api/controller. rbacEnabled=true without them fails helm
+    # rendering (the chart requires them together).
   apiToken:
     # No create-api-token hook against the shared AAP; the workflow writes
     # the shared AAP token into this namespace as Secret
