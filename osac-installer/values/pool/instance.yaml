@@ -251,7 +251,7 @@ dbInit:
   pgPrefix: ""
   # Cap connection pooling so parallel pool runs cannot exhaust the shared
   # PostgreSQL's max_connections.
-  poolMaxConns: 4
+  poolMaxConns: 0
 
 # --- Bundled OpenBao ---
 bundledVault:
