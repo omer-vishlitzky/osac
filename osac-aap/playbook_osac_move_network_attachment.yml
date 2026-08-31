@@ -1,0 +1,12 @@
+---
+# Placeholder for the move-network-attachment action. The operator triggers
+# this template when a ComputeInstance's network attachment is moved between
+# subnets. The real implementation is tracked in a follow-up; this stub
+# lets the config-as-code bootstrap succeed so pool installs aren't blocked.
+- name: Move network attachment (stub)
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: No-op — move-network-attachment not yet implemented
+      ansible.builtin.debug:
+        msg: "move-network-attachment is a stub playbook"
