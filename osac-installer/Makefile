@@ -218,7 +218,11 @@ endif
 		$(if $(DOMAIN),--set service.externalHostname=fulfillment-api-$(NS).$(DOMAIN) --set service.internalHostname=fulfillment-internal-api-$(NS).$(DOMAIN) --set service.auth.issuerUrl=https://keycloak-keycloak.$(DOMAIN)/realms/osac --set service.idp.url=https://keycloak-keycloak.$(DOMAIN)) \
 		$(if $(KEYCLOAK_HOST),--set keycloak.enabled=true --set keycloak.routeHost=$(KEYCLOAK_HOST) --set service.auth.issuerUrl=https://keycloak.$(NS).svc.cluster.local/realms/osac --set service.idp.url=https://keycloak.$(NS).svc.cluster.local --set service.vault.keycloakIssuerUrl=https://keycloak.$(NS).svc.cluster.local/realms/osac) \
 		$(EXTRA_HELM_ARGS) \
-		--wait --timeout 40m
+		$(if $(filter pool,$(PROFILE)),--timeout 40m,--wait --timeout 40m)
+ifeq ($(PROFILE),pool)
+	@echo "Pool mode: running explicit readiness polling..."
+	@bash scripts/pool-wait-ready.sh $(NS)
+endif
 
 .PHONY: uninstall-osac
 uninstall-osac: ## Uninstall OSAC instance (PLATFORM= PROFILE= NS= required)
