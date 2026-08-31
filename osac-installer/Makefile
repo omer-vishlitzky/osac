@@ -212,6 +212,9 @@ endif
 ifeq ($(POOL_LABEL_NS),1)
 	oc label ns $(NS) osac.openshift.io/pool-instance=true --overwrite
 endif
+ifeq ($(PROFILE),pool)
+	oc delete job osac-create-creds -n $(NS) --ignore-not-found
+endif
 	helm upgrade --install osac $(OSAC_CHART) \
 		-f $(INSTANCE_VALUES) \
 		--namespace $(NS) --create-namespace \
