@@ -200,7 +200,9 @@ ifneq ($(PLATFORM),kind)
 	oc label secret config-as-code-manifest-ig \
 		osac.openshift.io/project=osac-aap \
 		-n $(NS) --overwrite
+ifneq ($(PROFILE),pool)
 	@bash -c 'source scripts/lib.sh && check_postgres_prerequisites "$(NS)" "$(INFRA_VALUES)"'
+endif
 	$(eval DOMAIN := $(shell oc get ingresses.config/cluster -o jsonpath='{.spec.domain}'))
 	@[ -n "$(DOMAIN)" ] || { echo "ERROR: Could not determine cluster domain. Is oc logged in?" >&2; exit 1; }
 endif
