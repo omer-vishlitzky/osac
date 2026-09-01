@@ -96,6 +96,12 @@ spec:
         args:
         - |
           set -euo pipefail
+          # Overriding the image entrypoint drops the EE's writable HOME;
+          # ansible then tries /.ansible and dies with EACCES. Pin HOME to
+          # the emptyDir we mount at /tmp.
+          export HOME=/tmp
+          export ANSIBLE_HOME=/tmp/.ansible
+          mkdir -p "${ANSIBLE_HOME}/tmp"
           : "${NAMESPACE:?NAMESPACE downward-API env is required}"
           : "${AAP_PROJECT_GIT_URI:?AAP_PROJECT_GIT_URI is required for remote bootstrap}"
           : "${AAP_PROJECT_GIT_BRANCH:?AAP_PROJECT_GIT_BRANCH is required for remote bootstrap}"
