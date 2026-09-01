@@ -3,9 +3,7 @@ kind: Pod
 metadata:
   labels:
     ansible_job: ''
-{% if lookup('env', 'NAMESPACE') %}
-  namespace: {{ lookup('env', 'NAMESPACE') }}
-{% endif %}
+  namespace: {{ lookup('env', 'NAMESPACE') | mandatory }}
 spec:
   serviceAccountName: osac-sa
   affinity:

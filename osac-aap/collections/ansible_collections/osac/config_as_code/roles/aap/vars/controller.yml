@@ -614,13 +614,13 @@ controller_execution_environments: # noqa: var-naming[no-role-prefix]
 # credentials when the template are run, that way Kubernetes is the source
 # of truth for the secrets, and we don't need to sync credentials into AAP
 #
-# Each pod_spec_override below records metadata.namespace at IG-creation
-# time from the NAMESPACE env of the config-as-code run (the downward-API
-# namespace that both the bootstrap job and the config-as-code-ig pod
-# provide). Job pods therefore land next to the ConfigMaps/Secrets the pod
-# specs mount, which lets an install point at a shared AAP running in a
-# different namespace; a same-namespace install resolves NAMESPACE to the
-# AAP namespace, i.e. exactly what AWX would have picked on its own.
+# Each pod_spec_override below ALWAYS sets metadata.namespace from the
+# NAMESPACE env of the config-as-code run (downward API on the bootstrap
+# job / config-as-code-ig pod). Missing NAMESPACE fails the run
+# (mandatory + configure assert). Job pods therefore land next to the
+# ConfigMaps/Secrets the pod specs mount, which lets an install point at
+# a shared AAP in another namespace; same-namespace installs resolve
+# NAMESPACE to the AAP namespace — what AWX would pick on its own.
 controller_instance_groups: # noqa: var-naming[no-role-prefix]
   # For cluster-fulfillment use cases, we want to allow KubeAPI access to the
   # cluster the pod works on, so we mount the credentials for the osac
@@ -635,9 +635,7 @@ controller_instance_groups: # noqa: var-naming[no-role-prefix]
       metadata:
         labels:
           ansible_job: ''
-      {% if lookup('env', 'NAMESPACE') %}
-        namespace: {{ lookup('env', 'NAMESPACE') }}
-      {% endif %}
+        namespace: {{ lookup('env', 'NAMESPACE') | mandatory }}
       spec:
         serviceAccountName: osac-sa
         affinity:
@@ -736,9 +734,7 @@ controller_instance_groups: # noqa: var-naming[no-role-prefix]
       metadata:
         labels:
           ansible_job: ''
-      {% if lookup('env', 'NAMESPACE') %}
-        namespace: {{ lookup('env', 'NAMESPACE') }}
-      {% endif %}
+        namespace: {{ lookup('env', 'NAMESPACE') | mandatory }}
       spec:
         serviceAccountName: default
         affinity:
@@ -791,9 +787,7 @@ controller_instance_groups: # noqa: var-naming[no-role-prefix]
       metadata:
         labels:
           ansible_job: ''
-      {% if lookup('env', 'NAMESPACE') %}
-        namespace: {{ lookup('env', 'NAMESPACE') }}
-      {% endif %}
+        namespace: {{ lookup('env', 'NAMESPACE') | mandatory }}
       spec:
         serviceAccountName: template-publisher
         affinity:
@@ -877,9 +871,7 @@ controller_instance_groups: # noqa: var-naming[no-role-prefix]
       metadata:
         labels:
           ansible_job: ''
-      {% if lookup('env', 'NAMESPACE') %}
-        namespace: {{ lookup('env', 'NAMESPACE') }}
-      {% endif %}
+        namespace: {{ lookup('env', 'NAMESPACE') | mandatory }}
       spec:
         serviceAccountName: osac-sa
         affinity:

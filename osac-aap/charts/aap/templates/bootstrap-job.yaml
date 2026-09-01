@@ -85,6 +85,36 @@ spec:
       containers:
       - name: bootstrap
         image: {{ .Values.bootstrap.image }}
+        {{- /* Remote mode: the published EE image lags the branch under
+             test (CI overrides the image; local pool installs do not).
+             Clone AAP_PROJECT_GIT_URI@BRANCH and prefer those collections
+             so pod_spec_override metadata.namespace and other branch
+             fixes actually reach Instance Group creation. Fail closed if
+             the git env or NAMESPACE downward API is missing. */}}
+        {{- if .Values.bootstrap.remote }}
+        command: ["/bin/bash", "-c"]
+        args:
+        - |
+          set -euo pipefail
+          : "${NAMESPACE:?NAMESPACE downward-API env is required}"
+          : "${AAP_PROJECT_GIT_URI:?AAP_PROJECT_GIT_URI is required for remote bootstrap}"
+          : "${AAP_PROJECT_GIT_BRANCH:?AAP_PROJECT_GIT_BRANCH is required for remote bootstrap}"
+          SRC=/tmp/osac-src
+          rm -rf "${SRC}"
+          echo "Cloning ${AAP_PROJECT_GIT_URI}@${AAP_PROJECT_GIT_BRANCH} for config-as-code collections"
+          git clone --depth 1 --branch "${AAP_PROJECT_GIT_BRANCH}" "${AAP_PROJECT_GIT_URI}" "${SRC}"
+          COLLECT="${SRC}/osac-aap/collections"
+          VENDOR="${SRC}/osac-aap/vendor"
+          test -d "${COLLECT}/ansible_collections/osac/config_as_code"
+          export ANSIBLE_COLLECTIONS_PATH="${COLLECT}:${VENDOR}:/usr/share/ansible/collections"
+          echo "ANSIBLE_COLLECTIONS_PATH=${ANSIBLE_COLLECTIONS_PATH}"
+          echo "NAMESPACE=${NAMESPACE}"
+          exec ansible-playbook \
+            {{- if not .Values.bootstrap.skipSubscription }}
+            osac.config_as_code.subscription \
+            {{- end }}
+            osac.config_as_code.configure
+        {{- else }}
         args:
         - ansible-playbook
         {{- if not .Values.bootstrap.skipSubscription }}
@@ -93,6 +123,7 @@ spec:
         - osac.config_as_code.subscription
         {{- end }}
         - osac.config_as_code.configure
+        {{- end }}
         envFrom:
         - secretRef:
             name: {{ .Values.configAsCode.secret }}
@@ -110,6 +141,8 @@ spec:
         - name: config-as-code-manifest-volume
           mountPath: /var/secrets/config-as-code-manifest
           readOnly: true
+        - name: tmp
+          mountPath: /tmp
       volumes:
       - name: config-as-code-manifest-volume
         secret:

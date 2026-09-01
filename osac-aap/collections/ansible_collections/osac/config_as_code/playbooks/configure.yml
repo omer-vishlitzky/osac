@@ -8,6 +8,17 @@
     - vars/config.yml
 
   tasks:
+    - name: Require NAMESPACE for Instance Group pod placement
+      ansible.builtin.assert:
+        that:
+          - lookup('env', 'NAMESPACE') | length > 0
+        fail_msg: >-
+          NAMESPACE env is empty. Bootstrap must inject the install
+          namespace via the downward API so every Instance Group's
+          pod_spec_override.metadata.namespace pins job pods next to
+          the ConfigMaps/Secrets they mount (required for shared-AAP /
+          pool installs).
+
     - name: Configure AAP
       ansible.builtin.include_role:
         name: osac.config_as_code.aap
