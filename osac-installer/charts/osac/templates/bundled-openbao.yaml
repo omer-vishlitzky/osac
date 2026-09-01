@@ -1,4 +1,30 @@
 {{- if .Values.bundledVault.enabled }}
+{{- /* OpenShift restricted SCCs reject openbao's fixed uid/gid (100/1000).
+     Bind a dedicated SA to anyuid so the pod can run as packaged. */}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: openbao
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "osac.labels" . | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: openbao-anyuid
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "osac.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:openshift:scc:anyuid
+subjects:
+  - kind: ServiceAccount
+    name: openbao
+    namespace: {{ .Release.Namespace }}
+---
 apiVersion: cert-manager.io/v1
 kind: Certificate
 metadata:
@@ -167,6 +193,7 @@ spec:
         app: openbao
         {{- include "osac.labels" . | nindent 8 }}
     spec:
+      serviceAccountName: openbao
       automountServiceAccountToken: false
       securityContext:
         runAsNonRoot: true
