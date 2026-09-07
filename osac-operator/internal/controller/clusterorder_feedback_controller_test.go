@@ -24,6 +24,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	grpcstatus "google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/fieldmaskpb"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -42,6 +43,7 @@ type mockClustersClient struct {
 	updateCalled   bool
 	updateCount    int
 	lastUpdate     *privatev1.Cluster
+	lastUpdateMask *fieldmaskpb.FieldMask
 	signalCalled   bool
 	signalCount    int
 	signalID       string
@@ -71,6 +73,7 @@ func (m *mockClustersClient) Update(_ context.Context, in *privatev1.ClustersUpd
 	m.updateCalled = true
 	m.updateCount++
 	m.lastUpdate = in.GetObject()
+	m.lastUpdateMask = in.GetUpdateMask()
 	if m.updateError != nil {
 		return nil, m.updateError
 	}
@@ -1015,6 +1018,63 @@ var _ = Describe("ClusterOrder FeedbackReconciler", func() {
 				_, ok := known[condition]
 				Expect(ok).To(BeTrue(), "unsurfaced condition %q is not a known ClusterOrder condition", condition)
 			}
+		})
+	})
+
+	Context("When reconciling a ready ClusterOrder with node requests", func() {
+		BeforeEach(func() {
+			clusterOrder := &osacv1alpha1.ClusterOrder{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      resourceName,
+					Namespace: clusterOrderNS,
+					Labels: map[string]string{
+						osacClusterOrderIDLabel: clusterID,
+					},
+					Finalizers: []string{osacClusterOrderFeedbackFinalizer},
+				},
+				Spec: osacv1alpha1.ClusterOrderSpec{
+					TemplateID: "test_template",
+				},
+			}
+			Expect(k8sClient.Create(testCtx, clusterOrder)).To(Succeed())
+			Expect(k8sClient.Get(testCtx, typeNamespacedName, clusterOrder)).To(Succeed())
+			clusterOrder.Status.Phase = osacv1alpha1.ClusterOrderPhaseReady
+			clusterOrder.Status.NodeRequests = []osacv1alpha1.NodeRequest{
+				{ResourceClass: "m5.xlarge", NumberOfNodes: 3},
+			}
+			Expect(k8sClient.Status().Update(testCtx, clusterOrder)).To(Succeed())
+
+			mockClient.getResponse = &privatev1.ClustersGetResponse{
+				Object: &privatev1.Cluster{
+					Id: clusterID,
+					Spec: &privatev1.ClusterSpec{
+						NodeSets: map[string]*privatev1.ClusterNodeSet{
+							"workers": {
+								HostType: privatev1.HostTypeReference_builder{Name: "m5.xlarge"}.Build(),
+							},
+						},
+					},
+					Status: &privatev1.ClusterStatus{},
+				},
+			}
+			mockClient.updateResponse = &privatev1.ClustersUpdateResponse{}
+		})
+
+		It("should propagate node set sizes to fulfillment", func() {
+			request := reconcile.Request{NamespacedName: typeNamespacedName}
+			result, err := reconciler.Reconcile(testCtx, request)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.IsZero()).To(BeTrue())
+			Expect(mockClient.updateCalled).To(BeTrue())
+			Expect(mockClient.lastUpdate.GetStatus().GetNodeSets()["workers"].GetSize()).To(Equal(int32(3)))
+
+			hasNodeSetsPath := false
+			for _, path := range mockClient.lastUpdateMask.GetPaths() {
+				if path == "status.node_sets" {
+					hasNodeSetsPath = true
+				}
+			}
+			Expect(hasNodeSetsPath).To(BeTrue())
 		})
 	})
 })

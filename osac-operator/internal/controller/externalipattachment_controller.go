@@ -163,6 +163,7 @@ func (r *ExternalIPAttachmentReconciler) Reconcile(ctx context.Context, req mcre
 	log.Info("start reconcile", "externalIP", attachment.Spec.ExternalIP, "phase", attachment.Status.Phase)
 
 	oldstatus := attachment.Status.DeepCopy()
+	hadFinalizer := controllerutil.ContainsFinalizer(attachment, osacExternalIPAttachmentFinalizer)
 
 	var res ctrl.Result
 	var err error
@@ -172,7 +173,9 @@ func (r *ExternalIPAttachmentReconciler) Reconcile(ctx context.Context, req mcre
 		res, err = r.handleDelete(ctx, attachment)
 	}
 
-	if !equality.Semantic.DeepEqual(attachment.Status, *oldstatus) {
+	statusPersistedBeforeFinalizerRemoval := !attachment.ObjectMeta.DeletionTimestamp.IsZero() &&
+		hadFinalizer && !controllerutil.ContainsFinalizer(attachment, osacExternalIPAttachmentFinalizer)
+	if !statusPersistedBeforeFinalizerRemoval && !equality.Semantic.DeepEqual(attachment.Status, *oldstatus) {
 		log.Info("status requires update", "phase", attachment.Status.Phase)
 		if updateErr := r.updateStatusWithRetry(ctx, client.ObjectKeyFromObject(attachment), attachment.Status); updateErr != nil {
 			return res, updateErr
@@ -197,14 +200,14 @@ func (r *ExternalIPAttachmentReconciler) handleUpdate(ctx context.Context, attac
 	}
 
 	if attachment.Status.Phase == "" {
-		attachment.Status.Phase = v1alpha1.ExternalIPAttachmentPhaseProgressing
+		setExternalIPAttachmentPhase(&attachment.Status, v1alpha1.ExternalIPAttachmentPhaseProgressing)
 	}
 
 	// When networking provisioning is disabled, skip AAP job dispatch and set Ready
 	// immediately. This must be checked before the BMI primary IP check to avoid
 	// blocking forever waiting for a BMI IP that will never be discovered in noop mode.
 	if !r.NetworkProvisioningEnabled {
-		attachment.Status.Phase = v1alpha1.ExternalIPAttachmentPhaseReady
+		setExternalIPAttachmentPhase(&attachment.Status, v1alpha1.ExternalIPAttachmentPhaseReady)
 		setReadyConditionTrue(&attachment.Status.Conditions)
 		return ctrl.Result{}, nil
 	}
@@ -316,7 +319,7 @@ func (r *ExternalIPAttachmentReconciler) handleUpdate(ctx context.Context, attac
 
 	if attachment.Status.Phase == "" || (attachment.Status.Phase == v1alpha1.ExternalIPAttachmentPhaseReady &&
 		!provisioning.IsConfigApplied(&attachment.Status.ProvisioningJobs, attachment.Status.DesiredConfigVersion)) {
-		attachment.Status.Phase = v1alpha1.ExternalIPAttachmentPhaseProgressing
+		setExternalIPAttachmentPhase(&attachment.Status, v1alpha1.ExternalIPAttachmentPhaseProgressing)
 	}
 
 	return r.handleProvisioning(ctx, attachment, externalIP, ci)
@@ -640,16 +643,16 @@ func (r *ExternalIPAttachmentReconciler) handleProvisioning(
 		r.MaxJobHistory, r.StatusPollInterval,
 		&provisioning.PollCallbacks{
 			OnFailed: func(message string) {
-				attachment.Status.Phase = v1alpha1.ExternalIPAttachmentPhaseFailed
+				setExternalIPAttachmentPhase(&attachment.Status, v1alpha1.ExternalIPAttachmentPhaseFailed)
 				setReadyConditionFailed(&attachment.Status.Conditions, message)
 			},
 			OnSuccess: func(_ provisioning.ProvisionStatus) {
-				attachment.Status.Phase = v1alpha1.ExternalIPAttachmentPhaseReady
+				setExternalIPAttachmentPhase(&attachment.Status, v1alpha1.ExternalIPAttachmentPhaseReady)
 				// onProvisionSuccess error causes a requeue via provisionErr, but the
 				// provisioning lifecycle won't re-invoke OnSuccess (job already succeeded).
 				// The retry.RetryOnConflict inside onProvisionSuccess makes this window
 				// very narrow — only persistent non-conflict API errors can reach here.
-				provisionErr = r.onProvisionSuccess(ctx, externalIP, ci)
+				provisionErr = r.onProvisionSuccess(ctx, externalIP, attachment, ci)
 				setReadyConditionTrue(&attachment.Status.Conditions)
 			},
 		},
@@ -672,24 +675,13 @@ func (r *ExternalIPAttachmentReconciler) handleProvisioning(
 	return result, nil
 }
 
-// onProvisionSuccess updates the parent ExternalIP and target ComputeInstance after
-// a successful attach operation.
-func (r *ExternalIPAttachmentReconciler) onProvisionSuccess(ctx context.Context, externalIP *v1alpha1.ExternalIP, ci *v1alpha1.ComputeInstance) error {
-	// Set ExternalIP.status.attached = true
-	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		fresh := &v1alpha1.ExternalIP{}
-		if err := r.Get(ctx, client.ObjectKeyFromObject(externalIP), fresh); err != nil {
-			return err
-		}
-		if fresh.Status.Attached {
-			return nil
-		}
-		fresh.Status.Attached = true
-		return r.Status().Update(ctx, fresh)
-	}); err != nil {
-		return fmt.Errorf("failed to set ExternalIP status.attached=true: %w", err)
-	}
-
+// onProvisionSuccess updates the target ComputeInstance status.
+func (r *ExternalIPAttachmentReconciler) onProvisionSuccess(
+	ctx context.Context,
+	externalIP *v1alpha1.ExternalIP,
+	attachment *v1alpha1.ExternalIPAttachment,
+	ci *v1alpha1.ComputeInstance,
+) error {
 	// Set ComputeInstance.status.externalIPAddress from the parent ExternalIP's address.
 	// Re-fetch ExternalIP to get the latest address — the object captured by handleUpdate
 	// may be stale if the ExternalIP controller populated the address after our initial read.
@@ -722,10 +714,20 @@ func (r *ExternalIPAttachmentReconciler) handleDelete(ctx context.Context, attac
 	log := ctrllog.FromContext(ctx)
 	log.Info("deleting ExternalIPAttachment")
 
-	attachment.Status.Phase = v1alpha1.ExternalIPAttachmentPhaseDeleting
+	statusChanged := setExternalIPAttachmentPhase(&attachment.Status, v1alpha1.ExternalIPAttachmentPhaseDeleting)
 
 	if !controllerutil.ContainsFinalizer(attachment, osacExternalIPAttachmentFinalizer) {
 		return ctrl.Result{}, nil
+	}
+	if statusChanged {
+		if err := r.Status().Update(ctx, attachment); err != nil {
+			return ctrl.Result{}, err
+		}
+		latest := &v1alpha1.ExternalIPAttachment{}
+		if err := r.APIReader.Get(ctx, client.ObjectKeyFromObject(attachment), latest); err != nil {
+			return ctrl.Result{}, err
+		}
+		*attachment = *latest
 	}
 
 	if attachment.Annotations[osacImplementationStrategyAnnotation] == "" {
@@ -751,32 +753,8 @@ func (r *ExternalIPAttachmentReconciler) handleDelete(ctx context.Context, attac
 	return ctrl.Result{}, nil
 }
 
-// onDeprovisionSuccess clears the attached state on the parent ExternalIP, clears
-// externalIPAddress on the ComputeInstance, and removes the CI detach finalizer when
-// no other ExternalIPAttachments reference the same CI.
+// onDeprovisionSuccess clears target status and target detach finalizers.
 func (r *ExternalIPAttachmentReconciler) onDeprovisionSuccess(ctx context.Context, attachment *v1alpha1.ExternalIPAttachment) error {
-	// Clear ExternalIP.status.attached (look up by UUID label)
-	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		externalIPList := &v1alpha1.ExternalIPList{}
-		if err := r.List(ctx, externalIPList,
-			client.InNamespace(attachment.Namespace),
-			client.MatchingLabels{osacExternalIPIDLabel: attachment.Spec.ExternalIP},
-		); err != nil {
-			return err
-		}
-		if len(externalIPList.Items) == 0 {
-			return nil
-		}
-		externalIP := &externalIPList.Items[0]
-		if !externalIP.Status.Attached {
-			return nil
-		}
-		externalIP.Status.Attached = false
-		return r.Status().Update(ctx, externalIP)
-	}); err != nil {
-		return fmt.Errorf("failed to clear ExternalIP status.attached: %w", err)
-	}
-
 	// Clear ComputeInstance.status.externalIPAddress and remove CI detach finalizer
 	if attachment.Spec.ComputeInstance != nil {
 		ciUUID := *attachment.Spec.ComputeInstance

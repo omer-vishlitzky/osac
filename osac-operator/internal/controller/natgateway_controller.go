@@ -118,6 +118,7 @@ func (r *NATGatewayReconciler) Reconcile(ctx context.Context, req mcreconcile.Re
 	log.Info("start reconcile")
 
 	oldstatus := natgw.Status.DeepCopy()
+	hadFinalizer := controllerutil.ContainsFinalizer(natgw, osacNATGatewayFinalizer)
 
 	var res ctrl.Result
 	if natgw.ObjectMeta.DeletionTimestamp.IsZero() {
@@ -126,7 +127,9 @@ func (r *NATGatewayReconciler) Reconcile(ctx context.Context, req mcreconcile.Re
 		res, err = r.handleDelete(ctx, natgw)
 	}
 
-	if !equality.Semantic.DeepEqual(natgw.Status, *oldstatus) {
+	statusPersistedBeforeFinalizerRemoval := !natgw.ObjectMeta.DeletionTimestamp.IsZero() &&
+		hadFinalizer && !controllerutil.ContainsFinalizer(natgw, osacNATGatewayFinalizer)
+	if !statusPersistedBeforeFinalizerRemoval && !equality.Semantic.DeepEqual(natgw.Status, *oldstatus) {
 		log.Info("status requires update")
 		if err := r.updateStatusWithRetry(ctx, client.ObjectKeyFromObject(natgw), natgw.Status); err != nil {
 			return res, err
@@ -171,13 +174,13 @@ func (r *NATGatewayReconciler) handleUpdate(ctx context.Context, natgw *v1alpha1
 
 	// Set phase to Progressing only on first reconcile (empty phase).
 	if natgw.Status.Phase == "" {
-		natgw.Status.Phase = v1alpha1.NATGatewayPhaseProgressing
+		setNATGatewayPhase(&natgw.Status, v1alpha1.NATGatewayPhaseProgressing)
 	}
 
 	// When networking provisioning is disabled, skip AAP job dispatch and set Ready
 	// immediately.
 	if !r.NetworkProvisioningEnabled {
-		natgw.Status.Phase = v1alpha1.NATGatewayPhaseReady
+		setNATGatewayPhase(&natgw.Status, v1alpha1.NATGatewayPhaseReady)
 		setReadyConditionTrue(&natgw.Status.Conditions)
 		return ctrl.Result{}, nil
 	}
@@ -278,7 +281,7 @@ func (r *NATGatewayReconciler) handleUpdate(ctx context.Context, natgw *v1alpha1
 	// after a previous success. Don't override Failed during backoff.
 	if natgw.Status.Phase == "" || (natgw.Status.Phase == v1alpha1.NATGatewayPhaseReady &&
 		!provisioning.IsConfigApplied(&natgw.Status.ProvisioningJobs, natgw.Status.DesiredConfigVersion)) {
-		natgw.Status.Phase = v1alpha1.NATGatewayPhaseProgressing
+		setNATGatewayPhase(&natgw.Status, v1alpha1.NATGatewayPhaseProgressing)
 	}
 
 	return r.handleProvisioning(ctx, natgw)
@@ -288,10 +291,20 @@ func (r *NATGatewayReconciler) handleDelete(ctx context.Context, natgw *v1alpha1
 	log := ctrllog.FromContext(ctx)
 	log.Info("deleting NATGateway")
 
-	natgw.Status.Phase = v1alpha1.NATGatewayPhaseDeleting
+	statusChanged := setNATGatewayPhase(&natgw.Status, v1alpha1.NATGatewayPhaseDeleting)
 
 	if !controllerutil.ContainsFinalizer(natgw, osacNATGatewayFinalizer) {
 		return ctrl.Result{}, nil
+	}
+	if statusChanged {
+		if err := r.Status().Update(ctx, natgw); err != nil {
+			return ctrl.Result{}, err
+		}
+		latest := &v1alpha1.NATGateway{}
+		if err := r.APIReader.Get(ctx, client.ObjectKeyFromObject(natgw), latest); err != nil {
+			return ctrl.Result{}, err
+		}
+		*natgw = *latest
 	}
 
 	if natgw.Annotations[osacImplementationStrategyAnnotation] == "" {
@@ -327,11 +340,11 @@ func (r *NATGatewayReconciler) handleProvisioning(ctx context.Context, natgw *v1
 		r.MaxJobHistory, r.StatusPollInterval,
 		&provisioning.PollCallbacks{
 			OnFailed: func(message string) {
-				natgw.Status.Phase = v1alpha1.NATGatewayPhaseFailed
+				setNATGatewayPhase(&natgw.Status, v1alpha1.NATGatewayPhaseFailed)
 				setReadyConditionFailed(&natgw.Status.Conditions, message)
 			},
 			OnSuccess: func(_ provisioning.ProvisionStatus) {
-				natgw.Status.Phase = v1alpha1.NATGatewayPhaseReady
+				setNATGatewayPhase(&natgw.Status, v1alpha1.NATGatewayPhaseReady)
 				setReadyConditionTrue(&natgw.Status.Conditions)
 			},
 		},

@@ -433,7 +433,7 @@ var _ = Describe("ExternalIPAttachmentReconciler", func() {
 			Expect(updated.Status.Phase).To(Equal(osacv1alpha1.ExternalIPAttachmentPhaseReady))
 		})
 
-		It("should set ExternalIP.status.attached on provision success", func() {
+		It("should leave ExternalIP.status.attached to the feedback controller on provision success", func() {
 			fakeClient = buildClient(attachment, publicIP, pool, ci)
 			setupReconciler(fakeClient)
 
@@ -456,7 +456,8 @@ var _ = Describe("ExternalIPAttachmentReconciler", func() {
 
 			updatedPIP := &osacv1alpha1.ExternalIP{}
 			Expect(fakeClient.Get(testCtx, client.ObjectKeyFromObject(publicIP), updatedPIP)).To(Succeed())
-			Expect(updatedPIP.Status.Attached).To(BeTrue())
+			Expect(updatedPIP.Status.Attached).To(BeFalse())
+			Expect(updatedPIP.Status.AttachmentTransitionTime).To(BeNil())
 		})
 
 		It("should set ComputeInstance.status.externalIPAddress on provision success", func() {
@@ -686,11 +687,10 @@ var _ = Describe("ExternalIPAttachmentReconciler", func() {
 			Expect(toDelete.Finalizers).NotTo(ContainElement(osacExternalIPAttachmentFinalizer))
 		})
 
-		It("should clear ExternalIP.status.attached on deprovision", func() {
+		It("should leave ExternalIP.status.attached to the feedback controller on deprovision", func() {
 			fakeClient = buildClient(attachment, publicIP, pool, ci)
 			setupReconciler(fakeClient)
 
-			// Set attached=true on ExternalIP
 			pip := &osacv1alpha1.ExternalIP{}
 			Expect(fakeClient.Get(testCtx, client.ObjectKeyFromObject(publicIP), pip)).To(Succeed())
 			pip.Status.Attached = true
@@ -715,7 +715,8 @@ var _ = Describe("ExternalIPAttachmentReconciler", func() {
 
 			updatedPIP := &osacv1alpha1.ExternalIP{}
 			Expect(fakeClient.Get(testCtx, client.ObjectKeyFromObject(publicIP), updatedPIP)).To(Succeed())
-			Expect(updatedPIP.Status.Attached).To(BeFalse())
+			Expect(updatedPIP.Status.Attached).To(BeTrue())
+			Expect(updatedPIP.Status.AttachmentTransitionTime).To(BeNil())
 		})
 
 		It("should block deletion when deprovision fails with BlockDeletionOnFailure", func() {
@@ -1266,7 +1267,7 @@ var _ = Describe("ExternalIPAttachmentReconciler", func() {
 			Expect(updated.Status.Phase).To(Equal(osacv1alpha1.ExternalIPAttachmentPhaseReady))
 		})
 
-		It("should set ExternalIP.status.attached on provision success with cluster target", func() {
+		It("should leave ExternalIP.status.attached to the feedback controller with cluster target", func() {
 			fakeClient = buildClient(clusterAttachment, publicIP, pool, co)
 			setupReconciler(fakeClient)
 
@@ -1289,10 +1290,11 @@ var _ = Describe("ExternalIPAttachmentReconciler", func() {
 
 			updatedPIP := &osacv1alpha1.ExternalIP{}
 			Expect(fakeClient.Get(testCtx, client.ObjectKeyFromObject(publicIP), updatedPIP)).To(Succeed())
-			Expect(updatedPIP.Status.Attached).To(BeTrue())
+			Expect(updatedPIP.Status.Attached).To(BeFalse())
+			Expect(updatedPIP.Status.AttachmentTransitionTime).To(BeNil())
 		})
 
-		It("should clear ExternalIP.status.attached on deprovision with cluster target", func() {
+		It("should leave ExternalIP.status.attached to the feedback controller on deprovision with cluster target", func() {
 			fakeClient = buildClient(clusterAttachment, publicIP, pool, co)
 			setupReconciler(fakeClient)
 
@@ -1320,7 +1322,8 @@ var _ = Describe("ExternalIPAttachmentReconciler", func() {
 
 			updatedPIP := &osacv1alpha1.ExternalIP{}
 			Expect(fakeClient.Get(testCtx, client.ObjectKeyFromObject(publicIP), updatedPIP)).To(Succeed())
-			Expect(updatedPIP.Status.Attached).To(BeFalse())
+			Expect(updatedPIP.Status.Attached).To(BeTrue())
+			Expect(updatedPIP.Status.AttachmentTransitionTime).To(BeNil())
 		})
 	})
 
