@@ -21,6 +21,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/timestamppb"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	clnt "sigs.k8s.io/controller-runtime/pkg/client"
@@ -111,16 +112,34 @@ func (r *ExternalIPFeedbackReconciler) Reconcile(ctx context.Context, request ct
 func syncExternalIPUpdate(ctx context.Context, obj *v1alpha1.ExternalIP, remote *privatev1.ExternalIP) error {
 	syncExternalIPState(ctx, obj, remote)
 	syncExternalIPAddress(obj, remote)
+	syncExternalIPAttachmentTransitionTime(obj, remote)
 	return nil
 }
 
+func syncExternalIPAttachmentTransitionTime(obj *v1alpha1.ExternalIP, remote *privatev1.ExternalIP) {
+	if obj.Status.AttachmentTransitionTime == nil {
+		remote.GetStatus().ClearAttachmentTransitionTime()
+		return
+	}
+	remote.GetStatus().SetAttachmentTransitionTime(timestamppb.New(obj.Status.AttachmentTransitionTime.Time))
+}
+
 func syncExternalIPDelete(_ context.Context, obj *v1alpha1.ExternalIP, remote *privatev1.ExternalIP) error {
+	syncExternalIPStateTransitionTime(obj, remote)
 	if obj.Status.State == v1alpha1.ExternalIPStateFailed {
 		remote.GetStatus().SetState(privatev1.ExternalIPState_EXTERNAL_IP_STATE_FAILED)
 		return nil
 	}
 	remote.GetStatus().SetState(privatev1.ExternalIPState_EXTERNAL_IP_STATE_DELETING)
 	return nil
+}
+
+func syncExternalIPStateTransitionTime(obj *v1alpha1.ExternalIP, remote *privatev1.ExternalIP) {
+	if obj.Status.StateTransitionTime == nil {
+		remote.GetStatus().ClearStateTransitionTime()
+		return
+	}
+	remote.GetStatus().SetStateTransitionTime(timestamppb.New(obj.Status.StateTransitionTime.Time))
 }
 
 func syncExternalIPState(ctx context.Context, obj *v1alpha1.ExternalIP, remote *privatev1.ExternalIP) {
@@ -135,6 +154,8 @@ func syncExternalIPState(ctx context.Context, obj *v1alpha1.ExternalIP, remote *
 		log := ctrllog.FromContext(ctx)
 		log.Info("Unknown state, will ignore it", "state", obj.Status.State)
 	}
+
+	syncExternalIPStateTransitionTime(obj, remote)
 }
 
 func syncExternalIPAddress(obj *v1alpha1.ExternalIP, remote *privatev1.ExternalIP) {

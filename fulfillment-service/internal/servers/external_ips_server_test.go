@@ -19,6 +19,9 @@ import (
 	"github.com/google/uuid"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"google.golang.org/grpc/codes"
+	grpcstatus "google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/fieldmaskpb"
 
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
 	"github.com/osac-project/osac/fulfillment-service/internal/database/dao"
@@ -189,6 +192,38 @@ var _ = Describe("Public external IPs server", func() {
 				Id: createResp.GetObject().GetId(),
 			}.Build())
 			Expect(err).ToNot(HaveOccurred())
+		})
+
+		It("rejects output-only status updates with nil and explicit masks", func() {
+			poolID := getPoolID()
+			createResp, err := publicServer.Create(ctx, publicv1.ExternalIPsCreateRequest_builder{
+				Object: publicv1.ExternalIP_builder{
+					Metadata: publicv1.Metadata_builder{Name: "test-eip", Tenant: testTenant}.Build(),
+					Spec:     publicv1.ExternalIPSpec_builder{Pool: publicv1.ExternalIPPoolReference_builder{Id: poolID}.Build()}.Build(),
+				}.Build(),
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+
+			_, err = publicServer.Update(ctx, publicv1.ExternalIPsUpdateRequest_builder{
+				Object: createResp.GetObject(),
+			}.Build())
+			Expect(grpcstatus.Code(err)).To(Equal(codes.InvalidArgument))
+
+			_, err = publicServer.Update(ctx, publicv1.ExternalIPsUpdateRequest_builder{
+				Object: publicv1.ExternalIP_builder{Id: createResp.GetObject().GetId()}.Build(),
+				UpdateMask: &fieldmaskpb.FieldMask{
+					Paths: []string{"status.state"},
+				},
+			}.Build())
+			Expect(grpcstatus.Code(err)).To(Equal(codes.InvalidArgument))
+
+			_, err = publicServer.Update(ctx, publicv1.ExternalIPsUpdateRequest_builder{
+				Object: publicv1.ExternalIP_builder{Id: createResp.GetObject().GetId()}.Build(),
+				UpdateMask: &fieldmaskpb.FieldMask{
+					Paths: []string{"status.hub"},
+				},
+			}.Build())
+			Expect(grpcstatus.Code(err)).To(Equal(codes.InvalidArgument))
 		})
 	})
 })

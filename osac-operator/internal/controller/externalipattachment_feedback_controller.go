@@ -21,6 +21,9 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/timestamppb"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	clnt "sigs.k8s.io/controller-runtime/pkg/client"
@@ -82,9 +85,9 @@ func NewExternalIPAttachmentFeedbackReconciler(hubClient clnt.Client, grpcConn *
 			}.Build())
 			return err
 		},
-		SyncUpdate:       newExternalIPAttachmentSyncUpdate(eipClient),
+		SyncUpdate:       newExternalIPAttachmentSyncUpdate(eipClient, hubClient),
 		SyncDelete:       syncExternalIPAttachmentDelete,
-		PostSaveOnDelete: newExternalIPAttachmentPostSaveOnDelete(eipClient),
+		PostSaveOnDelete: newExternalIPAttachmentPostSaveOnDelete(eipClient, hubClient),
 		IsNotFound:       func(err error) bool { return errors.Is(err, ErrExternalIPAttachmentNotFound) },
 	}
 	return r
@@ -110,13 +113,13 @@ func (r *ExternalIPAttachmentFeedbackReconciler) Reconcile(ctx context.Context, 
 // newExternalIPAttachmentSyncUpdate returns a SyncUpdate that captures eipClient
 // for setting attached=true on the parent ExternalIP when Ready, and for syncing
 // the parent's address to the attachment.
-func newExternalIPAttachmentSyncUpdate(eipClient privatev1.ExternalIPsClient) func(context.Context, *v1alpha1.ExternalIPAttachment, *privatev1.ExternalIPAttachment) error {
+func newExternalIPAttachmentSyncUpdate(eipClient privatev1.ExternalIPsClient, hubClient clnt.Client) func(context.Context, *v1alpha1.ExternalIPAttachment, *privatev1.ExternalIPAttachment) error {
 	return func(ctx context.Context, obj *v1alpha1.ExternalIPAttachment, remote *privatev1.ExternalIPAttachment) error {
 		syncExternalIPAttachmentState(ctx, obj, remote)
 		syncExternalIPAttachmentAddress(ctx, eipClient, remote)
 
 		if obj.Status.Phase == v1alpha1.ExternalIPAttachmentPhaseReady {
-			if err := syncAttachedOnParentExternalIP(ctx, eipClient, remote, true); err != nil {
+			if err := syncAttachedOnParentExternalIP(ctx, eipClient, hubClient, obj.Namespace, remote, true); err != nil {
 				ctrllog.FromContext(ctx).Error(err, "Failed to set attached on parent ExternalIP, will retry")
 				return err
 			}
@@ -126,6 +129,7 @@ func newExternalIPAttachmentSyncUpdate(eipClient privatev1.ExternalIPsClient) fu
 }
 
 func syncExternalIPAttachmentDelete(_ context.Context, obj *v1alpha1.ExternalIPAttachment, remote *privatev1.ExternalIPAttachment) error {
+	syncExternalIPAttachmentStateTransitionTime(obj, remote)
 	if obj.Status.Phase == v1alpha1.ExternalIPAttachmentPhaseFailed {
 		remote.GetStatus().SetState(privatev1.ExternalIPAttachmentState_EXTERNAL_IP_ATTACHMENT_STATE_FAILED)
 		return nil
@@ -134,12 +138,20 @@ func syncExternalIPAttachmentDelete(_ context.Context, obj *v1alpha1.ExternalIPA
 	return nil
 }
 
+func syncExternalIPAttachmentStateTransitionTime(obj *v1alpha1.ExternalIPAttachment, remote *privatev1.ExternalIPAttachment) {
+	if obj.Status.StateTransitionTime == nil {
+		remote.GetStatus().ClearStateTransitionTime()
+		return
+	}
+	remote.GetStatus().SetStateTransitionTime(timestamppb.New(obj.Status.StateTransitionTime.Time))
+}
+
 // newExternalIPAttachmentPostSaveOnDelete returns a PostSaveOnDelete that clears
 // the attached flag on the parent ExternalIP after the attachment's DELETING
 // state is persisted.
-func newExternalIPAttachmentPostSaveOnDelete(eipClient privatev1.ExternalIPsClient) func(context.Context, *v1alpha1.ExternalIPAttachment, *privatev1.ExternalIPAttachment) error {
-	return func(ctx context.Context, _ *v1alpha1.ExternalIPAttachment, remote *privatev1.ExternalIPAttachment) error {
-		if err := syncAttachedOnParentExternalIP(ctx, eipClient, remote, false); err != nil {
+func newExternalIPAttachmentPostSaveOnDelete(eipClient privatev1.ExternalIPsClient, hubClient clnt.Client) func(context.Context, *v1alpha1.ExternalIPAttachment, *privatev1.ExternalIPAttachment) error {
+	return func(ctx context.Context, obj *v1alpha1.ExternalIPAttachment, remote *privatev1.ExternalIPAttachment) error {
+		if err := syncAttachedOnParentExternalIP(ctx, eipClient, hubClient, obj.Namespace, remote, false); err != nil {
 			ctrllog.FromContext(ctx).Error(err, "Failed to clear attached on parent ExternalIP, will retry")
 			return err
 		}
@@ -159,6 +171,8 @@ func syncExternalIPAttachmentState(ctx context.Context, obj *v1alpha1.ExternalIP
 		log := ctrllog.FromContext(ctx)
 		log.Info("Unknown phase, will ignore it", "phase", obj.Status.Phase)
 	}
+
+	syncExternalIPAttachmentStateTransitionTime(obj, remote)
 }
 
 func syncExternalIPAttachmentAddress(ctx context.Context, eipClient privatev1.ExternalIPsClient, remote *privatev1.ExternalIPAttachment) {
@@ -182,9 +196,16 @@ func syncExternalIPAttachmentAddress(ctx context.Context, eipClient privatev1.Ex
 	}
 }
 
-func syncAttachedOnParentExternalIP(ctx context.Context, eipClient privatev1.ExternalIPsClient, remote *privatev1.ExternalIPAttachment, attached bool) error {
+func syncAttachedOnParentExternalIP(ctx context.Context, eipClient privatev1.ExternalIPsClient, hubClient clnt.Client, namespace string, remote *privatev1.ExternalIPAttachment, attached bool) error {
+	attribution, err := externalIPAttribution(remote, attached)
+	if err != nil {
+		return err
+	}
 	externalIPRef := remote.GetSpec().GetExternalIp()
 	if externalIPRef.GetId() == "" {
+		if attached {
+			return fmt.Errorf("external IP attachment %s has no external IP identifier", remote.GetId())
+		}
 		return nil
 	}
 
@@ -207,13 +228,93 @@ func syncAttachedOnParentExternalIP(ctx context.Context, eipClient privatev1.Ext
 		externalIP.SetStatus(&privatev1.ExternalIPStatus{})
 	}
 
-	if externalIP.GetStatus().GetAttached() == attached {
-		return nil
+	var attachmentTransitionTime *timestamppb.Timestamp
+	if value := remote.GetStatus().GetStateTransitionTime(); value != nil {
+		attachmentTransitionTime = proto.Clone(value).(*timestamppb.Timestamp)
+	}
+	if externalIP.GetStatus().GetAttached() == attached &&
+		proto.Equal(externalIP.GetStatus().GetAttribution(), attribution) &&
+		proto.Equal(externalIP.GetStatus().GetAttachmentTransitionTime(), attachmentTransitionTime) {
+		return syncExternalIPCRDTransitionTime(ctx, hubClient, namespace, externalIPRef.GetId(), attachmentTransitionTime)
 	}
 
 	externalIP.GetStatus().SetAttached(attached)
+	externalIP.GetStatus().SetAttribution(attribution)
+	externalIP.GetStatus().SetAttachmentTransitionTime(attachmentTransitionTime)
 	_, err = eipClient.Update(ctx, privatev1.ExternalIPsUpdateRequest_builder{
 		Object: externalIP,
 	}.Build())
-	return err
+	if err != nil {
+		return err
+	}
+
+	return syncExternalIPCRDTransitionTime(ctx, hubClient, namespace, externalIPRef.GetId(), attachmentTransitionTime)
+}
+
+func externalIPAttribution(remote *privatev1.ExternalIPAttachment, attached bool) (*privatev1.ExternalIPAttribution, error) {
+	if !attached {
+		return nil, nil
+	}
+	spec := remote.GetSpec()
+	switch {
+	case spec.HasComputeInstance():
+		if spec.GetComputeInstance().GetId() == "" {
+			return nil, fmt.Errorf("external IP attachment %s has an empty compute instance attribution ID", remote.GetId())
+		}
+		if spec.GetTargetEndpoint() != privatev1.ExternalIPAttachmentEndpoint_EXTERNAL_IP_ATTACHMENT_ENDPOINT_UNSPECIFIED {
+			return nil, fmt.Errorf("external IP attachment %s has an endpoint for a compute instance target", remote.GetId())
+		}
+		return privatev1.ExternalIPAttribution_builder{
+			ComputeInstance: proto.Clone(spec.GetComputeInstance()).(*privatev1.ComputeInstanceLocalReference),
+		}.Build(), nil
+	case spec.HasCluster():
+		if spec.GetCluster().GetId() == "" {
+			return nil, fmt.Errorf("external IP attachment %s has an empty cluster attribution ID", remote.GetId())
+		}
+		endpoint := spec.GetTargetEndpoint()
+		if endpoint != privatev1.ExternalIPAttachmentEndpoint_EXTERNAL_IP_ATTACHMENT_ENDPOINT_API &&
+			endpoint != privatev1.ExternalIPAttachmentEndpoint_EXTERNAL_IP_ATTACHMENT_ENDPOINT_INGRESS {
+			return nil, fmt.Errorf("external IP attachment %s has an invalid cluster endpoint %s", remote.GetId(), endpoint)
+		}
+		return privatev1.ExternalIPAttribution_builder{
+			Cluster:  proto.Clone(spec.GetCluster()).(*privatev1.ClusterLocalReference),
+			Endpoint: endpoint,
+		}.Build(), nil
+	case spec.HasBaremetalInstance():
+		if spec.GetBaremetalInstance().GetId() == "" {
+			return nil, fmt.Errorf("external IP attachment %s has an empty bare metal instance attribution ID", remote.GetId())
+		}
+		if spec.GetTargetEndpoint() != privatev1.ExternalIPAttachmentEndpoint_EXTERNAL_IP_ATTACHMENT_ENDPOINT_UNSPECIFIED {
+			return nil, fmt.Errorf("external IP attachment %s has an endpoint for a bare metal instance target", remote.GetId())
+		}
+		return privatev1.ExternalIPAttribution_builder{
+			BaremetalInstance: proto.Clone(spec.GetBaremetalInstance()).(*privatev1.BareMetalInstanceLocalReference),
+		}.Build(), nil
+	default:
+		return nil, fmt.Errorf("external IP attachment %s has no attribution target", remote.GetId())
+	}
+}
+
+func syncExternalIPCRDTransitionTime(ctx context.Context, hubClient clnt.Client, namespace, externalIPID string, transitionTime *timestamppb.Timestamp) error {
+	if hubClient == nil {
+		return nil
+	}
+	list := &v1alpha1.ExternalIPList{}
+	if err := hubClient.List(ctx, list, clnt.InNamespace(namespace), clnt.MatchingLabels{osacExternalIPIDLabel: externalIPID}); err != nil {
+		return err
+	}
+	if len(list.Items) == 0 {
+		return fmt.Errorf("ExternalIP CR for ID %s was not found in namespace %s", externalIPID, namespace)
+	}
+	if len(list.Items) != 1 {
+		return fmt.Errorf("expected one ExternalIP CR for ID %s, found %d", externalIPID, len(list.Items))
+	}
+	parent := &list.Items[0]
+	if transitionTime == nil {
+		parent.Status.AttachmentTransitionTime = nil
+	} else {
+		time := metav1.NewTime(transitionTime.AsTime())
+		parent.Status.AttachmentTransitionTime = &time
+	}
+	return hubClient.Status().Update(ctx, parent)
 }

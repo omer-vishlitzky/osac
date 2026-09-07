@@ -197,14 +197,14 @@ func (r *ExternalIPAttachmentReconciler) handleUpdate(ctx context.Context, attac
 	}
 
 	if attachment.Status.Phase == "" {
-		attachment.Status.Phase = v1alpha1.ExternalIPAttachmentPhaseProgressing
+		setExternalIPAttachmentPhase(&attachment.Status, v1alpha1.ExternalIPAttachmentPhaseProgressing)
 	}
 
 	// When networking provisioning is disabled, skip AAP job dispatch and set Ready
 	// immediately. This must be checked before the BMI primary IP check to avoid
 	// blocking forever waiting for a BMI IP that will never be discovered in noop mode.
 	if !r.NetworkProvisioningEnabled {
-		attachment.Status.Phase = v1alpha1.ExternalIPAttachmentPhaseReady
+		setExternalIPAttachmentPhase(&attachment.Status, v1alpha1.ExternalIPAttachmentPhaseReady)
 		setReadyConditionTrue(&attachment.Status.Conditions)
 		return ctrl.Result{}, nil
 	}
@@ -316,7 +316,7 @@ func (r *ExternalIPAttachmentReconciler) handleUpdate(ctx context.Context, attac
 
 	if attachment.Status.Phase == "" || (attachment.Status.Phase == v1alpha1.ExternalIPAttachmentPhaseReady &&
 		!provisioning.IsConfigApplied(&attachment.Status.ProvisioningJobs, attachment.Status.DesiredConfigVersion)) {
-		attachment.Status.Phase = v1alpha1.ExternalIPAttachmentPhaseProgressing
+		setExternalIPAttachmentPhase(&attachment.Status, v1alpha1.ExternalIPAttachmentPhaseProgressing)
 	}
 
 	return r.handleProvisioning(ctx, attachment, externalIP, ci)
@@ -640,11 +640,11 @@ func (r *ExternalIPAttachmentReconciler) handleProvisioning(
 		r.MaxJobHistory, r.StatusPollInterval,
 		&provisioning.PollCallbacks{
 			OnFailed: func(message string) {
-				attachment.Status.Phase = v1alpha1.ExternalIPAttachmentPhaseFailed
+				setExternalIPAttachmentPhase(&attachment.Status, v1alpha1.ExternalIPAttachmentPhaseFailed)
 				setReadyConditionFailed(&attachment.Status.Conditions, message)
 			},
 			OnSuccess: func(_ provisioning.ProvisionStatus) {
-				attachment.Status.Phase = v1alpha1.ExternalIPAttachmentPhaseReady
+				setExternalIPAttachmentPhase(&attachment.Status, v1alpha1.ExternalIPAttachmentPhaseReady)
 				// onProvisionSuccess error causes a requeue via provisionErr, but the
 				// provisioning lifecycle won't re-invoke OnSuccess (job already succeeded).
 				// The retry.RetryOnConflict inside onProvisionSuccess makes this window
@@ -722,7 +722,7 @@ func (r *ExternalIPAttachmentReconciler) handleDelete(ctx context.Context, attac
 	log := ctrllog.FromContext(ctx)
 	log.Info("deleting ExternalIPAttachment")
 
-	attachment.Status.Phase = v1alpha1.ExternalIPAttachmentPhaseDeleting
+	setExternalIPAttachmentPhase(&attachment.Status, v1alpha1.ExternalIPAttachmentPhaseDeleting)
 
 	if !controllerutil.ContainsFinalizer(attachment, osacExternalIPAttachmentFinalizer) {
 		return ctrl.Result{}, nil

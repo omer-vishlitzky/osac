@@ -201,6 +201,11 @@ func (s *PrivateExternalIPsServer) Update(ctx context.Context,
 
 	existingExternalIP := getResponse.GetObject()
 	mask := request.GetUpdateMask()
+	if mask != nil && len(mask.GetPaths()) > 0 && updateIncludesField(mask,
+		"status.pool", "status.attribution", "status.attached", "status.attachment_transition_time", "status.state_transition_time") {
+		err = grpcstatus.Errorf(grpccodes.InvalidArgument, "status output fields cannot be updated")
+		return
+	}
 
 	if updateIncludesField(mask, "spec.pool") {
 		if err = validateImmutableFieldsExternalIP(request.GetObject(), existingExternalIP); err != nil {

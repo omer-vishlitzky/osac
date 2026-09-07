@@ -242,6 +242,11 @@ func (s *NATGatewaysServer) Update(ctx context.Context,
 		err = grpcstatus.Errorf(grpccodes.InvalidArgument, "object is mandatory")
 		return
 	}
+	if updateIncludesField(request.GetUpdateMask(),
+		"status.state", "status.message", "status.hub", "status.state_transition_time") {
+		err = grpcstatus.Errorf(grpccodes.InvalidArgument, "status output fields cannot be updated")
+		return
+	}
 	privateNATGateway := &privatev1.NATGateway{}
 	err = s.inMapper.Copy(ctx, publicNATGateway, privateNATGateway)
 	if err != nil {

@@ -390,6 +390,41 @@ var _ = Describe("Private external IP attachments server", func() {
 			Expect(updateResponse.GetObject().GetMetadata().GetLabels()).To(HaveKeyWithValue("env", "test"))
 		})
 
+		It("allows trusted lifecycle updates to status.message and status.hub", func() {
+			eip := createExternalIPInState(ctx, externalIPDao, sharedPool.GetId(),
+				privatev1.ExternalIPState_EXTERNAL_IP_STATE_ALLOCATED, false)
+			ci := createComputeInstanceInState(ctx, computeInstanceDao,
+				privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_RUNNING)
+			createResponse, err := server.Create(ctx, privatev1.ExternalIPAttachmentsCreateRequest_builder{
+				Object: privatev1.ExternalIPAttachment_builder{
+					Metadata: privatev1.Metadata_builder{Name: "trusted-status-update"}.Build(),
+					Spec: privatev1.ExternalIPAttachmentSpec_builder{
+						ExternalIp:      privatev1.ExternalIPLocalReference_builder{Id: eip.GetId()}.Build(),
+						ComputeInstance: privatev1.ComputeInstanceLocalReference_builder{Id: ci.GetId()}.Build(),
+					}.Build(),
+				}.Build(),
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+
+			message := "trusted message"
+			object := privatev1.ExternalIPAttachment_builder{
+				Id: createResponse.GetObject().GetId(),
+				Status: privatev1.ExternalIPAttachmentStatus_builder{
+					Message: &message,
+					Hub:     "hub-1",
+				}.Build(),
+			}.Build()
+			response, err := server.Update(ctx, privatev1.ExternalIPAttachmentsUpdateRequest_builder{
+				Object: object,
+				UpdateMask: &fieldmaskpb.FieldMask{
+					Paths: []string{"status.message", "status.hub"},
+				},
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+			Expect(response.GetObject().GetStatus().GetMessage()).To(Equal("trusted message"))
+			Expect(response.GetObject().GetStatus().GetHub()).To(Equal("hub-1"))
+		})
+
 		It("Deletes an external IP attachment", func() {
 			eip := createExternalIPInState(ctx, externalIPDao, sharedPool.GetId(),
 				privatev1.ExternalIPState_EXTERNAL_IP_STATE_ALLOCATED, false)

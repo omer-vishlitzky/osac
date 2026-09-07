@@ -317,6 +317,40 @@ var _ = Describe("Private NAT gateways server", func() {
 			Expect(updateResponse.GetObject().GetMetadata().GetLabels()).To(HaveKeyWithValue("env", "test"))
 		})
 
+		It("allows trusted lifecycle updates to status.state, status.message, and status.hub", func() {
+			eip := createAllocatedExternalIP()
+			createResponse, err := natGatewaysServer.Create(ctx, privatev1.NATGatewaysCreateRequest_builder{
+				Object: privatev1.NATGateway_builder{
+					Metadata: privatev1.Metadata_builder{Name: "trusted-status-update", Tenant: testTenant}.Build(),
+					Spec: privatev1.NATGatewaySpec_builder{
+						VirtualNetwork: privatev1.VirtualNetworkLocalReference_builder{Id: vnID}.Build(),
+						ExternalIp:     privatev1.ExternalIPLocalReference_builder{Id: eip.GetId()}.Build(),
+					}.Build(),
+				}.Build(),
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+
+			message := "trusted message"
+			object := privatev1.NATGateway_builder{
+				Id: createResponse.GetObject().GetId(),
+				Status: privatev1.NATGatewayStatus_builder{
+					State:   privatev1.NATGatewayState_NAT_GATEWAY_STATE_FAILED,
+					Message: &message,
+					Hub:     "hub-1",
+				}.Build(),
+			}.Build()
+			response, err := natGatewaysServer.Update(ctx, privatev1.NATGatewaysUpdateRequest_builder{
+				Object: object,
+				UpdateMask: &fieldmaskpb.FieldMask{
+					Paths: []string{"status.state", "status.message", "status.hub"},
+				},
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+			Expect(response.GetObject().GetStatus().GetState()).To(Equal(privatev1.NATGatewayState_NAT_GATEWAY_STATE_FAILED))
+			Expect(response.GetObject().GetStatus().GetMessage()).To(Equal("trusted message"))
+			Expect(response.GetObject().GetStatus().GetHub()).To(Equal("hub-1"))
+		})
+
 		It("soft deletes NATGateway", func() {
 			eip := createAllocatedExternalIP()
 			createResponse, err := natGatewaysServer.Create(ctx, privatev1.NATGatewaysCreateRequest_builder{

@@ -21,6 +21,7 @@ import (
 	"errors"
 	"net"
 	"sync"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -64,7 +65,10 @@ var _ = Describe("ExternalIPAttachmentFeedbackController", func() {
 
 		scheme := runtime.NewScheme()
 		Expect(v1alpha1.AddToScheme(scheme)).To(Succeed())
-		k8sClient = fake.NewClientBuilder().WithScheme(scheme).Build()
+		k8sClient = fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithStatusSubresource(&v1alpha1.ExternalIP{}, &v1alpha1.ExternalIPAttachment{}).
+			Build()
 
 		mockAttachmentsServer = &mockExternalIPAttachmentsServer{
 			attachments: make(map[string]*privatev1.ExternalIPAttachment),
@@ -164,6 +168,7 @@ var _ = Describe("ExternalIPAttachmentFeedbackController", func() {
 				},
 			}
 			attachment.GetSpec().SetExternalIp(&privatev1.ExternalIPLocalReference{Id: parentExternalIPID})
+			attachment.GetSpec().SetComputeInstance(&privatev1.ComputeInstanceLocalReference{Id: "compute-instance-789"})
 			mockAttachmentsServer.addAttachment(attachment)
 
 			parentExternalIP := &privatev1.ExternalIP{
@@ -175,7 +180,16 @@ var _ = Describe("ExternalIPAttachmentFeedbackController", func() {
 				Status: &privatev1.ExternalIPStatus{},
 			}
 			mockExternalIPsServer2.addExternalIP(parentExternalIP)
+			Expect(k8sClient.Create(ctx, &v1alpha1.ExternalIP{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "parent-externalip",
+					Namespace: attachmentNamespace,
+					Labels:    map[string]string{osacExternalIPIDLabel: parentExternalIPID},
+				},
+				Spec: v1alpha1.ExternalIPSpec{Pool: "pool-id"},
+			})).To(Succeed())
 
+			transitionTime := time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC)
 			cr := &v1alpha1.ExternalIPAttachment{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      attachmentName,
@@ -188,7 +202,8 @@ var _ = Describe("ExternalIPAttachmentFeedbackController", func() {
 					ExternalIP: "some-externalip",
 				},
 				Status: v1alpha1.ExternalIPAttachmentStatus{
-					Phase: v1alpha1.ExternalIPAttachmentPhaseReady,
+					Phase:               v1alpha1.ExternalIPAttachmentPhaseReady,
+					StateTransitionTime: &metav1.Time{Time: transitionTime},
 				},
 			}
 			Expect(k8sClient.Create(ctx, cr)).To(Succeed())
@@ -206,6 +221,8 @@ var _ = Describe("ExternalIPAttachmentFeedbackController", func() {
 
 			Expect(mockExternalIPsServer2.updates).To(HaveLen(1))
 			Expect(mockExternalIPsServer2.updates[0].GetStatus().GetAttached()).To(BeTrue())
+			Expect(mockExternalIPsServer2.updates[0].GetStatus().GetAttribution().GetComputeInstance().GetId()).To(Equal("compute-instance-789"))
+			Expect(mockExternalIPsServer2.updates[0].GetStatus().GetAttachmentTransitionTime().AsTime()).To(Equal(transitionTime))
 		})
 
 		It("should sync Phase=Failed to state=FAILED", func() {
@@ -275,6 +292,14 @@ var _ = Describe("ExternalIPAttachmentFeedbackController", func() {
 			}
 			parentExternalIP.GetStatus().SetAttached(true)
 			mockExternalIPsServer2.addExternalIP(parentExternalIP)
+			Expect(k8sClient.Create(ctx, &v1alpha1.ExternalIP{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "parent-externalip",
+					Namespace: attachmentNamespace,
+					Labels:    map[string]string{osacExternalIPIDLabel: parentExternalIPID},
+				},
+				Spec: v1alpha1.ExternalIPSpec{Pool: "pool-id"},
+			})).To(Succeed())
 
 			cr := &v1alpha1.ExternalIPAttachment{
 				ObjectMeta: metav1.ObjectMeta{
@@ -333,6 +358,14 @@ var _ = Describe("ExternalIPAttachmentFeedbackController", func() {
 				Status: &privatev1.ExternalIPStatus{},
 			}
 			mockExternalIPsServer2.addExternalIP(parentExternalIP)
+			Expect(k8sClient.Create(ctx, &v1alpha1.ExternalIP{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "parent-externalip",
+					Namespace: attachmentNamespace,
+					Labels:    map[string]string{osacExternalIPIDLabel: parentExternalIPID},
+				},
+				Spec: v1alpha1.ExternalIPSpec{Pool: "pool-id"},
+			})).To(Succeed())
 
 			cr := &v1alpha1.ExternalIPAttachment{
 				ObjectMeta: metav1.ObjectMeta{
@@ -487,7 +520,7 @@ var _ = Describe("ExternalIPAttachmentFeedbackController", func() {
 			Expect(errors.Is(err, ErrExternalIPAttachmentNotFound)).To(BeTrue())
 		})
 
-		It("should not update if status unchanged", func() {
+		It("should fail attached feedback without an attribution target", func() {
 			attachment := &privatev1.ExternalIPAttachment{
 				Id: attachmentID,
 				Metadata: &privatev1.Metadata{
@@ -536,10 +569,39 @@ var _ = Describe("ExternalIPAttachmentFeedbackController", func() {
 					Namespace: attachmentNamespace,
 				},
 			})
-			Expect(err).NotTo(HaveOccurred())
+			Expect(err).To(MatchError(ContainSubstring("has no attribution target")))
 
 			Expect(mockAttachmentsServer.updates).To(BeEmpty())
 			Expect(mockExternalIPsServer2.updates).To(BeEmpty())
+		})
+
+		It("should fail attached feedback when the parent ExternalIP ID is empty", func() {
+			attachment := &privatev1.ExternalIPAttachment{
+				Id:       attachmentID,
+				Metadata: &privatev1.Metadata{Name: attachmentName},
+				Spec:     &privatev1.ExternalIPAttachmentSpec{},
+				Status: &privatev1.ExternalIPAttachmentStatus{
+					State: privatev1.ExternalIPAttachmentState_EXTERNAL_IP_ATTACHMENT_STATE_READY,
+				},
+			}
+			attachment.GetSpec().SetComputeInstance(&privatev1.ComputeInstanceLocalReference{Id: "compute-instance-789"})
+			mockAttachmentsServer.addAttachment(attachment)
+
+			cr := &v1alpha1.ExternalIPAttachment{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      attachmentName,
+					Namespace: attachmentNamespace,
+					Labels:    map[string]string{osacExternalIPAttachmentIDLabel: attachmentID},
+				},
+				Spec:   v1alpha1.ExternalIPAttachmentSpec{ExternalIP: ""},
+				Status: v1alpha1.ExternalIPAttachmentStatus{Phase: v1alpha1.ExternalIPAttachmentPhaseReady},
+			}
+			Expect(k8sClient.Create(ctx, cr)).To(Succeed())
+
+			_, err := reconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: attachmentName, Namespace: attachmentNamespace},
+			})
+			Expect(err).To(MatchError(ContainSubstring("has no external IP identifier")))
 		})
 
 		It("should remove feedback finalizer and signal when it is the last finalizer", func() {
@@ -565,6 +627,14 @@ var _ = Describe("ExternalIPAttachmentFeedbackController", func() {
 				Status: &privatev1.ExternalIPStatus{},
 			}
 			mockExternalIPsServer2.addExternalIP(parentExternalIP)
+			Expect(k8sClient.Create(ctx, &v1alpha1.ExternalIP{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "parent-externalip",
+					Namespace: attachmentNamespace,
+					Labels:    map[string]string{osacExternalIPIDLabel: parentExternalIPID},
+				},
+				Spec: v1alpha1.ExternalIPSpec{Pool: "pool-id"},
+			})).To(Succeed())
 
 			cr := &v1alpha1.ExternalIPAttachment{
 				ObjectMeta: metav1.ObjectMeta{

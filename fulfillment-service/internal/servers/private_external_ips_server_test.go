@@ -482,6 +482,40 @@ var _ = Describe("Private external IPs server", func() {
 			Expect(err).To(HaveOccurred())
 			Expect(err.Error()).To(ContainSubstring("immutable"))
 		})
+
+		It("allows trusted lifecycle updates to status.hub", func() {
+			object := createExternalIPInState(externalIPsServer, privatev1.ExternalIPState_EXTERNAL_IP_STATE_ALLOCATED)
+			object.GetStatus().SetHub("hub-1")
+			response, err := externalIPsServer.Update(ctx, privatev1.ExternalIPsUpdateRequest_builder{
+				Object: object,
+				UpdateMask: &fieldmaskpb.FieldMask{
+					Paths: []string{"status.hub"},
+				},
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+			Expect(response.GetObject().GetStatus().GetHub()).To(Equal("hub-1"))
+		})
+
+		DescribeTable("rejects output-only status fields in an update mask",
+			func(path string) {
+				object := createExternalIPInState(externalIPsServer, privatev1.ExternalIPState_EXTERNAL_IP_STATE_ALLOCATED)
+				_, err := externalIPsServer.Update(ctx, privatev1.ExternalIPsUpdateRequest_builder{
+					Object: object,
+					UpdateMask: &fieldmaskpb.FieldMask{
+						Paths: []string{path},
+					},
+				}.Build())
+				Expect(err).To(HaveOccurred())
+				status, ok := grpcstatus.FromError(err)
+				Expect(ok).To(BeTrue())
+				Expect(status.Code()).To(Equal(grpccodes.InvalidArgument))
+			},
+			Entry("attribution", "status.attribution"),
+			Entry("attached", "status.attached"),
+			Entry("pool", "status.pool"),
+			Entry("attachment transition time", "status.attachment_transition_time"),
+			Entry("state transition time", "status.state_transition_time"),
+		)
 	})
 
 	Describe("Delete constraint", func() {

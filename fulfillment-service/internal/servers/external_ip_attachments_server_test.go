@@ -19,6 +19,8 @@ import (
 	"github.com/google/uuid"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"google.golang.org/grpc/codes"
+	grpcstatus "google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
 
@@ -353,9 +355,29 @@ var _ = Describe("External IP attachments server", func() {
 							ExternalIp: publicv1.ExternalIPLocalReference_builder{Id: "different-ip-id"}.Build(),
 						}.Build(),
 					}.Build(),
+					UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"spec.external_ip"}},
 				}.Build())
 			Expect(err).To(HaveOccurred())
 			Expect(err.Error()).To(ContainSubstring("immutable"))
+		})
+
+		It("rejects output-only status updates with nil and explicit masks", func() {
+			created := createAttachment()
+
+			_, err := externalIPAttachmentsServer.Update(ctx,
+				publicv1.ExternalIPAttachmentsUpdateRequest_builder{
+					Object: created,
+				}.Build())
+			Expect(grpcstatus.Code(err)).To(Equal(codes.InvalidArgument))
+
+			_, err = externalIPAttachmentsServer.Update(ctx,
+				publicv1.ExternalIPAttachmentsUpdateRequest_builder{
+					Object: publicv1.ExternalIPAttachment_builder{Id: created.GetId()}.Build(),
+					UpdateMask: &fieldmaskpb.FieldMask{
+						Paths: []string{"status.state"},
+					},
+				}.Build())
+			Expect(grpcstatus.Code(err)).To(Equal(codes.InvalidArgument))
 		})
 
 		It("Delete object", func() {

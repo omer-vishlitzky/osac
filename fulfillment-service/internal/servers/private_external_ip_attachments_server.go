@@ -239,6 +239,11 @@ func (s *PrivateExternalIPAttachmentsServer) Update(ctx context.Context,
 	}
 
 	mask := request.GetUpdateMask()
+	if mask != nil && len(mask.GetPaths()) > 0 && updateIncludesField(mask,
+		"status.external_ip_address", "status.state_transition_time") {
+		err = grpcstatus.Errorf(grpccodes.InvalidArgument, "status output fields cannot be updated")
+		return
+	}
 	if updateIncludesField(mask,
 		"spec.external_ip", "spec.compute_instance", "spec.cluster",
 		"spec.baremetal_instance", "spec.target_endpoint") {

@@ -209,6 +209,10 @@ func (s *PrivateNATGatewaysServer) Update(ctx context.Context,
 	}
 
 	mask := request.GetUpdateMask()
+	if mask != nil && len(mask.GetPaths()) > 0 && updateIncludesField(mask, "status.state_transition_time") {
+		err = grpcstatus.Errorf(grpccodes.InvalidArgument, "status output fields cannot be updated")
+		return
+	}
 	if updateIncludesField(mask, "spec.virtual_network", "spec.external_ip") {
 		getRequest := &privatev1.NATGatewaysGetRequest{}
 		getRequest.SetId(id)
