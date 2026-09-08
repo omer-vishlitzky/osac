@@ -197,13 +197,13 @@ jobs:
       id-token: write
     uses: osac-project/osac-test-infra/.github/workflows/e2e-bmaas-full-install.yml@main
     with:
-      # PR/merge_group: sanity (-n 4).
-      # Schedule: serial (-n 0, inventory exhaust). workflow_dispatch: honor
-      # input, else sanity (bmaas/regression for networking, bmaas for all).
+      # PR/merge_group: full bmaas suite. Schedule: serial (-n 0, inventory
+      # exhaust). workflow_dispatch: honor input, else sanity (bmaas/regression
+      # for networking, bmaas for all).
       test-suite: >-
         ${{
           inputs.test-suite != '' && inputs.test-suite ||
-          (github.event_name == 'pull_request' || github.event_name == 'merge_group') && 'bmaas/sanity' ||
+          (github.event_name == 'pull_request' || github.event_name == 'merge_group') && 'bmaas' ||
           github.event_name == 'schedule' && 'bmaas/serial' ||
           'bmaas/sanity'
         }}
