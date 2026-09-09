@@ -172,6 +172,13 @@ func (c *Consumer) handleEvent(ctx context.Context, event *privatev1.Event) erro
 		}
 		return err
 	}
+	if projectionIsAhead(existing, version, currentState, dims) {
+		c.logger.Info("skipping stale Watch event before publication",
+			"resource_id", resourceID,
+			"event_version", version,
+			"projection_version", existing.FulfillmentVersion)
+		return nil
+	}
 
 	if c.shouldSkipUpdate(ctx, event, existing, currentState, dims, version, transitionTime, resourceID) {
 		return nil
@@ -209,6 +216,17 @@ func (c *Consumer) handleEvent(ctx context.Context, event *privatev1.Event) erro
 	projState := c.buildProjectionState(mapper, existing, transitionTime, version, currentState, isBillable, dims)
 
 	if event.GetType() == privatev1.EventType_EVENT_TYPE_OBJECT_DELETED {
+		latest, err := c.store.Get(ctx, resourceID)
+		if err != nil {
+			return fmt.Errorf("rechecking projection for %s: %w", resourceID, err)
+		}
+		if projectionIsAhead(latest, version, currentState, dims) {
+			c.logger.Info("skipping stale delete event before publication",
+				"resource_id", resourceID,
+				"event_version", version,
+				"projection_version", latest.FulfillmentVersion)
+			return nil
+		}
 		if err := c.publishLifecycleEvents(ctx, ce, mapper, event.GetId()); err != nil {
 			return err
 		}
@@ -231,6 +249,18 @@ func (c *Consumer) handleEvent(ctx context.Context, event *privatev1.Event) erro
 // successful publish, replay produces duplicate events (handled by adapter
 // dedup via deterministic CloudEvent IDs).
 func (c *Consumer) publishAndUpsert(ctx context.Context, publish func() error, state projection.ResourceState, resourceID string) error {
+	latest, err := c.store.Get(ctx, resourceID)
+	if err != nil {
+		return fmt.Errorf("rechecking projection for %s: %w", resourceID, err)
+	}
+	if projectionIsAhead(latest, state.FulfillmentVersion, state.CurrentState, state.BillingDimensions) {
+		c.logger.Info("skipping stale Watch event before publication",
+			"resource_id", resourceID,
+			"event_version", state.FulfillmentVersion,
+			"projection_version", latest.FulfillmentVersion)
+		return nil
+	}
+
 	if err := publish(); err != nil {
 		return err
 	}
@@ -244,6 +274,20 @@ func (c *Consumer) publishAndUpsert(ctx context.Context, publish func() error, s
 		return fmt.Errorf("upserting projection for %s: %w", resourceID, err)
 	}
 	return nil
+}
+
+// projectionIsAhead rejects an older snapshot and a conflicting snapshot with
+// the same fulfillment version. A missing projection is always accepted because
+// no ordering information exists until the resource is first observed.
+func projectionIsAhead(existing *projection.ResourceState, version int32, currentState string, dims map[string]any) bool {
+	if existing == nil {
+		return false
+	}
+	if existing.FulfillmentVersion > version {
+		return true
+	}
+	return existing.FulfillmentVersion == version &&
+		(existing.CurrentState != currentState || !events.DimensionsEqual(existing.BillingDimensions, dims))
 }
 
 // handleTransientState updates only FulfillmentVersion and TransitionTime

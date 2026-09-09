@@ -707,6 +707,7 @@ var _ = Describe("Consumer", func() {
 			}
 
 			ci := makeComputeInstance("vm-del", "tenant-1")
+			ci.Metadata.Version = 2
 			ci.Metadata.DeletionTimestamp = timestamppb.Now()
 			event := &privatev1.Event{
 				Id:      "vm-del",
@@ -735,7 +736,7 @@ var _ = Describe("Consumer", func() {
 			Expect(store.states).ToNot(HaveKey("vm-del"))
 		})
 
-		It("publishes event but skips projection update on stale version", func() {
+		It("does not publish a stale Watch snapshot after a newer snapshot advanced the projection", func() {
 			store := newMockStore()
 			now := time.Now().UTC().Truncate(time.Microsecond)
 			store.states["vm-stale"] = projection.ResourceState{
@@ -744,21 +745,34 @@ var _ = Describe("Consumer", func() {
 				TenantID:           "tenant-1",
 				CurrentState:       "STOPPED",
 				IsBillable:         false,
-				FulfillmentVersion: 10,
+				FulfillmentVersion: 1,
 				BillingDimensions:  map[string]any{},
 				TransitionTime:     now,
 			}
 
-			ci := makeComputeInstance("vm-stale", "tenant-1")
-			ci.Metadata.Version = 5
-			event := &privatev1.Event{
+			newerCI := makeComputeInstance("vm-stale", "tenant-1")
+			newerCI.Metadata.Version = 10
+			newerCI.Status.State = privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_RUNNING
+			newerEvent := &privatev1.Event{
+				Id:      "evt-newer",
+				Type:    privatev1.EventType_EVENT_TYPE_OBJECT_UPDATED,
+				Payload: &privatev1.Event_ComputeInstance{ComputeInstance: newerCI},
+			}
+
+			staleCI := makeComputeInstance("vm-stale", "tenant-1")
+			staleCI.Metadata.Version = 5
+			staleCI.Status.State = privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_STOPPED
+			staleEvent := &privatev1.Event{
 				Id:      "evt-stale",
 				Type:    privatev1.EventType_EVENT_TYPE_OBJECT_UPDATED,
-				Payload: &privatev1.Event_ComputeInstance{ComputeInstance: ci},
+				Payload: &privatev1.Event_ComputeInstance{ComputeInstance: staleCI},
 			}
 
 			stream := &mockWatchStream{
-				responses: []*privatev1.EventsWatchResponse{makeResponse(event)},
+				responses: []*privatev1.EventsWatchResponse{
+					makeResponse(newerEvent),
+					makeResponse(staleEvent),
+				},
 			}
 			client.results = []mockStreamResult{{stream: stream}}
 
@@ -770,11 +784,59 @@ var _ = Describe("Consumer", func() {
 
 			pub.mu.Lock()
 			defer pub.mu.Unlock()
-			Expect(pub.published).To(HaveLen(1), "event published even when projection is stale")
+			Expect(pub.published).To(HaveLen(1))
+			Expect(pub.published[0].ID()).To(Equal("evt-newer"))
 
 			store.mu.Lock()
 			defer store.mu.Unlock()
 			Expect(store.states["vm-stale"].FulfillmentVersion).To(Equal(int32(10)))
+			Expect(store.states["vm-stale"].CurrentState).To(Equal("RUNNING"))
+		})
+
+		It("does not publish a conflicting snapshot with the same fulfillment version", func() {
+			store := newMockStore()
+			now := time.Now().UTC().Truncate(time.Microsecond)
+			store.states["vm-conflict"] = projection.ResourceState{
+				ResourceID:         "vm-conflict",
+				ResourceType:       events.ResourceTypeComputeInstance,
+				TenantID:           "tenant-1",
+				CurrentState:       "RUNNING",
+				IsBillable:         true,
+				FulfillmentVersion: 10,
+				BillingDimensions:  map[string]any{},
+				TransitionTime:     now,
+			}
+
+			ci := makeComputeInstance("vm-conflict", "tenant-1")
+			ci.Metadata.Version = 10
+			ci.Status.State = privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_STOPPED
+			event := &privatev1.Event{
+				Id:      "evt-conflict",
+				Type:    privatev1.EventType_EVENT_TYPE_OBJECT_UPDATED,
+				Payload: &privatev1.Event_ComputeInstance{ComputeInstance: ci},
+			}
+
+			stream := &mockWatchStream{
+				responses: []*privatev1.EventsWatchResponse{makeResponse(event)},
+			}
+			client.results = []mockStreamResult{{stream: stream}}
+
+			pub := &mockPublisher{}
+			consumer := newConsumerWithStore(pub, store)
+
+			done := make(chan error, 1)
+			go func() { done <- consumer.Run(ctx) }()
+			time.Sleep(50 * time.Millisecond)
+			cancel()
+			Eventually(done, time.Second).Should(Receive(BeNil()))
+
+			pub.mu.Lock()
+			defer pub.mu.Unlock()
+			Expect(pub.published).To(BeEmpty())
+
+			store.mu.Lock()
+			defer store.mu.Unlock()
+			Expect(store.states["vm-conflict"].CurrentState).To(Equal("RUNNING"))
 		})
 
 		It("publishes updated.v1 and updates projection on dimension change while billable (RUNNING->RUNNING)", func() {
@@ -1665,6 +1727,7 @@ var _ = Describe("Consumer", func() {
 				"cpu-workers": {HostType: &privatev1.HostTypeReference{Name: "cpu-only"}, Size: proto.Int32(5)},
 				"gpu-workers": {HostType: &privatev1.HostTypeReference{Name: "gpu-h100"}, Size: proto.Int32(4)},
 			})
+			clAtT2.Metadata.Version = 3
 			clAtT2.Status.StateTransitionTime = timestamppb.New(t2)
 			eventT2 := &privatev1.Event{
 				Id:      "evt-t2",
