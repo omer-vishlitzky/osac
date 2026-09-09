@@ -277,6 +277,10 @@ ui:
 # --- Metering ---
 metering:
   enabled: false
+  # Stable installation identity for metering dimensions. Empty uses the Helm
+  # release name; set an explicit namespace-qualified value when releases share
+  # billing data.
+  deploymentId: ""
   image:
     repository: ghcr.io/osac-project/metering-service
     tag: latest  # PLACEHOLDER -- overwritten at release time by publish-charts.yaml
