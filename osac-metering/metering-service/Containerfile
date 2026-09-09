@@ -5,7 +5,22 @@ ARG TARGETARCH
 WORKDIR /opt/app-root/src
 COPY --chown=1001:0 schema/ schema/
 COPY --chown=1001:0 metering-service/go.mod metering-service/go.sum metering-service/
-RUN cd metering-service && go mod download
+RUN \
+  set -eu; \
+  for attempt in 1 2 3 4 5; do \
+    if output=$(cd metering-service && go mod download 2>&1); then \
+      printf '%s\n' "$output"; \
+      exit 0; \
+    else \
+      status=$?; \
+    fi; \
+    printf '%s\n' "$output" >&2; \
+    if ! printf '%s\n' "$output" | grep -Eq 'stream error|unexpected EOF|connection (reset|refused|closed)|i/o timeout|TLS handshake timeout|proxyconnect|no such host|HTTP (408|429|5[0-9][0-9])'; then \
+      exit "$status"; \
+    fi; \
+    if [ "$attempt" -lt 5 ]; then sleep "$((attempt * 2))"; fi; \
+  done; \
+  exit 1
 
 COPY --chown=1001:0 metering-service/ metering-service/
 
