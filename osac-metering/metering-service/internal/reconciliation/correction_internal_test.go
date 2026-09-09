@@ -153,6 +153,66 @@ func TestBuildCorrectionEventsSameDimensionsGetSameID(t *testing.T) {
 	}
 }
 
+func TestBuildCorrectionEventsCanonicalizesAdjustmentOrder(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	firstOrder := map[string]any{
+		"cluster_template": "ocp-ci-small",
+		"release_image":    "4.17.0",
+		"components": []any{
+			map[string]any{
+				"node_set":   "_control_plane",
+				"component":  "control_plane",
+				"host_type":  "_control_plane",
+				"node_count": int32(1),
+			},
+			map[string]any{
+				"node_set":   "gpu-workers",
+				"component":  "worker",
+				"host_type":  "gpu-h100",
+				"node_count": int32(2),
+			},
+		},
+	}
+	secondOrder := map[string]any{
+		"components": []any{
+			map[string]any{
+				"node_count": int32(2),
+				"host_type":  "gpu-h100",
+				"component":  "worker",
+				"node_set":   "gpu-workers",
+			},
+			map[string]any{
+				"node_count": int32(1),
+				"host_type":  "_control_plane",
+				"component":  "control_plane",
+				"node_set":   "_control_plane",
+			},
+		},
+		"release_image":    "4.17.0",
+		"cluster_template": "ocp-ci-small",
+	}
+
+	first, err := buildCorrectionEvents("cluster-1", events.ResourceTypeClusterOrder, "tenant-1", "",
+		BillingDimensionsDrift, "READY", "READY", firstOrder, nil, now)
+	if err != nil {
+		t.Fatalf("first correction: unexpected error: %v", err)
+	}
+	replay, err := buildCorrectionEvents("cluster-1", events.ResourceTypeClusterOrder, "tenant-1", "",
+		BillingDimensionsDrift, "READY", "READY", secondOrder, nil, now)
+	if err != nil {
+		t.Fatalf("replayed correction: unexpected error: %v", err)
+	}
+
+	if len(first) != 2 || len(replay) != 2 {
+		t.Fatalf("expected two adjustment events per correction, got %d and %d", len(first), len(replay))
+	}
+	for i := range first {
+		if first[i].ID() != replay[i].ID() {
+			t.Errorf("semantic correction adjustment %d changed provider identity across order-only replay: %q != %q", i, first[i].ID(), replay[i].ID())
+		}
+	}
+}
+
 func TestTransientCheckersCoversAllBillabilityCheckerKeys(t *testing.T) {
 	for resourceType := range billabilityCheckers {
 		if _, ok := transientCheckers[resourceType]; !ok {

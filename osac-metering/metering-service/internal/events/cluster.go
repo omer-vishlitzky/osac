@@ -304,8 +304,30 @@ func DecomposeClusterComponents(billingDims map[string]any) ([]ComponentRecord, 
 			ReleaseImage:    releaseImage,
 		})
 	}
+	sort.Slice(records, func(i, j int) bool {
+		return componentRecordLess(records[i], records[j])
+	})
 
 	return records, nil
+}
+
+func componentRecordLess(a, b ComponentRecord) bool {
+	if a.NodeSet != b.NodeSet {
+		return a.NodeSet < b.NodeSet
+	}
+	if a.Component != b.Component {
+		return a.Component < b.Component
+	}
+	if a.HostType != b.HostType {
+		return a.HostType < b.HostType
+	}
+	if a.NodeCount != b.NodeCount {
+		return a.NodeCount < b.NodeCount
+	}
+	if a.ClusterTemplate != b.ClusterTemplate {
+		return a.ClusterTemplate < b.ClusterTemplate
+	}
+	return a.ReleaseImage < b.ReleaseImage
 }
 
 // ComponentEventID derives a deterministic CloudEvent ID for a decomposed
