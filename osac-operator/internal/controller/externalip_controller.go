@@ -154,6 +154,10 @@ func (r *ExternalIPReconciler) Reconcile(ctx context.Context, req mcreconcile.Re
 	}
 
 	if !equality.Semantic.DeepEqual(externalIP.Status, *oldstatus) {
+		if oldstatus.Phase != externalIP.Status.Phase || oldstatus.State != externalIP.Status.State {
+			now := metav1.Now()
+			externalIP.Status.StateTransitionTime = &now
+		}
 		log.Info("status requires update", "phase", externalIP.Status.Phase)
 		if updateErr := r.updateStatusWithRetry(ctx, req.NamespacedName, externalIP.Status); updateErr != nil {
 			log.Error(updateErr, "failed to update status")

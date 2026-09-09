@@ -21,6 +21,7 @@ import (
 	"errors"
 	"net"
 	"sync"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -153,6 +154,7 @@ var _ = Describe("ExternalIPAttachmentFeedbackController", func() {
 		})
 
 		It("should sync Phase=Ready to state=READY and set parent ExternalIP attached=true", func() {
+			transitionTime := metav1.NewTime(time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC))
 			attachment := &privatev1.ExternalIPAttachment{
 				Id: attachmentID,
 				Metadata: &privatev1.Metadata{
@@ -188,7 +190,8 @@ var _ = Describe("ExternalIPAttachmentFeedbackController", func() {
 					ExternalIP: "some-externalip",
 				},
 				Status: v1alpha1.ExternalIPAttachmentStatus{
-					Phase: v1alpha1.ExternalIPAttachmentPhaseReady,
+					Phase:               v1alpha1.ExternalIPAttachmentPhaseReady,
+					StateTransitionTime: &transitionTime,
 				},
 			}
 			Expect(k8sClient.Create(ctx, cr)).To(Succeed())
@@ -206,6 +209,7 @@ var _ = Describe("ExternalIPAttachmentFeedbackController", func() {
 
 			Expect(mockExternalIPsServer2.updates).To(HaveLen(1))
 			Expect(mockExternalIPsServer2.updates[0].GetStatus().GetAttached()).To(BeTrue())
+			Expect(mockExternalIPsServer2.updates[0].GetStatus().GetAttachmentTransitionTime().AsTime()).To(Equal(transitionTime.Time))
 		})
 
 		It("should sync Phase=Failed to state=FAILED", func() {

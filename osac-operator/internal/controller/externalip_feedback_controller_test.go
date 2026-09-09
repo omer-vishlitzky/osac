@@ -21,6 +21,7 @@ import (
 	"errors"
 	"net"
 	"sync"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -152,6 +153,7 @@ var _ = Describe("ExternalIPFeedbackController", func() {
 		})
 
 		It("should sync State=Allocated to database state=ALLOCATED", func() {
+			transitionTime := metav1.NewTime(time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC))
 			publicIP := &privatev1.ExternalIP{
 				Id: publicIPID,
 				Metadata: &privatev1.Metadata{
@@ -178,8 +180,9 @@ var _ = Describe("ExternalIPFeedbackController", func() {
 					Pool: testPool,
 				},
 				Status: v1alpha1.ExternalIPStatus{
-					Phase: v1alpha1.ExternalIPPhaseReady,
-					State: v1alpha1.ExternalIPStateAllocated,
+					Phase:               v1alpha1.ExternalIPPhaseReady,
+					State:               v1alpha1.ExternalIPStateAllocated,
+					StateTransitionTime: &transitionTime,
 				},
 			}
 			Expect(k8sClient.Create(ctx, cr)).To(Succeed())
@@ -194,6 +197,7 @@ var _ = Describe("ExternalIPFeedbackController", func() {
 
 			Expect(mockServer.updates).To(HaveLen(1))
 			Expect(mockServer.updates[0].GetStatus().GetState()).To(Equal(privatev1.ExternalIPState_EXTERNAL_IP_STATE_ALLOCATED))
+			Expect(mockServer.updates[0].GetStatus().GetStateTransitionTime().AsTime()).To(Equal(transitionTime.Time))
 
 			updated := &v1alpha1.ExternalIP{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: publicIPName, Namespace: publicIPNamespace}, updated)).To(Succeed())

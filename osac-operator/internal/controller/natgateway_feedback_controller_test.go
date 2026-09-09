@@ -20,6 +20,7 @@ import (
 	"context"
 	"net"
 	"sync"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -102,6 +103,7 @@ var _ = Describe("NATGatewayFeedbackController", func() {
 
 	Context("when reconciling a NATGateway CR", func() {
 		It("should sync Phase=Ready to database state=READY", func() {
+			transitionTime := metav1.NewTime(time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC))
 			natGateway := &privatev1.NATGateway{
 				Id: natGatewayID,
 				Metadata: &privatev1.Metadata{
@@ -130,7 +132,8 @@ var _ = Describe("NATGatewayFeedbackController", func() {
 					ExternalIP:     "eip-456",
 				},
 				Status: v1alpha1.NATGatewayStatus{
-					Phase: v1alpha1.NATGatewayPhaseReady,
+					Phase:               v1alpha1.NATGatewayPhaseReady,
+					StateTransitionTime: &transitionTime,
 				},
 			}
 			Expect(k8sClient.Create(ctx, cr)).To(Succeed())
@@ -145,6 +148,7 @@ var _ = Describe("NATGatewayFeedbackController", func() {
 
 			Expect(mockServer.updates).To(HaveLen(1))
 			Expect(mockServer.updates[0].GetStatus().GetState()).To(Equal(privatev1.NATGatewayState_NAT_GATEWAY_STATE_READY))
+			Expect(mockServer.updates[0].GetStatus().GetStateTransitionTime().AsTime()).To(Equal(transitionTime.Time))
 
 			updated := &v1alpha1.NATGateway{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: natGatewayName, Namespace: natGatewayNamespace}, updated)).To(Succeed())
