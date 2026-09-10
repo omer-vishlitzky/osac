@@ -195,6 +195,60 @@ var _ = Describe("ExternalIPReconciler", func() {
 			Expect(externalIPStateForTimestamp(deleting)).To(Equal(string(osacv1alpha1.ExternalIPStateAllocated)))
 		})
 
+		It("preserves the allocation timestamp while the CR is being deleted", func() {
+			key := types.NamespacedName{Name: "deleting-externalip", Namespace: testNamespace}
+			fixedTransitionTime := metav1.NewTime(time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC))
+			deletingIP := &osacv1alpha1.ExternalIP{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      key.Name,
+					Namespace: key.Namespace,
+					Finalizers: []string{
+						osacExternalIPFinalizer,
+					},
+					Annotations: map[string]string{
+						osacImplementationStrategyAnnotation: "metallb-l2",
+					},
+				},
+				Spec: osacv1alpha1.ExternalIPSpec{Pool: testPoolUUID},
+				Status: osacv1alpha1.ExternalIPStatus{
+					Phase:               osacv1alpha1.ExternalIPPhaseReady,
+					State:               osacv1alpha1.ExternalIPStateAllocated,
+					StateTransitionTime: &fixedTransitionTime,
+				},
+			}
+			Expect(fakeClient.Create(testCtx, deletingIP)).To(Succeed())
+
+			mockProvider.triggerDeprovisionFunc = func(
+				ctx context.Context, resource client.Object, _ []osacv1alpha1.JobStatus,
+			) (*provisioning.DeprovisionResult, error) {
+				return &provisioning.DeprovisionResult{
+					Action:                 provisioning.DeprovisionTriggered,
+					JobID:                  "deleting-job",
+					BlockDeletionOnFailure: true,
+				}, nil
+			}
+			mockProvider.getDeprovisionStatusFunc = func(
+				ctx context.Context, resource client.Object, jobID string,
+			) (provisioning.ProvisionStatus, error) {
+				return provisioning.ProvisionStatus{JobID: jobID, State: osacv1alpha1.JobStateRunning}, nil
+			}
+
+			Expect(fakeClient.Delete(testCtx, deletingIP)).To(Succeed())
+			_, err := reconciler.Reconcile(testCtx, mcreconcile.Request{Request: ctrl.Request{NamespacedName: key}})
+			Expect(err).NotTo(HaveOccurred())
+
+			updated := &osacv1alpha1.ExternalIP{}
+			Expect(fakeClient.Get(testCtx, key, updated)).To(Succeed())
+			Expect(updated.DeletionTimestamp.IsZero()).To(BeFalse())
+			Expect(updated.Status.Phase).To(Equal(osacv1alpha1.ExternalIPPhaseDeleting))
+			Expect(updated.Status.StateTransitionTime.Time.Equal(fixedTransitionTime.Time)).To(BeTrue())
+
+			_, err = reconciler.Reconcile(testCtx, mcreconcile.Request{Request: ctrl.Request{NamespacedName: key}})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(fakeClient.Get(testCtx, key, updated)).To(Succeed())
+			Expect(updated.Status.StateTransitionTime.Time.Equal(fixedTransitionTime.Time)).To(BeTrue())
+		})
+
 		It("should add finalizer on first reconcile", func() {
 			key := types.NamespacedName{Name: publicIP.Name, Namespace: publicIP.Namespace}
 			result, err := reconciler.Reconcile(testCtx, mcreconcile.Request{Request: ctrl.Request{NamespacedName: key}})

@@ -119,6 +119,7 @@ var _ = Describe("Protovalidate interceptor", func() {
 
 		It("Rejects an unknown ExternalIPAttachment endpoint enum value", func() {
 			invalidSpec := publicv1.ExternalIPAttachmentSpec_builder{
+				ExternalIp:     &publicv1.ExternalIPLocalReference{Id: "external-ip-1"},
 				Cluster:        &publicv1.ClusterLocalReference{Id: "cluster-1"},
 				TargetEndpoint: publicv1.ExternalIPAttachmentEndpoint(99),
 			}.Build()

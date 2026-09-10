@@ -143,10 +143,28 @@ func TestExternalIPAttributionValidation(t *testing.T) {
 	}
 
 	invalidPublicEndpoint := publicv1.ExternalIPAttachmentSpec_builder{
+		ExternalIp:     publicv1.ExternalIPLocalReference_builder{Id: "external-ip-1"}.Build(),
 		Cluster:        publicv1.ClusterLocalReference_builder{Id: "cluster-1"}.Build(),
 		TargetEndpoint: publicv1.ExternalIPAttachmentEndpoint(99),
 	}.Build()
 	if err := validator.Validate(invalidPublicEndpoint); err == nil {
 		t.Fatal("attachment with an unknown endpoint was accepted")
+	}
+
+	invalidPublicClusterEndpoint := publicv1.ExternalIPAttachmentSpec_builder{
+		ExternalIp: publicv1.ExternalIPLocalReference_builder{Id: "external-ip-1"}.Build(),
+		Cluster:    publicv1.ClusterLocalReference_builder{Id: "cluster-1"}.Build(),
+	}.Build()
+	if err := validator.Validate(invalidPublicClusterEndpoint); err == nil {
+		t.Fatal("attachment with an unspecified cluster endpoint was accepted")
+	}
+
+	invalidPublicComputeEndpoint := publicv1.ExternalIPAttachmentSpec_builder{
+		ExternalIp:      publicv1.ExternalIPLocalReference_builder{Id: "external-ip-1"}.Build(),
+		ComputeInstance: publicv1.ComputeInstanceLocalReference_builder{Id: "compute-1"}.Build(),
+		TargetEndpoint:  publicv1.ExternalIPAttachmentEndpoint_EXTERNAL_IP_ATTACHMENT_ENDPOINT_API,
+	}.Build()
+	if err := validator.Validate(invalidPublicComputeEndpoint); err == nil {
+		t.Fatal("attachment with an endpoint on a non-cluster target was accepted")
 	}
 }

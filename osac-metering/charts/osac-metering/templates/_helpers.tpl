@@ -16,7 +16,7 @@
 {{- end -}}
 
 {{- define "osac-metering.deploymentIdentityName" -}}
-{{- printf "%s-deployment-identity" (include "osac-metering.fullname" .) | trunc 63 | trimSuffix "-" -}}
+{{- printf "%s-metering-deployment-identity" .Release.Name | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
 
 {{- define "osac-metering.deploymentId" -}}

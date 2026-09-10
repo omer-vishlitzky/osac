@@ -7,4 +7,5 @@ metadata:
     app.kubernetes.io/component: metering
   annotations:
     helm.sh/resource-policy: keep
+data:
   deploymentId: {{ include "osac-metering.deploymentId" . | quote }}
