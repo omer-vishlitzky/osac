@@ -1172,7 +1172,7 @@
         },
         "deploymentId": {
           "type": "string",
-          "description": "Stable OSAC installation identity used by metering dimensions; empty uses the Helm release name"
+          "description": "Stable OSAC installation identity used by metering dimensions; empty uses the Helm release name; changes after installation are rejected"
         },
         "image": {
           "type": "object",

@@ -29,6 +29,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	grpcstatus "google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
+	"google.golang.org/protobuf/types/known/timestamppb"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -544,6 +545,53 @@ var _ = Describe("NATGatewayFeedbackController", func() {
 			Expect(err).NotTo(HaveOccurred())
 
 			Expect(mockServer.updates).To(BeEmpty())
+		})
+
+		It("should clear stale transition timestamps and remain idempotent", func() {
+			natGateway := &privatev1.NATGateway{
+				Id: natGatewayID,
+				Metadata: &privatev1.Metadata{
+					Name: natGatewayName,
+				},
+				Spec: &privatev1.NATGatewaySpec{
+					VirtualNetwork: &privatev1.VirtualNetworkLocalReference{Name: "vnet-123"},
+					ExternalIp:     &privatev1.ExternalIPLocalReference{Id: "eip-456"},
+				},
+				Status: privatev1.NATGatewayStatus_builder{
+					State:               privatev1.NATGatewayState_NAT_GATEWAY_STATE_READY,
+					StateTransitionTime: timestamppb.New(time.Date(2026, 9, 9, 11, 0, 0, 0, time.UTC)),
+				}.Build(),
+			}
+			mockServer.addNATGateway(natGateway)
+
+			cr := &v1alpha1.NATGateway{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      natGatewayName,
+					Namespace: natGatewayNamespace,
+					Labels: map[string]string{
+						osacNATGatewayIDLabel: natGatewayID,
+					},
+				},
+				Spec: v1alpha1.NATGatewaySpec{
+					VirtualNetwork: "vnet-123",
+					ExternalIP:     "eip-456",
+				},
+				Status: v1alpha1.NATGatewayStatus{Phase: v1alpha1.NATGatewayPhaseReady},
+			}
+			Expect(k8sClient.Create(ctx, cr)).To(Succeed())
+
+			_, err := reconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: natGatewayName, Namespace: natGatewayNamespace},
+			})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(mockServer.updates).To(HaveLen(1))
+			Expect(mockServer.updates[0].GetStatus().GetStateTransitionTime()).To(BeNil())
+
+			_, err = reconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: natGatewayName, Namespace: natGatewayNamespace},
+			})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(mockServer.updates).To(HaveLen(1))
 		})
 	})
 })

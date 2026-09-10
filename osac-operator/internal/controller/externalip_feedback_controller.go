@@ -129,9 +129,13 @@ func syncExternalIPDelete(_ context.Context, obj *v1alpha1.ExternalIP, remote *p
 func syncExternalIPTransitionTimes(obj *v1alpha1.ExternalIP, remote *privatev1.ExternalIP) {
 	if obj.Status.StateTransitionTime != nil {
 		remote.GetStatus().SetStateTransitionTime(timestamppb.New(obj.Status.StateTransitionTime.Time))
+	} else {
+		remote.GetStatus().ClearStateTransitionTime()
 	}
 	if obj.Status.AttachmentTransitionTime != nil {
 		remote.GetStatus().SetAttachmentTransitionTime(timestamppb.New(obj.Status.AttachmentTransitionTime.Time))
+	} else {
+		remote.GetStatus().ClearAttachmentTransitionTime()
 	}
 }
 

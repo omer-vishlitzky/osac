@@ -5,7 +5,8 @@ image:
 
 # Stable OSAC installation identity used by metering dimensions. Empty uses the
 # Helm release name; set an explicit namespace-qualified value when releases
-# share billing data.
+# share billing data. The first value is persisted and later changes fail Helm
+# upgrades to prevent identity splits.
 deploymentId: ""
 
 # Fulfillment address is auto-derived from release namespace.

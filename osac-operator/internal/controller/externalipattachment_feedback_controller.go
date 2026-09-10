@@ -228,6 +228,8 @@ func syncAttachedOnParentExternalIP(
 	externalIP.GetStatus().SetAttached(attached)
 	if attachmentTransitionTime != nil {
 		externalIP.GetStatus().SetAttachmentTransitionTime(attachmentTransitionTime)
+	} else {
+		externalIP.GetStatus().ClearAttachmentTransitionTime()
 	}
 	_, err = eipClient.Update(ctx, privatev1.ExternalIPsUpdateRequest_builder{
 		Object: externalIP,

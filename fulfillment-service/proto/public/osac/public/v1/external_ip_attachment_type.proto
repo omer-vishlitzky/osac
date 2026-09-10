@@ -15,6 +15,7 @@ syntax = "proto3";
 
 package osac.public.v1;
 
+import "buf/validate/validate.proto";
 import "google/api/field_behavior.proto";
 import "osac/public/v1/metadata_type.proto";
 import "osac/public/v1/baremetal_instance_type.proto";
@@ -97,7 +98,8 @@ message ExternalIPAttachmentSpec {
   // Specifies whether the external IP should be routed to the cluster's API server endpoint
   // or its ingress endpoint. Ignored for non-cluster targets. Immutable after creation.
   ExternalIPAttachmentEndpoint target_endpoint = 5 [
-    (google.api.field_behavior) = IMMUTABLE
+    (google.api.field_behavior) = IMMUTABLE,
+    (buf.validate.field).enum.defined_only = true
   ];
 }
 

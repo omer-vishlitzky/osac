@@ -154,7 +154,7 @@ func (r *ExternalIPReconciler) Reconcile(ctx context.Context, req mcreconcile.Re
 	}
 
 	if !equality.Semantic.DeepEqual(externalIP.Status, *oldstatus) {
-		if oldstatus.Phase != externalIP.Status.Phase || oldstatus.State != externalIP.Status.State {
+		if externalIPStateForTimestamp(*oldstatus) != externalIPStateForTimestamp(externalIP.Status) {
 			now := metav1.Now()
 			externalIP.Status.StateTransitionTime = &now
 		}
@@ -167,6 +167,10 @@ func (r *ExternalIPReconciler) Reconcile(ctx context.Context, req mcreconcile.Re
 
 	log.Info("end reconcile", "phase", externalIP.Status.Phase)
 	return res, err
+}
+
+func externalIPStateForTimestamp(status v1alpha1.ExternalIPStatus) string {
+	return string(status.State)
 }
 
 func (r *ExternalIPReconciler) updateStatusWithRetry(ctx context.Context, key client.ObjectKey, computed v1alpha1.ExternalIPStatus) error {

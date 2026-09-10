@@ -161,6 +161,40 @@ var _ = Describe("ExternalIPReconciler", func() {
 	})
 
 	Context("Reconcile", func() {
+		It("preserves the allocation timestamp across a phase-only Ready transition", func() {
+			key := types.NamespacedName{Name: publicIP.Name, Namespace: publicIP.Namespace}
+			fixedTransitionTime := metav1.NewTime(time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC))
+
+			stored := &osacv1alpha1.ExternalIP{}
+			Expect(fakeClient.Get(testCtx, key, stored)).To(Succeed())
+			stored.Annotations = map[string]string{
+				osacImplementationStrategyAnnotation:     "metallb-l2",
+				osacExternalIPPoolNameAnnotation:         parentPool.Name,
+				osacExternalIPAllocatedAddressAnnotation: "192.168.1.100",
+			}
+			Expect(fakeClient.Update(testCtx, stored)).To(Succeed())
+			stored.Status = osacv1alpha1.ExternalIPStatus{
+				Phase:               osacv1alpha1.ExternalIPPhaseProgressing,
+				State:               osacv1alpha1.ExternalIPStateAllocated,
+				StateTransitionTime: &fixedTransitionTime,
+			}
+			Expect(fakeClient.Status().Update(testCtx, stored)).To(Succeed())
+
+			reconciler.ProvisioningProvider = nil
+			_, err := reconciler.Reconcile(testCtx, mcreconcile.Request{Request: ctrl.Request{NamespacedName: key}})
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(fakeClient.Get(testCtx, key, stored)).To(Succeed())
+			Expect(stored.Status.Phase).To(Equal(osacv1alpha1.ExternalIPPhaseReady))
+			Expect(stored.Status.State).To(Equal(osacv1alpha1.ExternalIPStateAllocated))
+			Expect(stored.Status.StateTransitionTime.Time.Equal(fixedTransitionTime.Time)).To(BeTrue())
+			Expect(externalIPStateForTimestamp(stored.Status)).To(Equal(string(osacv1alpha1.ExternalIPStateAllocated)))
+
+			deleting := stored.Status
+			deleting.Phase = osacv1alpha1.ExternalIPPhaseDeleting
+			Expect(externalIPStateForTimestamp(deleting)).To(Equal(string(osacv1alpha1.ExternalIPStateAllocated)))
+		})
+
 		It("should add finalizer on first reconcile", func() {
 			key := types.NamespacedName{Name: publicIP.Name, Namespace: publicIP.Namespace}
 			result, err := reconciler.Reconcile(testCtx, mcreconcile.Request{Request: ctrl.Request{NamespacedName: key}})

@@ -121,6 +121,8 @@ func syncNATGatewayDelete(_ context.Context, obj *v1alpha1.NATGateway, remote *p
 func syncNATGatewayTransitionTime(obj *v1alpha1.NATGateway, remote *privatev1.NATGateway) {
 	if obj.Status.StateTransitionTime != nil {
 		remote.GetStatus().SetStateTransitionTime(timestamppb.New(obj.Status.StateTransitionTime.Time))
+	} else {
+		remote.GetStatus().ClearStateTransitionTime()
 	}
 }
 

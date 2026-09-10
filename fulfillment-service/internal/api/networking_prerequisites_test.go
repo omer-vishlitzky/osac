@@ -89,6 +89,28 @@ func TestExternalIPAttributionValidation(t *testing.T) {
 		t.Fatal("attribution without a target was accepted")
 	}
 
+	invalidComputeID := privatev1.ExternalIPAttribution_builder{
+		ComputeInstance: privatev1.ComputeInstanceLocalReference_builder{}.Build(),
+	}.Build()
+	if err := validator.Validate(invalidComputeID); err == nil {
+		t.Fatal("attribution with an empty compute instance ID was accepted")
+	}
+
+	invalidClusterID := privatev1.ExternalIPAttribution_builder{
+		Cluster:  privatev1.ClusterLocalReference_builder{}.Build(),
+		Endpoint: privatev1.ExternalIPAttachmentEndpoint_EXTERNAL_IP_ATTACHMENT_ENDPOINT_API,
+	}.Build()
+	if err := validator.Validate(invalidClusterID); err == nil {
+		t.Fatal("attribution with an empty cluster ID was accepted")
+	}
+
+	invalidBareMetalID := privatev1.ExternalIPAttribution_builder{
+		BaremetalInstance: privatev1.BareMetalInstanceLocalReference_builder{}.Build(),
+	}.Build()
+	if err := validator.Validate(invalidBareMetalID); err == nil {
+		t.Fatal("attribution with an empty bare-metal instance ID was accepted")
+	}
+
 	invalidEndpoint := privatev1.ExternalIPAttribution_builder{
 		ComputeInstance: privatev1.ComputeInstanceLocalReference_builder{Id: "compute-1"}.Build(),
 		Endpoint:        privatev1.ExternalIPAttachmentEndpoint_EXTERNAL_IP_ATTACHMENT_ENDPOINT_API,
@@ -97,11 +119,34 @@ func TestExternalIPAttributionValidation(t *testing.T) {
 		t.Fatal("endpoint on a non-cluster attribution was accepted")
 	}
 
+	invalidClusterEndpoint := privatev1.ExternalIPAttribution_builder{
+		Cluster: privatev1.ClusterLocalReference_builder{Id: "cluster-1"}.Build(),
+	}.Build()
+	if err := validator.Validate(invalidClusterEndpoint); err == nil {
+		t.Fatal("cluster attribution without an endpoint was accepted")
+	}
+
+	invalidUnknownEndpoint := privatev1.ExternalIPAttribution_builder{
+		Cluster:  privatev1.ClusterLocalReference_builder{Id: "cluster-1"}.Build(),
+		Endpoint: privatev1.ExternalIPAttachmentEndpoint(99),
+	}.Build()
+	if err := validator.Validate(invalidUnknownEndpoint); err == nil {
+		t.Fatal("cluster attribution with an unknown endpoint was accepted")
+	}
+
 	validCluster := privatev1.ExternalIPAttribution_builder{
 		Cluster:  privatev1.ClusterLocalReference_builder{Id: "cluster-1"}.Build(),
 		Endpoint: privatev1.ExternalIPAttachmentEndpoint_EXTERNAL_IP_ATTACHMENT_ENDPOINT_API,
 	}.Build()
 	if err := validator.Validate(validCluster); err != nil {
 		t.Fatalf("valid cluster attribution rejected: %v", err)
+	}
+
+	invalidPublicEndpoint := publicv1.ExternalIPAttachmentSpec_builder{
+		Cluster:        publicv1.ClusterLocalReference_builder{Id: "cluster-1"}.Build(),
+		TargetEndpoint: publicv1.ExternalIPAttachmentEndpoint(99),
+	}.Build()
+	if err := validator.Validate(invalidPublicEndpoint); err == nil {
+		t.Fatal("attachment with an unknown endpoint was accepted")
 	}
 }
