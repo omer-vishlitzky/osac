@@ -142,6 +142,13 @@ func TestExternalIPAttributionValidation(t *testing.T) {
 		t.Fatalf("valid cluster attribution rejected: %v", err)
 	}
 
+	invalidAttachmentTarget := publicv1.ExternalIPAttachmentSpec_builder{
+		ExternalIp: publicv1.ExternalIPLocalReference_builder{Id: "external-ip-1"}.Build(),
+	}.Build()
+	if err := validator.Validate(invalidAttachmentTarget); err == nil {
+		t.Fatal("attachment without a target was accepted")
+	}
+
 	invalidPublicEndpoint := publicv1.ExternalIPAttachmentSpec_builder{
 		ExternalIp:     publicv1.ExternalIPLocalReference_builder{Id: "external-ip-1"}.Build(),
 		Cluster:        publicv1.ClusterLocalReference_builder{Id: "cluster-1"}.Build(),

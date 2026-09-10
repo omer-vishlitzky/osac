@@ -81,6 +81,8 @@ message ExternalIPAttachmentSpec {
   // Target resource to attach the external IP to. Exactly one target field must be set.
   // Required and immutable after creation.
   oneof target {
+    option (buf.validate.oneof).required = true;
+
     // ComputeInstance reference to attach this external IP to.
     //
     // Must reference an existing ComputeInstance in RUNNING state. Only one
