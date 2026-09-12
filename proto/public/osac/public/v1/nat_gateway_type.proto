@@ -16,8 +16,8 @@ syntax = "proto3";
 package osac.public.v1;
 
 import "google/api/field_behavior.proto";
-import "osac/public/v1/metadata_type.proto";
 import "osac/public/v1/external_ip_type.proto";
+import "osac/public/v1/metadata_type.proto";
 import "osac/public/v1/virtual_network_type.proto";
 
 // Represents a NAT gateway for outbound traffic (SNAT) from a VirtualNetwork.
@@ -90,6 +90,7 @@ message NATGatewayStatus {
   // For PENDING state, may contain progress information like "Configuring SNAT rule".
   // For FAILED state, contains the error details. Typically empty for READY state.
   optional string message = 2 [(google.api.field_behavior) = OUTPUT_ONLY];
+
 }
 
 // Lifecycle states for NATGateway resources.

@@ -16,8 +16,8 @@ syntax = "proto3";
 package osac.public.v1;
 
 import "google/api/field_behavior.proto";
-import "osac/public/v1/metadata_type.proto";
 import "osac/public/v1/external_ip_pool_type.proto";
+import "osac/public/v1/metadata_type.proto";
 
 // Represents an external IP address allocated from an ExternalIPPool.
 //
@@ -92,6 +92,7 @@ message ExternalIPStatus {
   // Set to false when the ExternalIPAttachment is deleted. An ExternalIP with attached = true
   // cannot be deleted; the ExternalIPAttachment must be deleted first.
   bool attached = 5 [(google.api.field_behavior) = OUTPUT_ONLY];
+
 }
 
 // Lifecycle states for ExternalIP resources.
