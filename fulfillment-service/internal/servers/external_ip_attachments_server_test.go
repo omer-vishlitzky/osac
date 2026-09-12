@@ -365,7 +365,7 @@ var _ = Describe("External IP attachments server", func() {
 			Expect(err.Error()).To(ContainSubstring("object is mandatory"))
 		})
 
-		It("Propagates immutable field rejection from private server", func() {
+		It("rejects public lifecycle updates to spec fields", func() {
 			created := createAttachment()
 
 			_, err := externalIPAttachmentsServer.Update(ctx,
@@ -379,7 +379,7 @@ var _ = Describe("External IP attachments server", func() {
 					UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"spec.external_ip"}},
 				}.Build())
 			Expect(err).To(HaveOccurred())
-			Expect(err.Error()).To(ContainSubstring("immutable"))
+			Expect(err.Error()).To(ContainSubstring("public lifecycle updates may only name metadata fields"))
 		})
 
 		It("rejects output-only status updates with nil and explicit masks", func() {
