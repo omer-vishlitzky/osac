@@ -118,6 +118,14 @@ func (b *PrivateNATGatewaysServerBuilder) Build() (result *PrivateNATGatewaysSer
 	if err != nil {
 		return
 	}
+	externalIPAttachmentDao, err := dao.NewGenericDAO[*privatev1.ExternalIPAttachment]().
+		SetLogger(b.logger).
+		SetTenancyLogic(b.tenancyLogic).
+		SetMetricsRegisterer(b.metricsRegisterer).
+		Build()
+	if err != nil {
+		return
+	}
 
 	networkClassesDao, err := dao.NewGenericDAO[*privatev1.NetworkClass]().
 		SetLogger(b.logger).
@@ -150,7 +158,7 @@ func (b *PrivateNATGatewaysServerBuilder) Build() (result *PrivateNATGatewaysSer
 	}
 	result.lifecycle = newExternalIPLifecycle(
 		externalIPDao,
-		nil,
+		externalIPAttachmentDao,
 		generic.dao,
 		nil,
 		nil,
@@ -338,6 +346,9 @@ func (s *PrivateNATGatewaysServer) validateExternalIPReference(
 		return grpcstatus.Errorf(grpccodes.FailedPrecondition,
 			"ExternalIP '%s' is not in ALLOCATED state (current state: %s)",
 			externalIPID, externalIP.GetStatus().GetState().String())
+	}
+	if err := s.lifecycle.ensureExternalIPAvailable(ctx, externalIPID); err != nil {
+		return err
 	}
 
 	return nil

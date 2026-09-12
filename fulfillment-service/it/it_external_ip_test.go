@@ -480,9 +480,11 @@ var _ = Describe("ExternalIP lifecycle", func() {
 		Expect(poolResp.GetObject().GetStatus().GetAllocated()).To(Equal(int64(0)))
 	})
 
-	It("Rejects delete of ExternalIP not in ALLOCATED state", func() {
+	It("Can delete a PENDING ExternalIP and release its pool capacity", func() {
 		ipId := fmt.Sprintf("test-ip-%s", uuid.New())
-		_, err := externalIPsClient.Create(ctx, publicv1.ExternalIPsCreateRequest_builder{
+		poolBefore, err := poolsClient.Get(ctx, privatev1.ExternalIPPoolsGetRequest_builder{Id: poolId}.Build())
+		Expect(err).ToNot(HaveOccurred())
+		_, err = externalIPsClient.Create(ctx, publicv1.ExternalIPsCreateRequest_builder{
 			Object: publicv1.ExternalIP_builder{
 				Id: ipId,
 				Metadata: publicv1.Metadata_builder{
@@ -498,8 +500,11 @@ var _ = Describe("ExternalIP lifecycle", func() {
 		_, err = externalIPsClient.Delete(ctx, publicv1.ExternalIPsDeleteRequest_builder{
 			Id: ipId,
 		}.Build())
-		Expect(err).To(HaveOccurred())
-		Expect(grpcstatus.Code(err)).To(Equal(grpccodes.FailedPrecondition))
+		Expect(err).ToNot(HaveOccurred())
+		poolAfter, err := poolsClient.Get(ctx, privatev1.ExternalIPPoolsGetRequest_builder{Id: poolId}.Build())
+		Expect(err).ToNot(HaveOccurred())
+		Expect(poolAfter.GetObject().GetStatus().GetAllocated()).To(Equal(poolBefore.GetObject().GetStatus().GetAllocated()))
+		Expect(poolAfter.GetObject().GetStatus().GetAvailable()).To(Equal(poolBefore.GetObject().GetStatus().GetAvailable()))
 	})
 
 	It("Rejects create with non-existent pool", func() {

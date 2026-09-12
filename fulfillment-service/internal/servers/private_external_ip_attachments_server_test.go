@@ -224,6 +224,35 @@ var _ = Describe("Private external IP attachments server", func() {
 			Expect(grpcstatus.Code(err)).To(Equal(grpccodes.InvalidArgument))
 		})
 
+		It("rejects an ExternalIP already claimed by a NATGateway", func() {
+			eip := createExternalIPInState(ctx, externalIPDao, sharedPool.GetId(),
+				privatev1.ExternalIPState_EXTERNAL_IP_STATE_ALLOCATED, false)
+			_, err := server.lifecycle.natGatewayDao.Create().SetObject(privatev1.NATGateway_builder{
+				Metadata: privatev1.Metadata_builder{Name: "claimed-by-nat", Tenant: testTenant}.Build(),
+				Spec: privatev1.NATGatewaySpec_builder{
+					VirtualNetwork: privatev1.VirtualNetworkLocalReference_builder{Id: "virtual-network-id"}.Build(),
+					ExternalIp:     privatev1.ExternalIPLocalReference_builder{Id: eip.GetId()}.Build(),
+				}.Build(),
+				Status: privatev1.NATGatewayStatus_builder{
+					State: privatev1.NATGatewayState_NAT_GATEWAY_STATE_PENDING,
+				}.Build(),
+			}.Build()).Do(ctx)
+			Expect(err).ToNot(HaveOccurred())
+
+			ci := createComputeInstanceInState(ctx, computeInstanceDao,
+				privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_RUNNING)
+			_, err = server.Create(ctx, privatev1.ExternalIPAttachmentsCreateRequest_builder{
+				Object: privatev1.ExternalIPAttachment_builder{
+					Metadata: privatev1.Metadata_builder{Name: "attachment-after-nat"}.Build(),
+					Spec: privatev1.ExternalIPAttachmentSpec_builder{
+						ExternalIp:      privatev1.ExternalIPLocalReference_builder{Id: eip.GetId()}.Build(),
+						ComputeInstance: privatev1.ComputeInstanceLocalReference_builder{Id: ci.GetId()}.Build(),
+					}.Build(),
+				}.Build(),
+			}.Build())
+			Expect(grpcstatus.Code(err)).To(Equal(grpccodes.FailedPrecondition))
+		})
+
 		It("rolls back the child when parent settlement validation fails", func() {
 			eip := createExternalIPInState(ctx, externalIPDao, sharedPool.GetId(),
 				privatev1.ExternalIPState_EXTERNAL_IP_STATE_ALLOCATED, false)

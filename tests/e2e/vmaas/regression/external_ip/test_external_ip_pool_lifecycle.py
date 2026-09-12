@@ -129,6 +129,7 @@ class TestExternalIPPoolLifecycle:
         external_ip: tuple[str, str],
         make_compute_instances: Callable[..., tuple[tuple[str, str], ...]],
         grpc: GRPCClient,
+        private_grpc: GRPCClient,
         k8s_hub_client: K8sClient,
     ) -> None:
         _pool_id, _pool_cr_name = external_ip_pool
@@ -159,12 +160,21 @@ class TestExternalIPPoolLifecycle:
         )
         att_cr_name: str = wait_for_external_ip_attachment_cr(k8s=k8s_hub_client, uuid=att_id)
         wait_for_external_ip_attachment_ready(k8s=k8s_hub_client, name=att_cr_name)
+        poll_until(
+            fn=lambda: private_grpc.get_private_external_ip(external_ip_id=ip_id)["object"],
+            until=lambda item: (
+                bool(item["status"].get("attribution")) and bool(item["status"].get("attachmentTransitionTime"))
+            ),
+            retries=30,
+            delay=5,
+            description="duplicate-attachment ExternalIP settlement",
+        )
 
         with pytest.raises(subprocess.CalledProcessError) as exc_info:
             grpc.create_external_ip_attachment(
                 name=f"test-att-{uuid4().hex[:8]}", external_ip=ip_id, compute_instance=ci1_uuid
             )
-        assert_grpc_rejected(exc_info, "FailedPrecondition")
+        assert_grpc_rejected(exc_info, "AlreadyExists")
 
         with pytest.raises(subprocess.CalledProcessError) as exc_info:
             grpc.call(

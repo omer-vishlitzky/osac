@@ -234,9 +234,9 @@ var _ = Describe("Private NAT gateways server", func() {
 				Equal(privatev1.NATGatewayState_NAT_GATEWAY_STATE_PENDING))
 		})
 
-		It("overrides client-provided state to PENDING on Create", func() {
+		It("rejects client-provided output status on Create", func() {
 			eip := createAllocatedExternalIP()
-			response, err := natGatewaysServer.Create(ctx, privatev1.NATGatewaysCreateRequest_builder{
+			_, err := natGatewaysServer.Create(ctx, privatev1.NATGatewaysCreateRequest_builder{
 				Object: privatev1.NATGateway_builder{
 					Metadata: privatev1.Metadata_builder{Name: "test-nat-gateway", Tenant: testTenant}.Build(),
 					Spec: privatev1.NATGatewaySpec_builder{
@@ -248,9 +248,7 @@ var _ = Describe("Private NAT gateways server", func() {
 					}.Build(),
 				}.Build(),
 			}.Build())
-			Expect(err).ToNot(HaveOccurred())
-			Expect(response.GetObject().GetStatus().GetState()).To(
-				Equal(privatev1.NATGatewayState_NAT_GATEWAY_STATE_PENDING))
+			Expect(grpcstatus.Code(err)).To(Equal(grpccodes.InvalidArgument))
 		})
 
 		It("retrieves NATGateway by ID", func() {
@@ -336,6 +334,48 @@ var _ = Describe("Private NAT gateways server", func() {
 				}.Build(),
 			}.Build())
 			Expect(grpcstatus.Code(err)).To(Equal(grpccodes.InvalidArgument))
+		})
+
+		It("rejects an ExternalIP already claimed by an ExternalIPAttachment", func() {
+			eip := createAllocatedExternalIP()
+			computeDao, err := dao.NewGenericDAO[*privatev1.ComputeInstance]().
+				SetLogger(logger).
+				SetTenancyLogic(tenancy).
+				Build()
+			Expect(err).ToNot(HaveOccurred())
+			computeResponse, err := computeDao.Create().SetObject(privatev1.ComputeInstance_builder{
+				Metadata: privatev1.Metadata_builder{Name: "claimed-compute", Tenant: testTenant}.Build(),
+				Spec: privatev1.ComputeInstanceSpec_builder{
+					Template: privatev1.ComputeInstanceTemplateReference_builder{Id: "general.small"}.Build(),
+				}.Build(),
+				Status: privatev1.ComputeInstanceStatus_builder{
+					State: privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_RUNNING,
+				}.Build(),
+			}.Build()).Do(ctx)
+			Expect(err).ToNot(HaveOccurred())
+			_, err = natGatewaysServer.lifecycle.externalIPAttachmentDao.Create().SetObject(privatev1.ExternalIPAttachment_builder{
+				Metadata: privatev1.Metadata_builder{Name: "claimed-by-attachment", Tenant: testTenant}.Build(),
+				Spec: privatev1.ExternalIPAttachmentSpec_builder{
+					ExternalIp:      privatev1.ExternalIPLocalReference_builder{Id: eip.GetId()}.Build(),
+					ComputeInstance: privatev1.ComputeInstanceLocalReference_builder{Id: computeResponse.GetObject().GetId()}.Build(),
+				}.Build(),
+				Status: privatev1.ExternalIPAttachmentStatus_builder{
+					State: privatev1.ExternalIPAttachmentState_EXTERNAL_IP_ATTACHMENT_STATE_PENDING,
+				}.Build(),
+			}.Build()).Do(ctx)
+			Expect(err).ToNot(HaveOccurred())
+
+			vnID := createVirtualNetwork()
+			_, err = natGatewaysServer.Create(ctx, privatev1.NATGatewaysCreateRequest_builder{
+				Object: privatev1.NATGateway_builder{
+					Metadata: privatev1.Metadata_builder{Name: "nat-after-attachment", Tenant: testTenant}.Build(),
+					Spec: privatev1.NATGatewaySpec_builder{
+						VirtualNetwork: privatev1.VirtualNetworkLocalReference_builder{Id: vnID}.Build(),
+						ExternalIp:     privatev1.ExternalIPLocalReference_builder{Id: eip.GetId()}.Build(),
+					}.Build(),
+				}.Build(),
+			}.Build())
+			Expect(grpcstatus.Code(err)).To(Equal(grpccodes.FailedPrecondition))
 		})
 
 		It("rejects an update without an explicit mask", func() {

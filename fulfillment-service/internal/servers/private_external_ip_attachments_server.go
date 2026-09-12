@@ -145,6 +145,14 @@ func (b *PrivateExternalIPAttachmentsServerBuilder) Build() (*PrivateExternalIPA
 	if err != nil {
 		return nil, err
 	}
+	natGatewayDao, err := dao.NewGenericDAO[*privatev1.NATGateway]().
+		SetLogger(b.logger).
+		SetTenancyLogic(b.tenancyLogic).
+		SetMetricsRegisterer(b.metricsRegisterer).
+		Build()
+	if err != nil {
+		return nil, err
+	}
 
 	generic, err := NewGenericServer[*privatev1.ExternalIPAttachment]().
 		SetLogger(b.logger).
@@ -171,7 +179,7 @@ func (b *PrivateExternalIPAttachmentsServerBuilder) Build() (*PrivateExternalIPA
 	result.lifecycle = newExternalIPLifecycle(
 		externalIPDao,
 		externalIPAttachmentDao,
-		nil,
+		natGatewayDao,
 		nil,
 		computeInstanceDao,
 		clusterDao,
@@ -530,7 +538,7 @@ func (s *PrivateExternalIPAttachmentsServer) getTargetID(
 
 func (s *PrivateExternalIPAttachmentsServer) validateUniqueness(
 	ctx context.Context, externalIPID string, targetID string) error {
-	eipFilter := fmt.Sprintf("this.spec.external_ip.id == %[1]q || this.spec.external_ip.name == %[1]q", externalIPID)
+	eipFilter := fmt.Sprintf("(this.spec.external_ip.id == %[1]q || this.spec.external_ip.name == %[1]q) && !has(this.metadata.deletion_timestamp)", externalIPID)
 	eipResp, err := s.externalIPAttachmentDao.List().
 		SetFilter(eipFilter).
 		SetLimit(1).
@@ -544,6 +552,9 @@ func (s *PrivateExternalIPAttachmentsServer) validateUniqueness(
 	if eipResp.GetTotal() > 0 {
 		return grpcstatus.Errorf(grpccodes.AlreadyExists,
 			"an ExternalIPAttachment already exists for ExternalIP '%s'", externalIPID)
+	}
+	if err := s.lifecycle.ensureExternalIPAvailable(ctx, externalIPID); err != nil {
+		return err
 	}
 
 	return nil
