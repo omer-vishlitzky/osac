@@ -176,6 +176,9 @@ func (s *PrivateNATGatewaysServer) Get(ctx context.Context,
 func (s *PrivateNATGatewaysServer) Create(ctx context.Context,
 	request *privatev1.NATGatewaysCreateRequest) (response *privatev1.NATGatewaysCreateResponse, err error) {
 	natGateway := request.GetObject()
+	if err = rejectOutputStatusOnCreate(natGateway != nil && natGateway.HasStatus()); err != nil {
+		return
+	}
 
 	err = s.validateNATGateway(natGateway)
 	if err != nil {

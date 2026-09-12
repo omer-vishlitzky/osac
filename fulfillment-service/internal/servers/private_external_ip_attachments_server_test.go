@@ -199,6 +199,31 @@ var _ = Describe("Private external IP attachments server", func() {
 	})
 
 	Describe("Behaviour", func() {
+		It("rejects caller-supplied output status on Create", func() {
+			eip := createExternalIPInState(ctx, externalIPDao, sharedPool.GetId(),
+				privatev1.ExternalIPState_EXTERNAL_IP_STATE_ALLOCATED, false)
+			ci := createComputeInstanceInState(ctx, computeInstanceDao,
+				privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_RUNNING)
+			message := "malicious status"
+			_, err := server.Create(ctx, privatev1.ExternalIPAttachmentsCreateRequest_builder{
+				Object: privatev1.ExternalIPAttachment_builder{
+					Metadata: privatev1.Metadata_builder{Name: "output-on-create"}.Build(),
+					Spec: privatev1.ExternalIPAttachmentSpec_builder{
+						ExternalIp:      privatev1.ExternalIPLocalReference_builder{Id: eip.GetId()}.Build(),
+						ComputeInstance: privatev1.ComputeInstanceLocalReference_builder{Id: ci.GetId()}.Build(),
+					}.Build(),
+					Status: privatev1.ExternalIPAttachmentStatus_builder{
+						State:               privatev1.ExternalIPAttachmentState_EXTERNAL_IP_ATTACHMENT_STATE_READY,
+						ExternalIpAddress:   "198.51.100.11",
+						Message:             &message,
+						Hub:                 "hub-1",
+						StateTransitionTime: timestamppb.Now(),
+					}.Build(),
+				}.Build(),
+			}.Build())
+			Expect(grpcstatus.Code(err)).To(Equal(grpccodes.InvalidArgument))
+		})
+
 		It("rolls back the child when parent settlement validation fails", func() {
 			eip := createExternalIPInState(ctx, externalIPDao, sharedPool.GetId(),
 				privatev1.ExternalIPState_EXTERNAL_IP_STATE_ALLOCATED, false)

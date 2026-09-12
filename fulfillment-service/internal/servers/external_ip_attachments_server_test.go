@@ -164,6 +164,27 @@ var _ = Describe("External IP attachments server", func() {
 			return response.GetObject()
 		}
 
+		It("rejects caller-supplied output status on Create", func() {
+			eip := createExternalIPInState(ctx, externalIPDao, sharedPoolID,
+				privatev1.ExternalIPState_EXTERNAL_IP_STATE_ALLOCATED, false)
+			ci := createComputeInstanceInState(ctx, computeInstanceDao,
+				privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_RUNNING)
+			_, err := externalIPAttachmentsServer.Create(ctx, publicv1.ExternalIPAttachmentsCreateRequest_builder{
+				Object: publicv1.ExternalIPAttachment_builder{
+					Metadata: publicv1.Metadata_builder{Name: "output-on-create"}.Build(),
+					Spec: publicv1.ExternalIPAttachmentSpec_builder{
+						ExternalIp:      publicv1.ExternalIPLocalReference_builder{Id: eip.GetId()}.Build(),
+						ComputeInstance: publicv1.ComputeInstanceLocalReference_builder{Id: ci.GetId()}.Build(),
+					}.Build(),
+					Status: publicv1.ExternalIPAttachmentStatus_builder{
+						State:             publicv1.ExternalIPAttachmentState_EXTERNAL_IP_ATTACHMENT_STATE_READY,
+						ExternalIpAddress: "198.51.100.13",
+					}.Build(),
+				}.Build(),
+			}.Build())
+			Expect(grpcstatus.Code(err)).To(Equal(codes.InvalidArgument))
+		})
+
 		It("Creates object with ComputeInstance target", func() {
 			object := createAttachment()
 			Expect(object).ToNot(BeNil())

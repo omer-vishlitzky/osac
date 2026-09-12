@@ -195,6 +195,20 @@ var _ = Describe("Public external IPs server", func() {
 			Expect(err).ToNot(HaveOccurred())
 		})
 
+		It("rejects caller-supplied output status on Create", func() {
+			_, err := publicServer.Create(ctx, publicv1.ExternalIPsCreateRequest_builder{
+				Object: publicv1.ExternalIP_builder{
+					Metadata: publicv1.Metadata_builder{Name: "output-on-create", Tenant: testTenant}.Build(),
+					Spec:     publicv1.ExternalIPSpec_builder{Pool: publicv1.ExternalIPPoolReference_builder{Id: getPoolID()}.Build()}.Build(),
+					Status: publicv1.ExternalIPStatus_builder{
+						Attached: true,
+						Address:  "198.51.100.12",
+					}.Build(),
+				}.Build(),
+			}.Build())
+			Expect(grpcstatus.Code(err)).To(Equal(codes.InvalidArgument))
+		})
+
 		It("rejects output-only status updates with nil and explicit masks", func() {
 			poolID := getPoolID()
 			createResp, err := publicServer.Create(ctx, publicv1.ExternalIPsCreateRequest_builder{

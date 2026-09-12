@@ -101,6 +101,18 @@ func validatePublicUpdateMask(mask *fieldmaskpb.FieldMask) error {
 	return nil
 }
 
+func validatePublicMetadataUpdateMask(mask *fieldmaskpb.FieldMask) error {
+	if err := validatePublicUpdateMask(mask); err != nil {
+		return err
+	}
+	for _, path := range mask.GetPaths() {
+		if path != "metadata" && !maskPathHasPrefix(path, "metadata") {
+			return grpcInvalidArgument("public lifecycle updates may only name metadata fields")
+		}
+	}
+	return nil
+}
+
 func validatePrivateLifecycleUpdateMask(mask *fieldmaskpb.FieldMask, allowedStatusPaths, rejectedStatusPaths []string) error {
 	if mask == nil || len(mask.GetPaths()) == 0 {
 		return grpcInvalidArgument("update_mask is mandatory for private lifecycle updates")
@@ -135,6 +147,13 @@ func containsString(values []string, value string) bool {
 
 func grpcInvalidArgument(message string) error {
 	return grpcstatus.Error(grpccodes.InvalidArgument, message)
+}
+
+func rejectOutputStatusOnCreate(hasStatus bool) error {
+	if hasStatus {
+		return grpcInvalidArgument("status output fields cannot be set on create")
+	}
+	return nil
 }
 
 func translateLifecycleError(err error) error {
@@ -486,8 +505,12 @@ func (l *externalIPLifecycle) deleteExternalIP(ctx context.Context, id string) e
 }
 
 func (l *externalIPLifecycle) deleteLockedExternalIP(ctx context.Context, externalIP *privatev1.ExternalIP) error {
+	firstDeletionBoundary := !externalIP.HasMetadata() || !externalIP.GetMetadata().HasDeletionTimestamp()
 	if _, err := l.externalIPDao.Delete().SetId(externalIP.GetId()).Do(ctx); err != nil {
 		return err
+	}
+	if !firstDeletionBoundary {
+		return nil
 	}
 	poolID := refKey(externalIP.GetSpec().GetPool())
 	if poolID == "" {

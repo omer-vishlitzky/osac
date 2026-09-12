@@ -24,6 +24,7 @@ import (
 	grpccodes "google.golang.org/grpc/codes"
 	grpcstatus "google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/osac-project/osac/fulfillment-service/internal/uuid"
 	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
@@ -578,6 +579,7 @@ var _ = Describe("ExternalIPAttachment cross-resource validation", func() {
 		externalIPsClient        publicv1.ExternalIPsClient
 		privateExternalIPsClient privatev1.ExternalIPsClient
 		attachmentsClient        publicv1.ExternalIPAttachmentsClient
+		privateAttachmentsClient privatev1.ExternalIPAttachmentsClient
 		clustersClient           publicv1.ClustersClient
 		hostTypesClient          privatev1.HostTypesClient
 		clusterTemplatesClient   privatev1.ClusterTemplatesClient
@@ -595,6 +597,7 @@ var _ = Describe("ExternalIPAttachment cross-resource validation", func() {
 		externalIPsClient = publicv1.NewExternalIPsClient(tool.ExternalView().UserConn())
 		privateExternalIPsClient = privatev1.NewExternalIPsClient(tool.InternalView().AdminConn())
 		attachmentsClient = publicv1.NewExternalIPAttachmentsClient(tool.ExternalView().UserConn())
+		privateAttachmentsClient = privatev1.NewExternalIPAttachmentsClient(tool.InternalView().AdminConn())
 		clustersClient = publicv1.NewClustersClient(tool.ExternalView().UserConn())
 		hostTypesClient = privatev1.NewHostTypesClient(tool.InternalView().AdminConn())
 		clusterTemplatesClient = privatev1.NewClusterTemplatesClient(tool.InternalView().AdminConn())
@@ -774,7 +777,7 @@ var _ = Describe("ExternalIPAttachment cross-resource validation", func() {
 			Id: externalIPId,
 		}.Build())
 		Expect(err).ToNot(HaveOccurred())
-		Expect(ipResp.GetObject().GetStatus().GetAttached()).To(BeTrue())
+		Expect(ipResp.GetObject().GetStatus().GetAttached()).To(BeFalse())
 
 		getResponse, err := attachmentsClient.Get(ctx, publicv1.ExternalIPAttachmentsGetRequest_builder{
 			Id: attachmentId,
@@ -955,7 +958,7 @@ var _ = Describe("ExternalIPAttachment cross-resource validation", func() {
 		Expect(grpcstatus.Code(err)).To(Equal(grpccodes.InvalidArgument))
 	})
 
-	It("Deleting attachment resets ExternalIP attached flag", func() {
+	It("settles and clears ExternalIP attachment output through child feedback", func() {
 		attachmentId := fmt.Sprintf("test-att-%s", uuid.New())
 		_, err := attachmentsClient.Create(ctx, publicv1.ExternalIPAttachmentsCreateRequest_builder{
 			Object: publicv1.ExternalIPAttachment_builder{
@@ -971,12 +974,26 @@ var _ = Describe("ExternalIPAttachment cross-resource validation", func() {
 			}.Build(),
 		}.Build())
 		Expect(err).ToNot(HaveOccurred())
+		attachmentResponse, err := privateAttachmentsClient.Get(ctx, privatev1.ExternalIPAttachmentsGetRequest_builder{Id: attachmentId}.Build())
+		Expect(err).ToNot(HaveOccurred())
+		attachment := attachmentResponse.GetObject()
+		attachment.GetStatus().SetState(privatev1.ExternalIPAttachmentState_EXTERNAL_IP_ATTACHMENT_STATE_READY)
+		attachment.GetStatus().SetStateTransitionTime(timestamppb.Now())
+		_, err = privateAttachmentsClient.Update(ctx, privatev1.ExternalIPAttachmentsUpdateRequest_builder{
+			Object: attachment,
+			UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{
+				"status.state", "status.state_transition_time",
+			}},
+		}.Build())
+		Expect(err).ToNot(HaveOccurred())
 
 		ipResp, err := privateExternalIPsClient.Get(ctx, privatev1.ExternalIPsGetRequest_builder{
 			Id: externalIPId,
 		}.Build())
 		Expect(err).ToNot(HaveOccurred())
 		Expect(ipResp.GetObject().GetStatus().GetAttached()).To(BeTrue())
+		Expect(ipResp.GetObject().GetStatus().GetAttribution().GetCluster().GetId()).To(Equal(clusterId))
+		Expect(ipResp.GetObject().GetStatus().GetAttachmentTransitionTime()).ToNot(BeNil())
 
 		_, err = attachmentsClient.Delete(ctx, publicv1.ExternalIPAttachmentsDeleteRequest_builder{
 			Id: attachmentId,

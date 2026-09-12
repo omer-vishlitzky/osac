@@ -211,6 +211,9 @@ func (s *PrivateExternalIPsServer) Get(ctx context.Context,
 func (s *PrivateExternalIPsServer) Create(ctx context.Context,
 	request *privatev1.ExternalIPsCreateRequest) (response *privatev1.ExternalIPsCreateResponse, err error) {
 	externalIP := request.GetObject()
+	if err = rejectOutputStatusOnCreate(externalIP != nil && externalIP.HasStatus()); err != nil {
+		return
+	}
 
 	err = s.validateExternalIP(ctx, externalIP)
 	if err != nil {

@@ -169,6 +169,22 @@ var _ = Describe("Private external IPs server", func() {
 				Equal(privatev1.ExternalIPState_EXTERNAL_IP_STATE_PENDING))
 		})
 
+		It("rejects caller-supplied output status on Create", func() {
+			_, err := externalIPsServer.Create(ctx, privatev1.ExternalIPsCreateRequest_builder{
+				Object: privatev1.ExternalIP_builder{
+					Metadata: privatev1.Metadata_builder{Name: "output-on-create", Tenant: testTenant}.Build(),
+					Spec:     privatev1.ExternalIPSpec_builder{Pool: privatev1.ExternalIPPoolReference_builder{Id: poolID}.Build()}.Build(),
+					Status: privatev1.ExternalIPStatus_builder{
+						Attached: true,
+						Address:  "198.51.100.10",
+						Pool:     poolID,
+						Hub:      "hub-1",
+					}.Build(),
+				}.Build(),
+			}.Build())
+			Expect(grpcstatus.Code(err)).To(Equal(grpccodes.InvalidArgument))
+		})
+
 		It("retrieves ExternalIP by ID", func() {
 			createResponse, err := externalIPsServer.Create(ctx, privatev1.ExternalIPsCreateRequest_builder{
 				Object: privatev1.ExternalIP_builder{

@@ -346,7 +346,9 @@ class TestBmaasNetworking:
             description=f"NAT gateway egress curl quay.io (ssh_host={bmi1['ssh_host']}, tenant_ip={bmi1['ip']})",
         )
 
-    def test_12_external_ip_ingress(self, grpc: GRPCClient, k8s_hub_client: K8sClient, net_test_run_id: str) -> None:
+    def test_12_external_ip_ingress(
+        self, grpc: GRPCClient, private_grpc: GRPCClient, k8s_hub_client: K8sClient, net_test_run_id: str
+    ) -> None:
         _require(self.state, "bmi1", "pool_id")
         bmi1 = self.state["bmi1"]
 
@@ -361,6 +363,16 @@ class TestBmaasNetworking:
         )
         attach_cr = wait_for_external_ip_attachment_cr(k8s=k8s_hub_client, uuid=attach_id)
         wait_for_external_ip_attachment_ready(k8s=k8s_hub_client, name=attach_cr)
+        poll_until(
+            fn=lambda: private_grpc.get_private_external_ip(external_ip_id=eip_id)["object"],
+            until=lambda item: (
+                item["status"].get("attribution", {}).get("baremetalInstance", {}).get("id") == bmi1["id"]
+                and bool(item["status"].get("attachmentTransitionTime"))
+            ),
+            retries=30,
+            delay=5,
+            description="ingress ExternalIP attribution settlement",
+        )
 
         eip_data = grpc.get_external_ip(external_ip_id=eip_id)
         ext_addr = eip_data.get("object", {}).get("status", {}).get("address", "")

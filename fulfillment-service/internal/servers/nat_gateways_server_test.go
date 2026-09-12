@@ -196,6 +196,26 @@ var _ = Describe("Public NAT gateways server", func() {
 			Expect(getResp.GetObject().GetId()).To(Equal(createResp.GetObject().GetId()))
 		})
 
+		It("rejects caller-supplied output status on Create", func() {
+			vnID := createVirtualNetwork()
+			eip := createAllocatedExternalIP()
+			message := "malicious status"
+			_, err := publicServer.Create(ctx, publicv1.NATGatewaysCreateRequest_builder{
+				Object: publicv1.NATGateway_builder{
+					Metadata: publicv1.Metadata_builder{Tenant: testTenant}.Build(),
+					Spec: publicv1.NATGatewaySpec_builder{
+						VirtualNetwork: publicv1.VirtualNetworkLocalReference_builder{Id: vnID}.Build(),
+						ExternalIp:     publicv1.ExternalIPLocalReference_builder{Id: eip.GetId()}.Build(),
+					}.Build(),
+					Status: publicv1.NATGatewayStatus_builder{
+						State:   publicv1.NATGatewayState_NAT_GATEWAY_STATE_READY,
+						Message: &message,
+					}.Build(),
+				}.Build(),
+			}.Build())
+			Expect(grpcstatus.Code(err)).To(Equal(codes.InvalidArgument))
+		})
+
 		It("lists NATGateways", func() {
 			for range 3 {
 				vnID := createVirtualNetwork()

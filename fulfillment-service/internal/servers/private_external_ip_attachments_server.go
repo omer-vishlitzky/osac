@@ -196,6 +196,9 @@ func (s *PrivateExternalIPAttachmentsServer) Get(ctx context.Context,
 func (s *PrivateExternalIPAttachmentsServer) Create(ctx context.Context,
 	request *privatev1.ExternalIPAttachmentsCreateRequest) (response *privatev1.ExternalIPAttachmentsCreateResponse, err error) {
 	attachment := request.GetObject()
+	if err = rejectOutputStatusOnCreate(attachment != nil && attachment.HasStatus()); err != nil {
+		return
+	}
 
 	err = s.validateExternalIPAttachment(attachment)
 	if err != nil {

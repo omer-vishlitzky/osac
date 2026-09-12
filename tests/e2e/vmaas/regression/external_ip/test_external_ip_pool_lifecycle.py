@@ -47,11 +47,20 @@ class TestExternalIPPoolLifecycle:
         att_cr_name: str = wait_for_external_ip_attachment_cr(k8s=k8s_hub_client, uuid=att_id)
         wait_for_external_ip_attachment_ready(k8s=k8s_hub_client, name=att_cr_name)
 
+        private_ip_obj = poll_until(
+            fn=lambda: private_grpc.get_private_external_ip(external_ip_id=ip_id)["object"],
+            until=lambda item: (
+                item["status"].get("attribution", {}).get("computeInstance", {}).get("id") == ci1_uuid
+                and bool(item["status"].get("attachmentTransitionTime"))
+            ),
+            retries=30,
+            delay=5,
+            description="ExternalIP attribution settlement",
+        )
         ip_obj = grpc.get_external_ip(external_ip_id=ip_id)
         assert ip_obj["object"]["status"].get("attached") is True
         attached_ip_address: str = ip_obj["object"]["status"]["address"]
         assert attached_ip_address, "ExternalIP should have an allocated address"
-        private_ip_obj = private_grpc.get_private_external_ip(external_ip_id=ip_id)["object"]
         assert private_ip_obj["status"]["attribution"]["computeInstance"]["id"] == ci1_uuid
         assert private_ip_obj["status"].get("attachmentTransitionTime")
 
@@ -73,6 +82,17 @@ class TestExternalIPPoolLifecycle:
         )
         att2_cr_name: str = wait_for_external_ip_attachment_cr(k8s=k8s_hub_client, uuid=att2_id)
         wait_for_external_ip_attachment_ready(k8s=k8s_hub_client, name=att2_cr_name)
+        second_private_ip = poll_until(
+            fn=lambda: private_grpc.get_private_external_ip(external_ip_id=ip_id)["object"],
+            until=lambda item: (
+                item["status"].get("attribution", {}).get("computeInstance", {}).get("id") == ci2_uuid
+                and bool(item["status"].get("attachmentTransitionTime"))
+            ),
+            retries=30,
+            delay=5,
+            description="reattached ExternalIP attribution settlement",
+        )
+        assert second_private_ip["status"]["attribution"]["computeInstance"]["id"] == ci2_uuid
 
         ip_obj = grpc.get_external_ip(external_ip_id=ip_id)
         assert ip_obj["object"]["status"]["address"] == attached_ip_address, (

@@ -318,6 +318,26 @@ var _ = Describe("Private NAT gateways server", func() {
 			Expect(updateResponse.GetObject().GetMetadata().GetLabels()).To(HaveKeyWithValue("env", "test"))
 		})
 
+		It("rejects caller-supplied output status on Create", func() {
+			eip := createAllocatedExternalIP()
+			message := "malicious status"
+			_, err := natGatewaysServer.Create(ctx, privatev1.NATGatewaysCreateRequest_builder{
+				Object: privatev1.NATGateway_builder{
+					Metadata: privatev1.Metadata_builder{Name: "output-on-create", Tenant: testTenant}.Build(),
+					Spec: privatev1.NATGatewaySpec_builder{
+						VirtualNetwork: privatev1.VirtualNetworkLocalReference_builder{Id: vnID}.Build(),
+						ExternalIp:     privatev1.ExternalIPLocalReference_builder{Id: eip.GetId()}.Build(),
+					}.Build(),
+					Status: privatev1.NATGatewayStatus_builder{
+						State:   privatev1.NATGatewayState_NAT_GATEWAY_STATE_READY,
+						Message: &message,
+						Hub:     "hub-1",
+					}.Build(),
+				}.Build(),
+			}.Build())
+			Expect(grpcstatus.Code(err)).To(Equal(grpccodes.InvalidArgument))
+		})
+
 		It("rejects an update without an explicit mask", func() {
 			eip := createAllocatedExternalIP()
 			createResponse, err := natGatewaysServer.Create(ctx, privatev1.NATGatewaysCreateRequest_builder{
