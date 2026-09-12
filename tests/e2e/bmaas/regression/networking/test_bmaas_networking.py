@@ -227,7 +227,9 @@ class TestBmaasNetworking:
         self.__class__.state["bmi2"] = bmis[1]
         self.__class__.state["bmi3"] = bmis[2]
 
-    def test_05b_verify_auto_eip_on_bmi3(self, grpc: GRPCClient, private_grpc: GRPCClient) -> None:
+    def test_05b_verify_auto_eip_on_bmi3(
+        self, grpc: GRPCClient, private_grpc: GRPCClient, k8s_hub_client: K8sClient
+    ) -> None:
         _require(self.state, "bmi3")
         bmi3 = self.state["bmi3"]
 
@@ -248,15 +250,24 @@ class TestBmaasNetworking:
         )
 
         auto_attach_id = attachment["id"]
+        auto_attach_cr = wait_for_external_ip_attachment_cr(k8s=k8s_hub_client, uuid=auto_attach_id)
+        wait_for_external_ip_attachment_ready(k8s=k8s_hub_client, name=auto_attach_cr)
         auto_eip_ref = attachment.get("spec", {}).get("externalIp", {}).get("id", "")
         assert auto_eip_ref, "Auto-created attachment has no ExternalIP reference"
 
         eip_data = grpc.get_external_ip(external_ip_id=auto_eip_ref)
         auto_ext_addr = eip_data.get("object", {}).get("status", {}).get("address", "")
         assert auto_ext_addr, "Auto-created ExternalIP has no allocated address"
-        private_eip = private_grpc.get_private_external_ip(external_ip_id=auto_eip_ref)["object"]
-        assert private_eip["status"]["attribution"]["baremetalInstance"]["id"] == bmi3["id"]
-        assert private_eip["status"].get("attachmentTransitionTime")
+        _private_eip = poll_until(
+            fn=lambda: private_grpc.get_private_external_ip(external_ip_id=auto_eip_ref)["object"],
+            until=lambda item: (
+                item["status"].get("attribution", {}).get("baremetalInstance", {}).get("id") == bmi3["id"]
+                and bool(item["status"].get("attachmentTransitionTime"))
+            ),
+            retries=30,
+            delay=5,
+            description="auto-created ExternalIP attribution settlement for BMI3",
+        )
 
         self.__class__.state.update(
             auto_attach_id=auto_attach_id, auto_eip_id=auto_eip_ref, auto_ext_addr=auto_ext_addr

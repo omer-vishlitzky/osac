@@ -25,6 +25,7 @@ import (
 	"google.golang.org/protobuf/reflect/protoreflect"
 
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
+	"github.com/osac-project/osac/fulfillment-service/internal/database"
 	"github.com/osac-project/osac/fulfillment-service/internal/database/dao"
 	"github.com/osac-project/osac/fulfillment-service/internal/events"
 	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
@@ -240,6 +241,12 @@ func (s *PrivateExternalIPAttachmentsServer) Create(ctx context.Context,
 
 func (s *PrivateExternalIPAttachmentsServer) Update(ctx context.Context,
 	request *privatev1.ExternalIPAttachmentsUpdateRequest) (response *privatev1.ExternalIPAttachmentsUpdateResponse, err error) {
+	tx, txErr := database.TxFromContext(ctx)
+	if txErr != nil {
+		return nil, txErr
+	}
+	defer tx.ReportError(&err)
+
 	id := request.GetObject().GetId()
 	if id == "" {
 		err = grpcstatus.Errorf(grpccodes.InvalidArgument, "object identifier is mandatory")
@@ -286,6 +293,12 @@ func (s *PrivateExternalIPAttachmentsServer) Update(ctx context.Context,
 
 func (s *PrivateExternalIPAttachmentsServer) Delete(ctx context.Context,
 	request *privatev1.ExternalIPAttachmentsDeleteRequest) (response *privatev1.ExternalIPAttachmentsDeleteResponse, err error) {
+	tx, txErr := database.TxFromContext(ctx)
+	if txErr != nil {
+		return nil, txErr
+	}
+	defer tx.ReportError(&err)
+
 	id := request.GetId()
 	if id == "" {
 		err = grpcstatus.Errorf(grpccodes.InvalidArgument, "object identifier is mandatory")

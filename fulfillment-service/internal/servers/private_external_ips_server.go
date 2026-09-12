@@ -31,9 +31,9 @@ import (
 )
 
 var validExternalIPTransitions = map[privatev1.ExternalIPState][]privatev1.ExternalIPState{
-	privatev1.ExternalIPState_EXTERNAL_IP_STATE_PENDING:   {privatev1.ExternalIPState_EXTERNAL_IP_STATE_ALLOCATED, privatev1.ExternalIPState_EXTERNAL_IP_STATE_FAILED},
+	privatev1.ExternalIPState_EXTERNAL_IP_STATE_PENDING:   {privatev1.ExternalIPState_EXTERNAL_IP_STATE_ALLOCATED, privatev1.ExternalIPState_EXTERNAL_IP_STATE_FAILED, privatev1.ExternalIPState_EXTERNAL_IP_STATE_DELETING},
 	privatev1.ExternalIPState_EXTERNAL_IP_STATE_ALLOCATED: {privatev1.ExternalIPState_EXTERNAL_IP_STATE_FAILED, privatev1.ExternalIPState_EXTERNAL_IP_STATE_DELETING},
-	privatev1.ExternalIPState_EXTERNAL_IP_STATE_FAILED:    {privatev1.ExternalIPState_EXTERNAL_IP_STATE_ALLOCATED},
+	privatev1.ExternalIPState_EXTERNAL_IP_STATE_FAILED:    {privatev1.ExternalIPState_EXTERNAL_IP_STATE_ALLOCATED, privatev1.ExternalIPState_EXTERNAL_IP_STATE_DELETING},
 }
 
 type PrivateExternalIPsServerBuilder struct {
@@ -309,9 +309,11 @@ func (s *PrivateExternalIPsServer) Delete(ctx context.Context,
 	}
 
 	state := existingExternalIP.GetStatus().GetState()
-	if state != privatev1.ExternalIPState_EXTERNAL_IP_STATE_ALLOCATED {
+	if state != privatev1.ExternalIPState_EXTERNAL_IP_STATE_PENDING &&
+		state != privatev1.ExternalIPState_EXTERNAL_IP_STATE_ALLOCATED &&
+		state != privatev1.ExternalIPState_EXTERNAL_IP_STATE_FAILED {
 		err = grpcstatus.Errorf(grpccodes.FailedPrecondition,
-			"cannot delete ExternalIP in state %s: must be in ALLOCATED state", state)
+			"cannot delete ExternalIP in state %s: must be in PENDING, ALLOCATED, or FAILED state", state)
 		return
 	}
 

@@ -1255,27 +1255,9 @@ func (s *PrivateBareMetalInstancesServer) autoProvisionExternalIP(
 		}.Build(),
 	}.Build()
 
-	attResp, err := s.externalIPAttachmentDao.Create().SetObject(attachment).Do(ctx)
+	_, err = s.externalIPAttachmentDao.Create().SetObject(attachment).Do(ctx)
 	if err != nil {
 		return fmt.Errorf("auto_external_ip_attachment: failed to create ExternalIPAttachment: %w", err)
-	}
-
-	if s.notifier != nil {
-		eipEvent := privatev1.Event_builder{
-			Type:       privatev1.EventType_EVENT_TYPE_OBJECT_CREATED,
-			ExternalIp: eipResp.GetObject(),
-		}.Build()
-		if notifyErr := s.notifier.Notify(ctx, eipEvent); notifyErr != nil {
-			s.logger.WarnContext(ctx, "Failed to notify ExternalIP creation", "error", notifyErr)
-		}
-
-		attEvent := privatev1.Event_builder{
-			Type:                 privatev1.EventType_EVENT_TYPE_OBJECT_CREATED,
-			ExternalIpAttachment: attResp.GetObject(),
-		}.Build()
-		if notifyErr := s.notifier.Notify(ctx, attEvent); notifyErr != nil {
-			s.logger.WarnContext(ctx, "Failed to notify ExternalIPAttachment creation", "error", notifyErr)
-		}
 	}
 
 	return nil

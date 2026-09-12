@@ -27,6 +27,7 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
+	"github.com/osac-project/osac/fulfillment-service/internal/database"
 	"github.com/osac-project/osac/fulfillment-service/internal/database/dao"
 	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
@@ -198,6 +199,44 @@ var _ = Describe("Private external IP attachments server", func() {
 	})
 
 	Describe("Behaviour", func() {
+		It("rolls back the child when parent settlement validation fails", func() {
+			eip := createExternalIPInState(ctx, externalIPDao, sharedPool.GetId(),
+				privatev1.ExternalIPState_EXTERNAL_IP_STATE_ALLOCATED, false)
+			ci := createComputeInstanceInState(ctx, computeInstanceDao,
+				privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_RUNNING)
+			response, err := server.Create(ctx, privatev1.ExternalIPAttachmentsCreateRequest_builder{
+				Object: privatev1.ExternalIPAttachment_builder{
+					Metadata: privatev1.Metadata_builder{Name: "settlement-rollback"}.Build(),
+					Spec: privatev1.ExternalIPAttachmentSpec_builder{
+						ExternalIp:      privatev1.ExternalIPLocalReference_builder{Id: eip.GetId()}.Build(),
+						ComputeInstance: privatev1.ComputeInstanceLocalReference_builder{Id: ci.GetId()}.Build(),
+					}.Build(),
+				}.Build(),
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+
+			ready := response.GetObject()
+			ready.GetStatus().SetState(privatev1.ExternalIPAttachmentState_EXTERNAL_IP_ATTACHMENT_STATE_READY)
+			tx, txErr := database.TxFromContext(ctx)
+			Expect(txErr).ToNot(HaveOccurred())
+			err = tx.Savepoint(ctx, func(savepointCtx context.Context) error {
+				_, updateErr := server.Update(savepointCtx, privatev1.ExternalIPAttachmentsUpdateRequest_builder{
+					Object:     ready,
+					UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"status.state"}},
+				}.Build())
+				return updateErr
+			})
+			Expect(grpcstatus.Code(err)).To(Equal(grpccodes.InvalidArgument))
+
+			childResponse, getErr := server.externalIPAttachmentDao.Get().SetId(ready.GetId()).Do(ctx)
+			Expect(getErr).ToNot(HaveOccurred())
+			Expect(childResponse.GetObject().GetStatus().GetState()).To(Equal(
+				privatev1.ExternalIPAttachmentState_EXTERNAL_IP_ATTACHMENT_STATE_PENDING))
+			parentResponse, getErr := externalIPDao.Get().SetId(eip.GetId()).Do(ctx)
+			Expect(getErr).ToNot(HaveOccurred())
+			Expect(parentResponse.GetObject().GetStatus().GetAttached()).To(BeFalse())
+		})
+
 		It("builds attribution for compute, cluster, and bare-metal targets", func() {
 			compute := privatev1.ExternalIPAttachment_builder{
 				Spec: privatev1.ExternalIPAttachmentSpec_builder{

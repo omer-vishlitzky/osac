@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"time"
 
+	"google.golang.org/protobuf/types/known/timestamppb"
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -649,7 +650,7 @@ func (r *ExternalIPAttachmentReconciler) handleProvisioning(
 				// provisioning lifecycle won't re-invoke OnSuccess (job already succeeded).
 				// The retry.RetryOnConflict inside onProvisionSuccess makes this window
 				// very narrow — only persistent non-conflict API errors can reach here.
-				provisionErr = r.onProvisionSuccess(ctx, externalIP, ci)
+				provisionErr = r.onProvisionSuccess(ctx, externalIP, attachment, ci)
 				setReadyConditionTrue(&attachment.Status.Conditions)
 			},
 		},
@@ -672,8 +673,21 @@ func (r *ExternalIPAttachmentReconciler) handleProvisioning(
 	return result, nil
 }
 
-// onProvisionSuccess updates target ComputeInstance status after a successful attach operation.
-func (r *ExternalIPAttachmentReconciler) onProvisionSuccess(ctx context.Context, externalIP *v1alpha1.ExternalIP, ci *v1alpha1.ComputeInstance) error {
+// onProvisionSuccess updates the operator-visible parent CRD and target ComputeInstance status.
+func (r *ExternalIPAttachmentReconciler) onProvisionSuccess(
+	ctx context.Context,
+	externalIP *v1alpha1.ExternalIP,
+	attachment *v1alpha1.ExternalIPAttachment,
+	ci *v1alpha1.ComputeInstance,
+) error {
+	var transitionTime *timestamppb.Timestamp
+	if attachment.Status.StateTransitionTime != nil {
+		transitionTime = timestamppb.New(attachment.Status.StateTransitionTime.Time)
+	}
+	if err := syncExternalIPAttachmentParentCRD(ctx, r.Client, attachment.Namespace, attachment.Spec.ExternalIP, true, transitionTime); err != nil {
+		return fmt.Errorf("failed to set ExternalIP CRD attachment status: %w", err)
+	}
+
 	// Set ComputeInstance.status.externalIPAddress from the parent ExternalIP's address.
 	// Re-fetch ExternalIP to get the latest address — the object captured by handleUpdate
 	// may be stale if the ExternalIP controller populated the address after our initial read.
@@ -735,8 +749,16 @@ func (r *ExternalIPAttachmentReconciler) handleDelete(ctx context.Context, attac
 	return ctrl.Result{}, nil
 }
 
-// onDeprovisionSuccess clears target status and removes target detach finalizers.
+// onDeprovisionSuccess clears the operator-visible parent CRD, target status, and target detach finalizers.
 func (r *ExternalIPAttachmentReconciler) onDeprovisionSuccess(ctx context.Context, attachment *v1alpha1.ExternalIPAttachment) error {
+	var transitionTime *timestamppb.Timestamp
+	if attachment.Status.StateTransitionTime != nil {
+		transitionTime = timestamppb.New(attachment.Status.StateTransitionTime.Time)
+	}
+	if err := syncExternalIPAttachmentParentCRD(ctx, r.Client, attachment.Namespace, attachment.Spec.ExternalIP, false, transitionTime); err != nil {
+		return fmt.Errorf("failed to clear ExternalIP CRD attachment status: %w", err)
+	}
+
 	// Clear ComputeInstance.status.externalIPAddress and remove CI detach finalizer
 	if attachment.Spec.ComputeInstance != nil {
 		ciUUID := *attachment.Spec.ComputeInstance
