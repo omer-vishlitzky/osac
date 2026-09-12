@@ -664,11 +664,6 @@ func (p *DefaultNetworkingProvisioner) deprovisionDefaultNATGateway(ctx context.
 	}
 }
 
-// deprovisionDefaultExternalIP deletes the given ExternalIP and releases its pool capacity.
-func (p *DefaultNetworkingProvisioner) deprovisionDefaultExternalIP(ctx context.Context, externalIPID string) error {
-	return p.lifecycle.deleteExternalIP(ctx, externalIPID)
-}
-
 // deleteByVirtualNetwork deletes every default-labeled object of type O whose spec references the
 // given VirtualNetwork by id. Used to clean up the default Subnets and SecurityGroup attached to a
 // default VirtualNetwork before deleting the VirtualNetwork itself. Only resources labeled
