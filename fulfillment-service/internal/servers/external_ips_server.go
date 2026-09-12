@@ -242,10 +242,7 @@ func (s *ExternalIPsServer) Update(ctx context.Context,
 		err = grpcstatus.Errorf(grpccodes.InvalidArgument, "object is mandatory")
 		return
 	}
-	if updateIncludesField(request.GetUpdateMask(),
-		"status.state", "status.message", "status.address", "status.pool", "status.attached",
-		"status.hub", "status.attribution", "status.attachment_transition_time", "status.state_transition_time") {
-		err = grpcstatus.Errorf(grpccodes.InvalidArgument, "status output fields cannot be updated")
+	if err = validatePublicUpdateMask(request.GetUpdateMask()); err != nil {
 		return
 	}
 	privateExternalIP := &privatev1.ExternalIP{}

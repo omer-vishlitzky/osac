@@ -184,7 +184,8 @@ var _ = Describe("Public external IPs server", func() {
 			object := getResp.GetObject()
 			object.GetStatus().SetState(privatev1.ExternalIPState_EXTERNAL_IP_STATE_ALLOCATED)
 			_, err = privateServer.Update(ctx, privatev1.ExternalIPsUpdateRequest_builder{
-				Object: object,
+				Object:     object,
+				UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"status.state"}},
 			}.Build())
 			Expect(err).ToNot(HaveOccurred())
 

@@ -21,6 +21,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/fieldmaskpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -75,6 +76,9 @@ func NewExternalIPFeedbackReconciler(hubClient clnt.Client, grpcConn *grpc.Clien
 		Save: func(ctx context.Context, remote *privatev1.ExternalIP) error {
 			_, err := eipClient.Update(ctx, privatev1.ExternalIPsUpdateRequest_builder{
 				Object: remote,
+				UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{
+					feedbackStatusStatePath, feedbackStatusMessagePath, "status.address", feedbackStatusStateTransitionTimePath,
+				}},
 			}.Build())
 			return err
 		},
@@ -112,16 +116,7 @@ func (r *ExternalIPFeedbackReconciler) Reconcile(ctx context.Context, request ct
 func syncExternalIPUpdate(ctx context.Context, obj *v1alpha1.ExternalIP, remote *privatev1.ExternalIP) error {
 	syncExternalIPState(ctx, obj, remote)
 	syncExternalIPAddress(obj, remote)
-	syncExternalIPAttachmentTransitionTime(obj, remote)
 	return nil
-}
-
-func syncExternalIPAttachmentTransitionTime(obj *v1alpha1.ExternalIP, remote *privatev1.ExternalIP) {
-	if obj.Status.AttachmentTransitionTime == nil {
-		remote.GetStatus().ClearAttachmentTransitionTime()
-		return
-	}
-	remote.GetStatus().SetAttachmentTransitionTime(timestamppb.New(obj.Status.AttachmentTransitionTime.Time))
 }
 
 func syncExternalIPDelete(_ context.Context, obj *v1alpha1.ExternalIP, remote *privatev1.ExternalIP) error {

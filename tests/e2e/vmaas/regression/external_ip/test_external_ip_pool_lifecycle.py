@@ -51,6 +51,9 @@ class TestExternalIPPoolLifecycle:
         assert ip_obj["object"]["status"].get("attached") is True
         attached_ip_address: str = ip_obj["object"]["status"]["address"]
         assert attached_ip_address, "ExternalIP should have an allocated address"
+        private_ip_obj = private_grpc.get_private_external_ip(external_ip_id=ip_id)["object"]
+        assert private_ip_obj["status"]["attribution"]["computeInstance"]["id"] == ci1_uuid
+        assert private_ip_obj["status"].get("attachmentTransitionTime")
 
         # --- Detach (delete attachment) ---
         grpc.delete_external_ip_attachment(attachment_id=att_id)
@@ -142,6 +145,13 @@ class TestExternalIPPoolLifecycle:
                 name=f"test-att-{uuid4().hex[:8]}", external_ip=ip_id, compute_instance=ci1_uuid
             )
         assert_grpc_rejected(exc_info, "FailedPrecondition")
+
+        with pytest.raises(subprocess.CalledProcessError) as exc_info:
+            grpc.call(
+                service="osac.public.v1.ExternalIPs/Update",
+                data={"object": {"id": ip_id, "status": {"attached": False}}},
+            )
+        assert_grpc_rejected(exc_info, "InvalidArgument")
 
         grpc.delete_external_ip_attachment(attachment_id=att_id)
         wait_for_external_ip_attachment_deletion(k8s=k8s_hub_client, name=att_cr_name)

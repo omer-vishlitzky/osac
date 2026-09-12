@@ -53,6 +53,7 @@ type PrivateExternalIPsServer struct {
 	logger            *slog.Logger
 	generic           *GenericServer[*privatev1.ExternalIP]
 	externalIPPoolDao *dao.GenericDAO[*privatev1.ExternalIPPool]
+	lifecycle         *externalIPLifecycle
 }
 
 func NewPrivateExternalIPsServer() *PrivateExternalIPsServerBuilder {
@@ -105,7 +106,57 @@ func (b *PrivateExternalIPsServerBuilder) Build() (result *PrivateExternalIPsSer
 		return
 	}
 
-	externalIPPoolDao, err := dao.NewGenericDAO[*privatev1.ExternalIPPool]().
+	externalIPPoolDaoBuilder := dao.NewGenericDAO[*privatev1.ExternalIPPool]().
+		SetLogger(b.logger).
+		SetTenancyLogic(b.tenancyLogic).
+		SetMetricsRegisterer(b.metricsRegisterer)
+	addDAOEventCallback(externalIPPoolDaoBuilder, b.notifier)
+	externalIPPoolDao, err := externalIPPoolDaoBuilder.Build()
+	if err != nil {
+		return
+	}
+
+	externalIPAttachmentDao, err := dao.NewGenericDAO[*privatev1.ExternalIPAttachment]().
+		SetLogger(b.logger).
+		SetTenancyLogic(b.tenancyLogic).
+		SetMetricsRegisterer(b.metricsRegisterer).
+		Build()
+	if err != nil {
+		return
+	}
+	natGatewayDao, err := dao.NewGenericDAO[*privatev1.NATGateway]().
+		SetLogger(b.logger).
+		SetTenancyLogic(b.tenancyLogic).
+		SetMetricsRegisterer(b.metricsRegisterer).
+		Build()
+	if err != nil {
+		return
+	}
+	computeInstanceDao, err := dao.NewGenericDAO[*privatev1.ComputeInstance]().
+		SetLogger(b.logger).
+		SetTenancyLogic(b.tenancyLogic).
+		SetMetricsRegisterer(b.metricsRegisterer).
+		Build()
+	if err != nil {
+		return
+	}
+	clusterDao, err := dao.NewGenericDAO[*privatev1.Cluster]().
+		SetLogger(b.logger).
+		SetTenancyLogic(b.tenancyLogic).
+		SetMetricsRegisterer(b.metricsRegisterer).
+		Build()
+	if err != nil {
+		return
+	}
+	bareMetalInstanceDao, err := dao.NewGenericDAO[*privatev1.BareMetalInstance]().
+		SetLogger(b.logger).
+		SetTenancyLogic(b.tenancyLogic).
+		SetMetricsRegisterer(b.metricsRegisterer).
+		Build()
+	if err != nil {
+		return
+	}
+	virtualNetworkDao, err := dao.NewGenericDAO[*privatev1.VirtualNetwork]().
 		SetLogger(b.logger).
 		SetTenancyLogic(b.tenancyLogic).
 		SetMetricsRegisterer(b.metricsRegisterer).
@@ -132,6 +183,16 @@ func (b *PrivateExternalIPsServerBuilder) Build() (result *PrivateExternalIPsSer
 		generic:           generic,
 		externalIPPoolDao: externalIPPoolDao,
 	}
+	result.lifecycle = newExternalIPLifecycle(
+		generic.dao,
+		externalIPAttachmentDao,
+		natGatewayDao,
+		externalIPPoolDao,
+		computeInstanceDao,
+		clusterDao,
+		bareMetalInstanceDao,
+		virtualNetworkDao,
+	)
 	return
 }
 
@@ -191,19 +252,16 @@ func (s *PrivateExternalIPsServer) Update(ctx context.Context,
 		return
 	}
 
-	getRequest := &privatev1.ExternalIPsGetRequest{}
-	getRequest.SetId(id)
-	var getResponse *privatev1.ExternalIPsGetResponse
-	err = s.generic.Get(ctx, getRequest, &getResponse)
+	getResponse, err := s.lifecycle.externalIPDao.Get().SetId(id).SetLock(true).Do(ctx)
 	if err != nil {
 		return
 	}
 
 	existingExternalIP := getResponse.GetObject()
 	mask := request.GetUpdateMask()
-	if mask != nil && len(mask.GetPaths()) > 0 && updateIncludesField(mask,
-		"status.pool", "status.attribution", "status.attached", "status.attachment_transition_time", "status.state_transition_time") {
-		err = grpcstatus.Errorf(grpccodes.InvalidArgument, "status output fields cannot be updated")
+	if err = validatePrivateLifecycleUpdateMask(mask,
+		[]string{"status.state", "status.message", "status.address", "status.hub", "status.state_transition_time"},
+		[]string{"status.pool", "status.attached", "status.attribution", "status.attachment_transition_time"}); err != nil {
 		return
 	}
 
@@ -235,10 +293,7 @@ func (s *PrivateExternalIPsServer) Delete(ctx context.Context,
 		return
 	}
 
-	getRequest := &privatev1.ExternalIPsGetRequest{}
-	getRequest.SetId(id)
-	var getResponse *privatev1.ExternalIPsGetResponse
-	err = s.generic.Get(ctx, getRequest, &getResponse)
+	getResponse, err := s.lifecycle.externalIPDao.Get().SetId(id).SetLock(true).Do(ctx)
 	if err != nil {
 		return
 	}
@@ -246,6 +301,10 @@ func (s *PrivateExternalIPsServer) Delete(ctx context.Context,
 	existingExternalIP := getResponse.GetObject()
 
 	if err = validateNotDefault(existingExternalIP.GetMetadata().GetLabels(), "external IP"); err != nil {
+		return
+	}
+	if existingExternalIP.GetMetadata().GetDeletionTimestamp() != nil {
+		response = &privatev1.ExternalIPsDeleteResponse{}
 		return
 	}
 
@@ -256,19 +315,10 @@ func (s *PrivateExternalIPsServer) Delete(ctx context.Context,
 		return
 	}
 
-	err = s.generic.Delete(ctx, request, &response)
-	if err != nil {
-		return
+	err = translateLifecycleError(s.lifecycle.deleteExternalIP(ctx, id))
+	if err == nil {
+		response = &privatev1.ExternalIPsDeleteResponse{}
 	}
-
-	poolRef := existingExternalIP.GetSpec().GetPool()
-	if poolRef != nil {
-		err = s.updatePoolCapacity(ctx, refKey(poolRef), -1)
-		if err != nil {
-			return
-		}
-	}
-
 	return
 }
 

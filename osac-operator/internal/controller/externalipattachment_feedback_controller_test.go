@@ -156,7 +156,7 @@ var _ = Describe("ExternalIPAttachmentFeedbackController", func() {
 			Expect(controllerutil.ContainsFinalizer(updated, osacExternalIPAttachmentFeedbackFinalizer)).To(BeTrue())
 		})
 
-		It("should sync Phase=Ready to state=READY and set parent ExternalIP attached=true", func() {
+		It("should sync Phase=Ready to state=READY without writing the parent", func() {
 			attachment := &privatev1.ExternalIPAttachment{
 				Id: attachmentID,
 				Metadata: &privatev1.Metadata{
@@ -219,10 +219,7 @@ var _ = Describe("ExternalIPAttachmentFeedbackController", func() {
 			Expect(mockAttachmentsServer.updates).To(HaveLen(1))
 			Expect(mockAttachmentsServer.updates[0].GetStatus().GetState()).To(Equal(privatev1.ExternalIPAttachmentState_EXTERNAL_IP_ATTACHMENT_STATE_READY))
 
-			Expect(mockExternalIPsServer2.updates).To(HaveLen(1))
-			Expect(mockExternalIPsServer2.updates[0].GetStatus().GetAttached()).To(BeTrue())
-			Expect(mockExternalIPsServer2.updates[0].GetStatus().GetAttribution().GetComputeInstance().GetId()).To(Equal("compute-instance-789"))
-			Expect(mockExternalIPsServer2.updates[0].GetStatus().GetAttachmentTransitionTime().AsTime()).To(Equal(transitionTime))
+			Expect(mockExternalIPsServer2.updates).To(BeEmpty())
 		})
 
 		It("should sync Phase=Failed to state=FAILED", func() {
@@ -268,7 +265,7 @@ var _ = Describe("ExternalIPAttachmentFeedbackController", func() {
 			Expect(mockAttachmentsServer.updates[0].GetStatus().GetState()).To(Equal(privatev1.ExternalIPAttachmentState_EXTERNAL_IP_ATTACHMENT_STATE_FAILED))
 		})
 
-		It("should sync state=DELETING during deletion and clear parent ExternalIP attached", func() {
+		It("should sync state=DELETING during deletion without writing the parent", func() {
 			attachment := &privatev1.ExternalIPAttachment{
 				Id: attachmentID,
 				Metadata: &privatev1.Metadata{
@@ -331,8 +328,7 @@ var _ = Describe("ExternalIPAttachmentFeedbackController", func() {
 			Expect(mockAttachmentsServer.updates).To(HaveLen(1))
 			Expect(mockAttachmentsServer.updates[0].GetStatus().GetState()).To(Equal(privatev1.ExternalIPAttachmentState_EXTERNAL_IP_ATTACHMENT_STATE_DELETING))
 
-			Expect(mockExternalIPsServer2.updates).To(HaveLen(1))
-			Expect(mockExternalIPsServer2.updates[0].GetStatus().GetAttached()).To(BeFalse())
+			Expect(mockExternalIPsServer2.updates).To(BeEmpty())
 		})
 
 		It("should sync state=FAILED during deletion when phase is Failed", func() {
@@ -520,7 +516,7 @@ var _ = Describe("ExternalIPAttachmentFeedbackController", func() {
 			Expect(errors.Is(err, ErrExternalIPAttachmentNotFound)).To(BeTrue())
 		})
 
-		It("should fail attached feedback without an attribution target", func() {
+		It("should sync attached feedback without writing parent attribution", func() {
 			attachment := &privatev1.ExternalIPAttachment{
 				Id: attachmentID,
 				Metadata: &privatev1.Metadata{
@@ -569,13 +565,13 @@ var _ = Describe("ExternalIPAttachmentFeedbackController", func() {
 					Namespace: attachmentNamespace,
 				},
 			})
-			Expect(err).To(MatchError(ContainSubstring("has no attribution target")))
+			Expect(err).NotTo(HaveOccurred())
 
-			Expect(mockAttachmentsServer.updates).To(BeEmpty())
+			Expect(mockAttachmentsServer.updates).To(HaveLen(1))
 			Expect(mockExternalIPsServer2.updates).To(BeEmpty())
 		})
 
-		It("should fail attached feedback when the parent ExternalIP ID is empty", func() {
+		It("should sync attached feedback when the parent ExternalIP ID is empty", func() {
 			attachment := &privatev1.ExternalIPAttachment{
 				Id:       attachmentID,
 				Metadata: &privatev1.Metadata{Name: attachmentName},
@@ -601,7 +597,7 @@ var _ = Describe("ExternalIPAttachmentFeedbackController", func() {
 			_, err := reconciler.Reconcile(ctx, reconcile.Request{
 				NamespacedName: types.NamespacedName{Name: attachmentName, Namespace: attachmentNamespace},
 			})
-			Expect(err).To(MatchError(ContainSubstring("has no external IP identifier")))
+			Expect(err).NotTo(HaveOccurred())
 		})
 
 		It("should remove feedback finalizer and signal when it is the last finalizer", func() {

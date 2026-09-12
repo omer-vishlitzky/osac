@@ -672,24 +672,8 @@ func (r *ExternalIPAttachmentReconciler) handleProvisioning(
 	return result, nil
 }
 
-// onProvisionSuccess updates the parent ExternalIP and target ComputeInstance after
-// a successful attach operation.
+// onProvisionSuccess updates target ComputeInstance status after a successful attach operation.
 func (r *ExternalIPAttachmentReconciler) onProvisionSuccess(ctx context.Context, externalIP *v1alpha1.ExternalIP, ci *v1alpha1.ComputeInstance) error {
-	// Set ExternalIP.status.attached = true
-	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		fresh := &v1alpha1.ExternalIP{}
-		if err := r.Get(ctx, client.ObjectKeyFromObject(externalIP), fresh); err != nil {
-			return err
-		}
-		if fresh.Status.Attached {
-			return nil
-		}
-		fresh.Status.Attached = true
-		return r.Status().Update(ctx, fresh)
-	}); err != nil {
-		return fmt.Errorf("failed to set ExternalIP status.attached=true: %w", err)
-	}
-
 	// Set ComputeInstance.status.externalIPAddress from the parent ExternalIP's address.
 	// Re-fetch ExternalIP to get the latest address — the object captured by handleUpdate
 	// may be stale if the ExternalIP controller populated the address after our initial read.
@@ -751,32 +735,8 @@ func (r *ExternalIPAttachmentReconciler) handleDelete(ctx context.Context, attac
 	return ctrl.Result{}, nil
 }
 
-// onDeprovisionSuccess clears the attached state on the parent ExternalIP, clears
-// externalIPAddress on the ComputeInstance, and removes the CI detach finalizer when
-// no other ExternalIPAttachments reference the same CI.
+// onDeprovisionSuccess clears target status and removes target detach finalizers.
 func (r *ExternalIPAttachmentReconciler) onDeprovisionSuccess(ctx context.Context, attachment *v1alpha1.ExternalIPAttachment) error {
-	// Clear ExternalIP.status.attached (look up by UUID label)
-	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		externalIPList := &v1alpha1.ExternalIPList{}
-		if err := r.List(ctx, externalIPList,
-			client.InNamespace(attachment.Namespace),
-			client.MatchingLabels{osacExternalIPIDLabel: attachment.Spec.ExternalIP},
-		); err != nil {
-			return err
-		}
-		if len(externalIPList.Items) == 0 {
-			return nil
-		}
-		externalIP := &externalIPList.Items[0]
-		if !externalIP.Status.Attached {
-			return nil
-		}
-		externalIP.Status.Attached = false
-		return r.Status().Update(ctx, externalIP)
-	}); err != nil {
-		return fmt.Errorf("failed to clear ExternalIP status.attached: %w", err)
-	}
-
 	// Clear ComputeInstance.status.externalIPAddress and remove CI detach finalizer
 	if attachment.Spec.ComputeInstance != nil {
 		ciUUID := *attachment.Spec.ComputeInstance

@@ -16,6 +16,7 @@ package servers
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 	. "github.com/onsi/ginkgo/v2"
@@ -23,6 +24,7 @@ import (
 	grpccodes "google.golang.org/grpc/codes"
 	grpcstatus "google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
 	"github.com/osac-project/osac/fulfillment-service/internal/database/dao"
@@ -196,6 +198,111 @@ var _ = Describe("Private external IP attachments server", func() {
 	})
 
 	Describe("Behaviour", func() {
+		It("builds attribution for compute, cluster, and bare-metal targets", func() {
+			compute := privatev1.ExternalIPAttachment_builder{
+				Spec: privatev1.ExternalIPAttachmentSpec_builder{
+					ComputeInstance: privatev1.ComputeInstanceLocalReference_builder{Id: "compute-id"}.Build(),
+				}.Build(),
+			}.Build()
+			attribution, err := buildExternalIPAttribution(compute)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(attribution.GetComputeInstance().GetId()).To(Equal("compute-id"))
+
+			cluster := privatev1.ExternalIPAttachment_builder{
+				Spec: privatev1.ExternalIPAttachmentSpec_builder{
+					Cluster:        privatev1.ClusterLocalReference_builder{Id: "cluster-id"}.Build(),
+					TargetEndpoint: privatev1.ExternalIPAttachmentEndpoint_EXTERNAL_IP_ATTACHMENT_ENDPOINT_API,
+				}.Build(),
+			}.Build()
+			attribution, err = buildExternalIPAttribution(cluster)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(attribution.GetCluster().GetId()).To(Equal("cluster-id"))
+			Expect(attribution.GetEndpoint()).To(Equal(privatev1.ExternalIPAttachmentEndpoint_EXTERNAL_IP_ATTACHMENT_ENDPOINT_API))
+
+			bareMetal := privatev1.ExternalIPAttachment_builder{
+				Spec: privatev1.ExternalIPAttachmentSpec_builder{
+					BaremetalInstance: privatev1.BareMetalInstanceLocalReference_builder{Id: "bmi-id"}.Build(),
+				}.Build(),
+			}.Build()
+			attribution, err = buildExternalIPAttribution(bareMetal)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(attribution.GetBaremetalInstance().GetId()).To(Equal("bmi-id"))
+		})
+
+		It("rejects an update without an explicit mask", func() {
+			eip := createExternalIPInState(ctx, externalIPDao, sharedPool.GetId(),
+				privatev1.ExternalIPState_EXTERNAL_IP_STATE_ALLOCATED, false)
+			ci := createComputeInstanceInState(ctx, computeInstanceDao,
+				privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_RUNNING)
+			response, err := server.Create(ctx, privatev1.ExternalIPAttachmentsCreateRequest_builder{
+				Object: privatev1.ExternalIPAttachment_builder{
+					Metadata: privatev1.Metadata_builder{Name: "nil-mask-attachment"}.Build(),
+					Spec: privatev1.ExternalIPAttachmentSpec_builder{
+						ExternalIp:      privatev1.ExternalIPLocalReference_builder{Id: eip.GetId()}.Build(),
+						ComputeInstance: privatev1.ComputeInstanceLocalReference_builder{Id: ci.GetId()}.Build(),
+					}.Build(),
+				}.Build(),
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+			_, err = server.Update(ctx, privatev1.ExternalIPAttachmentsUpdateRequest_builder{
+				Object: response.GetObject(),
+			}.Build())
+			Expect(grpcstatus.Code(err)).To(Equal(grpccodes.InvalidArgument))
+		})
+
+		It("settles and clears the ExternalIP parent from child transitions", func() {
+			eip := createExternalIPInState(ctx, externalIPDao, sharedPool.GetId(),
+				privatev1.ExternalIPState_EXTERNAL_IP_STATE_ALLOCATED, false)
+			ci := createComputeInstanceInState(ctx, computeInstanceDao,
+				privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_RUNNING)
+			createResponse, err := server.Create(ctx, privatev1.ExternalIPAttachmentsCreateRequest_builder{
+				Object: privatev1.ExternalIPAttachment_builder{
+					Metadata: privatev1.Metadata_builder{Name: "settled-attachment"}.Build(),
+					Spec: privatev1.ExternalIPAttachmentSpec_builder{
+						ExternalIp:      privatev1.ExternalIPLocalReference_builder{Id: eip.GetId()}.Build(),
+						ComputeInstance: privatev1.ComputeInstanceLocalReference_builder{Id: ci.GetId()}.Build(),
+					}.Build(),
+				}.Build(),
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+
+			readyTime := timestamppb.New(time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC))
+			ready := createResponse.GetObject()
+			ready.GetStatus().SetState(privatev1.ExternalIPAttachmentState_EXTERNAL_IP_ATTACHMENT_STATE_READY)
+			ready.GetStatus().SetStateTransitionTime(readyTime)
+			_, err = server.Update(ctx, privatev1.ExternalIPAttachmentsUpdateRequest_builder{
+				Object: ready,
+				UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{
+					"status.state", "status.state_transition_time",
+				}},
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+
+			parentResponse, err := externalIPDao.Get().SetId(eip.GetId()).Do(ctx)
+			Expect(err).ToNot(HaveOccurred())
+			parent := parentResponse.GetObject()
+			Expect(parent.GetStatus().GetAttached()).To(BeTrue())
+			Expect(parent.GetStatus().GetAttribution().GetComputeInstance().GetId()).To(Equal(ci.GetId()))
+			Expect(parent.GetStatus().GetAttachmentTransitionTime().AsTime()).To(Equal(readyTime.AsTime()))
+
+			detachTime := timestamppb.New(readyTime.AsTime().Add(time.Minute))
+			ready.GetStatus().SetState(privatev1.ExternalIPAttachmentState_EXTERNAL_IP_ATTACHMENT_STATE_DELETING)
+			ready.GetStatus().SetStateTransitionTime(detachTime)
+			_, err = server.Update(ctx, privatev1.ExternalIPAttachmentsUpdateRequest_builder{
+				Object: ready,
+				UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{
+					"status.state", "status.state_transition_time",
+				}},
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+
+			parentResponse, err = externalIPDao.Get().SetId(eip.GetId()).Do(ctx)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(parentResponse.GetObject().GetStatus().GetAttached()).To(BeFalse())
+			Expect(parentResponse.GetObject().GetStatus().GetAttribution()).To(BeNil())
+			Expect(parentResponse.GetObject().GetStatus().GetAttachmentTransitionTime().AsTime()).To(Equal(detachTime.AsTime()))
+		})
+
 		It("Creates an attachment with a ComputeInstance target", func() {
 			eip := createExternalIPInState(ctx, externalIPDao, sharedPool.GetId(),
 				privatev1.ExternalIPState_EXTERNAL_IP_STATE_ALLOCATED, false)
@@ -635,7 +742,7 @@ var _ = Describe("Private external IP attachments server", func() {
 			Expect(err.Error()).To(ContainSubstring("not in ALLOCATED state"))
 		})
 
-		It("Rejects Create when ExternalIP is already attached", func() {
+		It("does not use the parent attached output as an exclusivity guard", func() {
 			eip := createExternalIPInState(ctx, externalIPDao, sharedPool.GetId(),
 				privatev1.ExternalIPState_EXTERNAL_IP_STATE_ALLOCATED, true)
 			ci := createComputeInstanceInState(ctx, computeInstanceDao,
@@ -652,11 +759,7 @@ var _ = Describe("Private external IP attachments server", func() {
 					}.Build(),
 				}.Build(),
 			}.Build())
-			Expect(err).To(HaveOccurred())
-			status, ok := grpcstatus.FromError(err)
-			Expect(ok).To(BeTrue())
-			Expect(status.Code()).To(Equal(grpccodes.FailedPrecondition))
-			Expect(err.Error()).To(ContainSubstring("already attached"))
+			Expect(err).ToNot(HaveOccurred())
 		})
 	})
 
@@ -733,7 +836,7 @@ var _ = Describe("Private external IP attachments server", func() {
 	})
 
 	Describe("Uniqueness constraints", func() {
-		It("Rejects Create when ExternalIP is already attached (attached flag)", func() {
+		It("Rejects Create when ExternalIP already has an attachment", func() {
 			eip := createExternalIPInState(ctx, externalIPDao, sharedPool.GetId(),
 				privatev1.ExternalIPState_EXTERNAL_IP_STATE_ALLOCATED, false)
 			ci1 := createComputeInstanceInState(ctx, computeInstanceDao,
@@ -768,8 +871,8 @@ var _ = Describe("Private external IP attachments server", func() {
 			Expect(err).To(HaveOccurred())
 			status, ok := grpcstatus.FromError(err)
 			Expect(ok).To(BeTrue())
-			Expect(status.Code()).To(Equal(grpccodes.FailedPrecondition))
-			Expect(err.Error()).To(ContainSubstring("already attached"))
+			Expect(status.Code()).To(Equal(grpccodes.AlreadyExists))
+			Expect(err.Error()).To(ContainSubstring("ExternalIP"))
 		})
 
 		It("Rejects Create when ExternalIP already has an attachment (uniqueness check)", func() {
@@ -791,13 +894,6 @@ var _ = Describe("Private external IP attachments server", func() {
 					}.Build(),
 				}.Build(),
 			}.Build())
-			Expect(err).ToNot(HaveOccurred())
-
-			// Reset the attached flag so the uniqueness check path is exercised
-			ipResp, err := externalIPDao.Get().SetId(eip.GetId()).Do(ctx)
-			Expect(err).ToNot(HaveOccurred())
-			ipResp.GetObject().GetStatus().SetAttached(false)
-			_, err = externalIPDao.Update().SetObject(ipResp.GetObject()).Do(ctx)
 			Expect(err).ToNot(HaveOccurred())
 
 			_, err = server.Create(ctx, privatev1.ExternalIPAttachmentsCreateRequest_builder{
@@ -903,7 +999,7 @@ var _ = Describe("Private external IP attachments server", func() {
 	})
 
 	Describe("Attached flag management", func() {
-		It("Sets ExternalIP.status.attached to true on Create", func() {
+		It("does not settle ExternalIP status on Create", func() {
 			eip := createExternalIPInState(ctx, externalIPDao, sharedPool.GetId(),
 				privatev1.ExternalIPState_EXTERNAL_IP_STATE_ALLOCATED, false)
 			ci := createComputeInstanceInState(ctx, computeInstanceDao,
@@ -924,7 +1020,7 @@ var _ = Describe("Private external IP attachments server", func() {
 
 			ipResp, err := externalIPDao.Get().SetId(eip.GetId()).Do(ctx)
 			Expect(err).ToNot(HaveOccurred())
-			Expect(ipResp.GetObject().GetStatus().GetAttached()).To(BeTrue())
+			Expect(ipResp.GetObject().GetStatus().GetAttached()).To(BeFalse())
 		})
 
 		It("Sets ExternalIP.status.attached to false on Delete", func() {

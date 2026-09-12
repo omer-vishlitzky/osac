@@ -242,9 +242,7 @@ func (s *NATGatewaysServer) Update(ctx context.Context,
 		err = grpcstatus.Errorf(grpccodes.InvalidArgument, "object is mandatory")
 		return
 	}
-	if updateIncludesField(request.GetUpdateMask(),
-		"status.state", "status.message", "status.hub", "status.state_transition_time") {
-		err = grpcstatus.Errorf(grpccodes.InvalidArgument, "status output fields cannot be updated")
+	if err = validatePublicUpdateMask(request.GetUpdateMask()); err != nil {
 		return
 	}
 	privateNATGateway := &privatev1.NATGateway{}

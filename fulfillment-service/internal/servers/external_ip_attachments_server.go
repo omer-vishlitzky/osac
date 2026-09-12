@@ -238,9 +238,8 @@ func (s *ExternalIPAttachmentsServer) Update(ctx context.Context,
 	if publicAttachment == nil {
 		return nil, grpcstatus.Errorf(grpccodes.InvalidArgument, "object is mandatory")
 	}
-	if updateIncludesField(request.GetUpdateMask(),
-		"status.state", "status.external_ip_address", "status.message", "status.hub", "status.state_transition_time") {
-		return nil, grpcstatus.Errorf(grpccodes.InvalidArgument, "status output fields cannot be updated")
+	if err := validatePublicUpdateMask(request.GetUpdateMask()); err != nil {
+		return nil, err
 	}
 	privateAttachment := &privatev1.ExternalIPAttachment{}
 	err := s.inMapper.Copy(ctx, publicAttachment, privateAttachment)

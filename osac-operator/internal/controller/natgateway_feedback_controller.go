@@ -19,6 +19,7 @@ import (
 	"fmt"
 
 	"google.golang.org/grpc"
+	"google.golang.org/protobuf/types/known/fieldmaskpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -69,6 +70,9 @@ func NewNATGatewayFeedbackReconciler(hubClient clnt.Client, grpcConn *grpc.Clien
 		Save: func(ctx context.Context, remote *privatev1.NATGateway) error {
 			_, err := ngClient.Update(ctx, privatev1.NATGatewaysUpdateRequest_builder{
 				Object: remote,
+				UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{
+					feedbackStatusStatePath, feedbackStatusMessagePath, "status.hub", feedbackStatusStateTransitionTimePath,
+				}},
 			}.Build())
 			return err
 		},

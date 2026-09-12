@@ -145,6 +145,16 @@ class TestBmaasNetworking:
             delay=5,
             description=f"NATGateway {nat_name} to become Ready",
         )
+        nat_cr_name = poll_until(
+            fn=lambda: k8s_hub_client.get_nat_gateway_name(uuid=nat_id, checked=False),
+            until=lambda name: name != "",
+            retries=30,
+            delay=5,
+            description=f"NATGateway CR for {nat_name}",
+        )
+        assert k8s_hub_client.get_jsonpath(
+            resource="natgateway", name=nat_cr_name, jsonpath="{.status.stateTransitionTime}"
+        )
 
         self.__class__.state.update(
             nat_eip_id=nat_eip_id, nat_eip_cr=nat_eip_cr, nat_eip_name=nat_eip_name, nat_id=nat_id, nat_name=nat_name
@@ -217,7 +227,7 @@ class TestBmaasNetworking:
         self.__class__.state["bmi2"] = bmis[1]
         self.__class__.state["bmi3"] = bmis[2]
 
-    def test_05b_verify_auto_eip_on_bmi3(self, grpc: GRPCClient) -> None:
+    def test_05b_verify_auto_eip_on_bmi3(self, grpc: GRPCClient, private_grpc: GRPCClient) -> None:
         _require(self.state, "bmi3")
         bmi3 = self.state["bmi3"]
 
@@ -244,6 +254,9 @@ class TestBmaasNetworking:
         eip_data = grpc.get_external_ip(external_ip_id=auto_eip_ref)
         auto_ext_addr = eip_data.get("object", {}).get("status", {}).get("address", "")
         assert auto_ext_addr, "Auto-created ExternalIP has no allocated address"
+        private_eip = private_grpc.get_private_external_ip(external_ip_id=auto_eip_ref)["object"]
+        assert private_eip["status"]["attribution"]["baremetalInstance"]["id"] == bmi3["id"]
+        assert private_eip["status"].get("attachmentTransitionTime")
 
         self.__class__.state.update(
             auto_attach_id=auto_attach_id, auto_eip_id=auto_eip_ref, auto_ext_addr=auto_ext_addr

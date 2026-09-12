@@ -20,11 +20,9 @@ import (
 
 	"google.golang.org/protobuf/types/known/timestamppb"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	"github.com/osac-project/osac/osac-operator/api/v1alpha1"
-	privatev1 "github.com/osac-project/osac/osac-operator/internal/api/osac/private/v1"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
 func TestDeleteFeedbackCopiesAuthoritativeTransitionTimes(t *testing.T) {
@@ -88,61 +86,6 @@ func TestExternalIPDeleteRecordsTransitionTime(t *testing.T) {
 	setExternalIPDeleting(status)
 	if !status.StateTransitionTime.Time.Equal(first.Time) {
 		t.Fatal("deletion transition time changed on repeated reconciliation")
-	}
-}
-
-func TestSyncExternalIPUpdateCopiesAttachmentTransitionTime(t *testing.T) {
-	want := time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC)
-	obj := &v1alpha1.ExternalIP{Status: v1alpha1.ExternalIPStatus{
-		AttachmentTransitionTime: &metav1.Time{Time: want},
-	}}
-	remote := &privatev1.ExternalIP{Status: &privatev1.ExternalIPStatus{}}
-
-	if err := syncExternalIPUpdate(context.Background(), obj, remote); err != nil {
-		t.Fatal(err)
-	}
-	assertTransitionTime(t, remote.GetStatus().GetAttachmentTransitionTime(), want)
-}
-
-func TestExternalIPAttributionRejectsInvalidTargetAndEndpoint(t *testing.T) {
-	tests := map[string]*privatev1.ExternalIPAttachment{
-		"empty compute ID": {
-			Id:   "attachment",
-			Spec: &privatev1.ExternalIPAttachmentSpec{},
-		},
-		"cluster endpoint unspecified": {
-			Id:   "attachment",
-			Spec: &privatev1.ExternalIPAttachmentSpec{},
-		},
-		"compute endpoint set": {
-			Id:   "attachment",
-			Spec: &privatev1.ExternalIPAttachmentSpec{},
-		},
-	}
-	tests["empty compute ID"].GetSpec().SetComputeInstance(&privatev1.ComputeInstanceLocalReference{})
-	tests["cluster endpoint unspecified"].GetSpec().SetCluster(&privatev1.ClusterLocalReference{Id: "cluster"})
-	tests["compute endpoint set"].GetSpec().SetComputeInstance(&privatev1.ComputeInstanceLocalReference{Id: "compute"})
-	tests["compute endpoint set"].GetSpec().SetTargetEndpoint(privatev1.ExternalIPAttachmentEndpoint_EXTERNAL_IP_ATTACHMENT_ENDPOINT_API)
-
-	for name, attachment := range tests {
-		t.Run(name, func(t *testing.T) {
-			if _, err := externalIPAttribution(attachment, true); err == nil {
-				t.Fatal("expected invalid attribution to fail")
-			}
-		})
-	}
-}
-
-func TestSyncExternalIPCRDTransitionTimeRequiresParent(t *testing.T) {
-	scheme := runtime.NewScheme()
-	if err := v1alpha1.AddToScheme(scheme); err != nil {
-		t.Fatal(err)
-	}
-	hubClient := fake.NewClientBuilder().WithScheme(scheme).Build()
-
-	err := syncExternalIPCRDTransitionTime(context.Background(), hubClient, "networking", "external-ip-id", nil)
-	if err == nil {
-		t.Fatal("expected missing parent ExternalIP CR to fail")
 	}
 }
 
