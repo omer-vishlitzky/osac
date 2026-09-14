@@ -56,6 +56,7 @@ type config struct {
 	dbURLFile              string
 	heartbeatInterval      time.Duration
 	reconciliationInterval time.Duration
+	deploymentID           string
 	enableCaaS             bool
 	enableVMaaS            bool
 	enableBMaaS            bool
@@ -96,6 +97,7 @@ func configFromEnv() *config {
 		dbURLFile:              envOrDefault("DB_URL_FILE", "/etc/metering/db"),
 		heartbeatInterval:      parseDurationOrDefault(os.Getenv("HEARTBEAT_INTERVAL"), 60*time.Second),
 		reconciliationInterval: parseDurationOrDefault(os.Getenv("RECONCILIATION_INTERVAL"), 60*time.Minute),
+		deploymentID:           os.Getenv("METERING_DEPLOYMENT_ID"),
 		enableCaaS:             envBool("ENABLE_CAAS"),
 		enableVMaaS:            envBool("ENABLE_VMAAS"),
 		enableBMaaS:            envBool("ENABLE_BMAAS"),
@@ -138,6 +140,9 @@ func (c *config) validate() error {
 	}
 	if c.dbURLFile == "" {
 		return fmt.Errorf("DB_URL_FILE is required")
+	}
+	if c.deploymentID == "" {
+		return fmt.Errorf("METERING_DEPLOYMENT_ID is required")
 	}
 	return nil
 }
@@ -242,7 +247,15 @@ func run(ctx context.Context, logger logr.Logger, cfg *config) error {
 	if cfg.enableCaaS {
 		clusterClient = privatev1.NewClustersClient(grpcConn)
 	}
+	externalIPClient := privatev1.NewExternalIPsClient(grpcConn)
+	natGatewayClient := privatev1.NewNATGatewaysClient(grpcConn)
+	externalIPPoolClient := privatev1.NewExternalIPPoolsClient(grpcConn)
 	reconciler := reconciliation.NewReconciler(computeClient, clusterClient, store, publisher, logger, cfg.heartbeatInterval)
+	reconciler.SetNetworkingClients(externalIPClient, natGatewayClient, externalIPPoolClient, cfg.deploymentID)
+	pools, err := reconciliation.LoadExternalIPPools(ctx, externalIPPoolClient)
+	if err != nil {
+		return fmt.Errorf("loading external IP pool families: %w", err)
+	}
 
 	logger.Info("running startup reconciliation")
 	if err := reconciler.Reconcile(ctx); err != nil {
@@ -273,6 +286,9 @@ func run(ctx context.Context, logger logr.Logger, cfg *config) error {
 	eventsClient := privatev1.NewEventsClient(grpcConn)
 	consumer := watch.NewConsumer(eventsClient, publisher, store, logger)
 	consumer.Filter = watch.BuildFilter(cfg.enableVMaaS, cfg.enableCaaS)
+	consumer.DeploymentID = cfg.deploymentID
+	consumer.ExternalIPPoolClient = externalIPPoolClient
+	consumer.ExternalIPPools = pools
 	err = consumer.Run(ctx)
 	runCancel()
 	wg.Wait()
