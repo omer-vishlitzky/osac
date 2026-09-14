@@ -591,7 +591,9 @@ var _ = Describe("ExternalIPAttachmentFeedbackController", func() {
 			})
 			Expect(err).NotTo(HaveOccurred())
 
-			Expect(mockAttachmentsServer.updates).To(BeEmpty())
+			Expect(mockAttachmentsServer.updates).To(HaveLen(1))
+			Expect(mockAttachmentsServer.updates[0].GetStatus().GetState()).To(Equal(
+				privatev1.ExternalIPAttachmentState_EXTERNAL_IP_ATTACHMENT_STATE_READY))
 			Expect(mockExternalIPsServer2.updates).To(BeEmpty())
 		})
 
