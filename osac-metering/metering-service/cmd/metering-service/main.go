@@ -204,9 +204,8 @@ func run(ctx context.Context, logger logr.Logger, cfg *config) error {
 	defer dbPool.Close()
 	logger.Info("database pool connected", "urlFile", cfg.dbURLFile)
 
-	dbTool := database.NewTool(logger, dbURL)
-	if err := dbTool.Migrate(ctx); err != nil {
-		return fmt.Errorf("running database migrations: %w", err)
+	if err := database.InitializeSchema(ctx, dbPool); err != nil {
+		return fmt.Errorf("initializing database schema: %w", err)
 	}
 
 	store := projection.NewPostgresStore(dbPool)
