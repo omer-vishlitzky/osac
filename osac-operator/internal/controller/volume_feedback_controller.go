@@ -20,6 +20,7 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
+	"google.golang.org/protobuf/types/known/timestamppb"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	clnt "sigs.k8s.io/controller-runtime/pkg/client"
@@ -77,7 +78,7 @@ func NewVolumeFeedbackReconciler(hubClient clnt.Client, grpcConn *grpc.ClientCon
 			_, err := volClient.Update(ctx, privatev1.VolumesUpdateRequest_builder{
 				Object: remote,
 				UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{
-					feedbackStatusStatePath, "status.vendor_volume_id", "status.backend", "status.vendor_context", "status.protocol",
+					feedbackStatusStatePath, "status.vendor_volume_id", "status.backend", "status.vendor_context", "status.protocol", "status.state_transition_time",
 				}},
 			}.Build())
 			return err
@@ -120,18 +121,28 @@ func (r *VolumeFeedbackReconciler) Reconcile(ctx context.Context, request ctrl.R
 func syncVolumeUpdate(ctx context.Context, obj *v1alpha1.Volume, remote *privatev1.Volume) error {
 	syncVolumePhase(ctx, obj, remote)
 	syncVolumeVendorFields(ctx, obj, remote)
+	syncVolumeStateTransitionTime(obj, remote)
 	return nil
 }
 
 // syncVolumeDelete maps Volume CR status during deletion. Failed volumes
 // report FAILED; all other deletion states report DELETING.
 func syncVolumeDelete(_ context.Context, obj *v1alpha1.Volume, remote *privatev1.Volume) error {
+	syncVolumeStateTransitionTime(obj, remote)
 	if obj.Status.Phase == v1alpha1.VolumePhaseFailed {
 		remote.GetStatus().SetState(privatev1.VolumeState_VOLUME_STATE_FAILED)
 		return nil
 	}
 	remote.GetStatus().SetState(privatev1.VolumeState_VOLUME_STATE_DELETING)
 	return nil
+}
+
+func syncVolumeStateTransitionTime(obj *v1alpha1.Volume, remote *privatev1.Volume) {
+	if obj.Status.StateTransitionTime == nil {
+		remote.GetStatus().ClearStateTransitionTime()
+		return
+	}
+	remote.GetStatus().SetStateTransitionTime(timestamppb.New(obj.Status.StateTransitionTime.Time))
 }
 
 // syncVolumePhase converts the CRD phase to the proto state enum.

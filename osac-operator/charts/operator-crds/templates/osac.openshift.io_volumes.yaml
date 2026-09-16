@@ -195,6 +195,12 @@ spec:
                   Protocol is the storage protocol used for this volume.
                   Resolved during tier resolution at creation time.
                 type: string
+              stateTransitionTime:
+                description: |-
+                  StateTransitionTime is the authoritative time at which the lifecycle
+                  phase last changed.
+                format: date-time
+                type: string
               vendorContext:
                 additionalProperties:
                   type: string

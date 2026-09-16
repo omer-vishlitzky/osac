@@ -204,8 +204,13 @@ func (r *VolumeReconciler) handleUpdate(ctx context.Context, vol *v1alpha1.Volum
 		return ctrl.Result{RequeueAfter: statusStampPollInterval}, nil
 	}
 
+	previousPhase := vol.Status.Phase
 	if vol.Status.Phase == "" {
 		vol.Status.Phase = v1alpha1.VolumePhaseProgressing
+	}
+	if vol.Status.Phase != previousPhase {
+		now := metav1.Now()
+		vol.Status.StateTransitionTime = &now
 	}
 
 	// Already provisioned; nothing to do until spec changes (future: resize).
@@ -257,6 +262,8 @@ func (r *VolumeReconciler) handleProvisioning(ctx context.Context, vol *v1alpha1
 	if err != nil {
 		log.Error(err, "vendor provisioning failed")
 		vol.Status.Phase = v1alpha1.VolumePhaseFailed
+		now := metav1.Now()
+		vol.Status.StateTransitionTime = &now
 		setVendorProvisionedCondition(&vol.Status.Conditions, metav1.ConditionFalse, "ProvisioningFailed", err.Error())
 		return ctrl.Result{}, nil
 	}
@@ -266,6 +273,8 @@ func (r *VolumeReconciler) handleProvisioning(ctx context.Context, vol *v1alpha1
 	vol.Status.Protocol = v1alpha1.VolumeProtocol(resp.Protocol)
 	vol.Status.VendorContext = resp.VendorContext
 	vol.Status.Phase = v1alpha1.VolumePhaseReady
+	now := metav1.Now()
+	vol.Status.StateTransitionTime = &now
 	setVendorProvisionedCondition(&vol.Status.Conditions, metav1.ConditionTrue, "Provisioned", "Volume provisioned on vendor storage array")
 
 	log.Info("vendor provisioning succeeded",
@@ -285,7 +294,11 @@ func (r *VolumeReconciler) handleDelete(ctx context.Context, vol *v1alpha1.Volum
 	log := ctrllog.FromContext(ctx)
 	log.Info("deleting volume")
 
-	vol.Status.Phase = v1alpha1.VolumePhaseDeleting
+	if vol.Status.Phase != v1alpha1.VolumePhaseDeleting {
+		vol.Status.Phase = v1alpha1.VolumePhaseDeleting
+		now := metav1.Now()
+		vol.Status.StateTransitionTime = &now
+	}
 
 	if !controllerutil.ContainsFinalizer(vol, osacVolumeFinalizer) {
 		return ctrl.Result{}, nil

@@ -125,6 +125,11 @@ type VolumeStatus struct {
 	// osac-csi-driver to the vendor CSI controller's ControllerPublishVolume.
 	// +kubebuilder:validation:Optional
 	VendorContext map[string]string `json:"vendorContext,omitempty"`
+
+	// StateTransitionTime is the authoritative time at which the lifecycle
+	// phase last changed.
+	// +kubebuilder:validation:Optional
+	StateTransitionTime *metav1.Time `json:"stateTransitionTime,omitempty"`
 }
 
 // +kubebuilder:object:root=true
