@@ -249,8 +249,10 @@ func run(ctx context.Context, logger logr.Logger, cfg *config) error {
 	externalIPClient := privatev1.NewExternalIPsClient(grpcConn)
 	natGatewayClient := privatev1.NewNATGatewaysClient(grpcConn)
 	externalIPPoolClient := privatev1.NewExternalIPPoolsClient(grpcConn)
+	volumeClient := privatev1.NewVolumesClient(grpcConn)
 	reconciler := reconciliation.NewReconciler(computeClient, clusterClient, store, publisher, logger, cfg.heartbeatInterval)
 	reconciler.SetNetworkingClients(externalIPClient, natGatewayClient, externalIPPoolClient, cfg.deploymentID)
+	reconciler.SetVolumeClient(volumeClient)
 	pools, err := reconciliation.LoadExternalIPPools(ctx, externalIPPoolClient)
 	if err != nil {
 		return fmt.Errorf("loading external IP pool families: %w", err)

@@ -26,6 +26,7 @@ var resourceTypeEndpoints = map[string]string{
 	schema.ResourceTypeClusterOrder:    "/caas/event",
 	schema.ResourceTypeExternalIP:      "/networking/event",
 	schema.ResourceTypeNATGateway:      "/networking/event",
+	schema.ResourceTypeVolume:          "/storage/event",
 	"maas_inference":                   "/maas/event",
 }
 

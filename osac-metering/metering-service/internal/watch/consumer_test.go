@@ -225,6 +225,57 @@ var _ = Describe("Consumer", func() {
 	}
 
 	Describe("Run", func() {
+		It("meters a block Volume from creation through availability", func() {
+			creationTime := time.Date(2026, 1, 1, 10, 0, 0, 0, time.UTC)
+			availableTime := creationTime.Add(time.Minute)
+			volume := func(state privatev1.VolumeState, version int32, transition time.Time, vendorID string) *privatev1.Volume {
+				return &privatev1.Volume{
+					Id: "volume-1",
+					Metadata: &privatev1.Metadata{
+						Tenant:            "tenant-1",
+						Project:           "project-1",
+						Version:           version,
+						CreationTimestamp: timestamppb.New(creationTime),
+					},
+					Spec: &privatev1.VolumeSpec{StorageTier: "gold", SizeGib: 100},
+					Status: &privatev1.VolumeStatus{
+						State:               state,
+						VendorVolumeId:      vendorID,
+						Protocol:            privatev1.StorageProtocol_STORAGE_PROTOCOL_BLOCK,
+						StateTransitionTime: timestamppb.New(transition),
+					},
+				}
+			}
+			creating := volume(privatev1.VolumeState_VOLUME_STATE_CREATING, 1, creationTime, "")
+			available := volume(privatev1.VolumeState_VOLUME_STATE_AVAILABLE, 2, availableTime, "vendor-1")
+
+			client.results = []mockStreamResult{{stream: &mockWatchStream{
+				responses: []*privatev1.EventsWatchResponse{
+					makeResponse(&privatev1.Event{
+						Id:      "volume-created",
+						Type:    privatev1.EventType_EVENT_TYPE_OBJECT_CREATED,
+						Payload: &privatev1.Event_Volume{Volume: creating},
+					}),
+					makeResponse(&privatev1.Event{
+						Id:      "volume-available",
+						Type:    privatev1.EventType_EVENT_TYPE_OBJECT_UPDATED,
+						Payload: &privatev1.Event_Volume{Volume: available},
+					}),
+				},
+			}}}
+
+			pub := &mockPublisher{published: make([]cloudevents.Event, 0, 2), cancelFunc: cancel}
+			consumer := newConsumer(pub)
+			Expect(consumer.Run(ctx)).To(Succeed())
+
+			pub.mu.Lock()
+			defer pub.mu.Unlock()
+			Expect(pub.published).To(HaveLen(2))
+			Expect(pub.published[0].Type()).To(Equal(events.EventCreated))
+			Expect(pub.published[1].Type()).To(Equal(events.EventStarted))
+			Expect(pub.published[1].Time()).To(Equal(availableTime))
+		})
+
 		It("meters a NATGateway lifecycle without a network provider", func() {
 			creationTime := time.Date(2026, 1, 1, 10, 0, 0, 0, time.UTC)
 			readyTime := creationTime.Add(time.Minute)
@@ -474,7 +525,7 @@ var _ = Describe("Consumer", func() {
 			client.mu.Lock()
 			defer client.mu.Unlock()
 			Expect(client.calls).ToNot(BeEmpty())
-			Expect(client.calls[0].GetFilter()).To(Equal("has(event.compute_instance) || has(event.cluster) || has(event.external_ip) || has(event.nat_gateway)"))
+			Expect(client.calls[0].GetFilter()).To(Equal("has(event.compute_instance) || has(event.cluster) || has(event.external_ip) || has(event.nat_gateway) || has(event.volume)"))
 		})
 
 		It("fails fast on unknown payload type and reconnects", func() {

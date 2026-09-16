@@ -53,7 +53,7 @@ func BuildFilter(vmaas, caas bool) string {
 	if caas {
 		parts = append(parts, "has(event.cluster)")
 	}
-	parts = append(parts, "has(event.external_ip)", "has(event.nat_gateway)")
+	parts = append(parts, "has(event.external_ip)", "has(event.nat_gateway)", "has(event.volume)")
 	return strings.Join(parts, " || ")
 }
 
@@ -195,11 +195,15 @@ func (c *Consumer) handleEvent(ctx context.Context, event *privatev1.Event) erro
 		return nil
 	}
 
-	if c.shouldSkipUpdate(ctx, event, existing, currentState, dims, version, transitionTime, resourceID) {
+	if c.shouldSkipUpdate(ctx, event, existing, currentState, isBillable, dims, version, transitionTime, resourceID) {
 		return nil
 	}
 
 	stateCtx := c.buildStateContext(existing, isBillable, transitionTime, dims)
+	if mapper.ResourceType() == events.ResourceTypeVolume && existing != nil && existing.IsBillable && isBillable &&
+		existing.CurrentState == currentState && !events.DimensionsEqual(existing.BillingDimensions, dims) {
+		return c.handleScalingEvent(ctx, event, mapper, existing, transitionTime, version, currentState, isBillable, dims)
+	}
 
 	eventDims := dims
 	if mapper.ResourceType() == events.ResourceTypeClusterOrder &&
@@ -506,11 +510,11 @@ func (c *Consumer) buildScalingEvent(eventID string, mapper events.ResourceMappe
 	}
 	return ce, nil
 }
-func (c *Consumer) shouldSkipUpdate(ctx context.Context, event *privatev1.Event, existing *projection.ResourceState, currentState string, dims map[string]any, version int32, transitionTime time.Time, resourceID string) bool {
+func (c *Consumer) shouldSkipUpdate(ctx context.Context, event *privatev1.Event, existing *projection.ResourceState, currentState string, isBillable bool, dims map[string]any, version int32, transitionTime time.Time, resourceID string) bool {
 	if event.GetType() != privatev1.EventType_EVENT_TYPE_OBJECT_UPDATED || existing == nil {
 		return false
 	}
-	if existing.CurrentState != currentState || !events.DimensionsEqual(existing.BillingDimensions, dims) {
+	if existing.CurrentState != currentState || existing.IsBillable != isBillable || !events.DimensionsEqual(existing.BillingDimensions, dims) {
 		return false
 	}
 	if version > existing.FulfillmentVersion {

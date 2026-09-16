@@ -123,6 +123,9 @@ func mapperForEvent(event *privatev1.Event, context MapperContext) (ResourceMapp
 	if cl := event.GetCluster(); cl != nil {
 		return &clusterMapper{cl: cl}, nil
 	}
+	if volume := event.GetVolume(); volume != nil {
+		return &volumeMapper{volume: volume}, nil
+	}
 	if ip := event.GetExternalIp(); ip != nil {
 		return &externalIPMapper{ip: ip, context: context}, nil
 	}

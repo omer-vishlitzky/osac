@@ -51,6 +51,13 @@ var requiredBillingDimensions = map[string][]string{
 		"tenant_id",
 		"project_id",
 	},
+	schema.ResourceTypeVolume: {
+		"volume_id",
+		"storage_tier",
+		"size_gib",
+		"tenant_id",
+		"project_id",
+	},
 }
 
 var networkingResourceTypes = map[string]struct{}{
@@ -63,7 +70,11 @@ func IsNetworkingResourceType(resourceType string) bool {
 	return ok
 }
 
-// ValidateBillingDimensions rejects incomplete networking dimensions before an
+func IsVolumeResourceType(resourceType string) bool {
+	return resourceType == schema.ResourceTypeVolume
+}
+
+// ValidateBillingDimensions rejects incomplete billing dimensions before an
 // event reaches Kafka. An empty project_id identifies the tenant default
 // project; all other string dimensions must be non-empty.
 func ValidateBillingDimensions(resourceType string, dimensions map[string]any) error {
@@ -74,6 +85,13 @@ func ValidateBillingDimensions(resourceType string, dimensions map[string]any) e
 		}
 		if key == "attached" {
 			if _, ok := value.(bool); !ok {
+				return fmt.Errorf("%w: resource type %s has invalid billing dimension %q", ErrDataQuality, resourceType, key)
+			}
+			continue
+		}
+		if resourceType == schema.ResourceTypeVolume && key == "size_gib" {
+			size, ok := toFloat64(value)
+			if !ok || size <= 0 {
 				return fmt.Errorf("%w: resource type %s has invalid billing dimension %q", ErrDataQuality, resourceType, key)
 			}
 			continue
