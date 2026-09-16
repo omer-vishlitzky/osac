@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"strings"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -44,6 +45,7 @@ func (c *grpcVolumeClient) CreateVolume(ctx context.Context, params CreateVolume
 	md := &privatev1.Metadata{}
 	md.SetName(params.PVCRef)
 	md.SetTenant(params.Tenant)
+	md.SetProject(params.Project)
 
 	spec := &privatev1.VolumeSpec{}
 	spec.SetStorageTier(params.Tier)
@@ -90,10 +92,18 @@ func (c *grpcVolumeClient) GetVolume(ctx context.Context, volumeID string) (*Vol
 // (retried) CreateVolume call.
 func (c *grpcVolumeClient) ListVolumes(ctx context.Context, params ListVolumesParams) ([]*VolumeInfo, error) {
 	req := &privatev1.VolumesListRequest{}
+	filters := make([]string, 0, 3)
 	if params.NameFilter != "" {
-		// CEL filter expression evaluated server-side (see fulfillment-service
-		// generic DAO filter language).
-		req.SetFilter(fmt.Sprintf("this.metadata.name == %q", params.NameFilter))
+		filters = append(filters, fmt.Sprintf("this.metadata.name == %q", params.NameFilter))
+	}
+	if params.TenantFilter != nil {
+		filters = append(filters, fmt.Sprintf("this.metadata.tenant == %q", *params.TenantFilter))
+	}
+	if params.ProjectFilter != nil {
+		filters = append(filters, fmt.Sprintf("this.metadata.project == %q", *params.ProjectFilter))
+	}
+	if len(filters) > 0 {
+		req.SetFilter(strings.Join(filters, " && "))
 	}
 
 	resp, err := c.client.List(ctx, req)

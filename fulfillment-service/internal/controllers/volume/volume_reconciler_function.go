@@ -190,7 +190,8 @@ func (t *task) update(ctx context.Context) error {
 					labels.VolumeUuid: t.volume.GetId(),
 				},
 				Annotations: map[string]string{
-					annotations.Tenant: t.volume.GetMetadata().GetTenant(),
+					annotations.Tenant:  t.volume.GetMetadata().GetTenant(),
+					annotations.Project: t.volume.GetMetadata().GetProject(),
 				},
 			},
 			Spec: spec,
@@ -210,6 +211,11 @@ func (t *task) update(ctx context.Context) error {
 		)
 	} else {
 		update := object.DeepCopy()
+		if update.Annotations == nil {
+			update.Annotations = make(map[string]string)
+		}
+		update.Annotations[annotations.Tenant] = t.volume.GetMetadata().GetTenant()
+		update.Annotations[annotations.Project] = t.volume.GetMetadata().GetProject()
 		update.Spec = spec
 		err = t.hubClient.Patch(ctx, update, clnt.MergeFrom(object))
 		if err != nil {

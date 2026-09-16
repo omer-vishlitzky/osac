@@ -185,6 +185,9 @@ func TestCreateVolume_Success(t *testing.T) {
 			if params.Tenant != "my-tenant" {
 				t.Errorf("expected tenant 'my-tenant', got %q", params.Tenant)
 			}
+			if params.Project != "my-project" {
+				t.Errorf("expected project 'my-project', got %q", params.Project)
+			}
 			if params.ClusterID != "test-cluster" {
 				t.Errorf("expected clusterID 'test-cluster', got %q", params.ClusterID)
 			}
@@ -202,7 +205,7 @@ func TestCreateVolume_Success(t *testing.T) {
 	resp, err := cs.CreateVolume(context.Background(), &csi.CreateVolumeRequest{
 		Name:               "pvc-123",
 		VolumeCapabilities: defaultCaps(),
-		Parameters:         map[string]string{"tier": "gold", "tenant": "my-tenant"},
+		Parameters:         map[string]string{"tier": "gold", "tenant": "my-tenant", "project": "my-project"},
 		CapacityRange:      &csi.CapacityRange{RequiredBytes: 1024},
 	})
 	if err != nil {
@@ -228,6 +231,9 @@ func TestCreateVolume_DefaultTenant(t *testing.T) {
 		createVolumeFn: func(_ context.Context, params fulfillment.CreateVolumeParams) (*fulfillment.VolumeInfo, error) {
 			if params.Tenant != "default" {
 				t.Errorf("expected default tenant, got %q", params.Tenant)
+			}
+			if params.Project != "" {
+				t.Errorf("expected empty project, got %q", params.Project)
 			}
 			return availableVolume("vol-1", "pvc-123"), nil
 		},
@@ -376,7 +382,7 @@ func TestCreateVolume_AlreadyExistsNotFoundViaList(t *testing.T) {
 		VolumeCapabilities: defaultCaps(),
 		Parameters:         map[string]string{"tier": "gold"},
 	})
-	assertCode(t, err, codes.Internal)
+	assertCode(t, err, codes.AlreadyExists)
 }
 
 func TestCreateVolume_ErrorState(t *testing.T) {
