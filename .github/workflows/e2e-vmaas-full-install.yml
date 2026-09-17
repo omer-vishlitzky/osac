@@ -213,15 +213,16 @@ jobs:
       # as ../../../<name> siblings within it), so a PR touching those components
       # must deploy from this PR's own fork/ref, not the reusable workflow's
       # standalone-repo default.
-      installer-repo: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
-      installer-ref: ${{ github.event.pull_request.head.ref || github.sha }}
-      # Build all component images from the PR's fork/branch (same monorepo checkout).
+      installer-repo: ${{ github.repository }}
+      installer-ref: ${{ github.ref }}
+      # Build all component images from the synthetic PR merge ref in the base
+      # repository, so the build includes the current main branch.
       # osac-aap's execution-environment is built twice (aap.bootstrap.image and
       # aap.configAsCode.eeImage): the two are logically the same image but the
       # override mechanism keys strictly off imageKey, one build per key, so this
       # is the only way to get both fields covered without changing that mechanism
       # (which lives in osac-test-infra, not here). See OSAC-3546.
-      components: '[{"repo":"${{ github.event.pull_request.head.repo.full_name || github.repository }}","ref":"${{ github.event.pull_request.head.ref || github.sha }}","containerfile":"fulfillment-service/Containerfile","context":".","imageKey":"service.images.service"},{"repo":"${{ github.event.pull_request.head.repo.full_name || github.repository }}","ref":"${{ github.event.pull_request.head.ref || github.sha }}","containerfile":"osac-operator/Containerfile","context":".","imageKey":"operator.image.repository"},{"repo":"${{ github.event.pull_request.head.repo.full_name || github.repository }}","ref":"${{ github.event.pull_request.head.ref || github.sha }}","containerfile":"osac-aap/execution-environment/execution-environment.yaml","imageKey":"aap.bootstrap.image","buildType":"ansible-builder"},{"repo":"${{ github.event.pull_request.head.repo.full_name || github.repository }}","ref":"${{ github.event.pull_request.head.ref || github.sha }}","containerfile":"osac-aap/execution-environment/execution-environment.yaml","imageKey":"aap.configAsCode.eeImage","buildType":"ansible-builder"},{"repo":"${{ github.event.pull_request.head.repo.full_name || github.repository }}","ref":"${{ github.event.pull_request.head.ref || github.sha }}","containerfile":"bare-metal-fulfillment-operator/Containerfile","context":".","imageKey":"bmf.image.repository"},{"repo":"${{ github.event.pull_request.head.repo.full_name || github.repository }}","ref":"${{ github.event.pull_request.head.ref || github.sha }}","containerfile":"osac-metering/metering-service/Containerfile","context":".","imageKey":"metering.image.repository"},{"repo":"${{ github.event.pull_request.head.repo.full_name || github.repository }}","ref":"${{ github.event.pull_request.head.ref || github.sha }}","containerfile":"osac-metering/adapters/Containerfile.echo-adapter","context":"osac-metering","imageKey":"metering.echoAdapter.image.repository"},{"repo":"${{ github.event.pull_request.head.repo.full_name || github.repository }}","ref":"${{ github.event.pull_request.head.ref || github.sha }}","containerfile":"osac-csi-driver/Containerfile","context":".","imageKey":"csiDriver.image.repository"}]'
+      components: '[{"repo":"${{ github.repository }}","ref":"${{ github.ref }}","containerfile":"fulfillment-service/Containerfile","context":".","imageKey":"service.images.service"},{"repo":"${{ github.repository }}","ref":"${{ github.ref }}","containerfile":"osac-operator/Containerfile","context":".","imageKey":"operator.image.repository"},{"repo":"${{ github.repository }}","ref":"${{ github.ref }}","containerfile":"osac-aap/execution-environment/execution-environment.yaml","imageKey":"aap.bootstrap.image","buildType":"ansible-builder"},{"repo":"${{ github.repository }}","ref":"${{ github.ref }}","containerfile":"osac-aap/execution-environment/execution-environment.yaml","imageKey":"aap.configAsCode.eeImage","buildType":"ansible-builder"},{"repo":"${{ github.repository }}","ref":"${{ github.ref }}","containerfile":"bare-metal-fulfillment-operator/Containerfile","context":".","imageKey":"bmf.image.repository"},{"repo":"${{ github.repository }}","ref":"${{ github.ref }}","containerfile":"osac-metering/metering-service/Containerfile","context":".","imageKey":"metering.image.repository"},{"repo":"${{ github.repository }}","ref":"${{ github.ref }}","containerfile":"osac-metering/adapters/Containerfile.echo-adapter","context":"osac-metering","imageKey":"metering.echoAdapter.image.repository"},{"repo":"${{ github.repository }}","ref":"${{ github.ref }}","containerfile":"osac-csi-driver/Containerfile","context":".","imageKey":"csiDriver.image.repository"}]'
       # Pass author_association for fork PR authorization (empty for non-fork PRs)
       fork-pr-author-association: ${{ github.event.pull_request.head.repo.fork && github.event.pull_request.author_association || '' }}
       fork-pr-author: ${{ github.event.pull_request.head.repo.fork && github.event.pull_request.user.login || '' }}
@@ -229,8 +230,8 @@ jobs:
       # Checkout osac-test-infra for tests/Containerfile (not the caller repo)
       test-infra-repository: osac-project/osac-test-infra
       test-infra-ref: ${{ inputs.test-infra-ref || 'main' }}
-      test-repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
-      test-ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      test-repository: ${{ github.repository }}
+      test-ref: ${{ github.sha }}
       notify-on-failure: ${{ github.event_name == 'schedule' }}
       # Gated on ref, not event type: the real constraint is WIF trust
       # (main branch only), not which event triggered the run. This
