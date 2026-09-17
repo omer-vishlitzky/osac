@@ -145,7 +145,7 @@ func (g *Generator) buildHeartbeatEvents(state *projection.ResourceState, now ti
 	// e.g. a future in-tick retry — reproduces the same per-component
 	// CloudEvent IDs.
 	baseID := fmt.Sprintf("hb/%s/%d", state.ResourceID, now.Truncate(g.interval).Unix())
-	if events.IsNetworkingResourceType(state.ResourceType) {
+	if events.IsNetworkingResourceType(state.ResourceType) || events.IsVolumeResourceType(state.ResourceType) {
 		identity, err := events.HeartbeatIdentity(state.ResourceType, state.BillingDimensions, state.BillableSince)
 		if err != nil {
 			return nil, err
@@ -235,6 +235,17 @@ func buildHeartbeatEvent(state *projection.ResourceState, eventID string, dims m
 		BillingDimensions: dims,
 		SchemaVersion:     schema.SchemaVersion,
 	}
+	if events.IsVolumeResourceType(state.ResourceType) {
+		sizeGiB, err := events.VolumeSizeGiB(state.BillingDimensions)
+		if err != nil {
+			return ce, err
+		}
+		usage, err := events.VolumeHeartbeatUsage(state.ResourceID, sizeGiB, state.BillableSince, now)
+		if err != nil {
+			return ce, err
+		}
+		data.Usage = usage
+	}
 	if err := ce.SetData(cloudevents.ApplicationJSON, data); err != nil {
 		return ce, fmt.Errorf("setting heartbeat CloudEvent data: %w", err)
 	}
@@ -272,6 +283,7 @@ type heartbeatData struct {
 	ProjectID         *string        `json:"project_id"`
 	CurrentState      string         `json:"current_state"`
 	DurationSeconds   float64        `json:"duration_seconds"`
+	Usage             *schema.Usage  `json:"usage,omitempty"`
 	BillingDimensions map[string]any `json:"billing_dimensions"`
 	SchemaVersion     string         `json:"schema_version"`
 }

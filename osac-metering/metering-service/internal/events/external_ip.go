@@ -141,7 +141,7 @@ func ExternalIPBillingDimensions(ip *privatev1.ExternalIP, deploymentID string, 
 			dimensions[key] = value
 		}
 	}
-	return dimensions, ValidateBillingDimensions(schema.ResourceTypeExternalIP, dimensions)
+	return dimensions, validateNetworkingBillingDimensions(schema.ResourceTypeExternalIP, dimensions)
 }
 
 func IsExternalIPBillableState(state string) bool {

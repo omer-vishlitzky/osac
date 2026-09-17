@@ -65,10 +65,6 @@ func MapWatchEvent(event *privatev1.Event, mapper ResourceMapper, stateCtx *Stat
 	if err := ValidateLifecycleResource(mapper, event.GetId()); err != nil {
 		return nil, err
 	}
-	if err := ValidateBillingDimensions(mapper.ResourceType(), billingDims); err != nil {
-		return nil, err
-	}
-
 	transitionTime, err := mapper.TransitionTime(event, previousState)
 	if err != nil {
 		return nil, err
@@ -81,6 +77,7 @@ func MapWatchEvent(event *privatev1.Event, mapper ResourceMapper, stateCtx *Stat
 		billingDims,
 		stateCtx.PreviousState,
 		stateCtx.DurationSeconds,
+		stateCtx.BillableSince,
 		transitionTime,
 	)
 	if err != nil {
@@ -120,6 +117,7 @@ func BuildLifecycleEvent(
 	billingDims map[string]any,
 	previousState string,
 	durationSeconds *float64,
+	billableSince *time.Time,
 	transitionTime time.Time,
 ) (cloudevents.Event, error) {
 	ce := cloudevents.NewEvent()
@@ -138,6 +136,11 @@ func BuildLifecycleEvent(
 	SetOSACExtensions(&ce, mapper.ResourceID(), mapper.ResourceType(), mapper.TenantID(), projectID)
 
 	data := BuildLifecycleData(mapper, billingDims, previousState, durationSeconds, transitionTime)
+	usage, err := VolumeUsageForMapper(mapper, eventType, billableSince, transitionTime, billingDims)
+	if err != nil {
+		return ce, err
+	}
+	data.Usage = usage
 	if err := ce.SetData(cloudevents.ApplicationJSON, data); err != nil {
 		return ce, fmt.Errorf("setting CloudEvent data: %w", err)
 	}
@@ -164,6 +167,9 @@ func mapperForEvent(event *privatev1.Event, context MapperContext) (ResourceMapp
 	}
 	if cl := event.GetCluster(); cl != nil {
 		return &clusterMapper{cl: cl}, nil
+	}
+	if volume := event.GetVolume(); volume != nil {
+		return &volumeMapper{volume: volume}, nil
 	}
 	if ip := event.GetExternalIp(); ip != nil {
 		return &externalIPMapper{ip: ip, context: context}, nil

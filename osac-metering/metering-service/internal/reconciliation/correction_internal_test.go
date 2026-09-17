@@ -258,7 +258,7 @@ func TestTransientCheckersCoversAllBillabilityCheckerKeys(t *testing.T) {
 }
 
 func TestCorrectionResourceTypesIncludesNetworking(t *testing.T) {
-	for _, resourceType := range []string{events.ResourceTypeExternalIP, events.ResourceTypeNATGateway} {
+	for _, resourceType := range []string{events.ResourceTypeExternalIP, events.ResourceTypeNATGateway, events.ResourceTypeVolume} {
 		if _, ok := correctionResourceTypes[resourceType]; !ok {
 			t.Errorf("corrections do not support networking resource type %q", resourceType)
 		}

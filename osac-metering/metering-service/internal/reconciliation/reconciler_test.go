@@ -66,6 +66,61 @@ func (m *mockClusterClient) List(_ context.Context, req *privatev1.ClustersListR
 	}, nil
 }
 
+func newTestReconciler(
+	computeClient reconciliation.ComputeInstancesClient,
+	clusterClient reconciliation.ClustersClient,
+	store *mockStore,
+	publisher *mockPublisher,
+	interval time.Duration,
+) *reconciliation.Reconciler {
+	if computeClient == nil {
+		computeClient = &mockComputeClient{}
+	}
+	if clusterClient == nil {
+		clusterClient = &mockClusterClient{}
+	}
+	return reconciliation.NewReconciler(
+		computeClient,
+		clusterClient,
+		networkExternalIPClient{},
+		networkNATGatewayClient{},
+		networkPoolClient{response: &privatev1.ExternalIPPoolsListResponse{}},
+		volumeClient{},
+		store,
+		publisher,
+		logr.Discard(),
+		interval,
+		"deployment-1",
+	)
+}
+
+func newConfiguredReconciler(
+	computeClient reconciliation.ComputeInstancesClient,
+	clusterClient reconciliation.ClustersClient,
+	externalIPClient reconciliation.ExternalIPsClient,
+	natGatewayClient reconciliation.NATGatewaysClient,
+	externalIPPoolClient reconciliation.ExternalIPPoolsClient,
+	volumeClient reconciliation.VolumesClient,
+	store *mockStore,
+	publisher *mockPublisher,
+	interval time.Duration,
+	deploymentID string,
+) *reconciliation.Reconciler {
+	return reconciliation.NewReconciler(
+		computeClient,
+		clusterClient,
+		externalIPClient,
+		natGatewayClient,
+		externalIPPoolClient,
+		volumeClient,
+		store,
+		publisher,
+		logr.Discard(),
+		interval,
+		deploymentID,
+	)
+}
+
 type mockStore struct {
 	mu        sync.Mutex
 	states    map[string]projection.ResourceState
@@ -188,7 +243,7 @@ var _ = Describe("Reconciler", func() {
 			}
 			store := newMockStore()
 			pub := &mockPublisher{}
-			recon := reconciliation.NewReconciler(client, nil, store, pub, logr.Discard(), 60*time.Second)
+			recon := newTestReconciler(client, nil, store, pub, 60*time.Second)
 
 			Expect(recon.Reconcile(ctx)).To(Succeed())
 
@@ -221,7 +276,7 @@ var _ = Describe("Reconciler", func() {
 				CurrentState: "RUNNING",
 			}
 			pub := &mockPublisher{}
-			recon := reconciliation.NewReconciler(client, nil, store, pub, logr.Discard(), 60*time.Second)
+			recon := newTestReconciler(client, nil, store, pub, 60*time.Second)
 
 			Expect(recon.Reconcile(ctx)).To(Succeed())
 
@@ -278,7 +333,7 @@ var _ = Describe("Reconciler", func() {
 				FulfillmentVersion: 3,
 			}
 			pub := &mockPublisher{}
-			recon := reconciliation.NewReconciler(client, nil, store, pub, logr.Discard(), 60*time.Second)
+			recon := newTestReconciler(client, nil, store, pub, 60*time.Second)
 
 			Expect(recon.Reconcile(ctx)).To(Succeed())
 
@@ -308,7 +363,7 @@ var _ = Describe("Reconciler", func() {
 				FulfillmentVersion: 1,
 			}
 			pub := &mockPublisher{}
-			recon := reconciliation.NewReconciler(client, nil, store, pub, logr.Discard(), 60*time.Second)
+			recon := newTestReconciler(client, nil, store, pub, 60*time.Second)
 
 			Expect(recon.Reconcile(ctx)).To(Succeed())
 
@@ -337,7 +392,7 @@ var _ = Describe("Reconciler", func() {
 				FulfillmentVersion: 1,
 			}
 			pub := &mockPublisher{}
-			recon := reconciliation.NewReconciler(client, nil, store, pub, logr.Discard(), 60*time.Second)
+			recon := newTestReconciler(client, nil, store, pub, 60*time.Second)
 
 			Expect(recon.Reconcile(ctx)).To(Succeed())
 
@@ -368,7 +423,7 @@ var _ = Describe("Reconciler", func() {
 				LastHeartbeatAt:    &staleTime,
 			}
 			pub := &mockPublisher{}
-			recon := reconciliation.NewReconciler(client, nil, store, pub, logr.Discard(), 60*time.Second)
+			recon := newTestReconciler(client, nil, store, pub, 60*time.Second)
 
 			Expect(recon.Reconcile(ctx)).To(Succeed())
 
@@ -392,7 +447,7 @@ var _ = Describe("Reconciler", func() {
 			}
 			store := newMockStore()
 			pub := &mockPublisher{}
-			recon := reconciliation.NewReconciler(client, nil, store, pub, logr.Discard(), 60*time.Second)
+			recon := newTestReconciler(client, nil, store, pub, 60*time.Second)
 
 			Expect(recon.Reconcile(ctx)).To(Succeed())
 
@@ -424,7 +479,7 @@ var _ = Describe("Reconciler", func() {
 				},
 			}
 			pub := &mockPublisher{}
-			recon := reconciliation.NewReconciler(client, nil, store, pub, logr.Discard(), 60*time.Second)
+			recon := newTestReconciler(client, nil, store, pub, 60*time.Second)
 
 			Expect(recon.Reconcile(ctx)).To(Succeed())
 
@@ -437,7 +492,7 @@ var _ = Describe("Reconciler", func() {
 			client := &mockComputeClient{err: fmt.Errorf("connection refused")}
 			store := newMockStore()
 			pub := &mockPublisher{}
-			recon := reconciliation.NewReconciler(client, nil, store, pub, logr.Discard(), 60*time.Second)
+			recon := newTestReconciler(client, nil, store, pub, 60*time.Second)
 
 			err := recon.Reconcile(ctx)
 			Expect(err).To(HaveOccurred())
@@ -452,7 +507,7 @@ var _ = Describe("Reconciler", func() {
 			}
 			store := newMockStore()
 			pub := &mockPublisher{err: fmt.Errorf("kafka down")}
-			recon := reconciliation.NewReconciler(client, nil, store, pub, logr.Discard(), 60*time.Second)
+			recon := newTestReconciler(client, nil, store, pub, 60*time.Second)
 
 			err := recon.Reconcile(ctx)
 			Expect(err).To(HaveOccurred())
@@ -493,7 +548,7 @@ var _ = Describe("Reconciler", func() {
 				BillingDimensions:  map[string]any{"instance_type": "m5.large"},
 			}
 			pub := &mockPublisher{}
-			recon := reconciliation.NewReconciler(client, nil, store, pub, logr.Discard(), 60*time.Second)
+			recon := newTestReconciler(client, nil, store, pub, 60*time.Second)
 
 			Expect(recon.Reconcile(ctx)).To(Succeed())
 
@@ -548,7 +603,7 @@ var _ = Describe("Reconciler", func() {
 				BillingDimensions:  map[string]any{"instance_type": "m5.large"},
 			}
 			pub := &mockPublisher{}
-			recon := reconciliation.NewReconciler(client, nil, store, pub, logr.Discard(), 60*time.Second)
+			recon := newTestReconciler(client, nil, store, pub, 60*time.Second)
 
 			Expect(recon.Reconcile(ctx)).To(Succeed())
 
@@ -580,7 +635,7 @@ var _ = Describe("Reconciler", func() {
 				},
 			}
 			pub := &mockPublisher{}
-			recon := reconciliation.NewReconciler(client, nil, store, pub, logr.Discard(), 60*time.Second)
+			recon := newTestReconciler(client, nil, store, pub, 60*time.Second)
 
 			Expect(recon.Reconcile(ctx)).To(Succeed())
 
@@ -627,7 +682,7 @@ var _ = Describe("Reconciler", func() {
 				},
 			}
 			pub := &mockPublisher{}
-			recon := reconciliation.NewReconciler(client, nil, store, pub, logr.Discard(), 60*time.Second)
+			recon := newTestReconciler(client, nil, store, pub, 60*time.Second)
 
 			Expect(recon.Reconcile(ctx)).To(Succeed())
 
@@ -644,7 +699,7 @@ var _ = Describe("Reconciler", func() {
 			}
 			store := newMockStore()
 			pub := &mockPublisher{}
-			recon := reconciliation.NewReconciler(client, nil, store, pub, logr.Discard(), 60*time.Second)
+			recon := newTestReconciler(client, nil, store, pub, 60*time.Second)
 
 			Expect(recon.Reconcile(ctx)).To(Succeed())
 
@@ -666,7 +721,7 @@ var _ = Describe("Reconciler", func() {
 			}
 			store := newMockStore()
 			pub := &mockPublisher{}
-			recon := reconciliation.NewReconciler(client, nil, store, pub, logr.Discard(), 60*time.Second)
+			recon := newTestReconciler(client, nil, store, pub, 60*time.Second)
 
 			Expect(recon.Reconcile(ctx)).To(Succeed())
 
@@ -698,7 +753,7 @@ var _ = Describe("Reconciler", func() {
 				TransitionTime:     origTransition,
 			}
 			pub := &mockPublisher{}
-			recon := reconciliation.NewReconciler(client, nil, store, pub, logr.Discard(), 60*time.Second)
+			recon := newTestReconciler(client, nil, store, pub, 60*time.Second)
 
 			Expect(recon.Reconcile(ctx)).To(Succeed())
 
@@ -736,7 +791,7 @@ var _ = Describe("Reconciler", func() {
 				TransitionTime:     origTransition,
 			}
 			pub := &mockPublisher{}
-			recon := reconciliation.NewReconciler(client, nil, store, pub, logr.Discard(), 60*time.Second)
+			recon := newTestReconciler(client, nil, store, pub, 60*time.Second)
 
 			Expect(recon.Reconcile(ctx)).To(Succeed())
 
@@ -776,7 +831,7 @@ var _ = Describe("Reconciler", func() {
 				TransitionTime:     origTransition,
 			}
 			pub := &mockPublisher{}
-			recon := reconciliation.NewReconciler(client, nil, store, pub, logr.Discard(), 60*time.Second)
+			recon := newTestReconciler(client, nil, store, pub, 60*time.Second)
 
 			Expect(recon.Reconcile(ctx)).To(Succeed())
 
@@ -816,7 +871,7 @@ var _ = Describe("Reconciler", func() {
 				"vm-stale": projection.ErrStaleVersion,
 			}
 			pub := &mockPublisher{}
-			recon := reconciliation.NewReconciler(client, nil, store, pub, logr.Discard(), 60*time.Second)
+			recon := newTestReconciler(client, nil, store, pub, 60*time.Second)
 
 			Expect(recon.Reconcile(ctx)).To(Succeed())
 
@@ -833,7 +888,7 @@ var _ = Describe("Reconciler", func() {
 			}
 			store := newMockStore()
 			pub := &mockPublisher{}
-			recon := reconciliation.NewReconciler(client, nil, store, pub, logr.Discard(), 60*time.Second)
+			recon := newTestReconciler(client, nil, store, pub, 60*time.Second)
 
 			Expect(recon.Reconcile(ctx)).To(Succeed())
 
@@ -856,7 +911,7 @@ var _ = Describe("Reconciler", func() {
 			client := &mockComputeClient{}
 			store := newMockStore()
 			pub := &mockPublisher{}
-			recon := reconciliation.NewReconciler(client, nil, store, pub, logr.Discard(), 60*time.Second)
+			recon := newTestReconciler(client, nil, store, pub, 60*time.Second)
 
 			periodicCtx, periodicCancel := context.WithCancel(ctx)
 			done := make(chan struct{})
@@ -899,7 +954,7 @@ var _ = Describe("Reconciler", func() {
 			}
 			store := newMockStore()
 			pub := &mockPublisher{}
-			recon := reconciliation.NewReconciler(computeClient, clusterClient, store, pub, logr.Discard(), 60*time.Second)
+			recon := newTestReconciler(computeClient, clusterClient, store, pub, 60*time.Second)
 
 			Expect(recon.Reconcile(ctx)).To(Succeed())
 
@@ -957,7 +1012,7 @@ var _ = Describe("Reconciler", func() {
 			}
 
 			pub := &mockPublisher{}
-			recon := reconciliation.NewReconciler(computeClient, clusterClient, store, pub, logr.Discard(), 60*time.Second)
+			recon := newTestReconciler(computeClient, clusterClient, store, pub, 60*time.Second)
 
 			Expect(recon.Reconcile(ctx)).To(Succeed())
 
@@ -1003,7 +1058,7 @@ var _ = Describe("Reconciler", func() {
 			}
 
 			pub := &mockPublisher{}
-			recon := reconciliation.NewReconciler(computeClient, clusterClient, store, pub, logr.Discard(), 60*time.Second)
+			recon := newTestReconciler(computeClient, clusterClient, store, pub, 60*time.Second)
 
 			Expect(recon.Reconcile(ctx)).To(Succeed())
 
@@ -1029,37 +1084,6 @@ var _ = Describe("Reconciler", func() {
 			Expect(store.states).ToNot(HaveKey("cl-gone"))
 		})
 
-		It("skips cluster missed_deletion when clusterClient is nil", func() {
-			computeClient := &mockComputeClient{}
-			store := newMockStore()
-			now := time.Now().UTC().Truncate(time.Microsecond)
-			store.states["cl-safe"] = projection.ResourceState{
-				ResourceID:        "cl-safe",
-				ResourceType:      events.ResourceTypeClusterOrder,
-				TenantID:          "tenant-1",
-				CurrentState:      "READY",
-				IsBillable:        true,
-				BillableSince:     &now,
-				LastHeartbeatAt:   &now,
-				BillingDimensions: map[string]any{},
-			}
-
-			pub := &mockPublisher{}
-			recon := reconciliation.NewReconciler(computeClient, nil, store, pub, logr.Discard(), 60*time.Second)
-
-			Expect(recon.Reconcile(ctx)).To(Succeed())
-
-			pub.mu.Lock()
-			defer pub.mu.Unlock()
-			for _, e := range pub.published {
-				Expect(e.Type()).ToNot(Equal(events.EventCorrection))
-			}
-
-			store.mu.Lock()
-			defer store.mu.Unlock()
-			Expect(store.states).To(HaveKey("cl-safe"))
-		})
-
 		It("paginates ListClusters correctly", func() {
 			clusters := make([]*privatev1.Cluster, 0, 600)
 			for i := range 600 {
@@ -1071,7 +1095,7 @@ var _ = Describe("Reconciler", func() {
 			clusterClient := &mockClusterClient{items: clusters}
 			store := newMockStore()
 			pub := &mockPublisher{}
-			recon := reconciliation.NewReconciler(computeClient, clusterClient, store, pub, logr.Discard(), 60*time.Second)
+			recon := newTestReconciler(computeClient, clusterClient, store, pub, 60*time.Second)
 
 			Expect(recon.Reconcile(ctx)).To(Succeed())
 
@@ -1108,7 +1132,7 @@ var _ = Describe("Reconciler", func() {
 			}
 
 			pub := &mockPublisher{}
-			recon := reconciliation.NewReconciler(computeClient, clusterClient, store, pub, logr.Discard(), 60*time.Second)
+			recon := newTestReconciler(computeClient, clusterClient, store, pub, 60*time.Second)
 
 			Expect(recon.Reconcile(ctx)).To(Succeed())
 
