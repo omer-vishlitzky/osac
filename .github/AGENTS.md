@@ -6,15 +6,17 @@ effects, and follow the instructions for every affected component.
 
 ## E2E execution
 
-Full-install E2E runs directly for non-draft pull requests on `opened`,
-`ready_for_review`, `synchronize`, and `reopened`. Pull-request runs use
-GitHub's synthetic PR merge ref without changing the contributor's branch.
-Draft PRs skip E2E. The same workflows run on `merge_group`, using GitHub's
-fresh temporary merge-queue ref against the latest `main`.
+Full-install callers run a cheap readiness job on non-draft pull requests;
+expensive E2E starts only after an organization member invokes `/e2e-ready`.
+The trusted unlock handler dispatches a fresh workflow with the current
+synthetic PR merge ref and never reruns an older PR workflow run. Draft PRs
+skip E2E. The same workflows run on `merge_group`, using GitHub's fresh
+temporary merge-queue ref against the latest `main`.
 
-`/ok-to-test` remains the fork secret authorization command. Path filtering
-skips docs and unit-test-only changes, while `tests/e2e/**` must still set
-`should-run` through the `e2e-suite` filter.
+Full-install pull-request workflows use trusted base-branch YAML before
+starting self-hosted jobs. Path filtering skips docs and unit-test-only
+changes, while `tests/e2e/**` must still set `should-run` through the
+`e2e-suite` filter.
 
 ## Release safety
 
