@@ -123,6 +123,61 @@ func TestVolumeDeletedStateWinsOverDeletionTimestamp(t *testing.T) {
 	}
 }
 
+func TestVolumeDeletedUpdateClosesAtDeletionTimestamp(t *testing.T) {
+	deletionTime := time.Date(2026, 9, 16, 11, 0, 0, 0, time.UTC)
+	stateTime := deletionTime.Add(time.Minute)
+	volume := &privatev1.Volume{
+		Id:       "volume-deleted-boundary",
+		Metadata: &privatev1.Metadata{Tenant: "tenant-1", DeletionTimestamp: timestamppb.New(deletionTime)},
+		Spec:     &privatev1.VolumeSpec{StorageTier: "gold", SizeGib: 1},
+		Status: &privatev1.VolumeStatus{
+			State:               privatev1.VolumeState_VOLUME_STATE_DELETED,
+			VendorVolumeId:      "vendor-1",
+			Protocol:            privatev1.StorageProtocol_STORAGE_PROTOCOL_BLOCK,
+			ProvisionedSizeGib:  1,
+			StateTransitionTime: timestamppb.New(stateTime),
+		},
+	}
+	event := &privatev1.Event{
+		Id:      "volume-deleted-boundary",
+		Type:    privatev1.EventType_EVENT_TYPE_OBJECT_UPDATED,
+		Payload: &privatev1.Event_Volume{Volume: volume},
+	}
+	mapper, err := events.MapperForEvent(event)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transitionTime, err := mapper.TransitionTime(event, events.VolumeStateAvailable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !transitionTime.Equal(deletionTime) {
+		t.Fatalf("transition time = %s, want deletion time %s", transitionTime, deletionTime)
+	}
+}
+
+func TestVolumeAvailableToAvailableIsNotALifecycleBoundary(t *testing.T) {
+	volume := &privatev1.Volume{
+		Id:       "volume-same-state",
+		Metadata: &privatev1.Metadata{Tenant: "tenant-1"},
+		Spec:     &privatev1.VolumeSpec{StorageTier: "gold", SizeGib: 1},
+		Status: &privatev1.VolumeStatus{
+			State:              privatev1.VolumeState_VOLUME_STATE_AVAILABLE,
+			VendorVolumeId:     "vendor-1",
+			Protocol:           privatev1.StorageProtocol_STORAGE_PROTOCOL_BLOCK,
+			ProvisionedSizeGib: 1,
+		},
+	}
+	mapper, err := events.MapperForEvent(&privatev1.Event{Payload: &privatev1.Event_Volume{Volume: volume}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = mapper.CloudEventType(privatev1.EventType_EVENT_TYPE_OBJECT_UPDATED, events.VolumeStateAvailable)
+	if !errors.Is(err, events.ErrSkipTransition) {
+		t.Fatalf("expected same-state update to skip, got %v", err)
+	}
+}
+
 func TestVolumeDeletingRequiresDeletionTimestamp(t *testing.T) {
 	volume := &privatev1.Volume{
 		Id:       "volume-deleting-without-timestamp",
