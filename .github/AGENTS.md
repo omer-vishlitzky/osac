@@ -8,8 +8,9 @@ effects, and follow the instructions for every affected component.
 
 Full-install callers run a cheap readiness job on non-draft pull requests;
 expensive E2E starts only after an organization member invokes `/e2e-ready`.
-The trusted unlock handler dispatches a fresh workflow with the current
-synthetic PR merge ref and never reruns an older PR workflow run. Draft PRs
+The trusted unlock handler dispatches a trusted base-branch workflow with the
+current synthetic PR merge ref as source/test inputs and never reruns an older
+PR workflow run. Draft PRs
 skip E2E. The same workflows run on `merge_group`, using GitHub's fresh
 temporary merge-queue ref against the latest `main`.
 

@@ -11,4 +11,4 @@ jobs:
     permissions:
       pull-requests: write
     if: contains(github.event.pull_request.labels.*.name, 'e2e-ready')
-    uses: osac-project/osac-test-infra/.github/workflows/e2e-ready-label-cleanup.yml@main
+    uses: osac-project/osac-test-infra/.github/workflows/e2e-ready-label-cleanup.yml@eac6a761704ae4f45d9bb9326375122803854a13

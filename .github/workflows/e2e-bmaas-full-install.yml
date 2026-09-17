@@ -57,6 +57,18 @@ on:
         description: "PR number that requested a fresh E2E run"
         required: false
         default: ""
+      head-sha:
+        description: "Exact PR head SHA authorized for E2E"
+        required: false
+        default: ""
+      installer-repo:
+        description: "Repository containing the installer source"
+        required: false
+        default: "osac-project/osac"
+      installer-ref:
+        description: "Ref for the installer source"
+        required: false
+        default: "main"
 
 concurrency:
   # pull_request: one run per PR; a newer push cancels the older run.
@@ -188,7 +200,10 @@ jobs:
   e2e-readiness:
     name: e2e-readiness (bmaas)
     needs: changes
-    if: needs.changes.outputs.should-run == 'true' && github.event_name == 'pull_request_target'
+    if: >-
+      needs.changes.outputs.should-run == 'true' &&
+      (github.event_name == 'pull_request_target' ||
+       (github.event_name == 'workflow_dispatch' && inputs.pr-number != ''))
     runs-on: ubuntu-latest
     permissions:
       issues: read
@@ -199,10 +214,10 @@ jobs:
     steps:
       - name: Check e2e readiness
         id: check
-        uses: osac-project/osac-test-infra/.github/actions/check-e2e-readiness@main
+        uses: osac-project/osac-test-infra/.github/actions/check-e2e-readiness@eac6a761704ae4f45d9bb9326375122803854a13
         with:
-          pr-number: ${{ github.event.pull_request.number }}
-          head-sha: ${{ github.event.pull_request.head.sha }}
+          pr-number: ${{ inputs.pr-number || github.event.pull_request.number }}
+          head-sha: ${{ inputs.head-sha || github.event.pull_request.head.sha }}
           require-e2e-ready: true
 
   # Builds fulfillment-service, osac-operator, osac-aap's execution
@@ -220,13 +235,13 @@ jobs:
       always()
       && needs.changes.result == 'success'
       && needs.changes.outputs.should-run == 'true'
-      && (needs.e2e-readiness.result == 'skipped'
-          || needs.e2e-readiness.outputs.ready == 'true')
+      && (needs.e2e-readiness.outputs.ready == 'true'
+          || (github.event_name != 'pull_request_target' && inputs.pr-number == ''))
     permissions:
       contents: read
       # See e2e-vmaas-full-install.yml's identical grant for why this is needed.
       id-token: write
-    uses: osac-project/osac-test-infra/.github/workflows/e2e-bmaas-full-install.yml@main
+    uses: osac-project/osac-test-infra/.github/workflows/e2e-bmaas-full-install.yml@eac6a761704ae4f45d9bb9326375122803854a13
     with:
       # PR/merge_group: full bmaas suite. Schedule: serial (-n 0, inventory
       # exhaust). workflow_dispatch: honor input, else sanity (bmaas/regression
@@ -248,8 +263,8 @@ jobs:
       # as ../../../<name> siblings within it), so a PR touching those components
       # must deploy from this PR's own fork/ref, not the reusable workflow's
       # standalone-repo default.
-      installer-repo: ${{ inputs.source-repository || github.repository }}
-      installer-ref: ${{ inputs.source-ref || github.event.pull_request.merge_commit_sha || github.sha }}
+      installer-repo: ${{ inputs.installer-repo || inputs.source-repository || github.repository }}
+      installer-ref: ${{ inputs.installer-ref || inputs.source-ref || github.event.pull_request.merge_commit_sha || github.sha }}
       # Build all component images from the PR's fork/branch (same monorepo checkout).
       # osac-aap's execution-environment is built twice (aap.bootstrap.image and
       # aap.configAsCode.eeImage): the two are logically the same image but the
@@ -275,7 +290,7 @@ jobs:
       # is fork-originated and gets no OIDC/WIF access at all by GitHub
       # Actions policy. merge_group is excluded the same way (its
       # github.ref is the readonly-queue ref).
-      enable-ai-diagnostic: ${{ github.event_name != 'pull_request_target' && github.ref == 'refs/heads/main' }}
+      enable-ai-diagnostic: ${{ (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.pr-number == '')) && github.ref == 'refs/heads/main' }}
 
   # Skip this required check on unreadiness so it stays pending (not red).
   # workflow_dispatch may green this gate on a PR SHA. Merge requires all
@@ -283,7 +298,7 @@ jobs:
   e2e-bmaas-gate:
     if: >-
       always()
-      && (github.event_name != 'pull_request_target'
+      && ((github.event_name != 'pull_request_target' && inputs.pr-number == '')
           || needs.changes.outputs.should-run != 'true'
           || needs.e2e-readiness.result != 'success'
           || needs.e2e-readiness.outputs.ready == 'true')
@@ -310,7 +325,8 @@ jobs:
   e2e-bmaas-complete-stale-gates:
     if: >-
       always()
-      && github.event_name == 'pull_request_target'
+      && (github.event_name == 'pull_request_target'
+          || (github.event_name == 'workflow_dispatch' && inputs.pr-number != ''))
       && needs.changes.outputs.should-run == 'true'
       && needs.e2e-readiness.result == 'success'
       && needs.e2e-readiness.outputs.ready == 'true'
@@ -320,7 +336,7 @@ jobs:
       checks: write
     steps:
       - name: Complete stale in_progress gate checks
-        uses: osac-project/osac-test-infra/.github/actions/complete-stale-e2e-gates@main
+        uses: osac-project/osac-test-infra/.github/actions/complete-stale-e2e-gates@eac6a761704ae4f45d9bb9326375122803854a13
         with:
           head-sha: ${{ github.event.pull_request.head.sha }}
           gate-name: e2e-bmaas-gate
@@ -332,7 +348,8 @@ jobs:
   e2e-bmaas-pending:
     if: >-
       always()
-      && github.event_name == 'pull_request_target'
+      && (github.event_name == 'pull_request_target'
+          || (github.event_name == 'workflow_dispatch' && inputs.pr-number != ''))
       && needs.changes.outputs.should-run == 'true'
       && needs.e2e-readiness.result == 'success'
       && needs.e2e-readiness.outputs.ready != 'true'

@@ -9,5 +9,5 @@ jobs:
     permissions:
       pull-requests: write
     if: contains(github.event.pull_request.labels.*.name, 'ok-to-test')
-    uses: osac-project/osac-test-infra/.github/workflows/ok-to-test-label-cleanup.yml@main
+    uses: osac-project/osac-test-infra/.github/workflows/ok-to-test-label-cleanup.yml@eac6a761704ae4f45d9bb9326375122803854a13
     secrets: inherit

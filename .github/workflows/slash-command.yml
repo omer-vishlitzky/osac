@@ -6,7 +6,7 @@ on:
     types: [created]
 
 permissions:
-  contents: write
+  contents: read
   pull-requests: write
   actions: write
   checks: write
@@ -20,5 +20,5 @@ jobs:
        startsWith(github.event.comment.body, '/cancel') ||
        startsWith(github.event.comment.body, '/ok-to-test') ||
        startsWith(github.event.comment.body, '/e2e-ready'))
-    uses: osac-project/osac-test-infra/.github/workflows/slash-command-handler.yml@main
+    uses: osac-project/osac-test-infra/.github/workflows/slash-command-handler.yml@eac6a761704ae4f45d9bb9326375122803854a13
     secrets: inherit

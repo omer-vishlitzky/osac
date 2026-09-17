@@ -3,10 +3,10 @@
 # Start logic is the reusable in osac-test-infra (workflow filenames differ).
 # GITHUB_TOKEN label events do not start other workflows, so the slash-command
 # handler dispatches this file after applying e2e-ready.
-# test-infra e2e-start creates a temporary base-repo branch containing the
-# current synthetic merge commit. Native full-install e2e-*-gate jobs report;
-# until then required gates stay pending. e2e-ready is the single cost and
-# authorization gate.
+# test-infra e2e-start dispatches trusted base-branch workflows with the
+# current synthetic merge ref as source/test inputs. Native full-install
+# e2e-*-gate jobs report; until then required gates stay pending. e2e-ready is
+# the single cost and authorization gate.
 name: E2E on unlock label
 
 on:
@@ -37,13 +37,13 @@ jobs:
     permissions:
       actions: write
       checks: write
-      contents: write
+      contents: read
       issues: read
       pull-requests: write
     if: >-
       github.event_name == 'workflow_dispatch' ||
        github.event.label.name == 'e2e-ready'
-    uses: osac-project/osac-test-infra/.github/workflows/e2e-on-label.yml@main
+    uses: osac-project/osac-test-infra/.github/workflows/e2e-on-label.yml@eac6a761704ae4f45d9bb9326375122803854a13
     with:
       pr_number: ${{ github.event.inputs.pr_number || format('{0}', github.event.pull_request.number) }}
       trigger_label: ${{ github.event.label.name || github.event.inputs.trigger_label || 'e2e-ready' }}
