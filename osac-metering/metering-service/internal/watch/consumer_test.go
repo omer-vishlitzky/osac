@@ -58,6 +58,12 @@ type mockEventsClient struct {
 	calls   []*privatev1.EventsWatchRequest
 }
 
+type mockExternalIPPoolClient struct{}
+
+func (mockExternalIPPoolClient) Get(context.Context, *privatev1.ExternalIPPoolsGetRequest, ...grpc.CallOption) (*privatev1.ExternalIPPoolsGetResponse, error) {
+	return nil, errors.New("unexpected ExternalIP pool lookup")
+}
+
 func (m *mockEventsClient) Watch(ctx context.Context, req *privatev1.EventsWatchRequest, _ ...grpc.CallOption) (privatev1.Events_WatchClient, error) {
 	m.mu.Lock()
 	m.calls = append(m.calls, req)
@@ -105,12 +111,16 @@ func (m *mockPublisher) Publish(_ context.Context, event cloudevents.Event) erro
 }
 
 type mockStore struct {
-	mu     sync.Mutex
-	states map[string]projection.ResourceState
+	mu         sync.Mutex
+	states     map[string]projection.ResourceState
+	upsertErrs map[string]error
 }
 
 func newMockStore() *mockStore {
-	return &mockStore{states: map[string]projection.ResourceState{}}
+	return &mockStore{
+		states:     map[string]projection.ResourceState{},
+		upsertErrs: map[string]error{},
+	}
 }
 
 func (s *mockStore) Get(_ context.Context, resourceID string) (*projection.ResourceState, error) {
@@ -126,6 +136,9 @@ func (s *mockStore) Get(_ context.Context, resourceID string) (*projection.Resou
 func (s *mockStore) Upsert(_ context.Context, state projection.ResourceState) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err, ok := s.upsertErrs[state.ResourceID]; ok {
+		return err
+	}
 	if existing, ok := s.states[state.ResourceID]; ok {
 		if existing.FulfillmentVersion > state.FulfillmentVersion {
 			return projection.ErrStaleVersion
@@ -234,14 +247,20 @@ var _ = Describe("Consumer", func() {
 	})
 
 	newConsumer := func(pub *mockPublisher) *watch.Consumer {
-		c := watch.NewConsumer(client, pub, newMockStore(), logr.Discard(), nil, "", nil)
+		mapperFactory, err := watch.NewMapperFactory(mockExternalIPPoolClient{}, "deployment-1", map[string]string{})
+		Expect(err).NotTo(HaveOccurred())
+		c, err := watch.NewConsumer(client, pub, newMockStore(), logr.Discard(), mapperFactory)
+		Expect(err).NotTo(HaveOccurred())
 		c.InitialDelay = time.Millisecond
 		c.MaxDelay = time.Millisecond
 		return c
 	}
 
 	newConsumerWithStore := func(pub *mockPublisher, store *mockStore) *watch.Consumer {
-		c := watch.NewConsumer(client, pub, store, logr.Discard(), nil, "", nil)
+		mapperFactory, err := watch.NewMapperFactory(mockExternalIPPoolClient{}, "deployment-1", map[string]string{})
+		Expect(err).NotTo(HaveOccurred())
+		c, err := watch.NewConsumer(client, pub, store, logr.Discard(), mapperFactory)
+		Expect(err).NotTo(HaveOccurred())
 		c.InitialDelay = time.Millisecond
 		c.MaxDelay = time.Millisecond
 		return c
@@ -430,6 +449,47 @@ var _ = Describe("Consumer", func() {
 			Expect(projected.BillingDimensions["size_gib"]).To(Equal(int64(200)))
 		})
 
+		It("meters an ExternalIP through the resource mapper factory", func() {
+			creationTime := time.Date(2026, 1, 1, 10, 0, 0, 0, time.UTC)
+			allocatedTime := creationTime.Add(time.Minute)
+			poolClient := &poolGetter{response: &privatev1.ExternalIPPoolsGetResponse{Object: &privatev1.ExternalIPPool{
+				Id:   "pool-1",
+				Spec: &privatev1.ExternalIPPoolSpec{IpFamily: privatev1.IPFamily_IP_FAMILY_IPV4},
+			}}}
+			mapperFactory, err := watch.NewMapperFactory(poolClient, "deployment-1", map[string]string{})
+			Expect(err).NotTo(HaveOccurred())
+
+			externalIP := func(version int32, state privatev1.ExternalIPState, stateTime time.Time) *privatev1.ExternalIP {
+				return &privatev1.ExternalIP{
+					Id: "ip-1",
+					Metadata: &privatev1.Metadata{
+						Tenant:            "tenant-1",
+						Project:           "project-1",
+						Version:           version,
+						CreationTimestamp: timestamppb.New(creationTime),
+					},
+					Spec: &privatev1.ExternalIPSpec{Pool: &privatev1.ExternalIPPoolReference{Id: "pool-1"}},
+					Status: &privatev1.ExternalIPStatus{
+						State:               state,
+						StateTransitionTime: timestamppb.New(stateTime),
+					},
+				}
+			}
+			pending := externalIP(1, privatev1.ExternalIPState_EXTERNAL_IP_STATE_PENDING, creationTime)
+			allocated := externalIP(2, privatev1.ExternalIPState_EXTERNAL_IP_STATE_ALLOCATED, allocatedTime)
+
+			client.results = []mockStreamResult{{stream: &mockWatchStream{responses: []*privatev1.EventsWatchResponse{
+				makeResponse(&privatev1.Event{Id: "ip-created", Type: privatev1.EventType_EVENT_TYPE_OBJECT_CREATED, Payload: &privatev1.Event_ExternalIp{ExternalIp: pending}}),
+				makeResponse(&privatev1.Event{Id: "ip-allocated", Type: privatev1.EventType_EVENT_TYPE_OBJECT_UPDATED, Payload: &privatev1.Event_ExternalIp{ExternalIp: allocated}}),
+			}}}}
+
+			consumer, err := watch.NewConsumer(client, &mockPublisher{published: make([]cloudevents.Event, 0, 2), cancelFunc: cancel}, newMockStore(), logr.Discard(), mapperFactory)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(consumer.Run(ctx)).To(Succeed())
+
+			Expect(poolClient.calls).To(Equal(1))
+		})
+
 		It("meters a NATGateway lifecycle without a network provider", func() {
 			creationTime := time.Date(2026, 1, 1, 10, 0, 0, 0, time.UTC)
 			readyTime := creationTime.Add(time.Minute)
@@ -492,8 +552,6 @@ var _ = Describe("Consumer", func() {
 
 			pub := &mockPublisher{published: make([]cloudevents.Event, 0, 4), cancelFunc: cancel}
 			consumer := newConsumer(pub)
-			consumer.DeploymentID = "deployment-1"
-
 			Expect(consumer.Run(ctx)).To(Succeed())
 
 			pub.mu.Lock()
@@ -910,6 +968,48 @@ var _ = Describe("Consumer", func() {
 			pub.mu.Lock()
 			defer pub.mu.Unlock()
 			Expect(pub.published).To(BeEmpty())
+		})
+
+		It("reconnects when advancing a skipped projection update fails", func() {
+			store := newMockStore()
+			now := time.Now().UTC().Truncate(time.Microsecond)
+			store.states["vm-upsert-error"] = projection.ResourceState{
+				ResourceID:         "vm-upsert-error",
+				ResourceType:       events.ResourceTypeComputeInstance,
+				TenantID:           "tenant-1",
+				CurrentState:       "RUNNING",
+				IsBillable:         true,
+				BillableSince:      &now,
+				FulfillmentVersion: 1,
+				BillingDimensions:  map[string]any{},
+			}
+			store.upsertErrs["vm-upsert-error"] = errors.New("database unavailable")
+
+			failed := makeComputeInstance("vm-upsert-error", "tenant-1")
+			failed.Metadata.Version = 2
+			failed.Status.StateTransitionTime = timestamppb.New(now.Add(time.Second))
+			client.results = []mockStreamResult{
+				{stream: &mockWatchStream{responses: []*privatev1.EventsWatchResponse{
+					makeResponse(&privatev1.Event{
+						Id:      "vm-upsert-error-update",
+						Type:    privatev1.EventType_EVENT_TYPE_OBJECT_UPDATED,
+						Payload: &privatev1.Event_ComputeInstance{ComputeInstance: failed},
+					}),
+				}}},
+				{stream: &mockWatchStream{responses: []*privatev1.EventsWatchResponse{
+					makeResponse(makeEvent("after-reconnect", privatev1.EventType_EVENT_TYPE_OBJECT_CREATED)),
+				}}},
+			}
+
+			pub := &mockPublisher{published: make([]cloudevents.Event, 0, 1), cancelFunc: cancel}
+			consumer := newConsumerWithStore(pub, store)
+			Expect(consumer.Run(ctx)).To(Succeed())
+			Expect(client.watchCallCount()).To(BeNumerically(">=", 2))
+
+			pub.mu.Lock()
+			defer pub.mu.Unlock()
+			Expect(pub.published).To(HaveLen(1))
+			Expect(pub.published[0].ID()).To(Equal("after-reconnect"))
 		})
 
 		It("emits resumed.v1 for STOPPED to RUNNING transition", func() {

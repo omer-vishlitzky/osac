@@ -61,13 +61,11 @@ func BuildFilter() string {
 // incoming events to CloudEvents, and publishes them to Kafka. It
 // automatically reconnects with exponential backoff when the stream breaks.
 type Consumer struct {
-	client               privatev1.EventsClient
-	ExternalIPPoolClient privatev1.ExternalIPPoolsClient
-	publisher            kafkapub.EventPublisher
-	store                projection.Store
-	logger               logr.Logger
-	DeploymentID         string
-	ExternalIPPools      map[string]string
+	client        privatev1.EventsClient
+	mapperFactory *MapperFactory
+	publisher     kafkapub.EventPublisher
+	store         projection.Store
+	logger        logr.Logger
 
 	InitialDelay   time.Duration
 	MaxDelay       time.Duration
@@ -80,23 +78,22 @@ func NewConsumer(
 	publisher kafkapub.EventPublisher,
 	store projection.Store,
 	logger logr.Logger,
-	externalIPPoolClient privatev1.ExternalIPPoolsClient,
-	deploymentID string,
-	externalIPPools map[string]string,
-	) *Consumer {
-	return &Consumer{
-		client:               client,
-		publisher:            publisher,
-		store:                store,
-		logger:               logger,
-		InitialDelay:         defaultInitialDelay,
-		MaxDelay:             defaultMaxDelay,
-		HandlerRetries:       defaultHandlerRetries,
-		Filter:               BuildFilter(),
-		ExternalIPPoolClient: externalIPPoolClient,
-		DeploymentID:         deploymentID,
-		ExternalIPPools:      externalIPPools,
+	mapperFactory *MapperFactory,
+) (*Consumer, error) {
+	if mapperFactory == nil {
+		return nil, fmt.Errorf("mapper factory is required")
 	}
+	return &Consumer{
+		client:         client,
+		mapperFactory:  mapperFactory,
+		publisher:      publisher,
+		store:          store,
+		logger:         logger,
+		InitialDelay:   defaultInitialDelay,
+		MaxDelay:       defaultMaxDelay,
+		HandlerRetries: defaultHandlerRetries,
+		Filter:         BuildFilter(),
+	}, nil
 }
 
 // Run starts consuming the Watch stream. It blocks until ctx is cancelled,
@@ -150,199 +147,80 @@ func (c *Consumer) consumeStream(ctx context.Context) (int, error) {
 	}
 }
 
+// ALL those if elses above are quite hard to follow. what do they all do? can we simplify somehow? extract to something clearer and easier to read and expand?
 func (c *Consumer) handleEvent(ctx context.Context, event *privatev1.Event) error {
-	mapperContext, err := c.mapperContext(ctx, event)
+	prepared, skipped, err := c.prepareEvent(ctx, event)
 	if err != nil {
 		return err
 	}
-	mapper, err := events.MapperForEventWithContext(event, mapperContext)
-	if err != nil {
-		return fmt.Errorf("unexpected event payload for %s: %w", event.GetId(), err)
-	}
-
-	resourceID := mapper.ResourceID()
-	currentState := mapper.CurrentState()
-	isBillable := mapper.IsBillable()
-	version := mapper.FulfillmentVersion()
-	dims, err := mapper.BillingDimensionsMap()
-	if err != nil {
-		if errors.Is(err, events.ErrDataQuality) {
-			eventsSkipped.WithLabelValues("data_quality").Inc()
-			c.logger.Info("skipping event with invalid billing dimensions",
-				"event_id", event.GetId(), "resource_id", resourceID, "error", err)
-			return nil
-		}
-		return fmt.Errorf("building billing dimensions for %s: %w", resourceID, err)
-	}
-
-	existing, err := c.store.Get(ctx, resourceID)
-	if err != nil {
-		return fmt.Errorf("reading projection for %s: %w", resourceID, err)
-	}
-
-	previousState := ""
-	if existing != nil {
-		previousState = existing.CurrentState
-	}
-	transitionTime, err := mapper.TransitionTime(event, previousState)
-	if err != nil {
-		if errors.Is(err, events.ErrUnsupportedEvent) {
-			eventsSkipped.WithLabelValues("unsupported_event_type").Inc()
-			c.logger.V(1).Info("skipping unsupported event type",
-				"event_id", event.GetId(), "resource_id", resourceID)
-			return nil
-		}
-		if errors.Is(err, events.ErrDataQuality) &&
-			event.GetType() == privatev1.EventType_EVENT_TYPE_OBJECT_UPDATED &&
-			mapper.ResourceType() != events.ResourceTypeVolume &&
-			existing != nil && existing.CurrentState == currentState {
-			c.logger.V(1).Info("skipping metadata-only update with no state change",
-				"event_id", event.GetId(), "resource_id", resourceID, "state", currentState)
-			return nil
-		}
-		if errors.Is(err, events.ErrDataQuality) && event.GetType() == privatev1.EventType_EVENT_TYPE_OBJECT_DELETED {
-			eventsSkipped.WithLabelValues("missing_event_timestamp").Inc()
-			c.logger.Info("skipping deleted event with missing timestamp",
-				"event_id", event.GetId(), "resource_id", resourceID)
-			return nil
-		}
-		return err
-	}
-	allowSameVersionDeletion := sameVersionVolumeDeletionBoundary(event, existing, version, currentState)
-	if projectionIsAhead(existing, version, currentState, dims, allowSameVersionDeletion) {
-		c.logger.Info("skipping stale Watch event before publication",
-			"resource_id", resourceID,
-			"event_version", version,
-			"projection_version", existing.FulfillmentVersion)
+	if skipped {
 		return nil
 	}
-	if transitionTimeIsStale(existing, event.GetType(), currentState, version, transitionTime) {
+	if c.skipStaleEvent(prepared) {
+		return nil
+	}
+	skip, err := c.shouldSkipUpdate(
+		ctx,
+		event,
+		prepared.existing,
+		prepared.currentState,
+		prepared.isBillable,
+		prepared.dimensions,
+		prepared.version,
+		prepared.transitionTime,
+		prepared.resourceID,
+	)
+	if err != nil {
+		return err
+	}
+	if skip {
+		return nil
+	}
+	if transitionTimeIsStale(prepared.existing, prepared.event.GetType(), prepared.currentState, prepared.version, prepared.transitionTime) {
 		c.logger.Info("skipping Watch event with stale transition time",
-			"resource_id", resourceID,
-			"event_version", version,
-			"projection_version", existing.FulfillmentVersion,
-			"event_transition_time", transitionTime,
-			"projection_transition_time", existing.TransitionTime)
+			"resource_id", prepared.resourceID,
+			"event_version", prepared.version,
+			"projection_version", prepared.existing.FulfillmentVersion,
+			"event_transition_time", prepared.transitionTime,
+			"projection_transition_time", prepared.existing.TransitionTime)
 		return nil
 	}
-	if mapper.ResourceType() == events.ResourceTypeBareMetalInstance &&
-		event.GetType() == privatev1.EventType_EVENT_TYPE_OBJECT_UPDATED &&
-		existing != nil && !events.DimensionsEqual(existing.BillingDimensions, dims) {
+	if prepared.mapper.ResourceType() == events.ResourceTypeBareMetalInstance &&
+		prepared.event.GetType() == privatev1.EventType_EVENT_TYPE_OBJECT_UPDATED &&
+		prepared.existing != nil && !events.DimensionsEqual(prepared.existing.BillingDimensions, prepared.dimensions) {
 		eventsSkipped.WithLabelValues("bmaas_dimension_drift").Inc()
 		c.logger.Info("skipping BMaaS event with immutable billing dimension drift",
-			"resource_id", resourceID,
-			"event_version", version)
+			"resource_id", prepared.resourceID,
+			"event_version", prepared.version)
 		return nil
 	}
 
-	if c.shouldSkipUpdate(ctx, event, existing, currentState, isBillable, dims, version, transitionTime, resourceID) {
-		return nil
+	if prepared.mapper.ResourceType() == events.ResourceTypeBareMetalInstance {
+		return c.handleBareMetalEvent(ctx, prepared.event, prepared.mapper, prepared.existing, prepared.version, prepared.transitionTime, prepared.dimensions)
 	}
 
-	if mapper.ResourceType() == events.ResourceTypeBareMetalInstance {
-		return c.handleBareMetalEvent(ctx, event, mapper, existing, version, transitionTime, dims)
-	}
-
-	stateCtx := c.buildStateContext(existing, isBillable, transitionTime, dims)
-	if mapper.ResourceType() == events.ResourceTypeVolume && existing != nil && existing.IsBillable && isBillable &&
-		existing.CurrentState == currentState && !events.DimensionsEqual(existing.BillingDimensions, dims) {
-		return c.handleScalingEvent(ctx, event, mapper, existing, transitionTime, version, currentState, isBillable, dims)
-	}
-
-	eventDims := dims
-	if mapper.ResourceType() == events.ResourceTypeClusterOrder &&
-		(event.GetType() == privatev1.EventType_EVENT_TYPE_OBJECT_CREATED ||
-			event.GetType() == privatev1.EventType_EVENT_TYPE_OBJECT_DELETED) {
-		eventDims = topLevelDims(dims)
-	}
-
-	ce, err := events.MapWatchEvent(event, mapper, stateCtx, eventDims)
-	if err != nil {
-		if errors.Is(err, events.ErrTransientState) {
-			return c.handleTransientState(ctx, mapper, existing, version, transitionTime)
-		}
-		if errors.Is(err, events.ErrSkipTransition) {
-			if existing != nil && !events.DimensionsEqual(existing.BillingDimensions, dims) {
-				return c.handleScalingEvent(ctx, event, mapper, existing, transitionTime, version, currentState, isBillable, dims)
-			}
-			c.logger.V(1).Info("non-billing state transition, updating projection only",
-				"resource_id", resourceID, "state", currentState)
-			projState := c.buildProjectionState(mapper, existing, transitionTime, version, currentState, isBillable, dims)
-			if upsertErr := c.store.Upsert(ctx, projState); upsertErr != nil && !errors.Is(upsertErr, projection.ErrStaleVersion) {
-				return fmt.Errorf("upserting projection for %s: %w", resourceID, upsertErr)
-			}
-			return nil
-		}
+	if handled, err := c.handlePreMappingScaling(
+		ctx,
+		prepared.event,
+		prepared.mapper,
+		prepared.existing,
+		prepared.transitionTime,
+		prepared.version,
+		prepared.currentState,
+		prepared.isBillable,
+		prepared.dimensions,
+	); handled || err != nil {
 		return err
 	}
 
-	projState := c.buildProjectionState(mapper, existing, transitionTime, version, currentState, isBillable, dims)
-
-	if event.GetType() == privatev1.EventType_EVENT_TYPE_OBJECT_DELETED {
-		latest, err := c.store.Get(ctx, resourceID)
-		if err != nil {
-			return fmt.Errorf("rechecking projection for %s: %w", resourceID, err)
-		}
-		if projectionIsAhead(latest, version, currentState, dims, false) {
-			c.logger.Info("skipping stale delete event before publication",
-				"resource_id", resourceID,
-				"event_version", version,
-				"projection_version", latest.FulfillmentVersion)
-			return nil
-		}
-		if err := c.publishLifecycleEvents(ctx, ce, mapper, event.GetId(), dims); err != nil {
-			return err
-		}
-		if existing != nil {
-			if err := c.store.Delete(ctx, resourceID); err != nil {
-				return fmt.Errorf("deleting projection for %s: %w", resourceID, err)
-			}
-		}
+	cloudEvent, handled, err := c.mapPreparedEvent(ctx, prepared)
+	if err != nil {
+		return err
+	}
+	if handled {
 		return nil
 	}
-
-	return c.publishAndUpsert(ctx, func() error {
-		return c.publishLifecycleEvents(ctx, ce, mapper, event.GetId(), dims)
-	}, projState, resourceID, allowSameVersionDeletion)
-}
-
-func (c *Consumer) mapperContext(ctx context.Context, event *privatev1.Event) (events.MapperContext, error) {
-	context := events.MapperContext{
-		DeploymentID:    c.DeploymentID,
-		ExternalIPPools: c.ExternalIPPools,
-	}
-	ip := event.GetExternalIp()
-	if ip == nil {
-		gateway := event.GetNatGateway()
-		if gateway == nil {
-			return context, nil
-		}
-		return context, nil
-	}
-	poolID := ip.GetSpec().GetPool().GetId()
-	if _, ok := context.ExternalIPPools[poolID]; ok {
-		return context, nil
-	}
-	if c.ExternalIPPoolClient == nil {
-		return context, fmt.Errorf("external IP pool client is required for pool %s", poolID)
-	}
-	response, err := c.ExternalIPPoolClient.Get(ctx, &privatev1.ExternalIPPoolsGetRequest{Id: poolID})
-	if err != nil {
-		return context, fmt.Errorf("getting external IP pool %s: %w", poolID, err)
-	}
-	if response.GetObject().GetId() != poolID {
-		return context, fmt.Errorf("external IP pool lookup returned %s for requested pool %s", response.GetObject().GetId(), poolID)
-	}
-	family, err := events.ExternalIPPoolFamily(response.GetObject())
-	if err != nil {
-		return context, err
-	}
-	if c.ExternalIPPools == nil {
-		c.ExternalIPPools = make(map[string]string)
-	}
-	c.ExternalIPPools[poolID] = family
-	context.ExternalIPPools = c.ExternalIPPools
-	return context, nil
+	return c.commitMappedEvent(ctx, prepared, cloudEvent)
 }
 
 // publishAndUpsert publishes events first, then commits projection state.
@@ -416,16 +294,6 @@ func transitionTimeIsStale(
 	}
 	return transitionTime.Before(existing.TransitionTime)
 }
-
-func sameVersionVolumeDeletionBoundary(event *privatev1.Event, existing *projection.ResourceState, version int32, currentState string) bool {
-	return event.GetType() == privatev1.EventType_EVENT_TYPE_OBJECT_UPDATED &&
-		event.GetVolume() != nil &&
-		event.GetVolume().GetMetadata().GetDeletionTimestamp() != nil &&
-		currentState == events.VolumeStateDeleting &&
-		existing != nil &&
-		existing.FulfillmentVersion == version &&
-		existing.CurrentState != events.VolumeStateDeleting
-}
 // handleTransientState updates only FulfillmentVersion and TransitionTime
 // for transient states (STOPPING, STARTING) without changing CurrentState,
 // billing fields, or emitting a CloudEvent. The projection keeps
@@ -459,9 +327,6 @@ func (c *Consumer) handleTransientState(
 		"resource_id", mapper.ResourceID())
 	return nil
 }
-
-// DimComponents is the billing dimensions key for the nested components array.
-const DimComponents = "components"
 
 func (c *Consumer) publishLifecycleEvents(ctx context.Context, baseCE *cloudevents.Event, mapper events.ResourceMapper, eventID string, billingDims map[string]any) error {
 	if baseCE.Type() == events.EventCreated || baseCE.Type() == events.EventDeleted {
@@ -779,67 +644,6 @@ func cloneTimePointer(value *time.Time) *time.Time {
 	return &cloned
 }
 
-func (c *Consumer) handleScalingEvent(ctx context.Context, event *privatev1.Event, mapper events.ResourceMapper, existing *projection.ResourceState, transitionTime time.Time, version int32, currentState string, isBillable bool, dims map[string]any) error {
-	resourceID := mapper.ResourceID()
-	projState := c.buildProjectionState(mapper, existing, transitionTime, version, currentState, isBillable, dims)
-	stateCtx := c.buildStateContext(existing, isBillable, transitionTime, dims)
-
-	return c.publishAndUpsert(ctx, func() error {
-		if mapper.ResourceType() == events.ResourceTypeClusterOrder {
-			changed, err := events.ChangedComponents(existing.BillingDimensions, dims)
-			if err != nil {
-				return err
-			}
-			if len(changed) == 0 {
-				c.logger.V(1).Info("non-component dimension change, projection updated",
-					"resource_id", resourceID)
-				return nil
-			}
-			for _, comp := range changed {
-				scalingCtx := &events.StateContext{
-					PreviousState: stateCtx.PreviousState,
-				}
-				if !comp.IsNew {
-					scalingCtx.DurationSeconds = c.componentDurationSeconds(existing, comp.NodeSet, transitionTime)
-				}
-				ce, ceErr := c.buildScalingEvent(
-					events.ComponentEventID(event.GetId(), comp),
-					mapper, comp.FlatBillingDimensions(), scalingCtx, transitionTime)
-				if ceErr != nil {
-					return ceErr
-				}
-				if err := c.publishWithRetry(ctx, &ce); err != nil {
-					return err
-				}
-			}
-			c.logger.Info("published scaling events",
-				"resource_id", resourceID, "changed_components", len(changed))
-			return nil
-		}
-		// VMaaS and networking use a single updated.v1. An ExternalIP
-		// dimension change closes the prior slice with its prior dimensions.
-		scalingDims := dims
-		if mapper.ResourceType() == events.ResourceTypeExternalIP || mapper.ResourceType() == events.ResourceTypeVolume {
-			scalingDims = existing.BillingDimensions
-		}
-		ce, ceErr := c.buildScalingEvent(event.GetId(), mapper, scalingDims, stateCtx, transitionTime)
-		if ceErr != nil {
-			return ceErr
-		}
-		return c.publishWithRetry(ctx, &ce)
-	}, projState, resourceID, false)
-}
-
-func topLevelDims(dims map[string]any) map[string]any {
-	flat := make(map[string]any, len(dims))
-	for k, v := range dims {
-		if k != DimComponents {
-			flat[k] = v
-		}
-	}
-	return flat
-}
-
 func (c *Consumer) buildComponentEvent(baseCE *cloudevents.Event, eventID string, dims map[string]any) (cloudevents.Event, error) {
 	ce := cloudevents.NewEvent()
 	ce.SetID(eventID)
@@ -866,30 +670,18 @@ func (c *Consumer) buildComponentEvent(baseCE *cloudevents.Event, eventID string
 	return ce, nil
 }
 
-func (c *Consumer) buildScalingEvent(eventID string, mapper events.ResourceMapper, dims map[string]any, stateCtx *events.StateContext, transitionTime time.Time) (cloudevents.Event, error) {
-	return events.BuildLifecycleEvent(
-		eventID,
-		events.EventUpdated,
-		mapper,
-		dims,
-		stateCtx.PreviousState,
-		stateCtx.DurationSeconds,
-		stateCtx.BillableSince,
-		transitionTime,
-	)
-}
-func (c *Consumer) shouldSkipUpdate(ctx context.Context, event *privatev1.Event, existing *projection.ResourceState, currentState string, isBillable bool, dims map[string]any, version int32, transitionTime time.Time, resourceID string) bool {
+func (c *Consumer) shouldSkipUpdate(ctx context.Context, event *privatev1.Event, existing *projection.ResourceState, currentState string, isBillable bool, dims map[string]any, version int32, transitionTime time.Time, resourceID string) (bool, error) {
 	if event.GetType() != privatev1.EventType_EVENT_TYPE_OBJECT_UPDATED || existing == nil {
-		return false
+		return false, nil
 	}
 	if existing.CurrentState != currentState || existing.IsBillable != isBillable || !events.DimensionsEqual(existing.BillingDimensions, dims) {
-		return false
+		return false, nil
 	}
 	if version > existing.FulfillmentVersion {
 		existing.FulfillmentVersion = version
 		existing.TransitionTime = transitionTime.UTC()
 		if err := c.store.Upsert(ctx, *existing); err != nil && !errors.Is(err, projection.ErrStaleVersion) {
-			c.logger.Error(err, "failed to advance projection version", "resource_id", resourceID)
+			return false, fmt.Errorf("advancing projection version for %s: %w", resourceID, err)
 		}
 	}
 	if !existing.TransitionTime.Truncate(time.Microsecond).Equal(transitionTime.UTC().Truncate(time.Microsecond)) {
@@ -899,7 +691,7 @@ func (c *Consumer) shouldSkipUpdate(ctx context.Context, event *privatev1.Event,
 		c.logger.V(1).Info("same state and dimensions, skipping",
 			"resource_id", resourceID, "state", currentState)
 	}
-	return true
+	return true, nil
 }
 
 func (c *Consumer) buildProjectionState(mapper events.ResourceMapper, existing *projection.ResourceState, transitionTime time.Time, version int32, currentState string, isBillable bool, dims map[string]any) projection.ResourceState {

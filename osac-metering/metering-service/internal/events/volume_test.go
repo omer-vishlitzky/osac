@@ -123,6 +123,30 @@ func TestVolumeDeletedStateWinsOverDeletionTimestamp(t *testing.T) {
 	}
 }
 
+func TestVolumeDeletingRequiresDeletionTimestamp(t *testing.T) {
+	volume := &privatev1.Volume{
+		Id:       "volume-deleting-without-timestamp",
+		Metadata: &privatev1.Metadata{Tenant: "tenant-1"},
+		Status: &privatev1.VolumeStatus{
+			State:               privatev1.VolumeState_VOLUME_STATE_DELETING,
+			StateTransitionTime: timestamppb.Now(),
+		},
+	}
+	event := &privatev1.Event{
+		Id:      "volume-deleting-without-timestamp",
+		Type:    privatev1.EventType_EVENT_TYPE_OBJECT_UPDATED,
+		Payload: &privatev1.Event_Volume{Volume: volume},
+	}
+	mapper, err := events.MapperForEvent(event)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = mapper.TransitionTime(event, events.VolumeStateAvailable)
+	if !errors.Is(err, events.ErrDataQuality) {
+		t.Fatalf("expected data quality error, got %v", err)
+	}
+}
+
 func TestVolumeUsageContract(t *testing.T) {
 	start := time.Date(2026, 9, 16, 10, 0, 0, 123456000, time.UTC)
 	end := start.Add(90 * time.Second)
@@ -193,7 +217,7 @@ func TestVolumeResizeUsageUsesClosingSliceCapacity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	usage, err := events.VolumeUsageForMapper(mapper, events.EventUpdated, &start, end, map[string]any{
+	usage, err := mapper.Usage(events.EventUpdated, &start, end, map[string]any{
 		"volume_id": "volume-resize", "tenant_id": "tenant-1", "project_id": "", "storage_tier": "gold", "size_gib": int64(100),
 	})
 	if err != nil {

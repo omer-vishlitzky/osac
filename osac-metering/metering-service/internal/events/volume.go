@@ -127,6 +127,14 @@ func (m *volumeMapper) BillingDimensionsMap() (map[string]any, error) {
 	return VolumeBillingDimensions(m.volume)
 }
 
+func (m *volumeMapper) Usage(eventType string, billableSince *time.Time, transitionTime time.Time, dimensions map[string]any) (*schema.Usage, error) {
+	sizeGiB, err := VolumeSizeGiB(dimensions)
+	if err != nil {
+		return nil, err
+	}
+	return VolumeLifecycleUsage(m.volume, eventType, billableSince, transitionTime, sizeGiB)
+}
+
 func VolumeBillingDimensions(volume *privatev1.Volume) (map[string]any, error) {
 	state := VolumeCurrentState(volume)
 	if _, ok := volumeStates[state]; !ok {
@@ -245,18 +253,6 @@ func VolumeLifecycleUsage(volume *privatev1.Volume, eventType string, billableSi
 	}, nil
 }
 
-func VolumeUsageForMapper(mapper ResourceMapper, eventType string, billableSince *time.Time, transitionTime time.Time, dimensions map[string]any) (*schema.Usage, error) {
-	volume, ok := mapper.(*volumeMapper)
-	if !ok {
-		return nil, nil
-	}
-	sizeGiB, err := VolumeSizeGiB(dimensions)
-	if err != nil {
-		return nil, err
-	}
-	return VolumeLifecycleUsage(volume.volume, eventType, billableSince, transitionTime, sizeGiB)
-}
-
 // VolumeHeartbeatUsage reports the complete current interval, not an
 // incremental slice. Providers replace a prior cumulative heartbeat.
 func VolumeHeartbeatUsage(volumeID string, sizeGiB int64, billableSince *time.Time, now time.Time) (*schema.Usage, error) {
@@ -306,8 +302,12 @@ func fixedGiByteSeconds(sizeGiB int64, duration time.Duration) string {
 }
 
 func VolumeTransitionTime(volume *privatev1.Volume, event *privatev1.Event) (time.Time, error) {
-	if event.GetType() == privatev1.EventType_EVENT_TYPE_OBJECT_UPDATED && volume.GetMetadata().GetDeletionTimestamp() != nil {
-		return volume.GetMetadata().GetDeletionTimestamp().AsTime(), nil
+	if event.GetType() == privatev1.EventType_EVENT_TYPE_OBJECT_UPDATED && VolumeCurrentState(volume) == VolumeStateDeleting {
+		deletionTimestamp := volume.GetMetadata().GetDeletionTimestamp()
+		if deletionTimestamp == nil {
+			return time.Time{}, fmt.Errorf("%w: volume %s is DELETING without deletion_timestamp", ErrDataQuality, volume.GetId())
+		}
+		return deletionTimestamp.AsTime(), nil
 	}
 	return ResolveTransitionTime(
 		event.GetType(),

@@ -232,6 +232,10 @@ func run(ctx context.Context, logger logr.Logger, cfg *config) error {
 	if err != nil {
 		return fmt.Errorf("loading external IP pool families: %w", err)
 	}
+	mapperFactory, err := watch.NewMapperFactory(externalIPPoolClient, cfg.deploymentID, pools)
+	if err != nil {
+		return fmt.Errorf("creating Watch mapper factory: %w", err)
+	}
 
 	logger.Info("running startup reconciliation")
 	if err := reconciler.Reconcile(ctx); err != nil {
@@ -260,15 +264,16 @@ func run(ctx context.Context, logger logr.Logger, cfg *config) error {
 	}()
 
 	eventsClient := privatev1.NewEventsClient(grpcConn)
-	consumer := watch.NewConsumer(
+	consumer, err := watch.NewConsumer(
 		eventsClient,
 		publisher,
 		store,
 		logger,
-		externalIPPoolClient,
-		cfg.deploymentID,
-		pools,
+		mapperFactory,
 	)
+	if err != nil {
+		return fmt.Errorf("creating Watch consumer: %w", err)
+	}
 	err = consumer.Run(ctx)
 	runCancel()
 	wg.Wait()
