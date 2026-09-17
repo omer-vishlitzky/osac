@@ -43,7 +43,7 @@ jobs:
     if: >-
       github.event_name == 'workflow_dispatch' ||
        github.event.label.name == 'e2e-ready'
-    uses: osac-project/osac-test-infra/.github/workflows/e2e-on-label.yml@eac6a761704ae4f45d9bb9326375122803854a13
+    uses: osac-project/osac-test-infra/.github/workflows/e2e-on-label.yml@4eec762d79da9f7494085e1c50a0d2539a946623
     with:
       pr_number: ${{ github.event.inputs.pr_number || format('{0}', github.event.pull_request.number) }}
       trigger_label: ${{ github.event.label.name || github.event.inputs.trigger_label || 'e2e-ready' }}

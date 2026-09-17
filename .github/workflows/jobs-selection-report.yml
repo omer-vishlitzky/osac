@@ -25,7 +25,7 @@ permissions: {}
 
 jobs:
   judge:
-    uses: osac-project/osac-test-infra/.github/workflows/jobs-selection-report.yml@eac6a761704ae4f45d9bb9326375122803854a13
+    uses: osac-project/osac-test-infra/.github/workflows/jobs-selection-report.yml@4eec762d79da9f7494085e1c50a0d2539a946623
     permissions:
       contents: read
       pull-requests: write

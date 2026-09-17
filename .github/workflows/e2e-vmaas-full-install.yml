@@ -214,7 +214,7 @@ jobs:
     steps:
       - name: Check e2e readiness
         id: check
-        uses: osac-project/osac-test-infra/.github/actions/check-e2e-readiness@eac6a761704ae4f45d9bb9326375122803854a13
+        uses: osac-project/osac-test-infra/.github/actions/check-e2e-readiness@4eec762d79da9f7494085e1c50a0d2539a946623
         with:
           pr-number: ${{ inputs.pr-number || github.event.pull_request.number }}
           head-sha: ${{ inputs.head-sha || github.event.pull_request.head.sha }}
@@ -252,7 +252,7 @@ jobs:
       # declared job permissions against what the caller grants regardless
       # of runtime reachability, so it must still be granted here.
       id-token: write
-    uses: osac-project/osac-test-infra/.github/workflows/e2e-vmaas-full-install.yml@eac6a761704ae4f45d9bb9326375122803854a13
+    uses: osac-project/osac-test-infra/.github/workflows/e2e-vmaas-full-install.yml@4eec762d79da9f7494085e1c50a0d2539a946623
     with:
       # PR/merge_group and schedule: full vmaas suite (sanity + regression +
       # serial). workflow_dispatch: honor the selected input, else sanity.
@@ -345,7 +345,7 @@ jobs:
       checks: write
     steps:
       - name: Complete stale in_progress gate checks
-        uses: osac-project/osac-test-infra/.github/actions/complete-stale-e2e-gates@eac6a761704ae4f45d9bb9326375122803854a13
+        uses: osac-project/osac-test-infra/.github/actions/complete-stale-e2e-gates@4eec762d79da9f7494085e1c50a0d2539a946623
         with:
           head-sha: ${{ github.event.pull_request.head.sha }}
           gate-name: e2e-vmaas-gate

@@ -793,7 +793,7 @@ jobs:
       # declared job permissions against what the caller grants regardless
       # of runtime reachability, so it must still be granted here.
       id-token: write
-    uses: osac-project/osac-test-infra/.github/workflows/e2e-vmaas-full-install.yml@eac6a761704ae4f45d9bb9326375122803854a13
+    uses: osac-project/osac-test-infra/.github/workflows/e2e-vmaas-full-install.yml@4eec762d79da9f7494085e1c50a0d2539a946623
     with:
       test-suite: vmaas
       # The references module contains CaaS and BMaaS tests too. Those
@@ -823,7 +823,7 @@ jobs:
       contents: read
       # See e2e-vmaas-test's identical grant above for why this is needed.
       id-token: write
-    uses: osac-project/osac-test-infra/.github/workflows/e2e-caas-full-install.yml@eac6a761704ae4f45d9bb9326375122803854a13
+    uses: osac-project/osac-test-infra/.github/workflows/e2e-caas-full-install.yml@4eec762d79da9f7494085e1c50a0d2539a946623
     with:
       test-suite: caas
       installer-repo: ${{ github.repository }}
@@ -842,7 +842,7 @@ jobs:
       contents: read
       # See e2e-vmaas-test's identical grant above for why this is needed.
       id-token: write
-    uses: osac-project/osac-test-infra/.github/workflows/e2e-bmaas-full-install.yml@eac6a761704ae4f45d9bb9326375122803854a13
+    uses: osac-project/osac-test-infra/.github/workflows/e2e-bmaas-full-install.yml@4eec762d79da9f7494085e1c50a0d2539a946623
     with:
       test-suite: bmaas
       test-filter: 'not TestBmaasNetworking'

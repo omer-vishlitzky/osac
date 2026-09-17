@@ -20,5 +20,5 @@ jobs:
        startsWith(github.event.comment.body, '/cancel') ||
        startsWith(github.event.comment.body, '/ok-to-test') ||
        startsWith(github.event.comment.body, '/e2e-ready'))
-    uses: osac-project/osac-test-infra/.github/workflows/slash-command-handler.yml@eac6a761704ae4f45d9bb9326375122803854a13
+    uses: osac-project/osac-test-infra/.github/workflows/slash-command-handler.yml@4eec762d79da9f7494085e1c50a0d2539a946623
     secrets: inherit

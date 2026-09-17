@@ -64,7 +64,7 @@ jobs:
       id-token: write
       checks: write
       pull-requests: read
-    uses: osac-project/osac-test-infra/.github/workflows/e2e-bmaas-netris-full-install.yml@eac6a761704ae4f45d9bb9326375122803854a13
+    uses: osac-project/osac-test-infra/.github/workflows/e2e-bmaas-netris-full-install.yml@4eec762d79da9f7494085e1c50a0d2539a946623
     with:
       osac-repo: https://github.com/${{ inputs.pr-repository || github.event.pull_request.head.repo.full_name || github.repository }}.git
       osac-branch: ${{ inputs.pr-ref || github.event.pull_request.head.ref || github.ref_name }}
