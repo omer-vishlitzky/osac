@@ -25,8 +25,7 @@ var _ = Describe("networking mappers", func() {
 			}},
 		}
 
-		mapper, err := events.MapperForEvent(event)
-		Expect(err).NotTo(HaveOccurred())
+		mapper := events.NewExternalIPMapper(event.GetExternalIp(), "deployment-1", map[string]string{})
 		transitionTime, err := mapper.TransitionTime(event, "")
 
 		Expect(err).NotTo(HaveOccurred())
@@ -45,8 +44,7 @@ var _ = Describe("networking mappers", func() {
 			}},
 		}
 
-		mapper, err := events.MapperForEvent(event)
-		Expect(err).NotTo(HaveOccurred())
+		mapper := events.NewExternalIPMapper(event.GetExternalIp(), "deployment-1", map[string]string{})
 		transitionTime, err := mapper.TransitionTime(event, "")
 
 		Expect(err).NotTo(HaveOccurred())
@@ -65,8 +63,7 @@ var _ = Describe("networking mappers", func() {
 			}},
 		}
 
-		mapper, err := events.MapperForEvent(event)
-		Expect(err).NotTo(HaveOccurred())
+		mapper := events.NewNATGatewayMapper(event.GetNatGateway(), "deployment-1")
 		transitionTime, err := mapper.TransitionTime(event, "")
 
 		Expect(err).NotTo(HaveOccurred())
@@ -85,8 +82,7 @@ var _ = Describe("networking mappers", func() {
 			}},
 		}
 
-		mapper, err := events.MapperForEvent(event)
-		Expect(err).NotTo(HaveOccurred())
+		mapper := events.NewNATGatewayMapper(event.GetNatGateway(), "deployment-1")
 		transitionTime, err := mapper.TransitionTime(event, "")
 
 		Expect(err).NotTo(HaveOccurred())
@@ -183,8 +179,7 @@ var _ = Describe("networking mappers", func() {
 			}},
 		}
 
-		mapper, err := events.MapperForEvent(event)
-		Expect(err).NotTo(HaveOccurred())
+		mapper := events.NewExternalIPMapper(event.GetExternalIp(), "deployment-1", map[string]string{"pool-1": "ipv4"})
 		transitionTime, err := mapper.TransitionTime(event, events.ExternalIPStatePending)
 
 		Expect(err).NotTo(HaveOccurred())
@@ -196,14 +191,9 @@ var _ = Describe("networking mappers", func() {
 			Metadata: &privatev1.Metadata{},
 			Spec:     &privatev1.ExternalIPSpec{Pool: &privatev1.ExternalIPPoolReference{Id: "pool-1"}},
 		}
-		event := &privatev1.Event{Payload: &privatev1.Event_ExternalIp{ExternalIp: ip}}
-		mapper, err := events.MapperForEventWithContext(event, events.MapperContext{
-			DeploymentID:    "deployment-1",
-			ExternalIPPools: map[string]string{"pool-1": "ipv4"},
-		})
-		Expect(err).NotTo(HaveOccurred())
+		mapper := events.NewExternalIPMapper(ip, "deployment-1", map[string]string{"pool-1": "ipv4"})
 
-		_, err = mapper.BillingDimensionsMap()
+		_, err := mapper.BillingDimensionsMap()
 		Expect(err).To(HaveOccurred())
 		Expect(errors.Is(err, events.ErrDataQuality)).To(BeTrue())
 	})
@@ -274,9 +264,7 @@ var _ = Describe("networking mappers", func() {
 			Status: &privatev1.NATGatewayStatus{State: privatev1.NATGatewayState_NAT_GATEWAY_STATE_READY},
 		}
 
-		event := &privatev1.Event{Payload: &privatev1.Event_NatGateway{NatGateway: gateway}}
-		mapper, err := events.MapperForEventWithContext(event, events.MapperContext{DeploymentID: "deployment-1"})
-		Expect(err).NotTo(HaveOccurred())
+		mapper := events.NewNATGatewayMapper(gateway, "deployment-1")
 		dimensions, err := mapper.BillingDimensionsMap()
 		Expect(err).NotTo(HaveOccurred())
 		Expect(dimensions).To(Equal(map[string]any{
@@ -299,9 +287,7 @@ var _ = Describe("networking mappers", func() {
 			},
 		}
 
-		event := &privatev1.Event{Payload: &privatev1.Event_NatGateway{NatGateway: gateway}}
-		mapper, err := events.MapperForEventWithContext(event, events.MapperContext{DeploymentID: "deployment-1"})
-		Expect(err).NotTo(HaveOccurred())
+		mapper := events.NewNATGatewayMapper(gateway, "deployment-1")
 		dimensions, err := mapper.BillingDimensionsMap()
 		Expect(err).NotTo(HaveOccurred())
 		Expect(dimensions["project_id"]).To(Equal(""))
@@ -316,11 +302,9 @@ var _ = Describe("networking mappers", func() {
 				ExternalIp:     &privatev1.ExternalIPLocalReference{Id: "ip-1"},
 			},
 		}
-		event := &privatev1.Event{Payload: &privatev1.Event_NatGateway{NatGateway: gateway}}
-		mapper, err := events.MapperForEventWithContext(event, events.MapperContext{DeploymentID: "deployment-1"})
-		Expect(err).NotTo(HaveOccurred())
+		mapper := events.NewNATGatewayMapper(gateway, "deployment-1")
 
-		_, err = mapper.BillingDimensionsMap()
+		_, err := mapper.BillingDimensionsMap()
 		Expect(err).To(HaveOccurred())
 		Expect(errors.Is(err, events.ErrDataQuality)).To(BeTrue())
 	})
@@ -338,11 +322,7 @@ var _ = Describe("networking mappers", func() {
 			}},
 		}
 
-		mapper, err := events.MapperForEventWithContext(event, events.MapperContext{
-			DeploymentID:    "deployment-1",
-			ExternalIPPools: map[string]string{"pool-1": "ipv4"},
-		})
-		Expect(err).NotTo(HaveOccurred())
+		mapper := events.NewExternalIPMapper(event.GetExternalIp(), "deployment-1", map[string]string{"pool-1": "ipv4"})
 		dimensions, err := mapper.BillingDimensionsMap()
 		Expect(err).NotTo(HaveOccurred())
 		cloudEvent, err := events.MapWatchEvent(event, mapper, &events.StateContext{PreviousState: "PENDING"}, dimensions)

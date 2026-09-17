@@ -58,8 +58,13 @@ var externalIPTransitions = TransitionTable{
 }
 
 type externalIPMapper struct {
-	ip      *privatev1.ExternalIP
-	context MapperContext
+	ip           *privatev1.ExternalIP
+	deploymentID string
+	poolFamilies map[string]string
+}
+
+func NewExternalIPMapper(ip *privatev1.ExternalIP, deploymentID string, poolFamilies map[string]string) ResourceMapper {
+	return &externalIPMapper{ip: ip, deploymentID: deploymentID, poolFamilies: poolFamilies}
 }
 
 var ipFamilyDimensions = map[privatev1.IPFamily]string{
@@ -113,7 +118,11 @@ func (m *externalIPMapper) IsBillable() bool {
 }
 
 func (m *externalIPMapper) BillingDimensionsMap() (map[string]any, error) {
-	return ExternalIPBillingDimensions(m.ip, m.context.DeploymentID, m.context.ExternalIPPools)
+	return ExternalIPBillingDimensions(m.ip, m.deploymentID, m.poolFamilies)
+}
+
+func (m *externalIPMapper) Usage(string, *time.Time, time.Time, map[string]any) (*schema.Usage, error) {
+	return nil, nil
 }
 
 func ExternalIPBillingDimensions(ip *privatev1.ExternalIP, deploymentID string, pools map[string]string) (map[string]any, error) {
