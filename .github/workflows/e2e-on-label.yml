@@ -37,7 +37,7 @@ jobs:
     permissions:
       actions: write
       checks: write
-      contents: read
+      contents: write
       issues: read
       pull-requests: write
     if: >-
