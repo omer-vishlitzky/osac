@@ -97,7 +97,7 @@ func (m *natGatewayMapper) IsBillable() bool {
 
 func (m *natGatewayMapper) BillingDimensionsMap() (map[string]any, error) {
 	dimensions := NATGatewayBillingDimensions(m.gateway, m.deployment)
-	return dimensions, nil
+	return dimensions, validateNetworkingBillingDimensions(schema.ResourceTypeNATGateway, dimensions)
 }
 
 func NATGatewayBillingDimensions(gateway *privatev1.NATGateway, deploymentID string) map[string]any {

@@ -192,16 +192,18 @@ var _ = Describe("networking mappers", func() {
 	})
 
 	It("requires a tenant dimension for ExternalIP usage", func() {
-		dimensions := map[string]any{
-			"deployment": "deployment-1",
-			"pool":       "pool-1",
-			"ip_family":  "ipv4",
-			"attached":   false,
-			"tenant_id":  "",
+		ip := &privatev1.ExternalIP{
+			Metadata: &privatev1.Metadata{},
+			Spec:     &privatev1.ExternalIPSpec{Pool: &privatev1.ExternalIPPoolReference{Id: "pool-1"}},
 		}
+		event := &privatev1.Event{Payload: &privatev1.Event_ExternalIp{ExternalIp: ip}}
+		mapper, err := events.MapperForEventWithContext(event, events.MapperContext{
+			DeploymentID:    "deployment-1",
+			ExternalIPPools: map[string]string{"pool-1": "ipv4"},
+		})
+		Expect(err).NotTo(HaveOccurred())
 
-		err := events.ValidateBillingDimensions(events.ResourceTypeExternalIP, dimensions)
-
+		_, err = mapper.BillingDimensionsMap()
 		Expect(err).To(HaveOccurred())
 		Expect(errors.Is(err, events.ErrDataQuality)).To(BeTrue())
 	})
@@ -272,9 +274,11 @@ var _ = Describe("networking mappers", func() {
 			Status: &privatev1.NATGatewayStatus{State: privatev1.NATGatewayState_NAT_GATEWAY_STATE_READY},
 		}
 
-		dimensions := events.NATGatewayBillingDimensions(gateway, "deployment-1")
-
-		Expect(events.ValidateBillingDimensions(events.ResourceTypeNATGateway, dimensions)).To(Succeed())
+		event := &privatev1.Event{Payload: &privatev1.Event_NatGateway{NatGateway: gateway}}
+		mapper, err := events.MapperForEventWithContext(event, events.MapperContext{DeploymentID: "deployment-1"})
+		Expect(err).NotTo(HaveOccurred())
+		dimensions, err := mapper.BillingDimensionsMap()
+		Expect(err).NotTo(HaveOccurred())
 		Expect(dimensions).To(Equal(map[string]any{
 			"deployment":      "deployment-1",
 			"virtual_network": "vn-1",
@@ -295,14 +299,30 @@ var _ = Describe("networking mappers", func() {
 			},
 		}
 
-		dimensions := events.NATGatewayBillingDimensions(gateway, "deployment-1")
-		err := events.ValidateBillingDimensions(
-			events.ResourceTypeNATGateway,
-			dimensions,
-		)
-
+		event := &privatev1.Event{Payload: &privatev1.Event_NatGateway{NatGateway: gateway}}
+		mapper, err := events.MapperForEventWithContext(event, events.MapperContext{DeploymentID: "deployment-1"})
+		Expect(err).NotTo(HaveOccurred())
+		dimensions, err := mapper.BillingDimensionsMap()
 		Expect(err).NotTo(HaveOccurred())
 		Expect(dimensions["project_id"]).To(Equal(""))
+	})
+
+	It("validates NATGateway dimensions through the mapper", func() {
+		gateway := &privatev1.NATGateway{
+			Id:       "nat-invalid-dimensions",
+			Metadata: &privatev1.Metadata{},
+			Spec: &privatev1.NATGatewaySpec{
+				VirtualNetwork: &privatev1.VirtualNetworkLocalReference{Id: "vn-1"},
+				ExternalIp:     &privatev1.ExternalIPLocalReference{Id: "ip-1"},
+			},
+		}
+		event := &privatev1.Event{Payload: &privatev1.Event_NatGateway{NatGateway: gateway}}
+		mapper, err := events.MapperForEventWithContext(event, events.MapperContext{DeploymentID: "deployment-1"})
+		Expect(err).NotTo(HaveOccurred())
+
+		_, err = mapper.BillingDimensionsMap()
+		Expect(err).To(HaveOccurred())
+		Expect(errors.Is(err, events.ErrDataQuality)).To(BeTrue())
 	})
 
 	It("maps billable networking transitions to started events", func() {

@@ -73,10 +73,6 @@ func MapWatchEvent(event *privatev1.Event, mapper ResourceMapper, stateCtx *Stat
 	if mapper.TenantID() == "" {
 		return nil, fmt.Errorf("%w: resource %s has no tenant_id", ErrDataQuality, mapper.ResourceID())
 	}
-	if err := ValidateBillingDimensions(mapper.ResourceType(), billingDims); err != nil {
-		return nil, err
-	}
-
 	transitionTime, err := mapper.TransitionTime(event, previousState)
 	if err != nil {
 		return nil, err
@@ -95,6 +91,10 @@ func MapWatchEvent(event *privatev1.Event, mapper ResourceMapper, stateCtx *Stat
 	SetOSACExtensions(&ce, mapper.ResourceID(), mapper.ResourceType(), mapper.TenantID(), projectID)
 
 	data := BuildLifecycleData(mapper, billingDims, stateCtx.PreviousState, stateCtx.DurationSeconds, transitionTime)
+	data.Usage, err = VolumeUsageForMapper(mapper, ceType, stateCtx.BillableSince, transitionTime, billingDims)
+	if err != nil {
+		return nil, err
+	}
 	if err := ce.SetData(cloudevents.ApplicationJSON, data); err != nil {
 		return nil, fmt.Errorf("setting CloudEvent data: %w", err)
 	}
@@ -122,6 +122,9 @@ func mapperForEvent(event *privatev1.Event, context MapperContext) (ResourceMapp
 	}
 	if cl := event.GetCluster(); cl != nil {
 		return &clusterMapper{cl: cl}, nil
+	}
+	if volume := event.GetVolume(); volume != nil {
+		return &volumeMapper{volume: volume}, nil
 	}
 	if ip := event.GetExternalIp(); ip != nil {
 		return &externalIPMapper{ip: ip, context: context}, nil
