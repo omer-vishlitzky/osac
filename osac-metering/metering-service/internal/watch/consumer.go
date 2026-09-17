@@ -147,7 +147,6 @@ func (c *Consumer) consumeStream(ctx context.Context) (int, error) {
 	}
 }
 
-// ALL those if elses above are quite hard to follow. what do they all do? can we simplify somehow? extract to something clearer and easier to read and expand?
 func (c *Consumer) handleEvent(ctx context.Context, event *privatev1.Event) error {
 	prepared, skipped, err := c.prepareEvent(ctx, event)
 	if err != nil {
@@ -157,6 +156,15 @@ func (c *Consumer) handleEvent(ctx context.Context, event *privatev1.Event) erro
 		return nil
 	}
 	if c.skipStaleEvent(prepared) {
+		return nil
+	}
+	if transitionTimeIsStale(prepared.existing, prepared.event.GetType(), prepared.currentState, prepared.version, prepared.transitionTime) {
+		c.logger.Info("skipping Watch event with stale transition time",
+			"resource_id", prepared.resourceID,
+			"event_version", prepared.version,
+			"projection_version", prepared.existing.FulfillmentVersion,
+			"event_transition_time", prepared.transitionTime,
+			"projection_transition_time", prepared.existing.TransitionTime)
 		return nil
 	}
 	skip, err := c.shouldSkipUpdate(
@@ -174,15 +182,6 @@ func (c *Consumer) handleEvent(ctx context.Context, event *privatev1.Event) erro
 		return err
 	}
 	if skip {
-		return nil
-	}
-	if transitionTimeIsStale(prepared.existing, prepared.event.GetType(), prepared.currentState, prepared.version, prepared.transitionTime) {
-		c.logger.Info("skipping Watch event with stale transition time",
-			"resource_id", prepared.resourceID,
-			"event_version", prepared.version,
-			"projection_version", prepared.existing.FulfillmentVersion,
-			"event_transition_time", prepared.transitionTime,
-			"projection_transition_time", prepared.existing.TransitionTime)
 		return nil
 	}
 	if prepared.mapper.ResourceType() == events.ResourceTypeBareMetalInstance &&
@@ -294,6 +293,7 @@ func transitionTimeIsStale(
 	}
 	return transitionTime.Before(existing.TransitionTime)
 }
+
 // handleTransientState updates only FulfillmentVersion and TransitionTime
 // for transient states (STOPPING, STARTING) without changing CurrentState,
 // billing fields, or emitting a CloudEvent. The projection keeps
@@ -427,7 +427,7 @@ func (c *Consumer) handleBareMetalEvent(
 				}
 			}
 			return nil
-		}, projectionState, resourceID)
+		}, projectionState, resourceID, false)
 	}
 
 	return c.publishAndUpsert(ctx, func() error {
@@ -437,7 +437,7 @@ func (c *Consumer) handleBareMetalEvent(
 			}
 		}
 		return nil
-	}, projectionState, resourceID)
+	}, projectionState, resourceID, false)
 }
 
 func (c *Consumer) handleBareMetalDeletion(
@@ -537,6 +537,7 @@ func buildBareMetalEvent(
 		request.BillingDims,
 		previousState,
 		request.DurationSeconds,
+		nil,
 		transitionTime,
 	)
 }

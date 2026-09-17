@@ -306,7 +306,7 @@ var _ = Describe("Reconciler", func() {
 				BillingDimensions: map[string]any{"bm_instance_type": "bmi-type-gpu-large"},
 			}
 			pub := &mockPublisher{}
-			recon := reconciliation.NewReconciler(nil, nil, store, pub, logr.Discard(), 60*time.Second)
+			recon := newTestReconciler(nil, nil, store, pub, 60*time.Second)
 
 			Expect(recon.Reconcile(ctx)).To(Succeed())
 

@@ -75,8 +75,8 @@ func NewVolumeFeedbackReconciler(hubClient clnt.Client, grpcConn *grpc.ClientCon
 		},
 		Save: func(ctx context.Context, remote *privatev1.Volume) error {
 			_, err := volClient.Update(ctx, privatev1.VolumesUpdateRequest_builder{
-			Object: remote,
-			UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{
+				Object: remote,
+				UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{
 					feedbackStatusStatePath, "status.vendor_volume_id", "status.vendor_context", "status.protocol", "status.provider", "status.state_transition_time", "status.provisioned_size_gib",
 				}},
 			}.Build())

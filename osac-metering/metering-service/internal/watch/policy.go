@@ -64,7 +64,6 @@ func normalizeEventDimensions(event *privatev1.Event, mapper events.ResourceMapp
 	return dims
 }
 
-// why do we have volume specific logic in this file?
 func sameVersionVolumeDeletionBoundary(event *privatev1.Event, existing *projection.ResourceState, version int32, currentState string) bool {
 	return event.GetType() == privatev1.EventType_EVENT_TYPE_OBJECT_UPDATED &&
 		event.GetVolume() != nil &&

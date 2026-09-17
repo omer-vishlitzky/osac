@@ -187,10 +187,6 @@ func (m *volumeMapper) CloudEventType(eventType privatev1.EventType, previousSta
 	if eventType == privatev1.EventType_EVENT_TYPE_OBJECT_CREATED && m.CurrentState() != VolumeStateCreating {
 		return "", fmt.Errorf("volume OBJECT_CREATED must be CREATING, got %s", m.CurrentState())
 	}
-	if eventType == privatev1.EventType_EVENT_TYPE_OBJECT_UPDATED &&
-		previousState == VolumeStateAvailable && m.CurrentState() == VolumeStateAvailable && m.IsBillable() {
-		return eventBillableStart, nil
-	}
 	result, err := ResolveCloudEventType(volumeTransitions, eventType, previousState, m.CurrentState())
 	if err != nil {
 		return "", err
@@ -302,12 +298,14 @@ func fixedGiByteSeconds(sizeGiB int64, duration time.Duration) string {
 }
 
 func VolumeTransitionTime(volume *privatev1.Volume, event *privatev1.Event) (time.Time, error) {
-	if event.GetType() == privatev1.EventType_EVENT_TYPE_OBJECT_UPDATED && VolumeCurrentState(volume) == VolumeStateDeleting {
+	if event.GetType() == privatev1.EventType_EVENT_TYPE_OBJECT_UPDATED {
 		deletionTimestamp := volume.GetMetadata().GetDeletionTimestamp()
-		if deletionTimestamp == nil {
+		if deletionTimestamp != nil {
+			return deletionTimestamp.AsTime(), nil
+		}
+		if VolumeCurrentState(volume) == VolumeStateDeleting {
 			return time.Time{}, fmt.Errorf("%w: volume %s is DELETING without deletion_timestamp", ErrDataQuality, volume.GetId())
 		}
-		return deletionTimestamp.AsTime(), nil
 	}
 	return ResolveTransitionTime(
 		event.GetType(),

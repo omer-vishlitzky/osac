@@ -25,7 +25,6 @@ func NewMapperFactory(
 	deploymentID string,
 	externalIPPools map[string]string,
 ) (*MapperFactory, error) {
-	// we now force it to be non nill, tehre is no selective metering. can we change the constructors so they are impossible to be nil and remove all those redundant checks?
 	if externalIPPoolClient == nil {
 		return nil, fmt.Errorf("external IP pool client is required")
 	}
@@ -42,7 +41,6 @@ func NewMapperFactory(
 	}, nil
 }
 
-// Can you explain why this function has networking specifics? it doesn't have anything vmaas/caas specifics.
 func (f *MapperFactory) MapperForEvent(ctx context.Context, event *privatev1.Event) (events.ResourceMapper, error) {
 	if ip := event.GetExternalIp(); ip != nil {
 		poolID := ip.GetSpec().GetPool().GetId()

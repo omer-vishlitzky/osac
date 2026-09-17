@@ -137,7 +137,6 @@ var _ = Describe("VolumeFeedbackController", func() {
 			mockServer.addVolume(newRemoteVolume(volID, privatev1.VolumeState_VOLUME_STATE_CREATING))
 
 			cr := newVolumeFeedbackCR(volName, volNamespace, volID, v1alpha1.VolumePhaseReady, nil)
-			cr.Status.Backend = "vast-backend"
 			cr.Status.Protocol = v1alpha1.VolumeProtocolBlock
 			Expect(fakeK8s.Create(ctx, cr)).To(Succeed())
 

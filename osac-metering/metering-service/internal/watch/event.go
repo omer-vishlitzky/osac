@@ -35,6 +35,12 @@ func (c *Consumer) prepareEvent(ctx context.Context, event *privatev1.Event) (pr
 	resourceID := mapper.ResourceID()
 	dimensions, err := mapper.BillingDimensionsMap()
 	if err != nil {
+		if errors.Is(err, events.ErrDataQuality) {
+			eventsSkipped.WithLabelValues("data_quality").Inc()
+			c.logger.Info("skipping event with invalid billing dimensions",
+				"event_id", event.GetId(), "resource_id", resourceID, "error", err)
+			return preparedEvent{}, true, nil
+		}
 		return preparedEvent{}, false, fmt.Errorf("building billing dimensions for %s: %w", resourceID, err)
 	}
 	existing, err := c.store.Get(ctx, resourceID)

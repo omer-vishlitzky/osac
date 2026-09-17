@@ -57,7 +57,7 @@ const (
 	ResourceTypeExternalIP        = schema.ResourceTypeExternalIP
 	ResourceTypeNATGateway        = schema.ResourceTypeNATGateway
 	ResourceTypeBareMetalInstance = schema.ResourceTypeBareMetalInstance
-	ResourceTypeVolume          = schema.ResourceTypeVolume
+	ResourceTypeVolume            = schema.ResourceTypeVolume
 )
 
 // StateEmpty is the empty previous state for initial transitions.
@@ -163,7 +163,7 @@ var resourceDecomposers = map[string]EventDecomposer{
 	ResourceTypeExternalIP:        singleEvent,
 	ResourceTypeNATGateway:        singleEvent,
 	ResourceTypeBareMetalInstance: unsupportedGenericDecomposition,
-	ResourceTypeVolume:          singleEvent,
+	ResourceTypeVolume:            singleEvent,
 }
 
 // BuildResourceEvents dispatches event building to the correct decomposer
