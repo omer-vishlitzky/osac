@@ -46,6 +46,9 @@ func (c *Consumer) prepareEvent(ctx context.Context, event *privatev1.Event) (pr
 	if existing != nil {
 		previousState = existing.CurrentState
 	}
+	currentState := mapper.CurrentState()
+	isBillable := mapper.IsBillable()
+	version := mapper.FulfillmentVersion()
 	transitionTime, err := mapper.TransitionTime(event, previousState)
 	if err != nil {
 		if errors.Is(err, events.ErrUnsupportedEvent) {
@@ -53,6 +56,17 @@ func (c *Consumer) prepareEvent(ctx context.Context, event *privatev1.Event) (pr
 			c.logger.V(1).Info("skipping unsupported event type",
 				"event_id", event.GetId(), "resource_id", resourceID)
 			return preparedEvent{}, true, nil
+		}
+		if event.GetType() == privatev1.EventType_EVENT_TYPE_OBJECT_UPDATED &&
+			errors.Is(err, events.ErrDataQuality) {
+			skipped, skipErr := c.skipUntimedNoopUpdate(
+				ctx, event, mapper, existing, currentState, isBillable, dimensions, version)
+			if skipErr != nil {
+				return preparedEvent{}, false, skipErr
+			}
+			if skipped {
+				return preparedEvent{}, true, nil
+			}
 		}
 		return preparedEvent{}, false, err
 	}
@@ -62,13 +76,67 @@ func (c *Consumer) prepareEvent(ctx context.Context, event *privatev1.Event) (pr
 		mapper:                   mapper,
 		existing:                 existing,
 		resourceID:               resourceID,
-		currentState:             mapper.CurrentState(),
-		isBillable:               mapper.IsBillable(),
-		version:                  mapper.FulfillmentVersion(),
+		currentState:             currentState,
+		isBillable:               isBillable,
+		version:                  version,
 		dimensions:               dimensions,
 		transitionTime:           transitionTime,
-		allowSameVersionDeletion: sameVersionVolumeDeletionBoundary(event, existing, mapper.FulfillmentVersion(), mapper.CurrentState()),
+		allowSameVersionDeletion: sameVersionVolumeDeletionBoundary(event, existing, version, currentState),
 	}, false, nil
+}
+
+// skipUntimedNoopUpdate keeps metadata-only updates from tearing down the live
+// Watch stream when they do not change any state represented by the metering
+// projection. Updates that change state, billability, project, tenant, or
+// billing dimensions still require an authoritative transition timestamp.
+func (c *Consumer) skipUntimedNoopUpdate(
+	ctx context.Context,
+	event *privatev1.Event,
+	mapper events.ResourceMapper,
+	existing *projection.ResourceState,
+	currentState string,
+	isBillable bool,
+	dimensions map[string]any,
+	version int32,
+) (bool, error) {
+	if !sameMeteringState(existing, mapper, currentState, isBillable, dimensions) {
+		return false, nil
+	}
+
+	if version > existing.FulfillmentVersion {
+		updated := *existing
+		updated.FulfillmentVersion = version
+		if err := c.store.Upsert(ctx, updated); err != nil && !errors.Is(err, projection.ErrStaleVersion) {
+			return false, fmt.Errorf("advancing projection version for %s: %w", mapper.ResourceID(), err)
+		}
+	}
+
+	eventsSkipped.WithLabelValues("no_metering_change").Inc()
+	c.logger.V(1).Info("skipping Watch update without a metering change or transition timestamp",
+		"event_id", event.GetId(), "resource_id", mapper.ResourceID())
+	return true, nil
+}
+
+func sameMeteringState(
+	existing *projection.ResourceState,
+	mapper events.ResourceMapper,
+	currentState string,
+	isBillable bool,
+	dimensions map[string]any,
+) bool {
+	if existing == nil {
+		return false
+	}
+	projectID := ""
+	if value := mapper.ProjectID(); value != nil {
+		projectID = *value
+	}
+	return existing.ResourceType == mapper.ResourceType() &&
+		existing.TenantID == mapper.TenantID() &&
+		existing.ProjectID == projectID &&
+		existing.CurrentState == currentState &&
+		existing.IsBillable == isBillable &&
+		events.DimensionsEqual(existing.BillingDimensions, dimensions)
 }
 
 func (c *Consumer) skipStaleEvent(prepared preparedEvent) bool {

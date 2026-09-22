@@ -449,6 +449,75 @@ var _ = Describe("Consumer", func() {
 			Expect(projected.BillingDimensions["size_gib"]).To(Equal(int64(200)))
 		})
 
+		It("fails fast on a same-state capacity change without its boundary timestamp", func() {
+			availableTime := time.Date(2026, 1, 1, 10, 0, 0, 0, time.UTC)
+			store := newMockStore()
+			billableSince := availableTime.Add(-time.Hour)
+			store.states["volume-resize-untimed"] = projection.ResourceState{
+				ResourceID:         "volume-resize-untimed",
+				ResourceType:       events.ResourceTypeVolume,
+				TenantID:           "tenant-1",
+				ProjectID:          "project-1",
+				CurrentState:       events.VolumeStateAvailable,
+				IsBillable:         true,
+				BillableSince:      &billableSince,
+				FulfillmentVersion: 1,
+				TransitionTime:     availableTime,
+				BillingDimensions: map[string]any{
+					"volume_id": "volume-resize-untimed", "tenant_id": "tenant-1", "project_id": "project-1",
+					"storage_tier": "gold", "size_gib": int64(100),
+				},
+			}
+
+			resized := &privatev1.Volume{
+				Id: "volume-resize-untimed",
+				Metadata: &privatev1.Metadata{
+					Tenant:            "tenant-1",
+					Project:           "project-1",
+					Version:           2,
+					CreationTimestamp: timestamppb.New(availableTime.Add(-time.Hour)),
+				},
+				Spec: &privatev1.VolumeSpec{StorageTier: "gold", SizeGib: 200},
+				Status: &privatev1.VolumeStatus{
+					State:               privatev1.VolumeState_VOLUME_STATE_AVAILABLE,
+					VendorVolumeId:      "vendor-1",
+					Protocol:            privatev1.StorageProtocol_STORAGE_PROTOCOL_BLOCK,
+					ProvisionedSizeGib:  200,
+					StateTransitionTime: timestamppb.New(availableTime),
+				},
+			}
+			unreachableEvent := makeEvent("evt-before-volume-boundary", privatev1.EventType_EVENT_TYPE_OBJECT_CREATED)
+			goodEvent := makeEvent("evt-after-volume-boundary", privatev1.EventType_EVENT_TYPE_OBJECT_CREATED)
+			client.results = []mockStreamResult{
+				{stream: &mockWatchStream{responses: []*privatev1.EventsWatchResponse{
+					makeResponse(&privatev1.Event{
+						Id:      "evt-volume-resize-no-boundary",
+						Type:    privatev1.EventType_EVENT_TYPE_OBJECT_UPDATED,
+						Payload: &privatev1.Event_Volume{Volume: resized},
+					}),
+					makeResponse(unreachableEvent),
+				}}},
+				{stream: &mockWatchStream{responses: []*privatev1.EventsWatchResponse{
+					makeResponse(goodEvent),
+				}}},
+			}
+
+			pub := &mockPublisher{published: make([]cloudevents.Event, 0, 1), cancelFunc: cancel}
+			consumer := newConsumerWithStore(pub, store)
+			Expect(consumer.Run(ctx)).To(Succeed())
+			Expect(client.watchCallCount()).To(Equal(2))
+
+			pub.mu.Lock()
+			defer pub.mu.Unlock()
+			Expect(pub.published).To(HaveLen(1))
+			Expect(pub.published[0].ID()).To(Equal(goodEvent.GetId()))
+
+			projected, err := store.Get(ctx, "volume-resize-untimed")
+			Expect(err).ToNot(HaveOccurred())
+			Expect(projected.FulfillmentVersion).To(Equal(int32(1)))
+			Expect(projected.BillingDimensions["size_gib"]).To(Equal(int64(100)))
+		})
+
 		It("meters an ExternalIP through the resource mapper factory", func() {
 			creationTime := time.Date(2026, 1, 1, 10, 0, 0, 0, time.UTC)
 			allocatedTime := creationTime.Add(time.Minute)
@@ -844,57 +913,61 @@ var _ = Describe("Consumer", func() {
 			Expect(pub.published[0].Type()).To(Equal("osac.resource.created.v1"))
 		})
 
-		It("fails fast on metadata-only update with no state_transition_time", func() {
+		It("skips an untimed no-op update and continues the Watch stream", func() {
 			store := newMockStore()
-			store.states["vm-meta"] = projection.ResourceState{
-				ResourceID:   "vm-meta",
-				ResourceType: "compute_instance",
-				TenantID:     "tenant-1",
-				CurrentState: "STARTING",
+			previousTransition := time.Date(2026, 9, 22, 20, 0, 0, 0, time.UTC)
+			store.states["cluster-meta"] = projection.ResourceState{
+				ResourceID:         "cluster-meta",
+				ResourceType:       events.ResourceTypeClusterOrder,
+				TenantID:           "tenant-1",
+				CurrentState:       events.ClusterStateUnspecified,
+				FulfillmentVersion: 1,
+				TransitionTime:     previousTransition,
+				BillingDimensions:  map[string]any{},
 			}
 
-			ciNoTimestamp := makeComputeInstance("vm-meta", "tenant-1")
-			ciNoTimestamp.Status.State = privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_STARTING
-			ciNoTimestamp.Status.StateTransitionTime = nil
+			clusterNoTimestamp := &privatev1.Cluster{
+				Id: "cluster-meta",
+				Metadata: &privatev1.Metadata{
+					Tenant:            "tenant-1",
+					Version:           2,
+					CreationTimestamp: timestamppb.New(previousTransition.Add(-time.Hour)),
+					DeletionTimestamp: timestamppb.New(previousTransition.Add(time.Minute)),
+				},
+				Status: &privatev1.ClusterStatus{
+					State: privatev1.ClusterState_CLUSTER_STATE_UNSPECIFIED,
+				},
+			}
 
-			ciRunning := makeComputeInstance("vm-meta", "tenant-1")
-			ciRunning.Status.State = privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_RUNNING
-			ciRunning.Metadata.Version = 2
-
-			stream1 := &mockWatchStream{
+			goodEvent := makeEvent("evt-after-noop", privatev1.EventType_EVENT_TYPE_OBJECT_CREATED)
+			stream := &mockWatchStream{
 				responses: []*privatev1.EventsWatchResponse{
 					makeResponse(&privatev1.Event{
 						Id:      "evt-meta-update",
 						Type:    privatev1.EventType_EVENT_TYPE_OBJECT_UPDATED,
-						Payload: &privatev1.Event_ComputeInstance{ComputeInstance: ciNoTimestamp},
+						Payload: &privatev1.Event_Cluster{Cluster: clusterNoTimestamp},
 					}),
+					makeResponse(goodEvent),
 				},
 			}
-			stream2 := &mockWatchStream{
-				responses: []*privatev1.EventsWatchResponse{makeResponse(&privatev1.Event{
-					Id:      "evt-running",
-					Type:    privatev1.EventType_EVENT_TYPE_OBJECT_UPDATED,
-					Payload: &privatev1.Event_ComputeInstance{ComputeInstance: ciRunning},
-				})},
-			}
-			client.results = []mockStreamResult{{stream: stream1}, {stream: stream2}}
+			client.results = []mockStreamResult{{stream: stream}}
 
 			pub := &mockPublisher{published: make([]cloudevents.Event, 0, 1), cancelFunc: cancel}
 			consumer := newConsumerWithStore(pub, store)
 
-			err := consumer.Run(ctx)
-			Expect(err).ToNot(HaveOccurred())
-
-			Expect(client.watchCallCount()).To(BeNumerically(">=", 2))
+			Expect(consumer.Run(ctx)).To(Succeed())
+			Expect(client.watchCallCount()).To(Equal(1))
 
 			pub.mu.Lock()
 			defer pub.mu.Unlock()
 			Expect(pub.published).To(HaveLen(1))
-			// Fixture has no recorded billing history (EverBillable defaults
-			// false) -- this is genuinely vm-meta's first activation, so
-			// started.v1 is correct. The type isn't this test's focus (see
-			// name), but it should still be right.
-			Expect(pub.published[0].Type()).To(Equal("osac.resource.started.v1"))
+			Expect(pub.published[0].ID()).To(Equal(goodEvent.GetId()))
+
+			projected, err := store.Get(ctx, "cluster-meta")
+			Expect(err).ToNot(HaveOccurred())
+			Expect(projected.FulfillmentVersion).To(Equal(int32(2)))
+			Expect(projected.TransitionTime).To(Equal(previousTransition),
+				"an untimed metadata update must not move the last lifecycle boundary")
 		})
 
 		It("fails fast on data quality error when state actually changed", func() {

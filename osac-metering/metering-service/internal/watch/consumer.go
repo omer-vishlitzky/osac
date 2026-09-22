@@ -35,7 +35,7 @@ var (
 	})
 	eventsSkipped = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "osac_metering_events_skipped_total",
-		Help: "Watch events skipped due to unsupported type or data quality issues",
+		Help: "Watch events skipped before publication",
 	}, []string{"reason"})
 )
 
@@ -170,13 +170,13 @@ func (c *Consumer) handleEvent(ctx context.Context, event *privatev1.Event) erro
 	skip, err := c.shouldSkipUpdate(
 		ctx,
 		event,
+		prepared.mapper,
 		prepared.existing,
 		prepared.currentState,
 		prepared.isBillable,
 		prepared.dimensions,
 		prepared.version,
 		prepared.transitionTime,
-		prepared.resourceID,
 	)
 	if err != nil {
 		return err
@@ -671,26 +671,24 @@ func (c *Consumer) buildComponentEvent(baseCE *cloudevents.Event, eventID string
 	return ce, nil
 }
 
-func (c *Consumer) shouldSkipUpdate(ctx context.Context, event *privatev1.Event, existing *projection.ResourceState, currentState string, isBillable bool, dims map[string]any, version int32, transitionTime time.Time, resourceID string) (bool, error) {
-	if event.GetType() != privatev1.EventType_EVENT_TYPE_OBJECT_UPDATED || existing == nil {
-		return false, nil
-	}
-	if existing.CurrentState != currentState || existing.IsBillable != isBillable || !events.DimensionsEqual(existing.BillingDimensions, dims) {
+func (c *Consumer) shouldSkipUpdate(ctx context.Context, event *privatev1.Event, mapper events.ResourceMapper, existing *projection.ResourceState, currentState string, isBillable bool, dims map[string]any, version int32, transitionTime time.Time) (bool, error) {
+	if event.GetType() != privatev1.EventType_EVENT_TYPE_OBJECT_UPDATED ||
+		!sameMeteringState(existing, mapper, currentState, isBillable, dims) {
 		return false, nil
 	}
 	if version > existing.FulfillmentVersion {
 		existing.FulfillmentVersion = version
 		existing.TransitionTime = transitionTime.UTC()
 		if err := c.store.Upsert(ctx, *existing); err != nil && !errors.Is(err, projection.ErrStaleVersion) {
-			return false, fmt.Errorf("advancing projection version for %s: %w", resourceID, err)
+			return false, fmt.Errorf("advancing projection version for %s: %w", mapper.ResourceID(), err)
 		}
 	}
 	if !existing.TransitionTime.Truncate(time.Microsecond).Equal(transitionTime.UTC().Truncate(time.Microsecond)) {
 		c.logger.Info("skipping replayed event (upserted but likely unpublished)",
-			"resource_id", resourceID, "state", currentState)
+			"resource_id", mapper.ResourceID(), "state", currentState)
 	} else {
 		c.logger.V(1).Info("same state and dimensions, skipping",
-			"resource_id", resourceID, "state", currentState)
+			"resource_id", mapper.ResourceID(), "state", currentState)
 	}
 	return true, nil
 }
