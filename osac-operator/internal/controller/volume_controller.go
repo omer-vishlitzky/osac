@@ -286,9 +286,6 @@ func (r *VolumeReconciler) handleProvisioning(ctx context.Context, vol *v1alpha1
 	if resp.VendorVolumeID == "" {
 		return r.failProvisioning(vol, "vendor CreateVolume returned an empty volume ID")
 	}
-	if resp.Protocol != string(v1alpha1.VolumeProtocolBlock) {
-		return r.failProvisioning(vol, fmt.Sprintf("vendor CreateVolume returned unsupported protocol %q", resp.Protocol))
-	}
 	if vol.Status.VendorVolumeID != "" && vol.Status.VendorVolumeID != resp.VendorVolumeID {
 		return r.failProvisioning(vol, fmt.Sprintf("vendor volume ID changed from %q to %q", vol.Status.VendorVolumeID, resp.VendorVolumeID))
 	}

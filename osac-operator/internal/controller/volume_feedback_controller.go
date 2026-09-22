@@ -124,14 +124,18 @@ func syncVolumeUpdate(_ context.Context, obj *v1alpha1.Volume, remote *privatev1
 	if err := syncVolumeVendorFields(obj, remote); err != nil {
 		return err
 	}
-	syncVolumeStateTransitionTime(obj, remote)
+	if err := syncVolumeStateTransitionTime(obj, remote); err != nil {
+		return err
+	}
 	return nil
 }
 
 // syncVolumeDelete maps Volume CR status during deletion. Failed volumes
 // report FAILED; all other deletion states report DELETING.
 func syncVolumeDelete(_ context.Context, obj *v1alpha1.Volume, remote *privatev1.Volume) error {
-	syncVolumeStateTransitionTime(obj, remote)
+	if err := syncVolumeStateTransitionTime(obj, remote); err != nil {
+		return err
+	}
 	switch obj.Status.Phase {
 	case v1alpha1.VolumePhaseFailed:
 		remote.GetStatus().SetState(privatev1.VolumeState_VOLUME_STATE_FAILED)
@@ -145,11 +149,15 @@ func syncVolumeDelete(_ context.Context, obj *v1alpha1.Volume, remote *privatev1
 	return nil
 }
 
-func syncVolumeStateTransitionTime(obj *v1alpha1.Volume, remote *privatev1.Volume) {
+func syncVolumeStateTransitionTime(obj *v1alpha1.Volume, remote *privatev1.Volume) error {
 	if obj.Status.StateTransitionTime == nil {
-		return
+		if remote.GetStatus().GetStateTransitionTime() != nil {
+			return nil
+		}
+		return fmt.Errorf("volume %s has no state transition time", remote.GetId())
 	}
 	remote.GetStatus().SetStateTransitionTime(timestamppb.New(obj.Status.StateTransitionTime.Time))
+	return nil
 }
 
 // syncVolumePhase converts the CRD phase to the proto state enum.

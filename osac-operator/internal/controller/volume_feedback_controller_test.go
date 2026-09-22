@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -476,9 +477,16 @@ var _ = Describe("syncVolumeStateTransitionTime", func() {
 		original := timestamppb.Now()
 		remote.GetStatus().SetStateTransitionTime(original)
 
-		syncVolumeStateTransitionTime(&v1alpha1.Volume{}, remote)
+		Expect(syncVolumeStateTransitionTime(&v1alpha1.Volume{}, remote)).To(Succeed())
 
 		Expect(proto.Equal(remote.GetStatus().GetStateTransitionTime(), original)).To(BeTrue())
+	})
+
+	It("rejects a missing CR and remote timestamp", func() {
+		remote := newRemoteVolume("vol-missing-timestamp", privatev1.VolumeState_VOLUME_STATE_AVAILABLE)
+		remote.GetStatus().StateTransitionTime = nil
+
+		Expect(syncVolumeStateTransitionTime(&v1alpha1.Volume{}, remote)).To(MatchError(ContainSubstring("no state transition time")))
 	})
 })
 
@@ -520,7 +528,8 @@ func newRemoteVolume(id string, state privatev1.VolumeState) *privatev1.Volume {
 			AccessMode:  privatev1.VolumeAccessMode_VOLUME_ACCESS_MODE_READ_WRITE_ONCE,
 		}.Build(),
 		Status: privatev1.VolumeStatus_builder{
-			State: state,
+			State:               state,
+			StateTransitionTime: timestamppb.New(time.Unix(0, 0)),
 		}.Build(),
 	}.Build()
 }

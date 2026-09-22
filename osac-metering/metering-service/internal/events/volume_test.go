@@ -73,6 +73,7 @@ func TestVolumeDoesNotBillWithoutVendorIdentity(t *testing.T) {
 		Spec:     &privatev1.VolumeSpec{StorageTier: "gold", SizeGib: 1},
 		Status: &privatev1.VolumeStatus{
 			State:               privatev1.VolumeState_VOLUME_STATE_AVAILABLE,
+			Protocol:            privatev1.StorageProtocol_STORAGE_PROTOCOL_BLOCK,
 			ProvisionedSizeGib:  1,
 			StateTransitionTime: timestamppb.Now(),
 		},
@@ -82,8 +83,8 @@ func TestVolumeDoesNotBillWithoutVendorIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err = mapper.CloudEventType(privatev1.EventType_EVENT_TYPE_OBJECT_UPDATED, events.VolumeStateCreating)
-	if !errors.Is(err, events.ErrSkipTransition) {
-		t.Fatalf("expected non-billable volume to skip, got %v", err)
+	if !errors.Is(err, events.ErrDataQuality) {
+		t.Fatalf("expected missing vendor identity to fail, got %v", err)
 	}
 }
 

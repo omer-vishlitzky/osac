@@ -135,8 +135,27 @@ var _ = Describe("VolumeReconciler", func() {
 		Expect(updated.Status.Conditions[0].Message).To(ContainSubstring(message))
 	},
 		Entry("empty ID", VendorCreateVolumeResponse{Protocol: "Block"}, "empty volume ID"),
-		Entry("non-block protocol", VendorCreateVolumeResponse{VendorVolumeID: "vendor-1", Protocol: "NFS"}, "unsupported protocol"),
 	)
+
+	It("accepts an NFS vendor response without making it billable", func() {
+		mockProv.UseCreateResponse = true
+		mockProv.CreateResponse = VendorCreateVolumeResponse{VendorVolumeID: "vendor-nfs", Protocol: "NFS"}
+		Expect(k8sClient.Create(testCtx, vol)).To(Succeed())
+		stamped := &osacv1alpha1.Volume{}
+		Expect(k8sClient.Get(testCtx, types.NamespacedName{Name: vol.Name, Namespace: vol.Namespace}, stamped)).To(Succeed())
+		stamped.Status.Provider = "vast-primary"
+		stamped.Status.Protocol = osacv1alpha1.VolumeProtocolNFS
+		Expect(k8sClient.Status().Update(testCtx, stamped)).To(Succeed())
+
+		_, err := reconciler.Reconcile(testCtx, mcreconcile.Request{Request: reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: vol.Name, Namespace: vol.Namespace},
+		}})
+		Expect(err).NotTo(HaveOccurred())
+		updated := &osacv1alpha1.Volume{}
+		Expect(k8sClient.Get(testCtx, types.NamespacedName{Name: vol.Name, Namespace: vol.Namespace}, updated)).To(Succeed())
+		Expect(updated.Status.Phase).To(Equal(osacv1alpha1.VolumePhaseReady))
+		Expect(updated.Status.Protocol).To(Equal(osacv1alpha1.VolumeProtocolNFS))
+	})
 
 	It("rejects a vendor identity replacement", func() {
 		mockProv.UseCreateResponse = true

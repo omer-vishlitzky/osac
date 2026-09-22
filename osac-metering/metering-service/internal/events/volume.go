@@ -120,8 +120,11 @@ func (m *volumeMapper) IsBillable() bool {
 }
 
 func volumeHasVendorIdentity(volume *privatev1.Volume) bool {
-	return volume.GetStatus().GetVendorVolumeId() != "" &&
-		volume.GetStatus().GetProtocol() == privatev1.StorageProtocol_STORAGE_PROTOCOL_BLOCK
+	return volumeUsesBlockProtocol(volume) && volume.GetStatus().GetVendorVolumeId() != ""
+}
+
+func volumeUsesBlockProtocol(volume *privatev1.Volume) bool {
+	return volume.GetStatus().GetProtocol() == privatev1.StorageProtocol_STORAGE_PROTOCOL_BLOCK
 }
 
 func (m *volumeMapper) BillingDimensionsMap() (map[string]any, error) {
@@ -195,7 +198,10 @@ func (m *volumeMapper) CloudEventType(eventType privatev1.EventType, previousSta
 	if eventType == privatev1.EventType_EVENT_TYPE_OBJECT_UPDATED &&
 		(result == eventBillableStart || result == EventSuspended) &&
 		!volumeHasVendorIdentity(m.volume) {
-		return "", ErrSkipTransition
+		if !volumeUsesBlockProtocol(m.volume) {
+			return "", ErrSkipTransition
+		}
+		return "", fmt.Errorf("%w: volume %s has no vendor volume ID at billing boundary", ErrDataQuality, m.ResourceID())
 	}
 	return result, nil
 }

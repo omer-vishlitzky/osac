@@ -15,23 +15,33 @@ func TestVolumeTransitionTableIsExplicit(t *testing.T) {
 		VolumeStateDeleting,
 		VolumeStateDeleted,
 	}
+	expectedEvents := map[TransitionKey]string{
+		{StateEmpty, VolumeStateAvailable}:             eventBillableStart,
+		{VolumeStateUnspecified, VolumeStateAvailable}: eventBillableStart,
+		{VolumeStateCreating, VolumeStateAvailable}:    eventBillableStart,
+		{VolumeStateAvailable, VolumeStateFailed}:      EventSuspended,
+		{VolumeStateAvailable, VolumeStateDeleting}:    EventSuspended,
+		{VolumeStateAvailable, VolumeStateDeleted}:     EventSuspended,
+	}
 
 	for _, from := range states {
-		for _, to := range states[1:] {
-			_, err := resolveTransition(volumeTransitions, from, to)
-			invalid := (from == VolumeStateCreating && to == VolumeStateUnspecified) ||
-				(from == VolumeStateAvailable && (to == VolumeStateUnspecified || to == VolumeStateCreating)) ||
-				(from == VolumeStateFailed && (to == VolumeStateUnspecified || to == VolumeStateCreating || to == VolumeStateAvailable)) ||
-				(from == VolumeStateDeleting && (to == VolumeStateUnspecified || to == VolumeStateCreating || to == VolumeStateAvailable || to == VolumeStateFailed)) ||
-				(from == VolumeStateDeleted && to != VolumeStateDeleted)
-			if invalid {
-				if err == nil || errors.Is(err, ErrSkipTransition) {
-					t.Fatalf("expected invalid transition for %s -> %s, got %v", from, to, err)
+		for _, to := range states {
+			got, err := resolveTransition(volumeTransitions, from, to)
+			key := TransitionKey{from, to}
+			if expectedEvent, ok := expectedEvents[key]; ok {
+				if err != nil || got != expectedEvent {
+					t.Fatalf("transition %s -> %s = %q, %v; want %q", from, to, got, err, expectedEvent)
 				}
 				continue
 			}
-			if err != nil && !errors.Is(err, ErrSkipTransition) {
-				t.Fatalf("unexpected transition result for %s -> %s: %v", from, to, err)
+			if _, exists := volumeTransitions[key]; exists {
+				if !errors.Is(err, ErrSkipTransition) {
+					t.Fatalf("transition %s -> %s = %v; want skip", from, to, err)
+				}
+				continue
+			}
+			if err == nil || errors.Is(err, ErrSkipTransition) {
+				t.Fatalf("transition %s -> %s = %v; want error", from, to, err)
 			}
 		}
 	}
