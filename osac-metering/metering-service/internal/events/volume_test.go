@@ -87,6 +87,31 @@ func TestVolumeDoesNotBillWithoutVendorIdentity(t *testing.T) {
 	}
 }
 
+func TestNFSVolumeDoesNotBill(t *testing.T) {
+	volume := &privatev1.Volume{
+		Id:       "volume-nfs",
+		Metadata: &privatev1.Metadata{Tenant: "tenant-1"},
+		Spec:     &privatev1.VolumeSpec{StorageTier: "gold", SizeGib: 1},
+		Status: &privatev1.VolumeStatus{
+			State:              privatev1.VolumeState_VOLUME_STATE_AVAILABLE,
+			VendorVolumeId:     "vendor-nfs",
+			Protocol:           privatev1.StorageProtocol_STORAGE_PROTOCOL_NFS,
+			ProvisionedSizeGib: 1,
+		},
+	}
+	mapper, err := events.MapperForEvent(&privatev1.Event{Payload: &privatev1.Event_Volume{Volume: volume}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mapper.IsBillable() {
+		t.Fatal("NFS volume is billable")
+	}
+	_, err = mapper.CloudEventType(privatev1.EventType_EVENT_TYPE_OBJECT_UPDATED, events.VolumeStateCreating)
+	if !errors.Is(err, events.ErrSkipTransition) {
+		t.Fatalf("expected NFS volume to skip, got %v", err)
+	}
+}
+
 func TestVolumeBillingDimensionsValidatesMapperOutput(t *testing.T) {
 	volume := &privatev1.Volume{
 		Id:       "volume-invalid-dimensions",
@@ -189,6 +214,30 @@ func TestVolumeDeletingRequiresDeletionTimestamp(t *testing.T) {
 	}
 	event := &privatev1.Event{
 		Id:      "volume-deleting-without-timestamp",
+		Type:    privatev1.EventType_EVENT_TYPE_OBJECT_UPDATED,
+		Payload: &privatev1.Event_Volume{Volume: volume},
+	}
+	mapper, err := events.MapperForEvent(event)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = mapper.TransitionTime(event, events.VolumeStateAvailable)
+	if !errors.Is(err, events.ErrDataQuality) {
+		t.Fatalf("expected data quality error, got %v", err)
+	}
+}
+
+func TestVolumeDeletedRequiresDeletionTimestamp(t *testing.T) {
+	volume := &privatev1.Volume{
+		Id:       "volume-deleted-without-timestamp",
+		Metadata: &privatev1.Metadata{Tenant: "tenant-1"},
+		Status: &privatev1.VolumeStatus{
+			State:               privatev1.VolumeState_VOLUME_STATE_DELETED,
+			StateTransitionTime: timestamppb.Now(),
+		},
+	}
+	event := &privatev1.Event{
+		Id:      "volume-deleted-without-timestamp",
 		Type:    privatev1.EventType_EVENT_TYPE_OBJECT_UPDATED,
 		Payload: &privatev1.Event_Volume{Volume: volume},
 	}

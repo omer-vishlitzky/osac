@@ -48,7 +48,7 @@ const (
 func BuildFilter() string {
 	arr := []string{
 		"has(event.compute_instance)",
-		"has(event.cluster_order)",
+		"has(event.cluster)",
 		"has(event.external_ip)",
 		"has(event.nat_gateway)",
 		"has(event.volume)",

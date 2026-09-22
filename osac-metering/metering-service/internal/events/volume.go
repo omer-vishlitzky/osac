@@ -120,7 +120,8 @@ func (m *volumeMapper) IsBillable() bool {
 }
 
 func volumeHasVendorIdentity(volume *privatev1.Volume) bool {
-	return volume.GetStatus().GetVendorVolumeId() != ""
+	return volume.GetStatus().GetVendorVolumeId() != "" &&
+		volume.GetStatus().GetProtocol() == privatev1.StorageProtocol_STORAGE_PROTOCOL_BLOCK
 }
 
 func (m *volumeMapper) BillingDimensionsMap() (map[string]any, error) {
@@ -193,7 +194,7 @@ func (m *volumeMapper) CloudEventType(eventType privatev1.EventType, previousSta
 	}
 	if eventType == privatev1.EventType_EVENT_TYPE_OBJECT_UPDATED &&
 		(result == eventBillableStart || result == EventSuspended) &&
-		!volumeHasVendorIdentity(m.volume) && m.CurrentState() == VolumeStateAvailable {
+		!volumeHasVendorIdentity(m.volume) {
 		return "", ErrSkipTransition
 	}
 	return result, nil
@@ -303,8 +304,9 @@ func VolumeTransitionTime(volume *privatev1.Volume, event *privatev1.Event) (tim
 		if deletionTimestamp != nil {
 			return deletionTimestamp.AsTime(), nil
 		}
-		if VolumeCurrentState(volume) == VolumeStateDeleting {
-			return time.Time{}, fmt.Errorf("%w: volume %s is DELETING without deletion_timestamp", ErrDataQuality, volume.GetId())
+		state := VolumeCurrentState(volume)
+		if state == VolumeStateDeleting || state == VolumeStateDeleted {
+			return time.Time{}, fmt.Errorf("%w: volume %s is %s without deletion_timestamp", ErrDataQuality, volume.GetId(), state)
 		}
 	}
 	return ResolveTransitionTime(

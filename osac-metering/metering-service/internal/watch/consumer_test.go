@@ -731,7 +731,7 @@ var _ = Describe("Consumer", func() {
 			client.mu.Lock()
 			defer client.mu.Unlock()
 			Expect(client.calls).ToNot(BeEmpty())
-			Expect(client.calls[0].GetFilter()).To(Equal("has(event.compute_instance) || has(event.cluster_order) || has(event.external_ip) || has(event.nat_gateway) || has(event.volume) || has(event.bare_metal_instance)"))
+			Expect(client.calls[0].GetFilter()).To(Equal("has(event.compute_instance) || has(event.cluster) || has(event.external_ip) || has(event.nat_gateway) || has(event.volume) || has(event.bare_metal_instance)"))
 		})
 
 		It("fails fast on unknown payload type and reconnects", func() {
@@ -931,6 +931,36 @@ var _ = Describe("Consumer", func() {
 			Expect(err).ToNot(HaveOccurred())
 
 			// Stream reconnected — real data quality issue, fail fast
+			Expect(client.watchCallCount()).To(BeNumerically(">=", 2))
+		})
+
+		It("fails fast on invalid Volume billing dimensions", func() {
+			volume := &privatev1.Volume{
+				Id:       "volume-invalid-dimensions",
+				Metadata: &privatev1.Metadata{Tenant: ""},
+				Spec:     &privatev1.VolumeSpec{StorageTier: "gold", SizeGib: 100},
+				Status: &privatev1.VolumeStatus{
+					State:               privatev1.VolumeState_VOLUME_STATE_AVAILABLE,
+					Protocol:            privatev1.StorageProtocol_STORAGE_PROTOCOL_BLOCK,
+					VendorVolumeId:      "vendor-1",
+					ProvisionedSizeGib:  100,
+					StateTransitionTime: timestamppb.Now(),
+				},
+			}
+			stream1 := &mockWatchStream{responses: []*privatev1.EventsWatchResponse{
+				makeResponse(&privatev1.Event{
+					Id:      "volume-invalid-dimensions",
+					Type:    privatev1.EventType_EVENT_TYPE_OBJECT_UPDATED,
+					Payload: &privatev1.Event_Volume{Volume: volume},
+				}),
+			}}
+			stream2 := &mockWatchStream{responses: []*privatev1.EventsWatchResponse{makeResponse(makeEvent("evt-after-volume-dq", privatev1.EventType_EVENT_TYPE_OBJECT_CREATED))}}
+			client.results = []mockStreamResult{{stream: stream1}, {stream: stream2}}
+
+			pub := &mockPublisher{published: make([]cloudevents.Event, 0, 1), cancelFunc: cancel}
+			consumer := newConsumerWithStore(pub, newMockStore())
+
+			Expect(consumer.Run(ctx)).To(Succeed())
 			Expect(client.watchCallCount()).To(BeNumerically(">=", 2))
 		})
 

@@ -12,6 +12,8 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/osac-project/osac-metering/internal/events"
@@ -497,6 +499,22 @@ var _ = Describe("Reconciler", func() {
 			err := recon.Reconcile(ctx)
 			Expect(err).To(HaveOccurred())
 			Expect(err.Error()).To(ContainSubstring("connection refused"))
+		})
+
+		It("ignores unavailable List API errors", func() {
+			client := &mockComputeClient{err: status.Error(codes.Unavailable, "service is not enabled")}
+			store := newMockStore()
+			store.states["vm-existing"] = projection.ResourceState{
+				ResourceID:   "vm-existing",
+				ResourceType: events.ResourceTypeComputeInstance,
+				CurrentState: "RUNNING",
+			}
+			pub := &mockPublisher{}
+			recon := newTestReconciler(client, nil, store, pub, 60*time.Second)
+
+			Expect(recon.Reconcile(ctx)).To(Succeed())
+			Expect(store.states).To(HaveKey("vm-existing"))
+			Expect(pub.published).To(BeEmpty())
 		})
 
 		It("fails when correction publish fails (publish-first)", func() {

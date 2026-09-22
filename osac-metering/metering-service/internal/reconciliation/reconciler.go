@@ -90,6 +90,7 @@ type Reconciler struct {
 	publisher            kafkapub.EventPublisher
 	logger               logr.Logger
 	heartbeatInterval    time.Duration
+	unavailableTypes     map[string]struct{}
 }
 
 var correctionResourceTypes = map[string]struct{}{
@@ -98,6 +99,10 @@ var correctionResourceTypes = map[string]struct{}{
 	events.ResourceTypeExternalIP:      {},
 	events.ResourceTypeNATGateway:      {},
 	events.ResourceTypeVolume:          {},
+}
+
+func isUnavailable(err error) bool {
+	return status.Code(err) == codes.Unavailable
 }
 
 func NewReconciler(
@@ -125,12 +130,14 @@ func NewReconciler(
 		logger:               logger,
 		heartbeatInterval:    heartbeatInterval,
 		deploymentID:         deploymentID,
+		unavailableTypes:     make(map[string]struct{}),
 	}
 }
 
 func (r *Reconciler) Reconcile(ctx context.Context) error {
 	start := time.Now()
 	now := start.UTC()
+	r.unavailableTypes = make(map[string]struct{})
 	r.logger.Info("starting reconciliation")
 
 	fulfillmentState, err := r.loadFulfillmentState(ctx)
@@ -378,6 +385,9 @@ func (r *Reconciler) reconcileMissedDeletions(ctx context.Context, fulfillmentSt
 
 	for id, ps := range projMap {
 		if _, exists := fulfillmentState[id]; !exists {
+			if _, unavailable := r.unavailableTypes[ps.ResourceType]; unavailable {
+				continue
+			}
 			if ps.ResourceType == events.ResourceTypeComputeInstance && r.computeClient == nil {
 				if !computeSkipLogged {
 					r.logger.Info("skipping compute_instance missed deletion checks, no compute client configured")
@@ -416,6 +426,9 @@ func (r *Reconciler) reconcileMissedDeletions(ctx context.Context, fulfillmentSt
 				if err == nil && response.GetObject() != nil {
 					continue
 				}
+				if isUnavailable(err) {
+					continue
+				}
 				if status.Code(err) != codes.NotFound {
 					return corrections, fmt.Errorf("confirming ExternalIP %s absence: %w", id, err)
 				}
@@ -425,6 +438,9 @@ func (r *Reconciler) reconcileMissedDeletions(ctx context.Context, fulfillmentSt
 				if err == nil && response.GetObject() != nil {
 					continue
 				}
+				if isUnavailable(err) {
+					continue
+				}
 				if status.Code(err) != codes.NotFound {
 					return corrections, fmt.Errorf("confirming NATGateway %s absence: %w", id, err)
 				}
@@ -432,6 +448,9 @@ func (r *Reconciler) reconcileMissedDeletions(ctx context.Context, fulfillmentSt
 			if ps.ResourceType == events.ResourceTypeVolume {
 				response, err := r.volumeClient.Get(ctx, &privatev1.VolumesGetRequest{Id: id})
 				if err == nil && response.GetObject() != nil {
+					continue
+				}
+				if isUnavailable(err) {
 					continue
 				}
 				if status.Code(err) != codes.NotFound {
@@ -600,6 +619,9 @@ func LoadExternalIPPools(ctx context.Context, client ExternalIPPoolsClient) (map
 			Limit:  &limit,
 		})
 		if err != nil {
+			if isUnavailable(err) {
+				return map[string]string{}, nil
+			}
 			return nil, fmt.Errorf("listing external IP pools (offset=%d): %w", offset, err)
 		}
 		total := resp.GetTotal()
@@ -631,6 +653,10 @@ func (r *Reconciler) loadComputeInstances(ctx context.Context, result map[string
 			Limit:  &limit,
 		})
 		if err != nil {
+			if isUnavailable(err) {
+				r.unavailableTypes[events.ResourceTypeComputeInstance] = struct{}{}
+				return nil
+			}
 			return fmt.Errorf("listing compute instances (offset=%d): %w", offset, err)
 		}
 
@@ -675,6 +701,10 @@ func (r *Reconciler) loadClusters(ctx context.Context, result map[string]fulfill
 			Limit:  &limit,
 		})
 		if err != nil {
+			if isUnavailable(err) {
+				r.unavailableTypes[events.ResourceTypeClusterOrder] = struct{}{}
+				return nil
+			}
 			return fmt.Errorf("listing clusters (offset=%d): %w", offset, err)
 		}
 
@@ -719,6 +749,10 @@ func (r *Reconciler) loadExternalIPs(ctx context.Context, result map[string]fulf
 			Limit:  &limit,
 		})
 		if err != nil {
+			if isUnavailable(err) {
+				r.unavailableTypes[events.ResourceTypeExternalIP] = struct{}{}
+				return nil
+			}
 			return fmt.Errorf("listing external IPs (offset=%d): %w", offset, err)
 		}
 		items := resp.GetItems()
@@ -770,6 +804,10 @@ func (r *Reconciler) loadNATGateways(ctx context.Context, result map[string]fulf
 			Limit:  &limit,
 		})
 		if err != nil {
+			if isUnavailable(err) {
+				r.unavailableTypes[events.ResourceTypeNATGateway] = struct{}{}
+				return nil
+			}
 			return fmt.Errorf("listing NAT gateways (offset=%d): %w", offset, err)
 		}
 		items := resp.GetItems()
@@ -818,6 +856,10 @@ func (r *Reconciler) loadVolumes(ctx context.Context, result map[string]fulfillm
 		limit := int32(defaultPageSize)
 		resp, err := r.volumeClient.List(ctx, &privatev1.VolumesListRequest{Offset: &offset, Limit: &limit})
 		if err != nil {
+			if isUnavailable(err) {
+				r.unavailableTypes[events.ResourceTypeVolume] = struct{}{}
+				return nil
+			}
 			return fmt.Errorf("listing volumes (offset=%d): %w", offset, err)
 		}
 		items := resp.GetItems()
