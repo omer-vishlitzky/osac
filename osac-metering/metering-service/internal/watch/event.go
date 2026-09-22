@@ -35,12 +35,6 @@ func (c *Consumer) prepareEvent(ctx context.Context, event *privatev1.Event) (pr
 	resourceID := mapper.ResourceID()
 	dimensions, err := mapper.BillingDimensionsMap()
 	if err != nil {
-		if errors.Is(err, events.ErrDataQuality) && mapper.ResourceType() != events.ResourceTypeVolume {
-			eventsSkipped.WithLabelValues("data_quality").Inc()
-			c.logger.Info("skipping event with invalid billing dimensions",
-				"event_id", event.GetId(), "resource_id", resourceID, "error", err)
-			return preparedEvent{}, true, nil
-		}
 		return preparedEvent{}, false, fmt.Errorf("building billing dimensions for %s: %w", resourceID, err)
 	}
 	existing, err := c.store.Get(ctx, resourceID)
@@ -58,11 +52,6 @@ func (c *Consumer) prepareEvent(ctx context.Context, event *privatev1.Event) (pr
 			eventsSkipped.WithLabelValues("unsupported_event_type").Inc()
 			c.logger.V(1).Info("skipping unsupported event type",
 				"event_id", event.GetId(), "resource_id", resourceID)
-			return preparedEvent{}, true, nil
-		}
-		if errors.Is(err, events.ErrDataQuality) && mapper.ResourceType() != events.ResourceTypeVolume && existing != nil && existing.CurrentState == mapper.CurrentState() {
-			c.logger.V(1).Info("skipping metadata-only update with no state change",
-				"event_id", event.GetId(), "resource_id", resourceID, "state", mapper.CurrentState())
 			return preparedEvent{}, true, nil
 		}
 		return preparedEvent{}, false, err

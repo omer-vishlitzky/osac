@@ -844,7 +844,7 @@ var _ = Describe("Consumer", func() {
 			Expect(pub.published[0].Type()).To(Equal("osac.resource.created.v1"))
 		})
 
-		It("skips metadata-only update with no state_transition_time without killing the stream", func() {
+		It("fails fast on metadata-only update with no state_transition_time", func() {
 			store := newMockStore()
 			store.states["vm-meta"] = projection.ResourceState{
 				ResourceID:   "vm-meta",
@@ -861,21 +861,23 @@ var _ = Describe("Consumer", func() {
 			ciRunning.Status.State = privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_RUNNING
 			ciRunning.Metadata.Version = 2
 
-			stream := &mockWatchStream{
+			stream1 := &mockWatchStream{
 				responses: []*privatev1.EventsWatchResponse{
 					makeResponse(&privatev1.Event{
 						Id:      "evt-meta-update",
 						Type:    privatev1.EventType_EVENT_TYPE_OBJECT_UPDATED,
 						Payload: &privatev1.Event_ComputeInstance{ComputeInstance: ciNoTimestamp},
 					}),
-					makeResponse(&privatev1.Event{
-						Id:      "evt-running",
-						Type:    privatev1.EventType_EVENT_TYPE_OBJECT_UPDATED,
-						Payload: &privatev1.Event_ComputeInstance{ComputeInstance: ciRunning},
-					}),
 				},
 			}
-			client.results = []mockStreamResult{{stream: stream}}
+			stream2 := &mockWatchStream{
+				responses: []*privatev1.EventsWatchResponse{makeResponse(&privatev1.Event{
+					Id:      "evt-running",
+					Type:    privatev1.EventType_EVENT_TYPE_OBJECT_UPDATED,
+					Payload: &privatev1.Event_ComputeInstance{ComputeInstance: ciRunning},
+				})},
+			}
+			client.results = []mockStreamResult{{stream: stream1}, {stream: stream2}}
 
 			pub := &mockPublisher{published: make([]cloudevents.Event, 0, 1), cancelFunc: cancel}
 			consumer := newConsumerWithStore(pub, store)
@@ -883,8 +885,7 @@ var _ = Describe("Consumer", func() {
 			err := consumer.Run(ctx)
 			Expect(err).ToNot(HaveOccurred())
 
-			// Single stream — no reconnect
-			Expect(client.watchCallCount()).To(Equal(1))
+			Expect(client.watchCallCount()).To(BeNumerically(">=", 2))
 
 			pub.mu.Lock()
 			defer pub.mu.Unlock()
@@ -2570,7 +2571,7 @@ var _ = Describe("Consumer", func() {
 			Expect(state.BillableSince).ToNot(BeNil())
 		})
 
-		It("skips a BMaaS deletion with a missing event timestamp without disrupting later Watch events", func() {
+		It("fails fast on a BMaaS deletion with a missing event timestamp", func() {
 			store := newMockStore()
 			startedAt := time.Date(2026, 9, 14, 11, 0, 0, 0, time.UTC)
 			store.states["bmi-delete-missing-timestamp"] = projection.ResourceState{
@@ -2602,14 +2603,15 @@ var _ = Describe("Consumer", func() {
 				Payload: &privatev1.Event_BareMetalInstance{BareMetalInstance: bmi},
 			}
 			goodEvent := makeEvent("evt-vm-after-delete", privatev1.EventType_EVENT_TYPE_OBJECT_CREATED)
-			client.results = []mockStreamResult{{stream: &mockWatchStream{
-				responses: []*privatev1.EventsWatchResponse{makeResponse(badDelete), makeResponse(goodEvent)},
-			}}}
+			client.results = []mockStreamResult{
+				{stream: &mockWatchStream{responses: []*privatev1.EventsWatchResponse{makeResponse(badDelete)}}},
+				{stream: &mockWatchStream{responses: []*privatev1.EventsWatchResponse{makeResponse(goodEvent)}}},
+			}
 
 			pub := &mockPublisher{published: make([]cloudevents.Event, 0, 1), cancelFunc: cancel}
 			consumer := newConsumerWithStore(pub, store)
 			Expect(consumer.Run(ctx)).To(Succeed())
-			Expect(client.watchCallCount()).To(Equal(1))
+			Expect(client.watchCallCount()).To(BeNumerically(">=", 2))
 
 			pub.mu.Lock()
 			Expect(pub.published).To(HaveLen(1))
@@ -2631,7 +2633,7 @@ var _ = Describe("Consumer", func() {
 			goodEvent := makeEvent("evt-vm-after-bmi", privatev1.EventType_EVENT_TYPE_OBJECT_CREATED)
 			client.results = []mockStreamResult{
 				{stream: &mockWatchStream{
-					responses: []*privatev1.EventsWatchResponse{makeResponse(badEvent), makeResponse(goodEvent)},
+					responses: []*privatev1.EventsWatchResponse{makeResponse(badEvent)},
 				}},
 				{stream: &mockWatchStream{
 					responses: []*privatev1.EventsWatchResponse{makeResponse(goodEvent)},
@@ -2642,7 +2644,7 @@ var _ = Describe("Consumer", func() {
 			consumer := newConsumerWithStore(pub, store)
 
 			Expect(consumer.Run(ctx)).To(Succeed())
-			Expect(client.watchCallCount()).To(Equal(1))
+			Expect(client.watchCallCount()).To(BeNumerically(">=", 2))
 
 			pub.mu.Lock()
 			Expect(pub.published).To(HaveLen(1))
