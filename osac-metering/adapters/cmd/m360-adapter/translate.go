@@ -24,9 +24,9 @@ import (
 var resourceTypeEndpoints = map[string]string{
 	schema.ResourceTypeComputeInstance: "/vmaas/event",
 	schema.ResourceTypeClusterOrder:    "/caas/event",
-	schema.ResourceTypeExternalIP:      "/networking/event",
-	schema.ResourceTypeNATGateway:      "/networking/event",
-	schema.ResourceTypeVolume:          "/storage/event",
+	schema.ResourceTypeExternalIP:      "/networking/externalip/event",
+	schema.ResourceTypeNATGateway:      "/networking/natgateway/event",
+	schema.ResourceTypeVolume:          "/storage/volume/event",
 	"maas_inference":                   "/maas/event",
 }
 

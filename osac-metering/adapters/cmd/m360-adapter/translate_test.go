@@ -54,6 +54,21 @@ func buildCloudEvent(
 	return ce
 }
 
+func withUsage(ce cloudevents.Event, quantity, unit string) cloudevents.Event {
+	var data map[string]any
+	ExpectWithOffset(1, ce.DataAs(&data)).To(Succeed())
+	data["usage"] = map[string]any{
+		"semantics": "interval",
+		"from":      "2026-07-20T10:00:00.000000Z",
+		"to":        "2026-07-20T10:01:00.000000Z",
+		"quantity":  quantity,
+		"unit":      unit,
+		"precision": "microsecond",
+	}
+	ExpectWithOffset(1, ce.SetData(cloudevents.ApplicationJSON, data)).To(Succeed())
+	return ce
+}
+
 var _ = Describe("translateEvent", func() {
 	Describe("VMaaS events", func() {
 		It("translates a compute_instance event to flat M360 payload", func() {
@@ -248,57 +263,103 @@ var _ = Describe("translateEvent", func() {
 	})
 
 	Describe("networking events", func() {
-		It("translates an ExternalIP event to the networking endpoint", func() {
-			ce := buildCloudEvent(
+		It("translates an ExternalIP event and preserves its usage and settled billing dimensions", func() {
+			ce := withUsage(buildCloudEvent(
 				"ce-ip-001", "osac.resource.started.v1", "ip-001", "external_ip",
 				"tenant-acme", "project-net", map[string]any{
-					"deployment": "installation-a",
-					"pool":       "pool-1",
-					"ip_family":  "ipv4",
-					"attached":   false,
+					"deployment":           "installation-a",
+					"pool":                 "pool-public-ipv4",
+					"ip_family":            "ipv4",
+					"attached":             true,
+					"attribution_type":     "cluster_order",
+					"attribution_id":       "cluster-001",
+					"attribution_endpoint": "api",
 				},
-			)
+			), "60.000000", "resource_second")
 
 			endpoint, payload, err := translateEvent(ce)
 
 			Expect(err).NotTo(HaveOccurred())
-			Expect(endpoint).To(Equal("/networking/event"))
+			Expect(endpoint).To(Equal("/networking/externalip/event"))
+			Expect(payload["event_id"]).To(Equal("ce-ip-001"))
+			Expect(payload["resource_id"]).To(Equal("ip-001"))
 			Expect(payload["resource_type"]).To(Equal("external_ip"))
+			Expect(payload["tenant_id"]).To(Equal("tenant-acme"))
+			Expect(payload["project_id"]).To(Equal("project-net"))
+			Expect(payload["usage_semantics"]).To(Equal("interval"))
+			Expect(payload["interval_from"]).To(Equal("2026-07-20T10:00:00.000000Z"))
+			Expect(payload["interval_to"]).To(Equal("2026-07-20T10:01:00.000000Z"))
+			Expect(payload["usage_quantity"]).To(Equal("60.000000"))
+			Expect(payload["usage_unit"]).To(Equal("resource_second"))
+			Expect(payload["usage_precision"]).To(Equal("microsecond"))
+			Expect(payload["deployment"]).To(Equal("installation-a"))
+			Expect(payload["pool"]).To(Equal("pool-public-ipv4"))
 			Expect(payload["ip_family"]).To(Equal("ipv4"))
+			Expect(payload["attached"]).To(BeTrue())
+			Expect(payload["attribution_type"]).To(Equal("cluster_order"))
+			Expect(payload["attribution_id"]).To(Equal("cluster-001"))
+			Expect(payload["attribution_endpoint"]).To(Equal("api"))
 		})
 
-		It("translates a NATGateway event to the networking endpoint", func() {
-			ce := buildCloudEvent(
+		It("translates a NATGateway event and preserves its usage and network dimensions", func() {
+			ce := withUsage(buildCloudEvent(
 				"ce-nat-001", "osac.resource.started.v1", "nat-001", "nat_gateway",
 				"tenant-acme", "project-net", map[string]any{
 					"deployment":      "installation-a",
 					"virtual_network": "vnet-1",
 					"external_ip":     "ip-001",
 				},
-			)
+			), "60.000000", "resource_second")
 
 			endpoint, payload, err := translateEvent(ce)
 
 			Expect(err).NotTo(HaveOccurred())
-			Expect(endpoint).To(Equal("/networking/event"))
+			Expect(endpoint).To(Equal("/networking/natgateway/event"))
+			Expect(payload["event_id"]).To(Equal("ce-nat-001"))
+			Expect(payload["resource_id"]).To(Equal("nat-001"))
 			Expect(payload["resource_type"]).To(Equal("nat_gateway"))
+			Expect(payload["tenant_id"]).To(Equal("tenant-acme"))
+			Expect(payload["project_id"]).To(Equal("project-net"))
+			Expect(payload["usage_semantics"]).To(Equal("interval"))
+			Expect(payload["interval_from"]).To(Equal("2026-07-20T10:00:00.000000Z"))
+			Expect(payload["interval_to"]).To(Equal("2026-07-20T10:01:00.000000Z"))
+			Expect(payload["usage_quantity"]).To(Equal("60.000000"))
+			Expect(payload["usage_unit"]).To(Equal("resource_second"))
+			Expect(payload["usage_precision"]).To(Equal("microsecond"))
+			Expect(payload["deployment"]).To(Equal("installation-a"))
+			Expect(payload["virtual_network"]).To(Equal("vnet-1"))
+			Expect(payload["external_ip"]).To(Equal("ip-001"))
 		})
 	})
 
 	Describe("storage events", func() {
-		It("translates Volume events to the storage endpoint", func() {
-			ce := buildCloudEvent(
+		It("translates Volume events with capacity and flattened GiB-second usage", func() {
+			ce := withUsage(buildCloudEvent(
 				"ce-volume", "osac.resource.started.v1", "volume-001", "volume",
 				"tenant-acme", "project-storage", map[string]any{
 					"volume_id": "volume-001", "storage_tier": "gold", "size_gib": 100,
 				},
-			)
+			), "6000.000000", "gibibyte_second")
 
 			endpoint, payload, err := translateEvent(ce)
 
 			Expect(err).NotTo(HaveOccurred())
-			Expect(endpoint).To(Equal("/storage/event"))
+			Expect(endpoint).To(Equal("/storage/volume/event"))
+			Expect(payload["event_id"]).To(Equal("ce-volume"))
+			Expect(payload["resource_id"]).To(Equal("volume-001"))
 			Expect(payload["resource_type"]).To(Equal("volume"))
+			Expect(payload["volume_id"]).To(Equal("volume-001"))
+			Expect(payload["storage_tier"]).To(Equal("gold"))
+			Expect(payload["size_gib"]).To(BeEquivalentTo(100))
+			Expect(payload["tenant_id"]).To(Equal("tenant-acme"))
+			Expect(payload["project_id"]).To(Equal("project-storage"))
+			Expect(payload["usage_semantics"]).To(Equal("interval"))
+			Expect(payload["interval_from"]).To(Equal("2026-07-20T10:00:00.000000Z"))
+			Expect(payload["interval_to"]).To(Equal("2026-07-20T10:01:00.000000Z"))
+			Expect(payload["usage_quantity"]).To(Equal("6000.000000"))
+			Expect(payload["usage_unit"]).To(Equal("gibibyte_second"))
+			Expect(payload["usage_precision"]).To(Equal("microsecond"))
+			Expect(payload).NotTo(HaveKey("usage"))
 		})
 
 		It("flattens canonical Volume usage for M360", func() {
@@ -320,7 +381,7 @@ var _ = Describe("translateEvent", func() {
 			endpoint, payload, err := translateEvent(ce)
 
 			Expect(err).NotTo(HaveOccurred())
-			Expect(endpoint).To(Equal("/storage/event"))
+			Expect(endpoint).To(Equal("/storage/volume/event"))
 			Expect(payload["usage_quantity"]).To(Equal("6000.000000"))
 			Expect(payload["usage_unit"]).To(Equal("gibibyte_second"))
 			Expect(payload).NotTo(HaveKey("usage"))
