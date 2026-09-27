@@ -184,8 +184,12 @@ func TestClusterHeartbeatOmitsDurationWhenComponentStartIsUnknown(t *testing.T) 
 		ComponentBillableSince: map[string]time.Time{"_control_plane": start},
 	}
 	dataByNodeSet := buildClusterHeartbeatDataByNodeSet(t, &Generator{interval: time.Minute}, &state, start.Add(time.Minute))
-	if _, ok := dataByNodeSet["gpu-workers"]["duration_seconds"]; ok {
-		t.Errorf("missing component interval start must not fall back to duration_seconds=%v", dataByNodeSet["gpu-workers"]["duration_seconds"])
+	gpuHeartbeat, ok := dataByNodeSet["gpu-workers"]
+	if !ok {
+		t.Fatal("missing GPU worker heartbeat")
+	}
+	if _, ok := gpuHeartbeat["duration_seconds"]; ok {
+		t.Errorf("missing component interval start must not fall back to duration_seconds=%v", gpuHeartbeat["duration_seconds"])
 	}
 }
 
