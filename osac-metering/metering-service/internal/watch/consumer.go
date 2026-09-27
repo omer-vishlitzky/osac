@@ -763,12 +763,16 @@ func (c *Consumer) componentDurationSeconds(existing *projection.ResourceState, 
 	if !ok {
 		return nil, fmt.Errorf("cluster %s node_set %q has no component billable-since timestamp", existing.ResourceID, nodeSet)
 	}
-	return events.DurationSeconds(transitionTime, existing.LastHeartbeatAt, &since), nil
+	duration, err := events.DurationSeconds(transitionTime, existing.LastHeartbeatAt, &since)
+	if err != nil {
+		return nil, fmt.Errorf("cluster %s node_set %q: %w", existing.ResourceID, nodeSet, err)
+	}
+	return duration, nil
 }
 
-func (c *Consumer) buildStateContext(existing *projection.ResourceState, nowBillable bool, transitionTime time.Time, newDims map[string]any) *events.StateContext {
+func (c *Consumer) buildStateContext(existing *projection.ResourceState, nowBillable bool, transitionTime time.Time, newDims map[string]any) (*events.StateContext, error) {
 	if existing == nil {
-		return &events.StateContext{}
+		return &events.StateContext{}, nil
 	}
 
 	sc := &events.StateContext{
@@ -776,14 +780,19 @@ func (c *Consumer) buildStateContext(existing *projection.ResourceState, nowBill
 		EverBillable:  existing.EverBillable,
 	}
 
-	if existing.IsBillable && existing.BillableSince != nil {
-		if !nowBillable || !events.DimensionsEqual(existing.BillingDimensions, newDims) {
-			sc.DurationSeconds = events.DurationSeconds(transitionTime, existing.LastHeartbeatAt, existing.BillableSince)
-			sc.BillableSince = existing.BillableSince
+	if existing.IsBillable && (!nowBillable || !events.DimensionsEqual(existing.BillingDimensions, newDims)) {
+		if existing.BillableSince == nil {
+			return nil, fmt.Errorf("resource %s is billable but has no billable-since timestamp for close", existing.ResourceID)
 		}
+		duration, err := events.DurationSeconds(transitionTime, existing.LastHeartbeatAt, existing.BillableSince)
+		if err != nil {
+			return nil, fmt.Errorf("resource %s billable close: %w", existing.ResourceID, err)
+		}
+		sc.DurationSeconds = duration
+		sc.BillableSince = existing.BillableSince
 	}
 
-	return sc
+	return sc, nil
 }
 
 func (c *Consumer) logPublished(ce *cloudevents.Event) {

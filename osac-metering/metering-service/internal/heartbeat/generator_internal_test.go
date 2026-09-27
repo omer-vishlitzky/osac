@@ -12,6 +12,7 @@ package heartbeat
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -75,13 +76,15 @@ func bmaasTickState(id, currentState string, activeSince time.Time) projection.R
 
 func TestBuildHeartbeatEventsStableIDWithinSameWindow(t *testing.T) {
 	g := &Generator{interval: 60 * time.Second}
+	windowStart := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	activeSince := windowStart.Add(-time.Hour)
 	state := &projection.ResourceState{
 		ResourceID:        "vm-1",
 		ResourceType:      events.ResourceTypeComputeInstance,
+		BillableSince:     &activeSince,
 		BillingDimensions: map[string]any{"instance_type": "m5.large"},
 	}
 
-	windowStart := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
 	first, err := g.buildHeartbeatEvents(state, windowStart.Add(5*time.Second))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -98,13 +101,15 @@ func TestBuildHeartbeatEventsStableIDWithinSameWindow(t *testing.T) {
 
 func TestBuildHeartbeatEventsNewIDInNextWindow(t *testing.T) {
 	g := &Generator{interval: 60 * time.Second}
+	windowStart := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	activeSince := windowStart.Add(-time.Hour)
 	state := &projection.ResourceState{
 		ResourceID:        "vm-1",
 		ResourceType:      events.ResourceTypeComputeInstance,
+		BillableSince:     &activeSince,
 		BillingDimensions: map[string]any{"instance_type": "m5.large"},
 	}
 
-	windowStart := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
 	first, err := g.buildHeartbeatEvents(state, windowStart)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -121,9 +126,11 @@ func TestBuildHeartbeatEventsNewIDInNextWindow(t *testing.T) {
 
 func TestBuildNetworkingHeartbeatEvents(t *testing.T) {
 	g := &Generator{interval: 60 * time.Second}
+	activeSince := time.Date(2026, 1, 1, 11, 0, 0, 0, time.UTC)
 	state := &projection.ResourceState{
-		ResourceID:   "nat-1",
-		ResourceType: events.ResourceTypeNATGateway,
+		ResourceID:    "nat-1",
+		ResourceType:  events.ResourceTypeNATGateway,
+		BillableSince: &activeSince,
 		BillingDimensions: map[string]any{
 			"deployment":      "installation-1",
 			"virtual_network": "vnet-1",
@@ -308,6 +315,25 @@ func TestFirstClusterHeartbeatUsesComponentStartWithoutLastHeartbeat(t *testing.
 	}
 	if got, want := data["duration_seconds"], float64(now.Sub(componentStart).Seconds()); got != want {
 		t.Errorf("first cluster heartbeat duration_seconds = %v, want %v from component start", got, want)
+	}
+}
+
+func TestBuildHeartbeatEventsRequiresBillableStart(t *testing.T) {
+	now := time.Date(2026, 9, 27, 12, 0, 0, 0, time.UTC)
+	lastHeartbeat := now.Add(-time.Minute)
+	state := &projection.ResourceState{
+		ResourceID:        "missing-heartbeat-start",
+		ResourceType:      events.ResourceTypeComputeInstance,
+		LastHeartbeatAt:   &lastHeartbeat,
+		BillingDimensions: map[string]any{"instance_type": "m6.large"},
+	}
+
+	got, err := BuildHeartbeatEvents(state, "hb/missing-start", now, "test")
+	if err == nil {
+		t.Fatalf("BuildHeartbeatEvents() events = %d, want missing active start error", len(got))
+	}
+	if !strings.Contains(err.Error(), "active start timestamp is required") {
+		t.Fatalf("BuildHeartbeatEvents() error = %q, want active start error", err)
 	}
 }
 

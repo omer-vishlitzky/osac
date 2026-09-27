@@ -157,7 +157,10 @@ func (c *Consumer) skipStaleEvent(prepared preparedEvent) bool {
 }
 
 func (c *Consumer) mapPreparedEvent(ctx context.Context, prepared preparedEvent) (*cloudevents.Event, bool, error) {
-	stateContext := c.buildStateContext(prepared.existing, prepared.isBillable, prepared.transitionTime, prepared.dimensions)
+	stateContext, err := c.buildStateContext(prepared.existing, prepared.isBillable, prepared.transitionTime, prepared.dimensions)
+	if err != nil {
+		return nil, false, err
+	}
 	eventDimensions := normalizeEventDimensions(prepared.event, prepared.mapper, prepared.dimensions)
 	cloudEvent, err := events.MapWatchEvent(prepared.event, prepared.mapper, stateContext, eventDimensions)
 	if err == nil {

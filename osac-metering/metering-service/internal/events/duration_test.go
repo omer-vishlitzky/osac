@@ -1,6 +1,7 @@
 package events_test
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -19,6 +20,7 @@ func TestDurationSeconds(t *testing.T) {
 		lastHeartbeatAt *time.Time
 		activeSince     *time.Time
 		want            *float64
+		wantErr         string
 	}{
 		{
 			name:        "first interval starts at the active start",
@@ -41,25 +43,33 @@ func TestDurationSeconds(t *testing.T) {
 			want:            floatPointer(900),
 		},
 		{
-			name:            "last heartbeat can provide the lower bound",
+			name:            "active start is required even when a heartbeat exists",
 			end:             start.Add(time.Hour),
 			lastHeartbeatAt: &lastHeartbeat,
-			want:            floatPointer(1800),
+			wantErr:         "active start timestamp is required",
 		},
 		{
-			name: "duration is unknown without either lower bound",
-			end:  start.Add(time.Hour),
-		},
-		{
-			name:            "end before lower bound is zero",
+			name:            "end before effective lower bound is an error",
 			end:             start.Add(15 * time.Minute),
 			lastHeartbeatAt: &lastHeartbeat,
 			activeSince:     &activeSince,
-			want:            floatPointer(0),
+			wantErr:         "before effective lower bound",
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			got := events.DurationSeconds(test.end, test.lastHeartbeatAt, test.activeSince)
+			got, err := events.DurationSeconds(test.end, test.lastHeartbeatAt, test.activeSince)
+			if test.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), test.wantErr) {
+					t.Fatalf("DurationSeconds() error = %v, want it to contain %q", err, test.wantErr)
+				}
+				if got != nil {
+					t.Fatalf("DurationSeconds() = %v, want nil after error", *got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("DurationSeconds() error = %v", err)
+			}
 			if test.want == nil {
 				if got != nil {
 					t.Fatalf("DurationSeconds() = %v, want nil", *got)

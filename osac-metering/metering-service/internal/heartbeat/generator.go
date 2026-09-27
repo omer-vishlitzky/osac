@@ -202,7 +202,14 @@ func BuildHeartbeatEventsWithMutes(state *projection.ResourceState, baseID strin
 			}
 			activeSince = &componentSince
 		}
-		return buildHeartbeatEvent(state, eventID, dims, now, source, events.DurationSeconds(now, state.LastHeartbeatAt, activeSince))
+		duration, err := events.DurationSeconds(now, state.LastHeartbeatAt, activeSince)
+		if err != nil {
+			if state.ResourceType == events.ResourceTypeClusterOrder {
+				return cloudevents.Event{}, fmt.Errorf("cluster %s node_set %q heartbeat: %w", state.ResourceID, dims["node_set"], err)
+			}
+			return cloudevents.Event{}, fmt.Errorf("resource %s heartbeat: %w", state.ResourceID, err)
+		}
+		return buildHeartbeatEvent(state, eventID, dims, now, source, duration)
 	}
 	return events.BuildResourceEvents(state.ResourceType, state.BillingDimensions, baseID, buildFn)
 }
@@ -245,6 +252,9 @@ func buildBMaaSHeartbeatEvents(state *projection.ResourceState, baseID string, n
 
 func buildHeartbeatEvent(state *projection.ResourceState, eventID string, dims map[string]any, now time.Time, source string, durationSeconds *float64) (cloudevents.Event, error) {
 	ce := cloudevents.NewEvent()
+	if durationSeconds == nil {
+		return ce, fmt.Errorf("resource %s heartbeat has no duration", state.ResourceID)
+	}
 	ce.SetID(eventID)
 	ce.SetSource(source)
 	ce.SetType(events.EventHeartbeat)
@@ -252,22 +262,13 @@ func buildHeartbeatEvent(state *projection.ResourceState, eventID string, dims m
 
 	events.SetOSACExtensions(&ce, state.ResourceID, state.ResourceType, state.TenantID, state.ProjectID)
 
-	duration := durationSeconds
-	if state.ResourceType != events.ResourceTypeBareMetalInstance || durationSeconds != nil {
-		seconds := float64(0)
-		if durationSeconds != nil {
-			seconds = *durationSeconds
-		}
-		duration = &seconds
-	}
-
 	data := heartbeatData{
 		ResourceID:        state.ResourceID,
 		ResourceType:      state.ResourceType,
 		TenantID:          state.TenantID,
 		ProjectID:         events.NilIfEmpty(state.ProjectID),
 		CurrentState:      state.CurrentState,
-		DurationSeconds:   duration,
+		DurationSeconds:   durationSeconds,
 		BillingDimensions: dims,
 		SchemaVersion:     schema.SchemaVersion,
 	}

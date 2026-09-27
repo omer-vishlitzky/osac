@@ -90,7 +90,10 @@ func topLevelDims(dims map[string]any) map[string]any {
 func (c *Consumer) handleScalingEvent(ctx context.Context, event *privatev1.Event, mapper events.ResourceMapper, existing *projection.ResourceState, transitionTime time.Time, version int32, currentState string, isBillable bool, dims map[string]any) error {
 	resourceID := mapper.ResourceID()
 	projState := c.buildProjectionState(mapper, existing, transitionTime, version, currentState, isBillable, dims)
-	stateCtx := c.buildStateContext(existing, isBillable, transitionTime, dims)
+	stateCtx, err := c.buildStateContext(existing, isBillable, transitionTime, dims)
+	if err != nil {
+		return err
+	}
 
 	return c.publishAndUpsert(ctx, func() error {
 		if mapper.ResourceType() == events.ResourceTypeClusterOrder {

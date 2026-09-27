@@ -505,6 +505,7 @@ var _ = Describe("Reconciler", func() {
 
 		It("emits synthetic heartbeat for stale billable resources", func() {
 			staleTime := time.Now().Add(-5 * time.Minute)
+			billableSince := staleTime.Add(-time.Hour)
 			client := &mockComputeClient{
 				items: []*privatev1.ComputeInstance{
 					makeCI("res-stale", "tenant-1", "RUNNING", 1),
@@ -517,6 +518,7 @@ var _ = Describe("Reconciler", func() {
 				TenantID:           "tenant-1",
 				CurrentState:       "RUNNING",
 				IsBillable:         true,
+				BillableSince:      &billableSince,
 				FulfillmentVersion: 1,
 				LastHeartbeatAt:    &staleTime,
 			}

@@ -102,7 +102,10 @@ func TestBuildStateContextUsesHeartbeatDeltaOrActiveStart(t *testing.T) {
 				BillableSince:   &start,
 				LastHeartbeatAt: test.lastHeartbeatAt,
 			}
-			got := consumer.buildStateContext(state, false, end, nil)
+			got, err := consumer.buildStateContext(state, false, end, nil)
+			if err != nil {
+				t.Fatalf("buildStateContext() error = %v", err)
+			}
 			if got.DurationSeconds == nil || *got.DurationSeconds != test.want {
 				t.Fatalf("duration_seconds = %v, want %v", got.DurationSeconds, test.want)
 			}
@@ -110,6 +113,23 @@ func TestBuildStateContextUsesHeartbeatDeltaOrActiveStart(t *testing.T) {
 				t.Fatalf("billable_since = %v, want %v", got.BillableSince, start)
 			}
 		})
+	}
+}
+
+func TestBuildStateContextRejectsBillableCloseWithoutStart(t *testing.T) {
+	consumer := &Consumer{}
+	state := &projection.ResourceState{
+		ResourceID: "missing-billable-start",
+		IsBillable: true,
+	}
+
+	got, err := consumer.buildStateContext(state, false, time.Now(), nil)
+	if err == nil {
+		t.Fatalf("buildStateContext() = %#v, want missing billable-since error", got)
+	}
+	const want = "resource missing-billable-start is billable but has no billable-since timestamp for close"
+	if err.Error() != want {
+		t.Fatalf("buildStateContext() error = %q, want %q", err, want)
 	}
 }
 
@@ -125,6 +145,7 @@ func TestComponentDurationSecondsRequiresComponentStart(t *testing.T) {
 
 func TestScalingClusterRequiresComponentStartBeforePublishing(t *testing.T) {
 	transitionTime := time.Date(2026, 9, 27, 12, 0, 0, 0, time.UTC)
+	billableSince := transitionTime.Add(-time.Hour)
 	event := &privatev1.Event{
 		Id:   "scale-event",
 		Type: privatev1.EventType_EVENT_TYPE_OBJECT_UPDATED,
@@ -159,6 +180,7 @@ func TestScalingClusterRequiresComponentStartBeforePublishing(t *testing.T) {
 		TenantID:           "tenant-1",
 		CurrentState:       "READY",
 		IsBillable:         true,
+		BillableSince:      &billableSince,
 		FulfillmentVersion: 1,
 		BillingDimensions:  oldDimensions,
 		ComponentBillableSince: map[string]time.Time{

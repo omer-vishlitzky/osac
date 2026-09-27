@@ -74,9 +74,11 @@ func TestCorrectionDescriptionUnknownReason(t *testing.T) {
 
 func TestBuildSyntheticHeartbeatsStableIDAcrossRetryOfSameGap(t *testing.T) {
 	lastHeartbeat := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	billableSince := lastHeartbeat.Add(-time.Hour)
 	ps := projection.ResourceState{
 		ResourceID:        "res-1",
 		ResourceType:      events.ResourceTypeComputeInstance,
+		BillableSince:     &billableSince,
 		LastHeartbeatAt:   &lastHeartbeat,
 		BillingDimensions: map[string]any{"instance_type": "m5.large"},
 	}
@@ -430,10 +432,12 @@ func TestBuildSyntheticHeartbeatsNewIDOnceGapResolves(t *testing.T) {
 	now := time.Date(2026, 1, 1, 15, 0, 0, 0, time.UTC)
 	firstGap := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
 	secondGap := time.Date(2026, 1, 1, 14, 0, 0, 0, time.UTC)
+	billableSince := firstGap.Add(-time.Hour)
 
 	psBefore := projection.ResourceState{
 		ResourceID:        "res-1",
 		ResourceType:      events.ResourceTypeComputeInstance,
+		BillableSince:     &billableSince,
 		LastHeartbeatAt:   &firstGap,
 		BillingDimensions: map[string]any{"instance_type": "m5.large"},
 	}
