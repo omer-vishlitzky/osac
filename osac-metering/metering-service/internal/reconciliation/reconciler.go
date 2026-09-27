@@ -551,6 +551,7 @@ func bmaasIntervals(state projection.ResourceState) events.BMaaSMeterIntervals {
 	return events.BMaaSMeterIntervals{
 		AllocationSince:  state.BMaaSMeterState.Allocation.ActiveSince,
 		ConsumptionSince: state.BMaaSMeterState.Consumption.ActiveSince,
+		LastHeartbeatAt:  state.LastHeartbeatAt,
 	}
 }
 
