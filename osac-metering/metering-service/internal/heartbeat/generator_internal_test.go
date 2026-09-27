@@ -59,6 +59,59 @@ func (p *tickPublisher) Publish(_ context.Context, event cloudevents.Event) erro
 	return nil
 }
 
+func clusterHeartbeatDimensions(gpuNodeCount float64) map[string]any {
+	return map[string]any{
+		"cluster_template": "ocp-ci-small",
+		"release_image":    "4.17.0",
+		"components": []any{
+			map[string]any{"node_set": "_control_plane", "component": "control_plane", "host_type": "_control_plane", "node_count": float64(1)},
+			map[string]any{"node_set": "gpu-workers", "component": "worker", "host_type": "gpu-h100", "node_count": gpuNodeCount},
+		},
+	}
+}
+
+func buildClusterHeartbeatDataByNodeSet(t *testing.T, g *Generator, state *projection.ResourceState, at time.Time) map[string]map[string]any {
+	t.Helper()
+
+	heartbeats, err := g.buildHeartbeatEvents(state, at)
+	if err != nil {
+		t.Fatalf("build cluster heartbeats: %v", err)
+	}
+	dataByNodeSet := make(map[string]map[string]any, len(heartbeats))
+	for _, heartbeat := range heartbeats {
+		var data map[string]any
+		if err := json.Unmarshal(heartbeat.Data(), &data); err != nil {
+			t.Fatalf("unmarshal heartbeat data: %v", err)
+		}
+		dimensions, ok := data["billing_dimensions"].(map[string]any)
+		if !ok {
+			t.Fatalf("heartbeat billing_dimensions = %T, want map[string]any", data["billing_dimensions"])
+		}
+		nodeSet, ok := dimensions["node_set"].(string)
+		if !ok {
+			t.Fatalf("heartbeat node_set = %T, want string", dimensions["node_set"])
+		}
+		dataByNodeSet[nodeSet] = data
+	}
+	return dataByNodeSet
+}
+
+func expectClusterHeartbeatDuration(t *testing.T, dataByNodeSet map[string]map[string]any, nodeSet string, want float64) {
+	t.Helper()
+
+	data, ok := dataByNodeSet[nodeSet]
+	if !ok {
+		t.Fatalf("no heartbeat for node_set %q", nodeSet)
+	}
+	got, ok := data["duration_seconds"].(float64)
+	if !ok {
+		t.Fatalf("duration_seconds for node_set %q = %T (%v), want %v", nodeSet, data["duration_seconds"], data["duration_seconds"], want)
+	}
+	if got != want {
+		t.Errorf("duration_seconds for node_set %q = %v, want %v", nodeSet, got, want)
+	}
+}
+
 func bmaasTickState(id, currentState string, activeSince time.Time) projection.ResourceState {
 	return projection.ResourceState{
 		ResourceID:   id,
@@ -70,6 +123,69 @@ func bmaasTickState(id, currentState string, activeSince time.Time) projection.R
 		BMaaSMeterState: projection.BMaaSMeterState{
 			Allocation: projection.MeterState{ActiveSince: &activeSince},
 		},
+	}
+}
+
+func TestClusterHeartbeatDurationUsesPerComponentBillableSince(t *testing.T) {
+	start := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	scaledAt := start.Add(time.Hour)
+	state := projection.ResourceState{
+		ResourceID:        "cluster-duration",
+		ResourceType:      events.ResourceTypeClusterOrder,
+		TenantID:          "tenant-1",
+		CurrentState:      events.ClusterStateReady,
+		IsBillable:        true,
+		BillableSince:     &start,
+		BillingDimensions: clusterHeartbeatDimensions(2),
+		ComponentBillableSince: map[string]time.Time{
+			"_control_plane": start,
+			"gpu-workers":    start,
+		},
+	}
+	g := &Generator{interval: time.Minute}
+
+	// The first heartbeat reports elapsed time from the initial component starts.
+	first := buildClusterHeartbeatDataByNodeSet(t, g, &state, start.Add(time.Minute))
+	expectClusterHeartbeatDuration(t, first, "_control_plane", 60)
+	expectClusterHeartbeatDuration(t, first, "gpu-workers", 60)
+
+	// Simulate the projection after gpu-workers scales: its component start and
+	// the cluster-wide BillableSince reset, but the control plane's start stays
+	// unchanged.
+	oldDimensions := state.BillingDimensions
+	newDimensions := clusterHeartbeatDimensions(4)
+	state.ComponentBillableSince = events.NextComponentBillableSince(
+		oldDimensions, state.ComponentBillableSince, newDimensions, scaledAt,
+	)
+	state.BillableSince = &scaledAt
+	state.BillingDimensions = newDimensions
+
+	firstAfterScaleAt := scaledAt.Add(time.Hour)
+	firstAfterScale := buildClusterHeartbeatDataByNodeSet(t, g, &state, firstAfterScaleAt)
+	expectClusterHeartbeatDuration(t, firstAfterScale, "_control_plane", 2*time.Hour.Seconds())
+	expectClusterHeartbeatDuration(t, firstAfterScale, "gpu-workers", time.Hour.Seconds())
+
+	// A later heartbeat remains cumulative from each component's own start.
+	later := buildClusterHeartbeatDataByNodeSet(t, g, &state, firstAfterScaleAt.Add(time.Hour))
+	expectClusterHeartbeatDuration(t, later, "_control_plane", 3*time.Hour.Seconds())
+	expectClusterHeartbeatDuration(t, later, "gpu-workers", 2*time.Hour.Seconds())
+}
+
+func TestClusterHeartbeatOmitsDurationWhenComponentStartIsUnknown(t *testing.T) {
+	start := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	state := projection.ResourceState{
+		ResourceID:             "cluster-missing-component-start",
+		ResourceType:           events.ResourceTypeClusterOrder,
+		TenantID:               "tenant-1",
+		CurrentState:           events.ClusterStateReady,
+		IsBillable:             true,
+		BillableSince:          &start,
+		BillingDimensions:      clusterHeartbeatDimensions(2),
+		ComponentBillableSince: map[string]time.Time{"_control_plane": start},
+	}
+	dataByNodeSet := buildClusterHeartbeatDataByNodeSet(t, &Generator{interval: time.Minute}, &state, start.Add(time.Minute))
+	if _, ok := dataByNodeSet["gpu-workers"]["duration_seconds"]; ok {
+		t.Errorf("missing component interval start must not fall back to duration_seconds=%v", dataByNodeSet["gpu-workers"]["duration_seconds"])
 	}
 }
 

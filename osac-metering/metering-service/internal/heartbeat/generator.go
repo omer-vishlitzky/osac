@@ -193,7 +193,8 @@ func BuildHeartbeatEventsWithMutes(state *projection.ResourceState, baseID strin
 	}
 
 	buildFn := func(dims map[string]any, eventID string) (cloudevents.Event, error) {
-		return buildHeartbeatEvent(state, eventID, dims, now, source, heartbeatDurationSeconds(now, state.BillableSince))
+		since := heartbeatBillableSince(state, dims)
+		return buildHeartbeatEvent(state, eventID, dims, now, source, heartbeatDurationSeconds(now, since))
 	}
 	return events.BuildResourceEvents(state.ResourceType, state.BillingDimensions, baseID, buildFn)
 }
@@ -241,6 +242,24 @@ func heartbeatDurationSeconds(now time.Time, since *time.Time) *float64 {
 	return &seconds
 }
 
+// heartbeatBillableSince uses each CaaS component's own billing interval
+// start. A cluster-wide reset caused by a different component's scaling must
+// not shorten this component's cumulative heartbeat duration.
+func heartbeatBillableSince(state *projection.ResourceState, dims map[string]any) *time.Time {
+	if state.ResourceType != events.ResourceTypeClusterOrder {
+		return state.BillableSince
+	}
+	nodeSet, ok := dims["node_set"].(string)
+	if !ok || nodeSet == "" {
+		return nil
+	}
+	since, ok := state.ComponentBillableSince[nodeSet]
+	if !ok {
+		return nil
+	}
+	return &since
+}
+
 func buildHeartbeatEvent(state *projection.ResourceState, eventID string, dims map[string]any, now time.Time, source string, durationSeconds *float64) (cloudevents.Event, error) {
 	ce := cloudevents.NewEvent()
 	ce.SetID(eventID)
@@ -252,11 +271,15 @@ func buildHeartbeatEvent(state *projection.ResourceState, eventID string, dims m
 
 	var duration *float64
 	if state.ResourceType != events.ResourceTypeBareMetalInstance {
-		seconds := float64(0)
 		if durationSeconds != nil {
-			seconds = *durationSeconds
+			duration = durationSeconds
+		} else if state.ResourceType != events.ResourceTypeClusterOrder {
+			// Preserve the established zero for non-CaaS resources without a
+			// recorded start. CaaS needs a per-component start; zero would
+			// misrepresent a missing timestamp as a known zero-length interval.
+			zero := float64(0)
+			duration = &zero
 		}
-		duration = &seconds
 	}
 
 	data := heartbeatData{
