@@ -206,7 +206,7 @@ func (c *Consumer) commitMappedEvent(ctx context.Context, prepared preparedEvent
 				"projection_version", latest.FulfillmentVersion)
 			return nil
 		}
-		if err := c.publishLifecycleEvents(ctx, cloudEvent, prepared.mapper, prepared.event.GetId(), prepared.dimensions); err != nil {
+		if err := c.publishLifecycleEvents(ctx, cloudEvent, prepared.mapper, prepared.event.GetId(), prepared.dimensions, prepared.existing, prepared.transitionTime); err != nil {
 			return err
 		}
 		if prepared.existing != nil {
@@ -223,6 +223,6 @@ func (c *Consumer) commitMappedEvent(ctx context.Context, prepared preparedEvent
 	}
 
 	return c.publishAndUpsert(ctx, func() error {
-		return c.publishLifecycleEvents(ctx, cloudEvent, prepared.mapper, prepared.event.GetId(), prepared.dimensions)
+		return c.publishLifecycleEvents(ctx, cloudEvent, prepared.mapper, prepared.event.GetId(), prepared.dimensions, prepared.existing, prepared.transitionTime)
 	}, projectionState, prepared.resourceID, prepared.allowSameVersionDeletion)
 }

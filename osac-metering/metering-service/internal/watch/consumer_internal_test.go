@@ -11,6 +11,7 @@ package watch
 
 import (
 	"testing"
+	"time"
 
 	cloudevents "github.com/cloudevents/sdk-go/v2"
 	"github.com/osac-project/osac-metering/internal/projection"
@@ -36,6 +37,37 @@ func TestBuildComponentEventHandlesNilBaseData(t *testing.T) {
 	}
 	if data["billing_dimensions"] == nil {
 		t.Errorf("expected billing_dimensions to be set on the component event even when the base event carried no data")
+	}
+}
+
+func TestBuildStateContextUsesHeartbeatDeltaOrActiveStart(t *testing.T) {
+	start := time.Date(2026, 9, 27, 10, 0, 0, 0, time.UTC)
+	lastHeartbeat := start.Add(45 * time.Minute)
+	end := start.Add(time.Hour)
+	consumer := &Consumer{}
+
+	for _, test := range []struct {
+		name            string
+		lastHeartbeatAt *time.Time
+		want            float64
+	}{
+		{name: "first close falls back to active start", want: 3600},
+		{name: "later close reports only the tail", lastHeartbeatAt: &lastHeartbeat, want: 900},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			state := &projection.ResourceState{
+				IsBillable:      true,
+				BillableSince:   &start,
+				LastHeartbeatAt: test.lastHeartbeatAt,
+			}
+			got := consumer.buildStateContext(state, false, end, nil)
+			if got.DurationSeconds == nil || *got.DurationSeconds != test.want {
+				t.Fatalf("duration_seconds = %v, want %v", got.DurationSeconds, test.want)
+			}
+			if got.BillableSince == nil || !got.BillableSince.Equal(start) {
+				t.Fatalf("billable_since = %v, want %v", got.BillableSince, start)
+			}
+		})
 	}
 }
 

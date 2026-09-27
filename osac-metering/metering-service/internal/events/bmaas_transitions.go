@@ -166,6 +166,7 @@ func BMaaSEffectEventType(effect string, everStarted bool) (string, error) {
 type BMaaSMeterIntervals struct {
 	AllocationSince  *time.Time
 	ConsumptionSince *time.Time
+	LastHeartbeatAt  *time.Time
 }
 
 type BMaaSEventBuildRequest struct {
@@ -196,9 +197,8 @@ func DecomposeBMIEvents(
 			return
 		}
 		var duration *float64
-		if since != nil && eventType == EventSuspended {
-			seconds := transitionTime.Sub(*since).Seconds()
-			duration = &seconds
+		if eventType == EventHeartbeat || eventType == EventSuspended {
+			duration = DurationSeconds(transitionTime, intervals.LastHeartbeatAt, since)
 		}
 		dims := maps.Clone(billingDims)
 		if dims == nil {

@@ -193,7 +193,15 @@ func BuildHeartbeatEventsWithMutes(state *projection.ResourceState, baseID strin
 	}
 
 	buildFn := func(dims map[string]any, eventID string) (cloudevents.Event, error) {
-		return buildHeartbeatEvent(state, eventID, dims, now, source, heartbeatDurationSeconds(now, state.BillableSince))
+		activeSince := state.BillableSince
+		if state.ResourceType == events.ResourceTypeClusterOrder {
+			if nodeSet, ok := dims["node_set"].(string); ok {
+				if componentSince, exists := state.ComponentBillableSince[nodeSet]; exists {
+					activeSince = &componentSince
+				}
+			}
+		}
+		return buildHeartbeatEvent(state, eventID, dims, now, source, events.DurationSeconds(now, state.LastHeartbeatAt, activeSince))
 	}
 	return events.BuildResourceEvents(state.ResourceType, state.BillingDimensions, baseID, buildFn)
 }
@@ -216,6 +224,7 @@ func buildBMaaSHeartbeatEvents(state *projection.ResourceState, baseID string, n
 			consumptionType = events.EventHeartbeat
 		}
 	}
+	intervals.LastHeartbeatAt = state.LastHeartbeatAt
 	if allocationType == "" && consumptionType == "" {
 		return nil, nil
 	}
@@ -233,14 +242,6 @@ func buildBMaaSHeartbeatEvents(state *projection.ResourceState, baseID string, n
 	)
 }
 
-func heartbeatDurationSeconds(now time.Time, since *time.Time) *float64 {
-	if since == nil {
-		return nil
-	}
-	seconds := now.Sub(*since).Seconds()
-	return &seconds
-}
-
 func buildHeartbeatEvent(state *projection.ResourceState, eventID string, dims map[string]any, now time.Time, source string, durationSeconds *float64) (cloudevents.Event, error) {
 	ce := cloudevents.NewEvent()
 	ce.SetID(eventID)
@@ -250,8 +251,8 @@ func buildHeartbeatEvent(state *projection.ResourceState, eventID string, dims m
 
 	events.SetOSACExtensions(&ce, state.ResourceID, state.ResourceType, state.TenantID, state.ProjectID)
 
-	var duration *float64
-	if state.ResourceType != events.ResourceTypeBareMetalInstance {
+	duration := durationSeconds
+	if state.ResourceType != events.ResourceTypeBareMetalInstance || durationSeconds != nil {
 		seconds := float64(0)
 		if durationSeconds != nil {
 			seconds = *durationSeconds

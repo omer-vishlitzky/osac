@@ -331,13 +331,40 @@ func (c *Consumer) handleTransientState(
 	return nil
 }
 
-func (c *Consumer) publishLifecycleEvents(ctx context.Context, baseCE *cloudevents.Event, mapper events.ResourceMapper, eventID string, billingDims map[string]any) error {
+func (c *Consumer) publishLifecycleEvents(
+	ctx context.Context,
+	baseCE *cloudevents.Event,
+	mapper events.ResourceMapper,
+	eventID string,
+	billingDims map[string]any,
+	existing *projection.ResourceState,
+	transitionTime time.Time,
+) error {
 	if baseCE.Type() == events.EventCreated || baseCE.Type() == events.EventDeleted {
 		return c.publishWithRetry(ctx, baseCE)
 	}
 
 	decomposed, err := events.BuildResourceEvents(mapper.ResourceType(), billingDims, eventID, func(dims map[string]any, compEventID string) (cloudevents.Event, error) {
-		return c.buildComponentEvent(baseCE, compEventID, dims)
+		ce, err := c.buildComponentEvent(baseCE, compEventID, dims)
+		if err != nil || mapper.ResourceType() != events.ResourceTypeClusterOrder || baseCE.Type() != events.EventSuspended || existing == nil {
+			return ce, err
+		}
+		activeSince := existing.BillableSince
+		if nodeSet, ok := dims["node_set"].(string); ok {
+			if componentSince, exists := existing.ComponentBillableSince[nodeSet]; exists {
+				activeSince = &componentSince
+			}
+		}
+		duration := events.DurationSeconds(transitionTime, existing.LastHeartbeatAt, activeSince)
+		var data map[string]any
+		if err := ce.DataAs(&data); err != nil {
+			return ce, fmt.Errorf("reading component lifecycle event data: %w", err)
+		}
+		data["duration_seconds"] = duration
+		if err := ce.SetData(cloudevents.ApplicationJSON, data); err != nil {
+			return ce, fmt.Errorf("setting component lifecycle duration: %w", err)
+		}
+		return ce, nil
 	})
 	if err != nil {
 		return err
@@ -520,6 +547,7 @@ func (c *Consumer) buildBareMetalLifecycleEvents(
 		consumptionState = existing.BMaaSMeterState.Consumption
 		intervals.AllocationSince = allocationState.ActiveSince
 		intervals.ConsumptionSince = consumptionState.ActiveSince
+		intervals.LastHeartbeatAt = existing.LastHeartbeatAt
 	}
 
 	return events.DecomposeBMIEvents(
@@ -726,25 +754,19 @@ func (c *Consumer) buildProjectionState(mapper events.ResourceMapper, existing *
 	return projState
 }
 
-// componentDurationSeconds returns how long a component's prior billing
-// dimensions were in effect. Returns nil if no per-component timestamp is
-// recorded for nodeSet — an honest "unknown" (the same signal already used
-// for a genuinely new component) rather than guessing via the resource-wide
-// BillableSince, which would silently reintroduce a narrower version of the
-// cross-component bug this exists to fix. The only path that can leave an
-// entry missing is a Reconciler correction that hasn't been updated to
-// maintain ComponentBillableSince (see events.NextComponentBillableSince
-// callers in the reconciliation package) — logged so an unexpected rate of
-// occurrence is debuggable rather than silently absorbed.
+// componentDurationSeconds returns the remaining interval for a component's
+// prior billing dimensions. When the per-component start is unavailable, a
+// recorded heartbeat still provides a valid lower bound; without either, the
+// duration remains unknown. Missing component starts are logged because
+// normal projections maintain them via events.NextComponentBillableSince.
 func (c *Consumer) componentDurationSeconds(existing *projection.ResourceState, nodeSet string, transitionTime time.Time) *float64 {
 	since, ok := existing.ComponentBillableSince[nodeSet]
 	if !ok {
-		c.logger.V(1).Info("no per-component billable-since recorded, reporting nil duration_seconds",
+		c.logger.V(1).Info("no per-component billable-since recorded; using last heartbeat as lower bound when available",
 			"resource_id", existing.ResourceID, "node_set", nodeSet)
-		return nil
+		return events.DurationSeconds(transitionTime, existing.LastHeartbeatAt, nil)
 	}
-	duration := transitionTime.Sub(since).Seconds()
-	return &duration
+	return events.DurationSeconds(transitionTime, existing.LastHeartbeatAt, &since)
 }
 
 func (c *Consumer) buildStateContext(existing *projection.ResourceState, nowBillable bool, transitionTime time.Time, newDims map[string]any) *events.StateContext {
@@ -759,8 +781,7 @@ func (c *Consumer) buildStateContext(existing *projection.ResourceState, nowBill
 
 	if existing.IsBillable && existing.BillableSince != nil {
 		if !nowBillable || !events.DimensionsEqual(existing.BillingDimensions, newDims) {
-			duration := transitionTime.Sub(*existing.BillableSince).Seconds()
-			sc.DurationSeconds = &duration
+			sc.DurationSeconds = events.DurationSeconds(transitionTime, existing.LastHeartbeatAt, existing.BillableSince)
 			sc.BillableSince = existing.BillableSince
 		}
 	}
