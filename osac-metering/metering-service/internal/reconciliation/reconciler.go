@@ -422,6 +422,10 @@ func (r *Reconciler) reconcileFulfillmentResources(ctx context.Context, fulfillm
 			}
 			corrections++
 
+			if fs.resourceType == events.ResourceTypeClusterOrder && ps.IsBillable {
+				ps.ComponentBillableSince = events.NextComponentBillableSince(
+					ps.BillingDimensions, ps.ComponentBillableSince, fs.billingDimensions, transitionTime)
+			}
 			ps.BillingDimensions = fs.billingDimensions
 			ps.FulfillmentVersion = fs.version
 			ps.TransitionTime = transitionTime

@@ -346,16 +346,17 @@ func (c *Consumer) publishLifecycleEvents(
 
 	decomposed, err := events.BuildResourceEvents(mapper.ResourceType(), billingDims, eventID, func(dims map[string]any, compEventID string) (cloudevents.Event, error) {
 		ce, err := c.buildComponentEvent(baseCE, compEventID, dims)
-		if err != nil || mapper.ResourceType() != events.ResourceTypeClusterOrder || baseCE.Type() != events.EventSuspended || existing == nil {
+		if err != nil || mapper.ResourceType() != events.ResourceTypeClusterOrder || baseCE.Type() != events.EventSuspended {
 			return ce, err
 		}
-		activeSince := existing.BillableSince
-		if nodeSet, ok := dims["node_set"].(string); ok {
-			if componentSince, exists := existing.ComponentBillableSince[nodeSet]; exists {
-				activeSince = &componentSince
-			}
+		nodeSet := dims["node_set"].(string)
+		if existing == nil {
+			return ce, fmt.Errorf("cluster %s node_set %q has no component billable-since timestamp", mapper.ResourceID(), nodeSet)
 		}
-		duration := events.DurationSeconds(transitionTime, existing.LastHeartbeatAt, activeSince)
+		duration, err := c.componentDurationSeconds(existing, nodeSet, transitionTime)
+		if err != nil {
+			return ce, err
+		}
 		var data map[string]any
 		if err := ce.DataAs(&data); err != nil {
 			return ce, fmt.Errorf("reading component lifecycle event data: %w", err)
@@ -755,18 +756,14 @@ func (c *Consumer) buildProjectionState(mapper events.ResourceMapper, existing *
 }
 
 // componentDurationSeconds returns the remaining interval for a component's
-// prior billing dimensions. When the per-component start is unavailable, a
-// recorded heartbeat still provides a valid lower bound; without either, the
-// duration remains unknown. Missing component starts are logged because
-// normal projections maintain them via events.NextComponentBillableSince.
-func (c *Consumer) componentDurationSeconds(existing *projection.ResourceState, nodeSet string, transitionTime time.Time) *float64 {
+// prior billing dimensions. A component start is required; LastHeartbeatAt is
+// only an optional lower bound on the interval.
+func (c *Consumer) componentDurationSeconds(existing *projection.ResourceState, nodeSet string, transitionTime time.Time) (*float64, error) {
 	since, ok := existing.ComponentBillableSince[nodeSet]
 	if !ok {
-		c.logger.V(1).Info("no per-component billable-since recorded; using last heartbeat as lower bound when available",
-			"resource_id", existing.ResourceID, "node_set", nodeSet)
-		return events.DurationSeconds(transitionTime, existing.LastHeartbeatAt, nil)
+		return nil, fmt.Errorf("cluster %s node_set %q has no component billable-since timestamp", existing.ResourceID, nodeSet)
 	}
-	return events.DurationSeconds(transitionTime, existing.LastHeartbeatAt, &since)
+	return events.DurationSeconds(transitionTime, existing.LastHeartbeatAt, &since), nil
 }
 
 func (c *Consumer) buildStateContext(existing *projection.ResourceState, nowBillable bool, transitionTime time.Time, newDims map[string]any) *events.StateContext {

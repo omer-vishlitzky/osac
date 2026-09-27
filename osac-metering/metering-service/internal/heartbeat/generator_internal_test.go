@@ -249,6 +249,68 @@ func TestBuildClusterHeartbeatUsesComponentStartAndHeartbeatBounds(t *testing.T)
 	}
 }
 
+func TestBuildClusterHeartbeatRequiresComponentStart(t *testing.T) {
+	start := time.Date(2026, 9, 27, 10, 0, 0, 0, time.UTC)
+	lastHeartbeat := start.Add(30 * time.Minute)
+	state := &projection.ResourceState{
+		ResourceID:      "cluster-missing-start",
+		ResourceType:    events.ResourceTypeClusterOrder,
+		CurrentState:    "READY",
+		BillableSince:   &start,
+		LastHeartbeatAt: &lastHeartbeat,
+		BillingDimensions: map[string]any{
+			"cluster_template": "ocp-ci-small",
+			"release_image":    "4.17.0",
+			"components": []any{
+				map[string]any{"node_set": "_control_plane", "component": "control_plane", "host_type": "_control_plane", "node_count": 1},
+			},
+		},
+	}
+
+	got, err := BuildHeartbeatEvents(state, "hb/missing-start", start.Add(time.Hour), "test")
+	if err == nil {
+		t.Fatalf("BuildHeartbeatEvents() events = %d, want missing component start error", len(got))
+	}
+	const want = `cluster cluster-missing-start node_set "_control_plane" has no component billable-since timestamp`
+	if err.Error() != want {
+		t.Fatalf("BuildHeartbeatEvents() error = %q, want %q", err, want)
+	}
+}
+
+func TestFirstClusterHeartbeatUsesComponentStartWithoutLastHeartbeat(t *testing.T) {
+	clusterStart := time.Date(2026, 9, 27, 9, 0, 0, 0, time.UTC)
+	componentStart := clusterStart.Add(20 * time.Minute)
+	now := clusterStart.Add(time.Hour)
+	state := &projection.ResourceState{
+		ResourceID:    "cluster-first-heartbeat",
+		ResourceType:  events.ResourceTypeClusterOrder,
+		CurrentState:  "READY",
+		BillableSince: &clusterStart,
+		ComponentBillableSince: map[string]time.Time{
+			"_control_plane": componentStart,
+		},
+		BillingDimensions: map[string]any{
+			"cluster_template": "ocp-ci-small",
+			"release_image":    "4.17.0",
+			"components": []any{
+				map[string]any{"node_set": "_control_plane", "component": "control_plane", "host_type": "_control_plane", "node_count": 1},
+			},
+		},
+	}
+
+	got, err := BuildHeartbeatEvents(state, "hb/first-cluster", now, "test")
+	if err != nil {
+		t.Fatalf("BuildHeartbeatEvents() error = %v", err)
+	}
+	var data map[string]any
+	if err := json.Unmarshal(got[0].Data(), &data); err != nil {
+		t.Fatalf("unmarshal heartbeat data: %v", err)
+	}
+	if got, want := data["duration_seconds"], float64(now.Sub(componentStart).Seconds()); got != want {
+		t.Errorf("first cluster heartbeat duration_seconds = %v, want %v from component start", got, want)
+	}
+}
+
 func TestBuildHeartbeatEventsBMaaSUsesIndependentMeters(t *testing.T) {
 	g := &Generator{interval: 60 * time.Second}
 	allocationSince := time.Date(2026, 1, 1, 11, 0, 0, 0, time.UTC)

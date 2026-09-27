@@ -195,11 +195,12 @@ func BuildHeartbeatEventsWithMutes(state *projection.ResourceState, baseID strin
 	buildFn := func(dims map[string]any, eventID string) (cloudevents.Event, error) {
 		activeSince := state.BillableSince
 		if state.ResourceType == events.ResourceTypeClusterOrder {
-			if nodeSet, ok := dims["node_set"].(string); ok {
-				if componentSince, exists := state.ComponentBillableSince[nodeSet]; exists {
-					activeSince = &componentSince
-				}
+			nodeSet := dims["node_set"].(string)
+			componentSince, exists := state.ComponentBillableSince[nodeSet]
+			if !exists {
+				return cloudevents.Event{}, fmt.Errorf("cluster %s node_set %q has no component billable-since timestamp", state.ResourceID, nodeSet)
 			}
+			activeSince = &componentSince
 		}
 		return buildHeartbeatEvent(state, eventID, dims, now, source, events.DurationSeconds(now, state.LastHeartbeatAt, activeSince))
 	}

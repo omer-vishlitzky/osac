@@ -108,7 +108,10 @@ func (c *Consumer) handleScalingEvent(ctx context.Context, event *privatev1.Even
 					PreviousState: stateCtx.PreviousState,
 				}
 				if !comp.IsNew {
-					scalingCtx.DurationSeconds = c.componentDurationSeconds(existing, comp.NodeSet, transitionTime)
+					scalingCtx.DurationSeconds, err = c.componentDurationSeconds(existing, comp.NodeSet, transitionTime)
+					if err != nil {
+						return err
+					}
 				}
 				ce, ceErr := c.buildScalingEvent(
 					events.ComponentEventID(event.GetId(), comp),
