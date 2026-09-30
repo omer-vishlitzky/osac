@@ -23,6 +23,7 @@ import (
 	grpcstatus "google.golang.org/grpc/status"
 
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
+	"github.com/osac-project/osac/fulfillment-service/internal/quota"
 	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
@@ -34,6 +35,7 @@ type VolumesServerBuilder struct {
 	attributionLogic  auth.AttributionLogic
 	tenancyLogic      auth.TenancyLogic
 	metricsRegisterer prometheus.Registerer
+	quotaStore        *quota.Store
 	tierResolver      TierResolverFunc
 }
 
@@ -92,6 +94,11 @@ func (b *VolumesServerBuilder) SetMetricsRegisterer(value prometheus.Registerer)
 	return b
 }
 
+func (b *VolumesServerBuilder) SetQuotaStore(value *quota.Store) *VolumesServerBuilder {
+	b.quotaStore = value
+	return b
+}
+
 // SetTierResolver sets the tier resolver function used to resolve storage tier names to their
 // provider and protocol. This is mandatory for CUD operations.
 func (b *VolumesServerBuilder) SetTierResolver(value TierResolverFunc) *VolumesServerBuilder {
@@ -138,6 +145,7 @@ func (b *VolumesServerBuilder) Build() (result *VolumesServer, err error) {
 		SetAttributionLogic(b.attributionLogic).
 		SetTenancyLogic(b.tenancyLogic).
 		SetMetricsRegisterer(b.metricsRegisterer).
+		SetQuotaStore(b.quotaStore).
 		SetTierResolver(b.tierResolver).
 		SetFilterDesc((*publicv1.Volume)(nil).ProtoReflect().Descriptor()).
 		Build()

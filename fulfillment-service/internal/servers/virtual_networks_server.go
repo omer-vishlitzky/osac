@@ -23,6 +23,7 @@ import (
 	grpcstatus "google.golang.org/grpc/status"
 
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
+	"github.com/osac-project/osac/fulfillment-service/internal/quota"
 	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
@@ -32,6 +33,7 @@ type VirtualNetworksServerBuilder struct {
 	attributionLogic  auth.AttributionLogic
 	tenancyLogic      auth.TenancyLogic
 	metricsRegisterer prometheus.Registerer
+	quotaStore        *quota.Store
 }
 
 var _ publicv1.VirtualNetworksServer = (*VirtualNetworksServer)(nil)
@@ -74,6 +76,11 @@ func (b *VirtualNetworksServerBuilder) SetMetricsRegisterer(value prometheus.Reg
 	return b
 }
 
+func (b *VirtualNetworksServerBuilder) SetQuotaStore(value *quota.Store) *VirtualNetworksServerBuilder {
+	b.quotaStore = value
+	return b
+}
+
 func (b *VirtualNetworksServerBuilder) Build() (result *VirtualNetworksServer, err error) {
 	// Check parameters:
 	if b.logger == nil {
@@ -107,6 +114,7 @@ func (b *VirtualNetworksServerBuilder) Build() (result *VirtualNetworksServer, e
 		SetAttributionLogic(b.attributionLogic).
 		SetTenancyLogic(b.tenancyLogic).
 		SetMetricsRegisterer(b.metricsRegisterer).
+		SetQuotaStore(b.quotaStore).
 		SetFilterDesc((*publicv1.VirtualNetwork)(nil).ProtoReflect().Descriptor()).
 		Build()
 	if err != nil {

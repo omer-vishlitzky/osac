@@ -1,0 +1,104 @@
+//
+// Copyright (c) 2026 Red Hat, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific
+// language governing permissions and limitations under the License.
+//
+
+syntax = "proto3";
+
+package osac.public.v1;
+
+import "buf/validate/validate.proto";
+import "google/protobuf/timestamp.proto";
+import "osac/public/v1/metadata_type.proto";
+
+// QuotaUsageEntry is the current usage view for one quota dimension and class.
+// It is a query result, not a persisted OSAC object.
+// buf:lint:ignore OSAC_OBJECT_SHAPE
+message QuotaUsageEntry {
+  // Quota dimension, such as "vcpus" or "storage_gib".
+  string dimension = 1;
+
+  // Resource class for classed dimensions (for example, a GPU resource name or storage tier).
+  // Empty for dimensions without classes.
+  string class_key = 2;
+
+  // Current held usage in the dimension's unit.
+  int64 used = 3;
+
+  // Configured tenant limit in the dimension's unit.
+  int64 limit = 4;
+
+  // Remaining capacity. This is negative when usage is over the limit.
+  int64 remaining = 5;
+
+  // Whether current usage exceeds the configured limit.
+  bool over_limit = 6;
+
+  // Optional absolute headroom at which the tenant wants a warning.
+  optional int64 warning_threshold = 7;
+}
+
+// QuotaIncreaseRequestState describes the review state of a quota increase request.
+enum QuotaIncreaseRequestState {
+  QUOTA_INCREASE_REQUEST_STATE_UNSPECIFIED = 0;
+  QUOTA_INCREASE_REQUEST_STATE_PENDING = 1;
+  QUOTA_INCREASE_REQUEST_STATE_APPROVED = 2;
+  QUOTA_INCREASE_REQUEST_STATE_DENIED = 3;
+}
+
+// QuotaIncreaseRequest records a tenant request for a higher limit.
+message QuotaIncreaseRequest {
+  // Unique identifier of the quota increase request.
+  string id = 1;
+
+  // Common metadata, including the request name, tenant, creator, and creation time.
+  Metadata metadata = 2;
+
+  // Requested quota change.
+  QuotaIncreaseRequestSpec spec = 3;
+
+  // Review state and response.
+  QuotaIncreaseRequestStatus status = 4;
+}
+
+// QuotaIncreaseRequestSpec contains the tenant's requested limit and reason.
+message QuotaIncreaseRequestSpec {
+  option (buf.validate.message).cel = {
+    id: "quota_increase_request_spec"
+    message: "dimension, requested_limit, and reason are required"
+    expression: "this.dimension != '' && this.requested_limit > 0 && this.reason != ''"
+  };
+
+  // Dimension to increase, such as "vcpus" or "storage_gib".
+  string dimension = 1 [(buf.validate.field).string.min_len = 1];
+
+  // Resource class for classed dimensions. Empty for dimensions without classes.
+  string class_key = 2;
+
+  // Desired total limit, not an increment over the current limit.
+  int64 requested_limit = 3 [(buf.validate.field).int64.gt = 0];
+
+  // Why the tenant is requesting the increase.
+  string reason = 4 [(buf.validate.field).string = {min_len: 1, max_len: 1024}];
+}
+
+// QuotaIncreaseRequestStatus contains the provider's decision.
+message QuotaIncreaseRequestStatus {
+  // Current review state.
+  QuotaIncreaseRequestState state = 1;
+
+  // Optional explanation returned with the decision.
+  string review_message = 2;
+
+  // When the provider reviewed the request.
+  google.protobuf.Timestamp reviewed_at = 3;
+}

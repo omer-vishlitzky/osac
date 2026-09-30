@@ -1012,6 +1012,36 @@ var _ = Describe("Rego authorization interceptor", func() {
 			Expect(handled).To(BeTrue())
 		})
 
+		DescribeTable("enforces tenant quota API roles",
+			func(ctx context.Context, roles []any, groups []any, method string, allowed bool) {
+				token := createKeycloakUserToken("my-tenant", "my-user", jwt.MapClaims{
+					"realm_access": map[string]any{"roles": roles},
+					"groups":       groups,
+				})
+				ctx = ContextWithToken(ctx, token)
+				handled := false
+				_, err := interceptor.UnaryServer(ctx, nil, &grpc.UnaryServerInfo{FullMethod: method},
+					func(context.Context, any) (any, error) {
+						handled = true
+						return nil, nil
+					})
+				if allowed {
+					Expect(err).ToNot(HaveOccurred())
+					Expect(handled).To(BeTrue())
+					return
+				}
+				Expect(grpcstatus.Code(err)).To(Equal(grpccodes.PermissionDenied))
+				Expect(handled).To(BeFalse())
+			},
+			Entry("regular user reads usage", []any{}, []any{}, "/osac.public.v1.Quotas/GetUsage", true),
+			Entry("regular user reads request status", []any{}, []any{}, "/osac.public.v1.QuotaIncreaseRequests/Get", true),
+			Entry("regular user cannot request more quota", []any{}, []any{}, "/osac.public.v1.QuotaIncreaseRequests/Create", false),
+			Entry("tenant admin can request more quota", []any{"tenant-admin"}, []any{}, "/osac.public.v1.QuotaIncreaseRequests/Create", true),
+			Entry("tenant admin can set a warning threshold", []any{"tenant-admin"}, []any{}, "/osac.public.v1.Quotas/SetWarningThreshold", true),
+			Entry("tenant admin cannot set provider limits", []any{"tenant-admin"}, []any{}, "/osac.private.v1.QuotaAdministration/SetTenantLimit", false),
+			Entry("provider admin can set tenant limits", []any{}, []any{"admins"}, "/osac.private.v1.QuotaAdministration/SetTenantLimit", true),
+		)
+
 		It("Denies regular user from creating project memberships", func(ctx context.Context) {
 			token := createKeycloakUserToken("my-tenant", "my-user", jwt.MapClaims{
 				"realm_access": map[string]any{

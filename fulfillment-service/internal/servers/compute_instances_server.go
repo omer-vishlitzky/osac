@@ -23,6 +23,7 @@ import (
 	grpcstatus "google.golang.org/grpc/status"
 
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
+	"github.com/osac-project/osac/fulfillment-service/internal/quota"
 	"github.com/osac-project/osac/fulfillment-service/internal/vault"
 	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
@@ -33,6 +34,7 @@ type ComputeInstancesServerBuilder struct {
 	attributionLogic  auth.AttributionLogic
 	tenancyLogic      auth.TenancyLogic
 	metricsRegisterer prometheus.Registerer
+	quotaStore        *quota.Store
 	secretStore       vault.SecretStore
 }
 
@@ -76,6 +78,11 @@ func (b *ComputeInstancesServerBuilder) SetMetricsRegisterer(value prometheus.Re
 	return b
 }
 
+func (b *ComputeInstancesServerBuilder) SetQuotaStore(value *quota.Store) *ComputeInstancesServerBuilder {
+	b.quotaStore = value
+	return b
+}
+
 func (b *ComputeInstancesServerBuilder) SetSecretStore(value vault.SecretStore) *ComputeInstancesServerBuilder {
 	b.secretStore = value
 	return b
@@ -114,6 +121,7 @@ func (b *ComputeInstancesServerBuilder) Build() (result *ComputeInstancesServer,
 		SetAttributionLogic(b.attributionLogic).
 		SetTenancyLogic(b.tenancyLogic).
 		SetMetricsRegisterer(b.metricsRegisterer).
+		SetQuotaStore(b.quotaStore).
 		SetSecretStore(b.secretStore).
 		SetFilterDesc((*publicv1.ComputeInstance)(nil).ProtoReflect().Descriptor()).
 		Build()

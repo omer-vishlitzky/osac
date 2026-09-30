@@ -1,0 +1,138 @@
+//
+// Copyright (c) 2026 Red Hat, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific
+// language governing permissions and limitations under the License.
+//
+
+syntax = "proto3";
+
+package osac.public.v1;
+
+import "buf/validate/validate.proto";
+import "google/api/annotations.proto";
+import "osac/public/v1/quota_types.proto";
+
+message QuotasGetUsageRequest {
+  // Tenant whose current usage should be returned.
+  string tenant = 1 [(buf.validate.field).string.min_len = 1];
+}
+
+message QuotasGetUsageResponse {
+  // Tenant whose usage was queried.
+  string tenant = 1;
+
+  // Usage and limit for each configured dimension/class and each dimension currently in use.
+  repeated QuotaUsageEntry entries = 2;
+}
+
+message QuotasSetWarningThresholdRequest {
+  // Tenant whose warning preference is being changed.
+  string tenant = 1 [(buf.validate.field).string.min_len = 1];
+
+  // Quota dimension.
+  string dimension = 2 [(buf.validate.field).string.min_len = 1];
+
+  // Absolute remaining headroom at which the tenant wants a warning. Omit to clear the preference.
+  optional int64 warning_threshold = 3 [(buf.validate.field).int64.gte = 0];
+}
+
+message QuotasSetWarningThresholdResponse {
+  // Updated usage view for the affected dimension.
+  QuotaUsageEntry entry = 1;
+}
+
+message QuotaIncreaseRequestsListRequest {
+  // Tenant whose requests should be listed.
+  string tenant = 1 [(buf.validate.field).string.min_len = 1];
+
+  // Maximum number of requests to return. If omitted, the service uses its default page size.
+  optional int32 limit = 2 [(buf.validate.field).int32 = {gt: 0, lte: 1000}];
+
+  // Number of requests to skip.
+  optional int32 offset = 3 [(buf.validate.field).int32.gte = 0];
+}
+
+message QuotaIncreaseRequestsListResponse {
+  // Number of requests returned.
+  int32 size = 1;
+
+  // Total number of requests for the tenant.
+  int32 total = 2;
+
+  // Tenant's quota increase requests, newest first.
+  repeated QuotaIncreaseRequest items = 3;
+}
+
+message QuotaIncreaseRequestsCreateRequest {
+  // Request object. The service assigns its ID and creation metadata.
+  QuotaIncreaseRequest object = 1;
+}
+
+message QuotaIncreaseRequestsCreateResponse {
+  // Created request.
+  QuotaIncreaseRequest object = 1;
+}
+
+message QuotaIncreaseRequestsGetRequest {
+  // Tenant that owns the request.
+  string tenant = 1 [(buf.validate.field).string.min_len = 1];
+
+  // Request ID.
+  string id = 2 [(buf.validate.field).string.min_len = 1];
+}
+
+message QuotaIncreaseRequestsGetResponse {
+  // Requested quota increase.
+  QuotaIncreaseRequest object = 1;
+}
+
+service Quotas {
+  // Returns current tenant usage and limits. The caller must be able to see the tenant.
+  rpc GetUsage(QuotasGetUsageRequest) returns (QuotasGetUsageResponse) {
+    option (google.api.http) = {
+      get: "/api/public/v1/tenants/{tenant}/quota/usage"
+    };
+  }
+
+  // Sets or clears a tenant's absolute-headroom warning threshold.
+  rpc SetWarningThreshold(QuotasSetWarningThresholdRequest) returns (QuotasSetWarningThresholdResponse) {
+    option (google.api.http) = {
+      patch: "/api/public/v1/tenants/{tenant}/quota/warning-thresholds/{dimension}"
+      body: "*"
+    };
+  }
+}
+
+service QuotaIncreaseRequests {
+  // Creates a request for a higher tenant limit.
+  rpc Create(QuotaIncreaseRequestsCreateRequest) returns (QuotaIncreaseRequestsCreateResponse) {
+    option (google.api.http) = {
+      post: "/api/public/v1/quota-increase-requests"
+      body: "object"
+      response_body: "object"
+    };
+  }
+
+  // Retrieves one quota increase request.
+  rpc Get(QuotaIncreaseRequestsGetRequest) returns (QuotaIncreaseRequestsGetResponse) {
+    option (google.api.http) = {
+      get: "/api/public/v1/tenants/{tenant}/quota/increase-requests/{id}"
+      response_body: "object"
+    };
+  }
+
+  // Lists quota increase requests for one tenant.
+  rpc List(QuotaIncreaseRequestsListRequest) returns (QuotaIncreaseRequestsListResponse) {
+    option (google.api.http) = {
+      get: "/api/public/v1/tenants/{tenant}/quota/increase-requests"
+    };
+  }
+}

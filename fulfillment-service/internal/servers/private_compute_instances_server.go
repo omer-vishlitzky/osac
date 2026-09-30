@@ -34,6 +34,7 @@ import (
 	"github.com/osac-project/osac/fulfillment-service/internal/computeinstancespec"
 	"github.com/osac-project/osac/fulfillment-service/internal/database"
 	"github.com/osac-project/osac/fulfillment-service/internal/database/dao"
+	"github.com/osac-project/osac/fulfillment-service/internal/quota"
 	"github.com/osac-project/osac/fulfillment-service/internal/utils"
 	"github.com/osac-project/osac/fulfillment-service/internal/vault"
 	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
@@ -44,6 +45,7 @@ type PrivateComputeInstancesServerBuilder struct {
 	attributionLogic  auth.AttributionLogic
 	tenancyLogic      auth.TenancyLogic
 	metricsRegisterer prometheus.Registerer
+	quotaStore        *quota.Store
 	filterDesc        protoreflect.MessageDescriptor
 	secretStore       vault.SecretStore
 }
@@ -94,6 +96,11 @@ func (b *PrivateComputeInstancesServerBuilder) SetTenancyLogic(value auth.Tenanc
 // access objects. This is optional. If not set, no metrics will be recorded.
 func (b *PrivateComputeInstancesServerBuilder) SetMetricsRegisterer(value prometheus.Registerer) *PrivateComputeInstancesServerBuilder {
 	b.metricsRegisterer = value
+	return b
+}
+
+func (b *PrivateComputeInstancesServerBuilder) SetQuotaStore(value *quota.Store) *PrivateComputeInstancesServerBuilder {
+	b.quotaStore = value
 	return b
 }
 
@@ -223,6 +230,10 @@ func (b *PrivateComputeInstancesServerBuilder) Build() (result *PrivateComputeIn
 		SetAttributionLogic(b.attributionLogic).
 		SetTenancyLogic(b.tenancyLogic).
 		SetMetricsRegisterer(b.metricsRegisterer).
+		SetQuotaAdmission(NewQuotaAdmission(b.logger, b.quotaStore, "compute_instances",
+			func(ctx context.Context, current, candidate *privatev1.ComputeInstance) ([]quota.Charge, error) {
+				return planComputeInstanceQuotaCharges(ctx, current, candidate, instanceTypesDao)
+			})).
 		SetFilterDesc(b.filterDesc).
 		Build()
 	if err != nil {

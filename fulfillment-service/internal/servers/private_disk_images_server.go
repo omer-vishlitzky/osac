@@ -27,6 +27,7 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
+	"github.com/osac-project/osac/fulfillment-service/internal/quota"
 	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
@@ -35,6 +36,7 @@ type PrivateDiskImagesServerBuilder struct {
 	attributionLogic  auth.AttributionLogic
 	tenancyLogic      auth.TenancyLogic
 	metricsRegisterer prometheus.Registerer
+	quotaStore        *quota.Store
 	filterDesc        protoreflect.MessageDescriptor
 }
 
@@ -71,6 +73,11 @@ func (b *PrivateDiskImagesServerBuilder) SetMetricsRegisterer(value prometheus.R
 	return b
 }
 
+func (b *PrivateDiskImagesServerBuilder) SetQuotaStore(value *quota.Store) *PrivateDiskImagesServerBuilder {
+	b.quotaStore = value
+	return b
+}
+
 // SetFilterDesc sets the protobuf message descriptor used to validate and translate CEL filter
 // expressions. This is optional. When unset, the descriptor of this server's own private message type is used.
 func (b *PrivateDiskImagesServerBuilder) SetFilterDesc(value protoreflect.MessageDescriptor) *PrivateDiskImagesServerBuilder {
@@ -94,6 +101,7 @@ func (b *PrivateDiskImagesServerBuilder) Build() (result *PrivateDiskImagesServe
 		SetAttributionLogic(b.attributionLogic).
 		SetTenancyLogic(b.tenancyLogic).
 		SetMetricsRegisterer(b.metricsRegisterer).
+		SetQuotaAdmission(NewQuotaAdmission(b.logger, b.quotaStore, "disk_images", planDiskImageQuotaCharges)).
 		SetFilterDesc(b.filterDesc).
 		AddAllowedTenants(auth.SharedTenant).
 		Build()

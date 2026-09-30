@@ -23,6 +23,7 @@ import (
 	grpcstatus "google.golang.org/grpc/status"
 
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
+	"github.com/osac-project/osac/fulfillment-service/internal/quota"
 	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
@@ -32,6 +33,7 @@ type ExternalIPsServerBuilder struct {
 	attributionLogic  auth.AttributionLogic
 	tenancyLogic      auth.TenancyLogic
 	metricsRegisterer prometheus.Registerer
+	quotaStore        *quota.Store
 }
 
 var _ publicv1.ExternalIPsServer = (*ExternalIPsServer)(nil)
@@ -69,6 +71,11 @@ func (b *ExternalIPsServerBuilder) SetMetricsRegisterer(value prometheus.Registe
 	return b
 }
 
+func (b *ExternalIPsServerBuilder) SetQuotaStore(value *quota.Store) *ExternalIPsServerBuilder {
+	b.quotaStore = value
+	return b
+}
+
 func (b *ExternalIPsServerBuilder) Build() (result *ExternalIPsServer, err error) {
 	if b.logger == nil {
 		err = errors.New("logger is mandatory")
@@ -103,6 +110,7 @@ func (b *ExternalIPsServerBuilder) Build() (result *ExternalIPsServer, err error
 		SetAttributionLogic(b.attributionLogic).
 		SetTenancyLogic(b.tenancyLogic).
 		SetMetricsRegisterer(b.metricsRegisterer).
+		SetQuotaStore(b.quotaStore).
 		SetFilterDesc((*publicv1.ExternalIP)(nil).ProtoReflect().Descriptor()).
 		Build()
 	if err != nil {

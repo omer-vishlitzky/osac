@@ -26,6 +26,7 @@ import (
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
 
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
+	"github.com/osac-project/osac/fulfillment-service/internal/quota"
 	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
@@ -51,6 +52,7 @@ type PrivateVolumesServerBuilder struct {
 	attributionLogic  auth.AttributionLogic
 	tenancyLogic      auth.TenancyLogic
 	metricsRegisterer prometheus.Registerer
+	quotaStore        *quota.Store
 	tierResolver      TierResolverFunc
 	filterDesc        protoreflect.MessageDescriptor
 }
@@ -89,6 +91,11 @@ func (b *PrivateVolumesServerBuilder) SetMetricsRegisterer(value prometheus.Regi
 	return b
 }
 
+func (b *PrivateVolumesServerBuilder) SetQuotaStore(value *quota.Store) *PrivateVolumesServerBuilder {
+	b.quotaStore = value
+	return b
+}
+
 func (b *PrivateVolumesServerBuilder) SetTierResolver(value TierResolverFunc) *PrivateVolumesServerBuilder {
 	b.tierResolver = value
 	return b
@@ -121,6 +128,7 @@ func (b *PrivateVolumesServerBuilder) Build() (result *PrivateVolumesServer, err
 		SetAttributionLogic(b.attributionLogic).
 		SetTenancyLogic(b.tenancyLogic).
 		SetMetricsRegisterer(b.metricsRegisterer).
+		SetQuotaAdmission(NewQuotaAdmission(b.logger, b.quotaStore, "volumes", planVolumeQuotaCharges)).
 		SetFilterDesc(b.filterDesc).
 		Build()
 	if err != nil {

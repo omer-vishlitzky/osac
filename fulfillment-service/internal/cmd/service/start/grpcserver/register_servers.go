@@ -24,6 +24,7 @@ import (
 
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
 	"github.com/osac-project/osac/fulfillment-service/internal/database/dao"
+	"github.com/osac-project/osac/fulfillment-service/internal/quota"
 	"github.com/osac-project/osac/fulfillment-service/internal/servers"
 	"github.com/osac-project/osac/fulfillment-service/internal/services"
 	"github.com/osac-project/osac/fulfillment-service/internal/vault"
@@ -42,6 +43,7 @@ type ResourceServerDeps struct {
 	HubScheme               *runtime.Scheme
 	SecretStore             vault.SecretStore
 	TierResolver            servers.TierResolverFunc
+	QuotaStore              *quota.Store
 
 	// PrivateUsersServer is already constructed by the caller — the JIT provisioning interceptor needs it
 	// before the gRPC server's interceptor chain is built, which happens before RegisterResourceServers is
@@ -65,6 +67,10 @@ type ResourceServers struct {
 // same code path.
 func RegisterResourceServers(ctx context.Context, registrar grpc.ServiceRegistrar, //nolint:gocyclo
 	deps ResourceServerDeps) (*ResourceServers, error) {
+	if deps.QuotaStore == nil {
+		return nil, fmt.Errorf("quota store is mandatory")
+	}
+
 	// CaaS: public cluster templates and catalog items
 	if deps.Services.CaaS {
 		deps.Logger.InfoContext(ctx, "Creating cluster templates server")
@@ -177,6 +183,7 @@ func RegisterResourceServers(ctx context.Context, registrar grpc.ServiceRegistra
 			SetAttributionLogic(deps.PublicAttributionLogic).
 			SetTenancyLogic(deps.TenancyLogic).
 			SetMetricsRegisterer(deps.MetricsRegisterer).
+			SetQuotaStore(deps.QuotaStore).
 			Build()
 		if err != nil {
 			return nil, fmt.Errorf("failed to create clusters server: %w", err)
@@ -189,6 +196,7 @@ func RegisterResourceServers(ctx context.Context, registrar grpc.ServiceRegistra
 			SetAttributionLogic(deps.PrivateAttributionLogic).
 			SetTenancyLogic(deps.TenancyLogic).
 			SetMetricsRegisterer(deps.MetricsRegisterer).
+			SetQuotaStore(deps.QuotaStore).
 			Build()
 		if err != nil {
 			return nil, fmt.Errorf("failed to create private clusters server: %w", err)
@@ -257,6 +265,7 @@ func RegisterResourceServers(ctx context.Context, registrar grpc.ServiceRegistra
 			SetAttributionLogic(deps.PublicAttributionLogic).
 			SetTenancyLogic(deps.TenancyLogic).
 			SetMetricsRegisterer(deps.MetricsRegisterer).
+			SetQuotaStore(deps.QuotaStore).
 			SetSecretStore(deps.SecretStore).
 			Build()
 		if err != nil {
@@ -270,6 +279,7 @@ func RegisterResourceServers(ctx context.Context, registrar grpc.ServiceRegistra
 			SetAttributionLogic(deps.PrivateAttributionLogic).
 			SetTenancyLogic(deps.TenancyLogic).
 			SetMetricsRegisterer(deps.MetricsRegisterer).
+			SetQuotaStore(deps.QuotaStore).
 			SetSecretStore(deps.SecretStore).
 			Build()
 		if err != nil {
@@ -286,6 +296,7 @@ func RegisterResourceServers(ctx context.Context, registrar grpc.ServiceRegistra
 			SetAttributionLogic(deps.PublicAttributionLogic).
 			SetTenancyLogic(deps.TenancyLogic).
 			SetMetricsRegisterer(deps.MetricsRegisterer).
+			SetQuotaStore(deps.QuotaStore).
 			Build()
 		if err != nil {
 			return nil, fmt.Errorf("failed to create disk images server: %w", err)
@@ -298,6 +309,7 @@ func RegisterResourceServers(ctx context.Context, registrar grpc.ServiceRegistra
 			SetAttributionLogic(deps.PrivateAttributionLogic).
 			SetTenancyLogic(deps.TenancyLogic).
 			SetMetricsRegisterer(deps.MetricsRegisterer).
+			SetQuotaStore(deps.QuotaStore).
 			Build()
 		if err != nil {
 			return nil, fmt.Errorf("failed to create private disk images server: %w", err)
@@ -336,6 +348,7 @@ func RegisterResourceServers(ctx context.Context, registrar grpc.ServiceRegistra
 			SetAttributionLogic(deps.PublicAttributionLogic).
 			SetTenancyLogic(deps.TenancyLogic).
 			SetMetricsRegisterer(deps.MetricsRegisterer).
+			SetQuotaStore(deps.QuotaStore).
 			SetSecretStore(deps.SecretStore).
 			Build()
 		if err != nil {
@@ -373,6 +386,7 @@ func RegisterResourceServers(ctx context.Context, registrar grpc.ServiceRegistra
 			SetAttributionLogic(deps.PrivateAttributionLogic).
 			SetTenancyLogic(deps.TenancyLogic).
 			SetMetricsRegisterer(deps.MetricsRegisterer).
+			SetQuotaStore(deps.QuotaStore).
 			SetSecretStore(deps.SecretStore).
 			Build()
 		if err != nil {
@@ -428,6 +442,7 @@ func RegisterResourceServers(ctx context.Context, registrar grpc.ServiceRegistra
 		SetAttributionLogic(deps.PublicAttributionLogic).
 		SetTenancyLogic(deps.TenancyLogic).
 		SetMetricsRegisterer(deps.MetricsRegisterer).
+		SetQuotaStore(deps.QuotaStore).
 		Build()
 	if err != nil {
 		return nil, fmt.Errorf("failed to create virtual networks server: %w", err)
@@ -441,6 +456,7 @@ func RegisterResourceServers(ctx context.Context, registrar grpc.ServiceRegistra
 		SetAttributionLogic(deps.PrivateAttributionLogic).
 		SetTenancyLogic(deps.TenancyLogic).
 		SetMetricsRegisterer(deps.MetricsRegisterer).
+		SetQuotaStore(deps.QuotaStore).
 		Build()
 	if err != nil {
 		return nil, fmt.Errorf("failed to create private virtual networks server: %w", err)
@@ -809,6 +825,7 @@ func RegisterResourceServers(ctx context.Context, registrar grpc.ServiceRegistra
 		SetAttributionLogic(deps.PublicAttributionLogic).
 		SetTenancyLogic(deps.TenancyLogic).
 		SetMetricsRegisterer(deps.MetricsRegisterer).
+		SetQuotaStore(deps.QuotaStore).
 		Build()
 	if err != nil {
 		return nil, fmt.Errorf("failed to create external IPs server: %w", err)
@@ -822,6 +839,7 @@ func RegisterResourceServers(ctx context.Context, registrar grpc.ServiceRegistra
 		SetAttributionLogic(deps.PrivateAttributionLogic).
 		SetTenancyLogic(deps.TenancyLogic).
 		SetMetricsRegisterer(deps.MetricsRegisterer).
+		SetQuotaStore(deps.QuotaStore).
 		Build()
 	if err != nil {
 		return nil, fmt.Errorf("failed to create private external IPs server: %w", err)
@@ -861,6 +879,7 @@ func RegisterResourceServers(ctx context.Context, registrar grpc.ServiceRegistra
 		SetAttributionLogic(deps.PublicAttributionLogic).
 		SetTenancyLogic(deps.TenancyLogic).
 		SetMetricsRegisterer(deps.MetricsRegisterer).
+		SetQuotaStore(deps.QuotaStore).
 		Build()
 	if err != nil {
 		return nil, fmt.Errorf("failed to create NAT gateways server: %w", err)
@@ -874,6 +893,7 @@ func RegisterResourceServers(ctx context.Context, registrar grpc.ServiceRegistra
 		SetAttributionLogic(deps.PrivateAttributionLogic).
 		SetTenancyLogic(deps.TenancyLogic).
 		SetMetricsRegisterer(deps.MetricsRegisterer).
+		SetQuotaStore(deps.QuotaStore).
 		Build()
 	if err != nil {
 		return nil, fmt.Errorf("failed to create private NAT gateways server: %w", err)
@@ -965,6 +985,7 @@ func RegisterResourceServers(ctx context.Context, registrar grpc.ServiceRegistra
 		SetAttributionLogic(deps.PublicAttributionLogic).
 		SetTenancyLogic(deps.TenancyLogic).
 		SetMetricsRegisterer(deps.MetricsRegisterer).
+		SetQuotaStore(deps.QuotaStore).
 		SetTierResolver(deps.TierResolver).
 		Build()
 	if err != nil {
@@ -979,6 +1000,7 @@ func RegisterResourceServers(ctx context.Context, registrar grpc.ServiceRegistra
 		SetAttributionLogic(deps.PrivateAttributionLogic).
 		SetTenancyLogic(deps.TenancyLogic).
 		SetMetricsRegisterer(deps.MetricsRegisterer).
+		SetQuotaStore(deps.QuotaStore).
 		SetTierResolver(deps.TierResolver).
 		Build()
 	if err != nil {
@@ -1001,6 +1023,28 @@ func RegisterResourceServers(ctx context.Context, registrar grpc.ServiceRegistra
 
 	// Register the private users server. It's already constructed — see the PrivateUsersServer doc comment.
 	privatev1.RegisterUsersServer(registrar, deps.PrivateUsersServer)
+
+	// Create the public quota usage and increase-request APIs.
+	deps.Logger.InfoContext(ctx, "Creating quota servers")
+	quotasServer, err := servers.NewQuotasServer().
+		SetLogger(deps.Logger).
+		SetAttributionLogic(deps.PublicAttributionLogic).
+		SetTenancyLogic(deps.TenancyLogic).
+		SetQuotaStore(deps.QuotaStore).Build()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create quota server: %w", err)
+	}
+	publicv1.RegisterQuotasServer(registrar, quotasServer)
+	publicv1.RegisterQuotaIncreaseRequestsServer(registrar, quotasServer)
+
+	quotaAdministrationServer, err := servers.NewQuotaAdministrationServer().
+		SetLogger(deps.Logger).
+		SetAttributionLogic(deps.PrivateAttributionLogic).
+		SetQuotaStore(deps.QuotaStore).Build()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create quota administration server: %w", err)
+	}
+	privatev1.RegisterQuotaAdministrationServer(registrar, quotaAdministrationServer)
 
 	return &ResourceServers{
 		PrivateHubsServer:             privateHubsServer,

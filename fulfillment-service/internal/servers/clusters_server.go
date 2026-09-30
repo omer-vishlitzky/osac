@@ -24,6 +24,7 @@ import (
 	grpcstatus "google.golang.org/grpc/status"
 
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
+	"github.com/osac-project/osac/fulfillment-service/internal/quota"
 	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
@@ -33,6 +34,7 @@ type ClustersServerBuilder struct {
 	attributionLogic  auth.AttributionLogic
 	tenancyLogic      auth.TenancyLogic
 	metricsRegisterer prometheus.Registerer
+	quotaStore        *quota.Store
 }
 
 var _ publicv1.ClustersServer = (*ClustersServer)(nil)
@@ -72,6 +74,11 @@ func (b *ClustersServerBuilder) SetTenancyLogic(value auth.TenancyLogic) *Cluste
 // access objects. This is optional. If not set, no metrics will be recorded.
 func (b *ClustersServerBuilder) SetMetricsRegisterer(value prometheus.Registerer) *ClustersServerBuilder {
 	b.metricsRegisterer = value
+	return b
+}
+
+func (b *ClustersServerBuilder) SetQuotaStore(value *quota.Store) *ClustersServerBuilder {
+	b.quotaStore = value
 	return b
 }
 
@@ -120,6 +127,7 @@ func (b *ClustersServerBuilder) Build() (result *ClustersServer, err error) {
 		SetAttributionLogic(b.attributionLogic).
 		SetTenancyLogic(b.tenancyLogic).
 		SetMetricsRegisterer(b.metricsRegisterer).
+		SetQuotaStore(b.quotaStore).
 		SetAddOnOperatorResolverFactory(newPublishedScopedAddOnOperatorResourceResolver).
 		SetFilterDesc(objectDesc).
 		Build()

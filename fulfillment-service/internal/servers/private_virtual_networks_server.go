@@ -26,6 +26,7 @@ import (
 
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
 	"github.com/osac-project/osac/fulfillment-service/internal/database/dao"
+	"github.com/osac-project/osac/fulfillment-service/internal/quota"
 	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
@@ -34,6 +35,7 @@ type PrivateVirtualNetworksServerBuilder struct {
 	attributionLogic  auth.AttributionLogic
 	tenancyLogic      auth.TenancyLogic
 	metricsRegisterer prometheus.Registerer
+	quotaStore        *quota.Store
 	filterDesc        protoreflect.MessageDescriptor
 }
 
@@ -73,6 +75,11 @@ func (b *PrivateVirtualNetworksServerBuilder) SetMetricsRegisterer(value prometh
 	return b
 }
 
+func (b *PrivateVirtualNetworksServerBuilder) SetQuotaStore(value *quota.Store) *PrivateVirtualNetworksServerBuilder {
+	b.quotaStore = value
+	return b
+}
+
 // SetFilterDesc sets the protobuf message descriptor used to validate and translate CEL filter
 // expressions. This is optional. When unset, the descriptor of this server's own private message type is used.
 func (b *PrivateVirtualNetworksServerBuilder) SetFilterDesc(value protoreflect.MessageDescriptor) *PrivateVirtualNetworksServerBuilder {
@@ -108,6 +115,7 @@ func (b *PrivateVirtualNetworksServerBuilder) Build() (result *PrivateVirtualNet
 		SetAttributionLogic(b.attributionLogic).
 		SetTenancyLogic(b.tenancyLogic).
 		SetMetricsRegisterer(b.metricsRegisterer).
+		SetQuotaAdmission(NewQuotaAdmission(b.logger, b.quotaStore, "virtual_networks", planVirtualNetworkQuotaCharges)).
 		SetFilterDesc(b.filterDesc).
 		Build()
 	if err != nil {

@@ -36,6 +36,7 @@ import (
 	"github.com/osac-project/osac/fulfillment-service/internal/collections"
 	"github.com/osac-project/osac/fulfillment-service/internal/database/dao"
 	"github.com/osac-project/osac/fulfillment-service/internal/masks"
+	"github.com/osac-project/osac/fulfillment-service/internal/uuid"
 	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
@@ -44,6 +45,10 @@ import (
 // changes, and candidate is a separate copy containing those changes. Returning an error rejects
 // the operation without changing the request or stored object.
 type PrepareCandidateFunc[O dao.Object] func(ctx context.Context, current, candidate O) error
+
+// QuotaAdmissionFunc checks the fully prepared candidate before it is persisted.
+// Implementations may replace the candidate's claims in the current transaction.
+type QuotaAdmissionFunc[O dao.Object] func(ctx context.Context, current, candidate O, dryRun bool) error
 
 // GenericServerBuilder contains the data and logic needed to create new generic servers.
 type GenericServerBuilder[O dao.Object] struct {
@@ -56,6 +61,7 @@ type GenericServerBuilder[O dao.Object] struct {
 	allowedTenants    collections.Set[string]
 	metricsRegisterer prometheus.Registerer
 	filterDesc        protoreflect.MessageDescriptor
+	quotaAdmission    QuotaAdmissionFunc[O]
 }
 
 // GenericServer is a gRPC server that knows how to implement the List, Get, Create, Update and Delete operators for
@@ -85,6 +91,7 @@ type GenericServer[O dao.Object] struct {
 	pathCache        map[string]*masks.Path[O]
 	pathCacheLock    *sync.Mutex
 	validator        protovalidate.Validator
+	quotaAdmission   QuotaAdmissionFunc[O]
 }
 
 type objectIface interface {
@@ -195,6 +202,13 @@ func (b *GenericServerBuilder[O]) SetFilterDesc(value protoreflect.MessageDescri
 	return b
 }
 
+// SetQuotaAdmission sets the optional admission check run after candidate preparation and
+// validation, but before the DAO writes the resource.
+func (b *GenericServerBuilder[O]) SetQuotaAdmission(value QuotaAdmissionFunc[O]) *GenericServerBuilder[O] {
+	b.quotaAdmission = value
+	return b
+}
+
 // Build uses the configuration stored in the builder to create and configure a new generic server.
 func (b *GenericServerBuilder[O]) Build() (result *GenericServer[O], err error) {
 	// Check parameters:
@@ -242,6 +256,7 @@ func (b *GenericServerBuilder[O]) Build() (result *GenericServer[O], err error) 
 		pathCache:        map[string]*masks.Path[O]{},
 		pathCacheLock:    &sync.Mutex{},
 		validator:        validator,
+		quotaAdmission:   b.quotaAdmission,
 	}
 
 	// Create the DAO:
@@ -500,6 +515,14 @@ func (s *GenericServer[O]) CreateWithCandidatePreparation(
 			return err
 		}
 		if err = s.validatePreparedCandidate(ctx, requestObject, preparedID, preparedMetadata); err != nil {
+			return err
+		}
+	}
+	if s.quotaAdmission != nil && !isDryRun(ctx) && requestObject.GetId() == "" {
+		requestObject.SetId(uuid.New())
+	}
+	if s.quotaAdmission != nil {
+		if err = s.quotaAdmission(ctx, nilObject, requestObject, isDryRun(ctx)); err != nil {
 			return err
 		}
 	}
@@ -844,6 +867,9 @@ func (s *GenericServer[O]) updateWithCandidatePreparation(
 	// Save the object only if there is any actual difference:
 	var responseObject O
 	if !s.equivalentObjects(tmpObject, currentObject) {
+		if err = s.admitUpdatedCandidate(ctx, currentObject, tmpObject); err != nil {
+			return err
+		}
 		updateResponse, err := s.dao.Update().
 			SetObject(tmpObject).
 			Do(ctx)
@@ -864,6 +890,13 @@ func (s *GenericServer[O]) updateWithCandidatePreparation(
 	s.setPointer(response, responseMsg)
 
 	return nil
+}
+
+func (s *GenericServer[O]) admitUpdatedCandidate(ctx context.Context, current, candidate O) error {
+	if s.quotaAdmission == nil {
+		return nil
+	}
+	return s.quotaAdmission(ctx, current, candidate, false)
 }
 
 // UpdateWithValidation adapts the networking resource validators to the generic

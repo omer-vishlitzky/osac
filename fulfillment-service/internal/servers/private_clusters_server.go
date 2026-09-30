@@ -34,6 +34,7 @@ import (
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
 	"github.com/osac-project/osac/fulfillment-service/internal/database"
 	"github.com/osac-project/osac/fulfillment-service/internal/database/dao"
+	"github.com/osac-project/osac/fulfillment-service/internal/quota"
 	"github.com/osac-project/osac/fulfillment-service/internal/utils"
 	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
@@ -43,6 +44,7 @@ type PrivateClustersServerBuilder struct {
 	attributionLogic             auth.AttributionLogic
 	tenancyLogic                 auth.TenancyLogic
 	metricsRegisterer            prometheus.Registerer
+	quotaStore                   *quota.Store
 	filterDesc                   protoreflect.MessageDescriptor
 	addOnOperatorResolverFactory addOnOperatorResolverFactory
 }
@@ -92,6 +94,11 @@ func (b *PrivateClustersServerBuilder) SetTenancyLogic(value auth.TenancyLogic) 
 // access objects. This is optional. If not set, no metrics will be recorded.
 func (b *PrivateClustersServerBuilder) SetMetricsRegisterer(value prometheus.Registerer) *PrivateClustersServerBuilder {
 	b.metricsRegisterer = value
+	return b
+}
+
+func (b *PrivateClustersServerBuilder) SetQuotaStore(value *quota.Store) *PrivateClustersServerBuilder {
+	b.quotaStore = value
 	return b
 }
 
@@ -254,6 +261,7 @@ func (b *PrivateClustersServerBuilder) Build() (result *PrivateClustersServer, e
 		SetAttributionLogic(b.attributionLogic).
 		SetTenancyLogic(b.tenancyLogic).
 		SetMetricsRegisterer(b.metricsRegisterer).
+		SetQuotaAdmission(NewQuotaAdmission(b.logger, b.quotaStore, "clusters", planClusterQuotaCharges)).
 		SetFilterDesc(b.filterDesc).
 		AddAllowedTenants(auth.SharedTenant).
 		Build()

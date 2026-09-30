@@ -1,0 +1,184 @@
+//
+// Copyright (c) 2026 Red Hat, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific
+// language governing permissions and limitations under the License.
+//
+
+syntax = "proto3";
+
+package osac.private.v1;
+
+import "buf/validate/validate.proto";
+import "cleanapi/cleanapi.proto";
+import "google/api/annotations.proto";
+import "google/protobuf/timestamp.proto";
+import "osac/private/v1/quota_types.proto";
+
+option (cleanapi.file).private = true;
+
+message SetDefaultLimitRequest {
+  // Quota dimension to configure.
+  string dimension = 1 [(buf.validate.field).string.min_len = 1];
+
+  // Resource class for classed dimensions. Empty for dimensions without classes.
+  string class_key = 2;
+
+  // Default total limit assigned to newly created tenants.
+  int64 limit = 3 [(buf.validate.field).int64.gte = 0];
+}
+
+message SetTenantLimitRequest {
+  // Tenant to configure.
+  string tenant = 1 [(buf.validate.field).string.min_len = 1];
+
+  // Quota dimension to configure.
+  string dimension = 2 [(buf.validate.field).string.min_len = 1];
+
+  // Resource class for classed dimensions. Empty for dimensions without classes.
+  string class_key = 3;
+
+  // Total tenant limit.
+  int64 limit = 4 [(buf.validate.field).int64.gte = 0];
+}
+
+message SetDefaultLimitResponse {
+  // Effective tenant limit after the update.
+  int64 limit = 1;
+}
+
+message SetTenantLimitResponse {
+  // Effective tenant limit after the update.
+  int64 limit = 1;
+}
+
+message ListDefaultLimitsRequest {}
+
+message QuotaLimitEntry {
+  // Quota dimension.
+  string dimension = 1;
+
+  // Resource class for classed dimensions. Empty for dimensions without classes.
+  string class_key = 2;
+
+  // Default limit in the dimension's unit.
+  int64 limit = 3;
+}
+
+message ListDefaultLimitsResponse {
+  // Configured defaults ordered by dimension and class.
+  repeated QuotaLimitEntry items = 1;
+}
+
+enum QuotaIncreaseDecision {
+  QUOTA_INCREASE_DECISION_UNSPECIFIED = 0;
+  QUOTA_INCREASE_DECISION_APPROVE = 1;
+  QUOTA_INCREASE_DECISION_DENY = 2;
+}
+
+message ReviewIncreaseRequestRequest {
+  // Request ID.
+  string id = 1 [(buf.validate.field).string.min_len = 1];
+
+  // Provider admin's decision.
+  QuotaIncreaseDecision decision = 2 [(buf.validate.field).enum = {defined_only: true, not_in: [0]}];
+
+  // Optional explanation returned to the tenant.
+  string message = 3;
+}
+
+message ReviewIncreaseRequestResponse {
+  // Request after review.
+  QuotaIncreaseRequest object = 1;
+}
+
+message ListAuditRecordsRequest {
+  // Optional tenant filter. Omit to list changes for all tenants.
+  string tenant = 1;
+
+  // Maximum number of records to return. If omitted, the service uses its default page size.
+  optional int32 limit = 2 [(buf.validate.field).int32 = {gt: 0, lte: 1000}];
+
+  // Number of records to skip.
+  optional int32 offset = 3 [(buf.validate.field).int32.gte = 0];
+}
+
+message QuotaAuditRecord {
+  // Tenant affected. Empty for a provider default change.
+  string tenant = 1;
+
+  // Quota dimension changed.
+  string dimension = 2;
+
+  // Resource class for classed dimensions.
+  string class_key = 3;
+
+  // Previous limit, omitted when the limit did not exist.
+  optional int64 previous_limit = 4;
+
+  // New limit.
+  int64 new_limit = 5;
+
+  // Actor that changed the limit.
+  string actor = 6;
+
+  // Time of the change.
+  google.protobuf.Timestamp changed_at = 7;
+}
+
+message ListAuditRecordsResponse {
+  // Number of records returned.
+  int32 size = 1;
+
+  // Total number of matching records.
+  int32 total = 2;
+
+  // Audit records ordered newest first.
+  repeated QuotaAuditRecord items = 3;
+}
+
+service QuotaAdministration {
+  // Lists provider defaults used for newly created tenants.
+  rpc ListDefaultLimits(ListDefaultLimitsRequest) returns (ListDefaultLimitsResponse) {
+    option (google.api.http) = {get: "/api/private/v1/quota-default-limits"};
+  }
+
+  // Sets the default limit for new tenants.
+  rpc SetDefaultLimit(SetDefaultLimitRequest) returns (SetDefaultLimitResponse) {
+    option (google.api.http) = {
+      put: "/api/private/v1/quota-default-limits/{dimension}"
+      body: "*"
+    };
+  }
+
+  // Sets a tenant-specific limit. A limit below current usage is allowed and does not terminate resources.
+  rpc SetTenantLimit(SetTenantLimitRequest) returns (SetTenantLimitResponse) {
+    option (google.api.http) = {
+      put: "/api/private/v1/tenants/{tenant}/quota-limits/{dimension}"
+      body: "*"
+    };
+  }
+
+  // Approves or denies a tenant's quota increase request.
+  rpc ReviewIncreaseRequest(ReviewIncreaseRequestRequest) returns (ReviewIncreaseRequestResponse) {
+    option (google.api.http) = {
+      post: "/api/private/v1/quota-increase-requests/{id}:review"
+      body: "*"
+      response_body: "object"
+    };
+  }
+
+  // Lists quota limit changes for audit.
+  rpc ListAuditRecords(ListAuditRecordsRequest) returns (ListAuditRecordsResponse) {
+    option (google.api.http) = {
+      get: "/api/private/v1/quota-audit-records"
+    };
+  }
+}

@@ -33,6 +33,7 @@ import (
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
 	"github.com/osac-project/osac/fulfillment-service/internal/database"
 	"github.com/osac-project/osac/fulfillment-service/internal/database/dao"
+	"github.com/osac-project/osac/fulfillment-service/internal/quota"
 	"github.com/osac-project/osac/fulfillment-service/internal/utils"
 	"github.com/osac-project/osac/fulfillment-service/internal/vault"
 	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
@@ -52,6 +53,7 @@ type PrivateBareMetalInstancesServerBuilder struct {
 	attributionLogic  auth.AttributionLogic
 	tenancyLogic      auth.TenancyLogic
 	metricsRegisterer prometheus.Registerer
+	quotaStore        *quota.Store
 	filterDesc        protoreflect.MessageDescriptor
 	secretStore       vault.SecretStore
 }
@@ -101,6 +103,11 @@ func (b *PrivateBareMetalInstancesServerBuilder) SetTenancyLogic(value auth.Tena
 
 func (b *PrivateBareMetalInstancesServerBuilder) SetMetricsRegisterer(value prometheus.Registerer) *PrivateBareMetalInstancesServerBuilder {
 	b.metricsRegisterer = value
+	return b
+}
+
+func (b *PrivateBareMetalInstancesServerBuilder) SetQuotaStore(value *quota.Store) *PrivateBareMetalInstancesServerBuilder {
+	b.quotaStore = value
 	return b
 }
 
@@ -249,6 +256,10 @@ func (b *PrivateBareMetalInstancesServerBuilder) Build() (result *PrivateBareMet
 		SetAttributionLogic(b.attributionLogic).
 		SetTenancyLogic(b.tenancyLogic).
 		SetMetricsRegisterer(b.metricsRegisterer).
+		SetQuotaAdmission(NewQuotaAdmission(b.logger, b.quotaStore, "bare_metal_instances",
+			func(ctx context.Context, current, candidate *privatev1.BareMetalInstance) ([]quota.Charge, error) {
+				return planBareMetalInstanceQuotaCharges(ctx, current, candidate, templatesDao)
+			})).
 		SetFilterDesc(b.filterDesc).
 		Build()
 	if err != nil {

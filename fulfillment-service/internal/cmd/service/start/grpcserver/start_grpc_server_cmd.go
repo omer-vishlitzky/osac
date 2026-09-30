@@ -51,6 +51,7 @@ import (
 	"github.com/osac-project/osac/fulfillment-service/internal/metrics"
 	"github.com/osac-project/osac/fulfillment-service/internal/network"
 	"github.com/osac-project/osac/fulfillment-service/internal/provisioners"
+	"github.com/osac-project/osac/fulfillment-service/internal/quota"
 	"github.com/osac-project/osac/fulfillment-service/internal/recovery"
 	"github.com/osac-project/osac/fulfillment-service/internal/servers"
 	"github.com/osac-project/osac/fulfillment-service/internal/services"
@@ -716,6 +717,7 @@ func (c *runnerContext) run(cmd *cobra.Command, argv []string) error { //nolint:
 		HubScheme:               hubScheme,
 		SecretStore:             secretStore,
 		TierResolver:            tierResolver,
+		QuotaStore:              quota.NewStore(),
 		PrivateUsersServer:      privateUsersServer,
 		Services:                c.args.services,
 	})

@@ -49,12 +49,14 @@ import (
 	hubscheme "github.com/osac-project/osac/fulfillment-service/internal/kubernetes/scheme"
 	"github.com/osac-project/osac/fulfillment-service/internal/logging"
 	"github.com/osac-project/osac/fulfillment-service/internal/packages"
+	"github.com/osac-project/osac/fulfillment-service/internal/quota"
 	"github.com/osac-project/osac/fulfillment-service/internal/recovery"
 	"github.com/osac-project/osac/fulfillment-service/internal/servers"
 	"github.com/osac-project/osac/fulfillment-service/internal/services"
 	itesting "github.com/osac-project/osac/fulfillment-service/internal/testing"
 	"github.com/osac-project/osac/fulfillment-service/internal/vault"
 	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
 
 func TestRegisterServers(t *testing.T) {
@@ -199,6 +201,7 @@ var _ = BeforeSuite(func() {
 		HubScheme:               hubScheme,
 		SecretStore:             vault.NewMockSecretStore(ctrl),
 		TierResolver:            tierResolver,
+		QuotaStore:              quota.NewStore(),
 		PrivateUsersServer:      privateUsersServer,
 		Services:                &services.Flags{CaaS: true, VMaaS: true, BMaaS: true, MaaS: true},
 	})
@@ -211,6 +214,75 @@ var _ = BeforeSuite(func() {
 	)
 	Expect(err).ToNot(HaveOccurred())
 	DeferCleanup(conn.Close)
+})
+
+var _ = Describe("Quota gRPC integration", func() {
+	It("creates a tenant request, approves it, and returns updated usage and audit", func() {
+		tenantName := "quota-grpc-tenant"
+		tenants := privatev1.NewTenantsClient(conn)
+		_, err := tenants.Create(ctx, privatev1.TenantsCreateRequest_builder{
+			Object: privatev1.Tenant_builder{
+				Metadata: privatev1.Metadata_builder{Name: tenantName}.Build(),
+				Spec:     &privatev1.TenantSpec{},
+			}.Build(),
+		}.Build())
+		Expect(err).ToNot(HaveOccurred())
+
+		admin := privatev1.NewQuotaAdministrationClient(conn)
+		_, err = admin.SetTenantLimit(ctx, privatev1.SetTenantLimitRequest_builder{
+			Tenant:    tenantName,
+			Dimension: "vcpus",
+			Limit:     4,
+		}.Build())
+		Expect(err).ToNot(HaveOccurred())
+
+		requests := publicv1.NewQuotaIncreaseRequestsClient(conn)
+		created, err := requests.Create(ctx, publicv1.QuotaIncreaseRequestsCreateRequest_builder{
+			Object: publicv1.QuotaIncreaseRequest_builder{
+				Metadata: publicv1.Metadata_builder{Name: "add-vcpus", Tenant: tenantName}.Build(),
+				Spec: publicv1.QuotaIncreaseRequestSpec_builder{
+					Dimension:      "vcpus",
+					RequestedLimit: 8,
+					Reason:         "Increase available compute",
+				}.Build(),
+			}.Build(),
+		}.Build())
+		Expect(err).ToNot(HaveOccurred())
+
+		_, err = admin.ReviewIncreaseRequest(ctx, privatev1.ReviewIncreaseRequestRequest_builder{
+			Id:       created.GetObject().GetId(),
+			Decision: privatev1.QuotaIncreaseDecision_QUOTA_INCREASE_DECISION_APPROVE,
+		}.Build())
+		Expect(err).ToNot(HaveOccurred())
+
+		getResponse, err := requests.Get(ctx, publicv1.QuotaIncreaseRequestsGetRequest_builder{
+			Tenant: tenantName,
+			Id:     created.GetObject().GetId(),
+		}.Build())
+		Expect(err).ToNot(HaveOccurred())
+		Expect(getResponse.GetObject().GetStatus().GetState()).To(Equal(
+			publicv1.QuotaIncreaseRequestState_QUOTA_INCREASE_REQUEST_STATE_APPROVED,
+		))
+
+		quotas := publicv1.NewQuotasClient(conn)
+		usage, err := quotas.GetUsage(ctx, publicv1.QuotasGetUsageRequest_builder{Tenant: tenantName}.Build())
+		Expect(err).ToNot(HaveOccurred())
+		var vcpus *publicv1.QuotaUsageEntry
+		for _, entry := range usage.GetEntries() {
+			if entry.GetDimension() == "vcpus" && entry.GetClassKey() == "" {
+				vcpus = entry
+				break
+			}
+		}
+		Expect(vcpus).ToNot(BeNil())
+		Expect(vcpus.GetLimit()).To(Equal(int64(8)))
+
+		audit, err := admin.ListAuditRecords(ctx, privatev1.ListAuditRecordsRequest_builder{
+			Tenant: tenantName,
+		}.Build())
+		Expect(err).ToNot(HaveOccurred())
+		Expect(audit.GetTotal()).To(Equal(int32(2)))
+	})
 })
 
 // filterOracleCase describes one private-only field path found on a resource that has a public List RPC.
@@ -462,6 +534,7 @@ func registerWithFlags(svcFlags *services.Flags) (map[string]grpc.ServiceInfo, *
 		HubScheme:               hubScheme,
 		SecretStore:             vault.NewMockSecretStore(ctrl),
 		TierResolver:            tierResolver,
+		QuotaStore:              quota.NewStore(),
 		PrivateUsersServer:      nil,
 		Services:                svcFlags,
 	})
@@ -472,6 +545,13 @@ func registerWithFlags(svcFlags *services.Flags) (map[string]grpc.ServiceInfo, *
 }
 
 var _ = Describe("Conditional service registration", func() {
+	It("requires a quota store so resource admission cannot be disabled by misconfiguration", func() {
+		server := grpc.NewServer()
+		DeferCleanup(server.Stop)
+		_, err := RegisterResourceServers(ctx, server, ResourceServerDeps{})
+		Expect(err).To(MatchError("quota store is mandatory"))
+	})
+
 	// CaaS service names (both public and private)
 	caasServices := []string{
 		"osac.public.v1.ClusterTemplates",

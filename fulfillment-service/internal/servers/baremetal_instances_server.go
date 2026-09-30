@@ -23,6 +23,7 @@ import (
 	grpcstatus "google.golang.org/grpc/status"
 
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
+	"github.com/osac-project/osac/fulfillment-service/internal/quota"
 	"github.com/osac-project/osac/fulfillment-service/internal/vault"
 	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
@@ -33,6 +34,7 @@ type BareMetalInstancesServerBuilder struct {
 	attributionLogic  auth.AttributionLogic
 	tenancyLogic      auth.TenancyLogic
 	metricsRegisterer prometheus.Registerer
+	quotaStore        *quota.Store
 	secretStore       vault.SecretStore
 }
 
@@ -76,6 +78,11 @@ func (b *BareMetalInstancesServerBuilder) SetMetricsRegisterer(value prometheus.
 	return b
 }
 
+func (b *BareMetalInstancesServerBuilder) SetQuotaStore(value *quota.Store) *BareMetalInstancesServerBuilder {
+	b.quotaStore = value
+	return b
+}
+
 func (b *BareMetalInstancesServerBuilder) SetSecretStore(value vault.SecretStore) *BareMetalInstancesServerBuilder {
 	b.secretStore = value
 	return b
@@ -112,6 +119,7 @@ func (b *BareMetalInstancesServerBuilder) Build() (result *BareMetalInstancesSer
 		SetAttributionLogic(b.attributionLogic).
 		SetTenancyLogic(b.tenancyLogic).
 		SetMetricsRegisterer(b.metricsRegisterer).
+		SetQuotaStore(b.quotaStore).
 		SetSecretStore(b.secretStore).
 		SetFilterDesc((*publicv1.BareMetalInstance)(nil).ProtoReflect().Descriptor()).
 		Build()

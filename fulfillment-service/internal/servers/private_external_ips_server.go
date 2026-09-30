@@ -26,6 +26,7 @@ import (
 
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
 	"github.com/osac-project/osac/fulfillment-service/internal/database/dao"
+	"github.com/osac-project/osac/fulfillment-service/internal/quota"
 	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
@@ -40,6 +41,7 @@ type PrivateExternalIPsServerBuilder struct {
 	attributionLogic  auth.AttributionLogic
 	tenancyLogic      auth.TenancyLogic
 	metricsRegisterer prometheus.Registerer
+	quotaStore        *quota.Store
 	filterDesc        protoreflect.MessageDescriptor
 }
 
@@ -76,6 +78,11 @@ func (b *PrivateExternalIPsServerBuilder) SetTenancyLogic(value auth.TenancyLogi
 
 func (b *PrivateExternalIPsServerBuilder) SetMetricsRegisterer(value prometheus.Registerer) *PrivateExternalIPsServerBuilder {
 	b.metricsRegisterer = value
+	return b
+}
+
+func (b *PrivateExternalIPsServerBuilder) SetQuotaStore(value *quota.Store) *PrivateExternalIPsServerBuilder {
+	b.quotaStore = value
 	return b
 }
 
@@ -164,6 +171,7 @@ func (b *PrivateExternalIPsServerBuilder) Build() (result *PrivateExternalIPsSer
 		SetAttributionLogic(b.attributionLogic).
 		SetTenancyLogic(b.tenancyLogic).
 		SetMetricsRegisterer(b.metricsRegisterer).
+		SetQuotaAdmission(NewQuotaAdmission(b.logger, b.quotaStore, "external_ips", planExternalIPQuotaCharges)).
 		SetFilterDesc(b.filterDesc).
 		Build()
 	if err != nil {

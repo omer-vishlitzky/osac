@@ -29,6 +29,119 @@ import (
 )
 
 var _ = Describe("Generic server", func() {
+	It("runs quota admission after preparation and before create persistence", func() {
+		var order []string
+		server, err := NewGenericServer[*privatev1.HostType]().
+			SetLogger(logger).
+			SetService(privatev1.HostTypes_ServiceDesc.ServiceName).
+			SetAttributionLogic(attribution).
+			SetTenancyLogic(tenancy).
+			SetQuotaAdmission(func(_ context.Context, current, candidate *privatev1.HostType, dryRun bool) error {
+				order = append(order, "quota")
+				Expect(current).To(BeNil())
+				Expect(dryRun).To(BeFalse())
+				Expect(candidate.GetId()).NotTo(BeEmpty())
+				Expect(candidate.GetMetadata().GetTenant()).To(Equal(testTenant))
+				return nil
+			}).
+			Build()
+		Expect(err).ToNot(HaveOccurred())
+
+		response := &privatev1.HostTypesCreateResponse{}
+		err = server.CreateWithCandidatePreparation(
+			ctx,
+			privatev1.HostTypesCreateRequest_builder{
+				Object: privatev1.HostType_builder{
+					Metadata: privatev1.Metadata_builder{Name: "quota-admission-create"}.Build(),
+				}.Build(),
+			}.Build(),
+			&response,
+			func(_ context.Context, _ *privatev1.HostType, candidate *privatev1.HostType) error {
+				order = append(order, "prepare")
+				candidate.SetDescription("prepared")
+				return nil
+			},
+		)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(order).To(Equal([]string{"prepare", "quota"}))
+		Expect(response.GetObject().GetId()).NotTo(BeEmpty())
+	})
+
+	It("rejects a quota failure before the object or outbox event is written", func() {
+		server, err := NewGenericServer[*privatev1.HostType]().
+			SetLogger(logger).
+			SetService(privatev1.HostTypes_ServiceDesc.ServiceName).
+			SetAttributionLogic(attribution).
+			SetTenancyLogic(tenancy).
+			SetQuotaAdmission(func(context.Context, *privatev1.HostType, *privatev1.HostType, bool) error {
+				return status.Error(codes.ResourceExhausted, "quota exceeded")
+			}).
+			Build()
+		Expect(err).ToNot(HaveOccurred())
+
+		response := &privatev1.HostTypesCreateResponse{}
+		err = server.Create(ctx, privatev1.HostTypesCreateRequest_builder{
+			Object: privatev1.HostType_builder{
+				Metadata: privatev1.Metadata_builder{Name: "quota-admission-rejected"}.Build(),
+			}.Build(),
+		}.Build(), &response)
+		Expect(status.Code(err)).To(Equal(codes.ResourceExhausted))
+
+		list := &privatev1.HostTypesListResponse{}
+		Expect(server.List(ctx, privatev1.HostTypesListRequest_builder{}.Build(), &list)).To(Succeed())
+		Expect(list.GetTotal()).To(Equal(int32(0)))
+		var count int
+		Expect(suiteTx.QueryRow(ctx, `select count(*) from changes where data->'data'->>'description' = 'quota-admission-rejected'`).Scan(&count)).To(Succeed())
+		Expect(count).To(BeZero())
+	})
+
+	It("passes the merged current and candidate objects to quota admission before update", func() {
+		var admissionCalls int
+		server, err := NewGenericServer[*privatev1.HostType]().
+			SetLogger(logger).
+			SetService(privatev1.HostTypes_ServiceDesc.ServiceName).
+			SetAttributionLogic(attribution).
+			SetTenancyLogic(tenancy).
+			SetQuotaAdmission(func(_ context.Context, current, candidate *privatev1.HostType, dryRun bool) error {
+				admissionCalls++
+				Expect(dryRun).To(BeFalse())
+				if current == nil {
+					Expect(candidate.GetDescription()).To(Equal("before"))
+					return nil
+				}
+				Expect(current.GetDescription()).To(Equal("before"))
+				Expect(candidate.GetDescription()).To(Equal("after"))
+				return nil
+			}).
+			Build()
+		Expect(err).ToNot(HaveOccurred())
+
+		created := &privatev1.HostTypesCreateResponse{}
+		err = server.Create(ctx, privatev1.HostTypesCreateRequest_builder{
+			Object: privatev1.HostType_builder{
+				Metadata:    privatev1.Metadata_builder{Name: "quota-admission-update"}.Build(),
+				Description: "before",
+			}.Build(),
+		}.Build(), &created)
+		Expect(err).ToNot(HaveOccurred())
+
+		requestObject := privatev1.HostType_builder{
+			Id: created.GetObject().GetId(),
+			Metadata: privatev1.Metadata_builder{
+				Tenant: testTenant,
+			}.Build(),
+			Description: "after",
+		}.Build()
+		updated := &privatev1.HostTypesUpdateResponse{}
+		err = server.Update(ctx, privatev1.HostTypesUpdateRequest_builder{
+			Object:     requestObject,
+			UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"description"}},
+		}.Build(), &updated)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(admissionCalls).To(Equal(2))
+		Expect(updated.GetObject().GetDescription()).To(Equal("after"))
+	})
+
 	It("signals objects through a flagged no-op update", func() {
 		server, err := NewGenericServer[*privatev1.HostType]().
 			SetLogger(logger).

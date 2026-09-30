@@ -25,6 +25,7 @@ import (
 
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
 	"github.com/osac-project/osac/fulfillment-service/internal/database/dao"
+	"github.com/osac-project/osac/fulfillment-service/internal/quota"
 	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
@@ -33,6 +34,7 @@ type PrivateNATGatewaysServerBuilder struct {
 	attributionLogic  auth.AttributionLogic
 	tenancyLogic      auth.TenancyLogic
 	metricsRegisterer prometheus.Registerer
+	quotaStore        *quota.Store
 	filterDesc        protoreflect.MessageDescriptor
 }
 
@@ -71,6 +73,11 @@ func (b *PrivateNATGatewaysServerBuilder) SetTenancyLogic(value auth.TenancyLogi
 
 func (b *PrivateNATGatewaysServerBuilder) SetMetricsRegisterer(value prometheus.Registerer) *PrivateNATGatewaysServerBuilder {
 	b.metricsRegisterer = value
+	return b
+}
+
+func (b *PrivateNATGatewaysServerBuilder) SetQuotaStore(value *quota.Store) *PrivateNATGatewaysServerBuilder {
+	b.quotaStore = value
 	return b
 }
 
@@ -136,6 +143,7 @@ func (b *PrivateNATGatewaysServerBuilder) Build() (result *PrivateNATGatewaysSer
 		SetAttributionLogic(b.attributionLogic).
 		SetTenancyLogic(b.tenancyLogic).
 		SetMetricsRegisterer(b.metricsRegisterer).
+		SetQuotaAdmission(NewQuotaAdmission(b.logger, b.quotaStore, "nat_gateways", planNATGatewayQuotaCharges)).
 		SetFilterDesc(b.filterDesc).
 		Build()
 	if err != nil {

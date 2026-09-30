@@ -24,6 +24,7 @@ import (
 	grpcstatus "google.golang.org/grpc/status"
 
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
+	"github.com/osac-project/osac/fulfillment-service/internal/quota"
 	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
@@ -40,6 +41,7 @@ type DiskImagesServerBuilder struct {
 	attributionLogic  auth.AttributionLogic
 	tenancyLogic      auth.TenancyLogic
 	metricsRegisterer prometheus.Registerer
+	quotaStore        *quota.Store
 }
 
 var _ publicv1.DiskImagesServer = (*DiskImagesServer)(nil)
@@ -77,6 +79,11 @@ func (b *DiskImagesServerBuilder) SetMetricsRegisterer(value prometheus.Register
 	return b
 }
 
+func (b *DiskImagesServerBuilder) SetQuotaStore(value *quota.Store) *DiskImagesServerBuilder {
+	b.quotaStore = value
+	return b
+}
+
 func (b *DiskImagesServerBuilder) Build() (result *DiskImagesServer, err error) {
 	if b.logger == nil {
 		err = errors.New("logger is mandatory")
@@ -111,6 +118,7 @@ func (b *DiskImagesServerBuilder) Build() (result *DiskImagesServer, err error) 
 		SetAttributionLogic(b.attributionLogic).
 		SetTenancyLogic(b.tenancyLogic).
 		SetMetricsRegisterer(b.metricsRegisterer).
+		SetQuotaStore(b.quotaStore).
 		SetFilterDesc((*publicv1.DiskImage)(nil).ProtoReflect().Descriptor()).
 		Build()
 	if err != nil {
