@@ -1,0 +1,10 @@
+drop table quota_limit_audit;
+drop trigger copy_quota_defaults_to_tenant on tenants;
+drop function copy_quota_defaults_to_tenant();
+drop trigger project_quota_claim on quota_claims;
+drop function project_quota_claim();
+drop function apply_quota_usage_delta(text, text, text, bigint);
+drop table quota_claims;
+drop table quota_usage;
+drop table tenant_quota_limits;
+drop table quota_default_limits;
