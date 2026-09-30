@@ -27,6 +27,8 @@ echo "Kubeconfig exported to: ${SCRIPT_DIR}/kubeconfig-osac-test"
 echo "Installing OSAC CRDs..."
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 kubectl apply -f "${REPO_ROOT}/osac-operator/config/crd/bases/"
+echo "Installing BareMetal fulfillment CRDs for cluster infrastructure cleanup tests..."
+kubectl apply -f "${REPO_ROOT}/bare-metal-fulfillment-operator/config/crd/bases/"
 
 # 2.1. Install external CRDs needed by workflows
 echo "Installing KubeVirt operator..."

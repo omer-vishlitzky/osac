@@ -59,6 +59,7 @@ ROLE_TESTS=(
   "finalizer"
   "lease"
   "agentless_net_stub"
+  "cluster_infra_pool_cleanup"
 )
 
 ROLE_SCENARIO_TESTS=(

@@ -1,0 +1,37 @@
+---
+- name: Cluster infrastructure BareMetalPool cleanup test
+  hosts: localhost
+  gather_facts: true
+
+  tasks:
+    - name: Create a BareMetalPool fixture
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: osac.openshift.io/v1alpha1
+          kind: BareMetalPool
+          metadata:
+            name: quota-cleanup-test
+            namespace: "{{ lookup('env', 'POD_NAMESPACE') }}"
+          spec:
+            hostSets: []
+
+    - name: Delete the BareMetalPool through the cluster infrastructure cleanup task
+      ansible.builtin.include_role:
+        name: osac.steps.cluster_infra
+        tasks_from: delete_baremetal_pool.yaml
+      vars:
+        cluster_infra_name: quota-cleanup-test
+
+    - name: Verify the BareMetalPool is absent
+      kubernetes.core.k8s_info:
+        api_version: osac.openshift.io/v1alpha1
+        kind: BareMetalPool
+        name: quota-cleanup-test
+        namespace: "{{ lookup('env', 'POD_NAMESPACE') }}"
+      register: baremetalpool_result
+
+    - name: Assert the BareMetalPool was deleted
+      ansible.builtin.assert:
+        that:
+          - baremetalpool_result.resources | length == 0

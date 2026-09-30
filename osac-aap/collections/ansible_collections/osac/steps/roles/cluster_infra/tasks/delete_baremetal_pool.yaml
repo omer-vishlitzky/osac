@@ -1,0 +1,19 @@
+---
+- name: Delete BareMetalPool
+  kubernetes.core.k8s:
+    state: absent
+    api_version: osac.openshift.io/v1alpha1
+    kind: BareMetalPool
+    name: "{{ cluster_infra_name }}"
+    namespace: "{{ lookup('env', 'POD_NAMESPACE') }}"
+
+- name: Wait for BareMetalPool and its hosted instances to be fully deleted
+  kubernetes.core.k8s_info:
+    api_version: osac.openshift.io/v1alpha1
+    kind: BareMetalPool
+    name: "{{ cluster_infra_name }}"
+    namespace: "{{ lookup('env', 'POD_NAMESPACE') }}"
+  register: baremetalpool_delete_result
+  until: baremetalpool_delete_result.resources | length == 0
+  retries: 60
+  delay: 10

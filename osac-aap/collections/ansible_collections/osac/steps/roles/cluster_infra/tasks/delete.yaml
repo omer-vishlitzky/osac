@@ -5,6 +5,9 @@
   vars:
     manage_agents_cluster_order_name: "{{ cluster_infra_name }}"
 
+- name: Delete BareMetalPool and wait for hosted bare-metal instances to be removed
+  ansible.builtin.include_tasks: delete_baremetal_pool.yaml
+
 - name: Delete cluster network
   ansible.builtin.include_role:
     name: osac.esi.network
