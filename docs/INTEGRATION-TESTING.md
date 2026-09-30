@@ -140,6 +140,10 @@ Touched-area requirements: [component guide](../fulfillment-service/AGENTS.md#in
 - **NetworkClass manager registration and capability propagation:** `it_networkclass_manager_capabilities_test.go` creates the NetworkClass first, then adds fabric and Kubernetes manager registrations and verifies the deployed operator persists their capability intersection. The installer target runs this spec separately with the local operator image so the rest of the service-only suite remains isolated from operator reconciliation.
 - **Provisioning journeys that cross into operators or providers:** Keep them in `tests/e2e/` and exercise those boundaries explicitly.
 - **Catalog Items:** `it/` checks creation and update behavior, publication visibility, CLI creation, and the ClusterOrder release image written by Fulfillment. Catalog-backed provisioning journeys that exercise other components remain in the CaaS, VMaaS, BMaaS, and reference E2E suites.
+- **Quota ledger and admission:** The internal quota, migration, server, and gRPC
+  registration suites use PostgreSQL test containers to cover backfill,
+  transactional limits, concurrency, VM-disk claim transfer, and quota APIs.
+  They do not exercise cloud providers.
 
 ## osac-operator
 
@@ -226,6 +230,11 @@ applicable integration tests separately to validate workflow behavior.
 
 - **Filters, variable transforms, and isolated plugin logic:** Include invalid input and default handling.
 - **Ansible roles, workflow tasks, hooks, leases, finalizers, or Kubernetes resources:** The test must exercise the role/playbook through Ansible against Kind.
+- **Cluster infrastructure pool cleanup (`cluster_infra_pool_cleanup`):** Exercises
+  the Ansible delete-and-wait tasks against the BareMetalPool CRD. The BMF
+  controller is not installed, so child-instance deletion and finalizer
+  behavior are outside this target; use the [BMF operator Envtest suite](../bare-metal-fulfillment-operator/AGENTS.md#integration-testing)
+  for that controller path.
 - **Execution-environment definition or dependency inputs:** Image success does not prove the workflow boundary.
 - **AAP, OpenStack, KubeVirt/RHACM, or provider provisioning:** Kind-only tests with mocks cannot claim provider coverage.
 - **Storage-provider behavior:** The mock VMS server validates role logic, not the provider API.
