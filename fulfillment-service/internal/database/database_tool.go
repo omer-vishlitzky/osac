@@ -488,7 +488,7 @@ func (t *tool) CheckSchema(ctx context.Context) error {
 }
 
 // listObjectTables returns the sorted list of object table names from the public schema, excluding active companion
-// tables, archive tables, and internal tables like changes and schema_migrations.
+// tables, archive tables, and internal tables like changes, schema_migrations, and the quota ledger.
 func (t *tool) listObjectTables(ctx context.Context, pool *pgxpool.Pool) (result []string, err error) {
 	rows, err := pool.Query(
 		ctx,
@@ -504,9 +504,11 @@ func (t *tool) listObjectTables(ctx context.Context, pool *pgxpool.Pool) (result
 			c.relkind = 'r' and
 			c.relname not like 'active_%' and
 			c.relname not like 'archived_%' and
+			left(c.relname, 6) <> 'quota_' and
 			c.relname not in (
 				'changes',
 				'project_membership_subjects',
+				'tenant_quota_limits',
 				'schema_migrations',
 				'storage_tier_backends',
 				'tenant_domains'

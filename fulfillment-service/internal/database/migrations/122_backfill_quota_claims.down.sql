@@ -1,0 +1,2 @@
+-- Backfilled claims become ordinary mutable claims, so deleting them on rollback
+-- could erase live usage. Keep them; the up migration is idempotent by claim key.
