@@ -1851,8 +1851,8 @@ var _ = Describe("applied cluster release image", func() {
 
 		upgradedAt := metav1.NewTime(time.Date(2026, time.January, 1, 14, 0, 0, 0, time.UTC))
 		hostedCluster.Status.Version.History = []configv1.UpdateHistory{
-			{State: configv1.CompletedUpdate, Image: "quay.io/release:upgraded", StartedTime: requestedAt, CompletionTime: &upgradedAt},
 			{State: configv1.CompletedUpdate, Image: "quay.io/release:applied", StartedTime: requestedAt, CompletionTime: &appliedAt},
+			{State: configv1.CompletedUpdate, Image: "quay.io/release:upgraded", StartedTime: requestedAt, CompletionTime: &upgradedAt},
 		}
 		updateAppliedReleaseImage(instance, hostedCluster)
 		Expect(instance.Status.ReleaseImage).To(Equal("quay.io/release:upgraded"))

@@ -35,6 +35,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	osacv1alpha1 "github.com/osac-project/osac/osac-operator/api/v1alpha1"
+	"github.com/osac-project/osac/osac-operator/internal/controller/feedback"
 	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
@@ -1112,6 +1113,34 @@ var _ = Describe("ComputeInstanceFeedbackReconciler", func() {
 })
 
 var _ = Describe("ComputeInstance billing feedback", func() {
+	It("syncs state and conditions while excluding an invalid applied type", func() {
+		transitionTime := metav1.NewTime(time.Date(2026, time.January, 1, 12, 0, 0, 0, time.UTC))
+		obj := &osacv1alpha1.ComputeInstance{Status: osacv1alpha1.ComputeInstanceStatus{
+			Phase:               osacv1alpha1.ComputeInstancePhaseRunning,
+			StateTransitionTime: &transitionTime,
+			InstanceType:        "large",
+			Conditions: []metav1.Condition{{
+				Type:               string(osacv1alpha1.ComputeInstanceConditionConfigurationApplied),
+				Status:             metav1.ConditionTrue,
+				LastTransitionTime: transitionTime,
+			}},
+		}}
+		remote := privatev1.ComputeInstance_builder{Status: privatev1.ComputeInstanceStatus_builder{
+			State: privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_STOPPED,
+		}.Build()}.Build()
+
+		err := syncComputeInstanceUpdate(context.Background(), obj, remote)
+		issues, ok := feedback.AsFieldIssues(err)
+		Expect(ok).To(BeTrue())
+		Expect(issues).To(HaveLen(1))
+		Expect(issues[0].Paths).To(ConsistOf("status.instance_type", "status.instance_type_transition_time"))
+		Expect(remote.GetStatus().GetState()).To(Equal(privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_RUNNING))
+		Expect(remote.GetStatus().GetStateTransitionTime().AsTime()).To(Equal(transitionTime.Time))
+		condition := findComputeInstanceCondition(remote, privatev1.ComputeInstanceConditionType_COMPUTE_INSTANCE_CONDITION_TYPE_CONFIGURATION_APPLIED)
+		Expect(condition.GetStatus()).To(Equal(privatev1.ConditionStatus_CONDITION_STATUS_TRUE))
+		Expect(remote.GetStatus().GetInstanceType()).To(BeEmpty())
+	})
+
 	It("copies the CRD failure boundary rather than the earlier RUNNING time", func() {
 		runningSince := time.Date(2026, time.January, 1, 9, 0, 0, 0, time.UTC)
 		failedAt := time.Date(2026, time.January, 1, 12, 0, 0, 0, time.UTC)

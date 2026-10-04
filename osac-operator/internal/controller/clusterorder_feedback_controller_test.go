@@ -33,6 +33,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	osacv1alpha1 "github.com/osac-project/osac/osac-operator/api/v1alpha1"
+	"github.com/osac-project/osac/osac-operator/internal/controller/feedback"
 	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
@@ -1137,8 +1138,8 @@ var _ = Describe("ClusterOrder FeedbackReconciler", func() {
 						BaremetalInstanceType: privatev1.BareMetalInstanceTypeLocalReference_builder{Name: "m5.xlarge"}.Build(),
 					}.Build(),
 				}}.Build(),
-				Status: privatev1.ClusterStatus_builder{NodeSets: map[string]*privatev1.ClusterNodeSet{
-					"workers-old": privatev1.ClusterNodeSet_builder{
+				Status: privatev1.ClusterStatus_builder{NodeSets: map[string]*privatev1.ClusterNodeSetStatus{
+					"workers-old": privatev1.ClusterNodeSetStatus_builder{
 						BaremetalInstanceType: privatev1.BareMetalInstanceTypeLocalReference_builder{Name: "m5.xlarge"}.Build(),
 						Size:                  &oldSize,
 						SizeTransitionTime:    timestamppb.New(resizeTime.Time),
@@ -1152,7 +1153,7 @@ var _ = Describe("ClusterOrder FeedbackReconciler", func() {
 			Expect(result.IsZero()).To(BeTrue())
 			removed := mockClient.lastUpdate.GetStatus().GetNodeSets()["workers-old"]
 			Expect(removed).NotTo(BeNil())
-			Expect(removed.HasSize()).To(BeFalse())
+			Expect(removed.HasSize()).To(BeTrue())
 			Expect(removed.GetSizeTransitionTime().AsTime()).To(Equal(removedAt.Time))
 			current := mockClient.lastUpdate.GetStatus().GetNodeSets()["workers-new"]
 			Expect(current).NotTo(BeNil())
@@ -1239,6 +1240,44 @@ var _ = Describe("humanizeConditionName", func() {
 })
 
 var _ = Describe("ClusterOrder billing phase feedback", func() {
+	It("syncs state and conditions while excluding invalid billing fields", func() {
+		transitionTime := metav1.NewTime(time.Date(2026, time.January, 1, 12, 0, 0, 0, time.UTC))
+		order := &osacv1alpha1.ClusterOrder{
+			Spec: osacv1alpha1.ClusterOrderSpec{},
+			Status: osacv1alpha1.ClusterOrderStatus{
+				Phase:               osacv1alpha1.ClusterOrderPhaseProgressing,
+				StateTransitionTime: &transitionTime,
+				NodeRequests: []osacv1alpha1.NodeRequestStatus{{
+					NodeSetID: "workers", ResourceClass: "worker", NumberOfNodes: 3,
+				}},
+				ReleaseImage: "quay.io/release:applied",
+				Conditions: []metav1.Condition{{
+					Type:               osacv1alpha1.ConditionProgressing,
+					Status:             metav1.ConditionTrue,
+					LastTransitionTime: transitionTime,
+				}},
+			},
+		}
+		remote := privatev1.Cluster_builder{
+			Spec: privatev1.ClusterSpec_builder{NodeSets: map[string]*privatev1.ClusterNodeSet{
+				"workers": privatev1.ClusterNodeSet_builder{
+					BaremetalInstanceType: privatev1.BareMetalInstanceTypeLocalReference_builder{Name: "worker"}.Build(),
+				}.Build(),
+			}}.Build(),
+			Status: privatev1.ClusterStatus_builder{State: privatev1.ClusterState_CLUSTER_STATE_FAILED}.Build(),
+		}.Build()
+
+		err := newClusterOrderSyncUpdate(nil)(context.Background(), order, remote)
+		issues, ok := feedback.AsFieldIssues(err)
+		Expect(ok).To(BeTrue())
+		Expect(issues).To(HaveLen(2))
+		Expect(remote.GetStatus().GetState()).To(Equal(privatev1.ClusterState_CLUSTER_STATE_PROGRESSING))
+		progressing := findClusterCondition(remote, privatev1.ClusterConditionType_CLUSTER_CONDITION_TYPE_PROGRESSING)
+		Expect(progressing.GetStatus()).To(Equal(privatev1.ConditionStatus_CONDITION_STATUS_TRUE))
+		Expect(remote.GetStatus().GetReleaseImage()).To(BeEmpty())
+		Expect(remote.GetStatus().GetNodeSets()).To(BeNil())
+	})
+
 	DescribeTable("copies each phase transition time", func(
 		phase osacv1alpha1.ClusterOrderPhaseType,
 		previous privatev1.ClusterState,
@@ -1291,8 +1330,8 @@ var _ = Describe("ClusterOrder removed node-set feedback", func() {
 					BaremetalInstanceType: privatev1.BareMetalInstanceTypeLocalReference_builder{Name: "current-class"}.Build(),
 				}.Build(),
 			}}.Build(),
-			Status: privatev1.ClusterStatus_builder{NodeSets: map[string]*privatev1.ClusterNodeSet{
-				"removed-node-set-id": privatev1.ClusterNodeSet_builder{
+			Status: privatev1.ClusterStatus_builder{NodeSets: map[string]*privatev1.ClusterNodeSetStatus{
+				"removed-node-set-id": privatev1.ClusterNodeSetStatus_builder{
 					BaremetalInstanceType: privatev1.BareMetalInstanceTypeLocalReference_builder{Name: "removed-class"}.Build(),
 					Size:                  &previousSize,
 					SizeTransitionTime:    previousSizeTime,
@@ -1303,7 +1342,7 @@ var _ = Describe("ClusterOrder removed node-set feedback", func() {
 		Expect(syncClusterOrderNodeRequests(context.Background(), clusterOrder, remote)).To(Succeed())
 		removed := remote.GetStatus().GetNodeSets()["removed-node-set-id"]
 		Expect(removed).NotTo(BeNil())
-		Expect(removed.HasSize()).To(BeFalse(), "zero is represented by clearing the positive-only size field")
+		Expect(removed.HasSize()).To(BeTrue(), "zero is an observed node-set size")
 		Expect(removed.GetSize()).To(BeZero())
 		Expect(removed.GetSizeTransitionTime().AsTime()).To(Equal(removedAt.Time))
 		Expect(remote.GetStatus().GetNodeSets()).To(HaveKey("removed-node-set-id"))
@@ -1315,8 +1354,8 @@ var _ = Describe("ClusterOrder removed node-set feedback", func() {
 			clusterOrder := &osacv1alpha1.ClusterOrder{Status: osacv1alpha1.ClusterOrderStatus{NodeSets: observed}}
 			remote := privatev1.Cluster_builder{
 				Spec: privatev1.ClusterSpec_builder{}.Build(),
-				Status: privatev1.ClusterStatus_builder{NodeSets: map[string]*privatev1.ClusterNodeSet{
-					"workers-id": privatev1.ClusterNodeSet_builder{
+				Status: privatev1.ClusterStatus_builder{NodeSets: map[string]*privatev1.ClusterNodeSetStatus{
+					"workers-id": privatev1.ClusterNodeSetStatus_builder{
 						HostType: privatev1.HostTypeReference_builder{Name: "worker-class"}.Build(),
 						Size:     &oldSize,
 					}.Build(),
@@ -1338,8 +1377,8 @@ var _ = Describe("ClusterOrder removed node-set feedback", func() {
 		}}
 		remote := privatev1.Cluster_builder{
 			Spec: privatev1.ClusterSpec_builder{}.Build(),
-			Status: privatev1.ClusterStatus_builder{NodeSets: map[string]*privatev1.ClusterNodeSet{
-				"workers-id": privatev1.ClusterNodeSet_builder{
+			Status: privatev1.ClusterStatus_builder{NodeSets: map[string]*privatev1.ClusterNodeSetStatus{
+				"workers-id": privatev1.ClusterNodeSetStatus_builder{
 					BaremetalInstanceType: privatev1.BareMetalInstanceTypeLocalReference_builder{Name: "worker-class"}.Build(),
 					SizeTransitionTime:    remoteTime,
 				}.Build(),
