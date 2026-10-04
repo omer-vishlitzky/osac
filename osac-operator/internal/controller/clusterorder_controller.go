@@ -329,15 +329,11 @@ func (r *ClusterOrderReconciler) patchStatusWithRetry(ctx context.Context, key c
 			return err
 		}
 		base := latest.DeepCopy()
-		latest.Status.Phase = computed.Phase
-		if latest.Status.Phase != base.Status.Phase {
-			if latest.Status.Phase == v1alpha1.ClusterOrderPhaseDeleting && latest.DeletionTimestamp != nil {
-				latest.Status.StateTransitionTime = latest.DeletionTimestamp.DeepCopy()
-			} else {
-				transitionTime := metav1.NewTime(time.Now().UTC())
-				latest.Status.StateTransitionTime = &transitionTime
-			}
+		transitionTime := metav1.Now()
+		if computed.Phase == v1alpha1.ClusterOrderPhaseDeleting && latest.DeletionTimestamp != nil {
+			transitionTime = *latest.DeletionTimestamp.DeepCopy()
 		}
+		setState(&latest.Status.Phase, &latest.Status.StateTransitionTime, computed.Phase, transitionTime)
 		latest.Status.ClusterReference = computed.ClusterReference
 		latest.Status.NodeRequests = computed.NodeRequests
 		latest.Status.NodeSets = computed.NodeSets
@@ -908,17 +904,22 @@ func updateAppliedReleaseImage(instance *v1alpha1.ClusterOrder, hostedCluster *h
 	if hostedCluster.Status.Version == nil {
 		return
 	}
+	var latestImage string
+	var latestCompletionTime *metav1.Time
 	for _, update := range hostedCluster.Status.Version.History {
 		if update.State != configv1.CompletedUpdate || update.Image == "" || update.CompletionTime == nil {
 			continue
 		}
-		if instance.Status.ReleaseImage == update.Image {
-			return
+		if latestCompletionTime == nil || update.CompletionTime.After(latestCompletionTime.Time) {
+			latestImage = update.Image
+			latestCompletionTime = update.CompletionTime
 		}
-		instance.Status.ReleaseImage = update.Image
-		instance.Status.ReleaseImageTransitionTime = update.CompletionTime.DeepCopy()
+	}
+	if latestCompletionTime == nil || instance.Status.ReleaseImage == latestImage {
 		return
 	}
+	instance.Status.ReleaseImage = latestImage
+	instance.Status.ReleaseImageTransitionTime = latestCompletionTime.DeepCopy()
 }
 
 func hostedClusterControlPlaneIsAvailable(hc *hypershiftv1beta1.HostedCluster) bool {

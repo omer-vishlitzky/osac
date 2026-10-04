@@ -3269,15 +3269,22 @@ var _ = Describe("ComputeInstance billing status sources", func() {
 		Expect(instance.Status.StateTransitionTime.Time).To(Equal(failedAt))
 	})
 
-	It("publishes instance type only after its configuration is applied", func() {
+	It("publishes instance type only after configuration and any required restart complete", func() {
 		instance := &osacv1alpha1.ComputeInstance{
 			Spec: osacv1alpha1.ComputeInstanceSpec{InstanceType: "small"},
 			Status: osacv1alpha1.ComputeInstanceStatus{
-				Conditions: []metav1.Condition{{
-					Type:               string(osacv1alpha1.ComputeInstanceConditionConfigurationApplied),
-					Status:             metav1.ConditionFalse,
-					LastTransitionTime: metav1.NewTime(time.Date(2026, time.January, 1, 9, 0, 0, 0, time.UTC)),
-				}},
+				Conditions: []metav1.Condition{
+					{
+						Type:               string(osacv1alpha1.ComputeInstanceConditionConfigurationApplied),
+						Status:             metav1.ConditionFalse,
+						LastTransitionTime: metav1.NewTime(time.Date(2026, time.January, 1, 9, 0, 0, 0, time.UTC)),
+					},
+					{
+						Type:               string(osacv1alpha1.ComputeInstanceConditionRestartRequired),
+						Status:             metav1.ConditionFalse,
+						LastTransitionTime: metav1.NewTime(time.Date(2026, time.January, 1, 9, 30, 0, 0, time.UTC)),
+					},
+				},
 			},
 		}
 
@@ -3290,15 +3297,20 @@ var _ = Describe("ComputeInstance billing status sources", func() {
 			metav1.ConditionTrue, "", osacv1alpha1.ReasonAsExpected)
 		condition := instance.GetStatusCondition(osacv1alpha1.ComputeInstanceConditionConfigurationApplied)
 		condition.LastTransitionTime = appliedAt
+		restartClearedAt := metav1.NewTime(time.Date(2026, time.January, 1, 10, 30, 0, 0, time.UTC))
+		restartCondition := instance.GetStatusCondition(osacv1alpha1.ComputeInstanceConditionRestartRequired)
+		restartCondition.LastTransitionTime = restartClearedAt
 		syncAppliedInstanceType(instance)
 		firstTransition := instance.Status.InstanceTypeTransitionTime.DeepCopy()
 		Expect(instance.Status.InstanceType).To(Equal("small"))
 		Expect(firstTransition).NotTo(BeNil())
-		Expect(firstTransition).To(Equal(&appliedAt))
+		Expect(firstTransition).To(Equal(&restartClearedAt))
 
 		instance.Spec.InstanceType = "large"
 		instance.SetStatusCondition(osacv1alpha1.ComputeInstanceConditionConfigurationApplied,
 			metav1.ConditionFalse, "Applying configuration", osacv1alpha1.ReasonAsExpected)
+		instance.SetStatusCondition(osacv1alpha1.ComputeInstanceConditionRestartRequired,
+			metav1.ConditionTrue, "Restart required", osacv1alpha1.ReasonAsExpected)
 		syncAppliedInstanceType(instance)
 		Expect(instance.Status.InstanceType).To(Equal("small"))
 		Expect(instance.Status.InstanceTypeTransitionTime).To(Equal(firstTransition))
@@ -3309,8 +3321,16 @@ var _ = Describe("ComputeInstance billing status sources", func() {
 		condition = instance.GetStatusCondition(osacv1alpha1.ComputeInstanceConditionConfigurationApplied)
 		condition.LastTransitionTime = secondAppliedAt
 		syncAppliedInstanceType(instance)
+		Expect(instance.Status.InstanceType).To(Equal("small"), "the applied type must wait for a required restart")
+
+		restartClearedAt = metav1.NewTime(time.Date(2026, time.January, 1, 12, 0, 0, 0, time.UTC))
+		instance.SetStatusCondition(osacv1alpha1.ComputeInstanceConditionRestartRequired,
+			metav1.ConditionFalse, "", osacv1alpha1.ReasonAsExpected)
+		restartCondition = instance.GetStatusCondition(osacv1alpha1.ComputeInstanceConditionRestartRequired)
+		restartCondition.LastTransitionTime = restartClearedAt
+		syncAppliedInstanceType(instance)
 		Expect(instance.Status.InstanceType).To(Equal("large"))
-		Expect(instance.Status.InstanceTypeTransitionTime).To(Equal(&secondAppliedAt))
+		Expect(instance.Status.InstanceTypeTransitionTime).To(Equal(&restartClearedAt))
 	})
 
 	It("rejects an empty-version job after a resize, then records the matching job boundary", func() {

@@ -75,6 +75,17 @@ func (r *FeedbackReconciler) Reconcile(ctx context.Context, request ctrl.Request
 // newClusterOrderFeedbackBridge creates a Bridge wired to the given clients. Used by both
 // the constructor and tests.
 func newClusterOrderFeedbackBridge(hubClient clnt.Client, clustersClient privatev1.ClustersClient) *feedback.Bridge[*ckv1alpha1.ClusterOrder, *privatev1.Cluster] {
+	save := func(ctx context.Context, remote *privatev1.Cluster, excludedPaths []string) error {
+		_, err := clustersClient.Update(ctx, privatev1.ClustersUpdateRequest_builder{
+			Object: remote,
+			UpdateMask: &fieldmaskpb.FieldMask{Paths: feedback.ExcludeUpdateMaskPaths([]string{
+				"status.conditions", feedbackStatusStatePath, "status.api_url", "status.console_url", "status.api_endpoint",
+				"status.ingress_endpoint", feedbackStatusStateTransitionTimePath, "status.kubeconfig_secret", "status.password_secret", "status.hub",
+				"status.node_sets", "status.add_on_operators", "status.release_image", "status.release_image_transition_time",
+			}, excludedPaths)},
+		}.Build())
+		return err
+	}
 	return &feedback.Bridge[*ckv1alpha1.ClusterOrder, *privatev1.Cluster]{
 		Client:    hubClient,
 		Finalizer: osacClusterOrderFeedbackFinalizer,
@@ -100,16 +111,9 @@ func newClusterOrderFeedbackBridge(hubClient clnt.Client, clustersClient private
 			return cluster, nil
 		},
 		Save: func(ctx context.Context, remote *privatev1.Cluster) error {
-			_, err := clustersClient.Update(ctx, privatev1.ClustersUpdateRequest_builder{
-				Object: remote,
-				UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{
-					"status.conditions", feedbackStatusStatePath, "status.api_url", "status.console_url", "status.api_endpoint",
-					"status.ingress_endpoint", feedbackStatusStateTransitionTimePath, "status.kubeconfig_secret", "status.password_secret", "status.hub",
-					"status.node_sets", "status.add_on_operators", "status.release_image", "status.release_image_transition_time",
-				}},
-			}.Build())
-			return err
+			return save(ctx, remote, nil)
 		},
+		SaveWithExcludedPaths: save,
 		Signal: func(ctx context.Context, id string) error {
 			_, err := clustersClient.Signal(ctx, privatev1.ClustersSignalRequest_builder{
 				Id: id,
@@ -132,15 +136,20 @@ func newClusterOrderSyncUpdate(hubClient clnt.Client) func(context.Context, *ckv
 		if err := syncClusterOrderURLs(ctx, hubClient, clusterOrder, remote); err != nil {
 			return err
 		}
+		var fieldIssues feedback.FieldIssues
 		if err := syncClusterOrderNodeRequests(ctx, clusterOrder, remote); err != nil {
-			return err
+			if err := appendFeedbackFieldIssues(&fieldIssues, err); err != nil {
+				return err
+			}
 		}
 		syncClusterOrderAddOnOperators(clusterOrder, remote)
 		syncClusterOrderVIPEndpoints(clusterOrder, remote)
 		if err := syncClusterOrderAppliedReleaseImage(clusterOrder, remote); err != nil {
-			return err
+			if err := appendFeedbackFieldIssues(&fieldIssues, err); err != nil {
+				return err
+			}
 		}
-		return nil
+		return fieldIssues.Err()
 	}
 }
 
@@ -205,8 +214,11 @@ func syncClusterOrderDelete(ctx context.Context, clusterOrder *ckv1alpha1.Cluste
 	if err := syncClusterOrderPhase(ctx, clusterOrder, remote); err != nil {
 		return err
 	}
+	var fieldIssues feedback.FieldIssues
 	if err := syncClusterOrderNodeRequests(ctx, clusterOrder, remote); err != nil {
-		return err
+		if err := appendFeedbackFieldIssues(&fieldIssues, err); err != nil {
+			return err
+		}
 	}
 	if clusterOrder.Status.Phase != ckv1alpha1.ClusterOrderPhaseDeleting {
 		if clusterOrder.DeletionTimestamp == nil {
@@ -217,8 +229,19 @@ func syncClusterOrderDelete(ctx context.Context, clusterOrder *ckv1alpha1.Cluste
 		}
 	}
 	if err := syncClusterOrderAppliedReleaseImage(clusterOrder, remote); err != nil {
+		if err := appendFeedbackFieldIssues(&fieldIssues, err); err != nil {
+			return err
+		}
+	}
+	return fieldIssues.Err()
+}
+
+func appendFeedbackFieldIssues(target *feedback.FieldIssues, err error) error {
+	issues, ok := feedback.AsFieldIssues(err)
+	if !ok {
 		return err
 	}
+	*target = append(*target, issues...)
 	return nil
 }
 
@@ -466,10 +489,15 @@ func syncClusterOrderURLs(ctx context.Context, hubClient clnt.Client, clusterOrd
 
 func syncClusterOrderNodeRequests(ctx context.Context, clusterOrder *ckv1alpha1.ClusterOrder, remote *privatev1.Cluster) error {
 	log := ctrllog.FromContext(ctx)
+	var fieldIssues feedback.FieldIssues
 	for i := range len(clusterOrder.Status.NodeRequests) {
 		nodeRequest := &clusterOrder.Status.NodeRequests[i]
 		if nodeRequest.NodeSetID == "" {
-			return fmt.Errorf("observed node request for resource class %q has no nodeSetID", nodeRequest.ResourceClass)
+			fieldIssues = append(fieldIssues, feedback.FieldIssue{
+				Paths: []string{"status.node_sets"},
+				Err:   fmt.Errorf("observed node request for resource class %q has no nodeSetID", nodeRequest.ResourceClass),
+			})
+			continue
 		}
 		specNodeSet, remainsDesired := remote.GetSpec().GetNodeSets()[nodeRequest.NodeSetID]
 		if !remainsDesired {
@@ -477,22 +505,30 @@ func syncClusterOrderNodeRequests(ctx context.Context, clusterOrder *ckv1alpha1.
 			continue
 		}
 		if resourceClass := clusterNodeSetResourceClass(specNodeSet); resourceClass != nodeRequest.ResourceClass {
-			return fmt.Errorf("node set %q resource class differs between spec %q and observed status %q",
-				nodeRequest.NodeSetID, resourceClass, nodeRequest.ResourceClass)
+			fieldIssues = append(fieldIssues, feedback.FieldIssue{
+				Paths: []string{"status.node_sets"},
+				Err: fmt.Errorf("node set %q resource class differs between spec %q and observed status %q",
+					nodeRequest.NodeSetID, resourceClass, nodeRequest.ResourceClass),
+			})
+			continue
 		}
 		observedStatus := clusterOrderNodeSetStatus(clusterOrder, nodeRequest.NodeSetID)
 		if observedStatus == nil || observedStatus.SizeTransitionTime == nil {
-			return fmt.Errorf("node set %q has no observed size transition", nodeRequest.NodeSetID)
+			fieldIssues = append(fieldIssues, feedback.FieldIssue{
+				Paths: []string{"status.node_sets"},
+				Err:   fmt.Errorf("node set %q has no observed size transition", nodeRequest.NodeSetID),
+			})
+			continue
 		}
 
 		nodeSets := remote.GetStatus().GetNodeSets()
 		if nodeSets == nil {
-			nodeSets = map[string]*privatev1.ClusterNodeSet{}
+			nodeSets = map[string]*privatev1.ClusterNodeSetStatus{}
 			remote.GetStatus().SetNodeSets(nodeSets)
 		}
 		nodeSet := nodeSets[nodeRequest.NodeSetID]
 		if nodeSet == nil {
-			nodeSet = privatev1.ClusterNodeSet_builder{
+			nodeSet = privatev1.ClusterNodeSetStatus_builder{
 				BaremetalInstanceType: specNodeSet.GetBaremetalInstanceType(),
 				HostType:              specNodeSet.GetHostType(),
 				FabricInterface:       specNodeSet.GetFabricInterface(),
@@ -502,21 +538,31 @@ func syncClusterOrderNodeRequests(ctx context.Context, clusterOrder *ckv1alpha1.
 
 		syncObservedClusterNodeSetSize(nodeSet, observedStatus)
 	}
-	return syncRemovedClusterOrderNodeSets(clusterOrder, remote, log)
+	if err := syncRemovedClusterOrderNodeSets(clusterOrder, remote, log); err != nil {
+		if err := appendFeedbackFieldIssues(&fieldIssues, err); err != nil {
+			return err
+		}
+	}
+	return fieldIssues.Err()
 }
 
 func syncRemovedClusterOrderNodeSets(clusterOrder *ckv1alpha1.ClusterOrder, remote *privatev1.Cluster, log logr.Logger) error {
+	var fieldIssues feedback.FieldIssues
 	for nodeSetID, nodeSet := range remote.GetStatus().GetNodeSets() {
 		if _, remainsDesired := remote.GetSpec().GetNodeSets()[nodeSetID]; remainsDesired {
 			continue
 		}
-		if nodeSet == nil {
-			nodeSet = &privatev1.ClusterNodeSet{}
-			remote.GetStatus().GetNodeSets()[nodeSetID] = nodeSet
-		}
 		observedStatus := clusterOrderNodeSetStatus(clusterOrder, nodeSetID)
 		if observedStatus == nil || observedStatus.SizeTransitionTime == nil {
-			return fmt.Errorf("removed node set %q has no observed size transition", nodeSetID)
+			fieldIssues = append(fieldIssues, feedback.FieldIssue{
+				Paths: []string{"status.node_sets"},
+				Err:   fmt.Errorf("removed node set %q has no observed size transition", nodeSetID),
+			})
+			continue
+		}
+		if nodeSet == nil {
+			nodeSet = &privatev1.ClusterNodeSetStatus{}
+			remote.GetStatus().GetNodeSets()[nodeSetID] = nodeSet
 		}
 		log.Info("syncing observed size for removed node set",
 			"node_set_id", nodeSetID,
@@ -525,7 +571,7 @@ func syncRemovedClusterOrderNodeSets(clusterOrder *ckv1alpha1.ClusterOrder, remo
 		)
 		syncObservedClusterNodeSetSize(nodeSet, observedStatus)
 	}
-	return nil
+	return fieldIssues.Err()
 }
 
 func clusterOrderNodeSetStatus(clusterOrder *ckv1alpha1.ClusterOrder, nodeSetID string) *ckv1alpha1.NodeSetStatus {
@@ -537,12 +583,8 @@ func clusterOrderNodeSetStatus(clusterOrder *ckv1alpha1.ClusterOrder, nodeSetID 
 	return nil
 }
 
-func syncObservedClusterNodeSetSize(nodeSet *privatev1.ClusterNodeSet, observed *ckv1alpha1.NodeSetStatus) {
-	if observed.Size == 0 {
-		nodeSet.ClearSize()
-	} else {
-		nodeSet.SetSize(observed.Size)
-	}
+func syncObservedClusterNodeSetSize(nodeSet *privatev1.ClusterNodeSetStatus, observed *ckv1alpha1.NodeSetStatus) {
+	nodeSet.SetSize(observed.Size)
 	observedTime := observed.SizeTransitionTime.Time
 	if !nodeSet.HasSizeTransitionTime() || !nodeSet.GetSizeTransitionTime().AsTime().Equal(observedTime) {
 		nodeSet.SetSizeTransitionTime(timestamppb.New(observedTime))
@@ -565,7 +607,10 @@ func syncClusterOrderAppliedReleaseImage(clusterOrder *ckv1alpha1.ClusterOrder, 
 		return nil
 	}
 	if clusterOrder.Status.ReleaseImageTransitionTime == nil {
-		return errors.New("applied release image has no releaseImageTransitionTime")
+		return feedback.FieldIssues{{
+			Paths: []string{"status.release_image", "status.release_image_transition_time"},
+			Err:   errors.New("applied release image has no releaseImageTransitionTime"),
+		}}.Err()
 	}
 	remote.GetStatus().SetReleaseImage(clusterOrder.Status.ReleaseImage)
 	remote.GetStatus().SetReleaseImageTransitionTime(

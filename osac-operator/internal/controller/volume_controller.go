@@ -376,12 +376,7 @@ func (r *VolumeReconciler) failProvisioning(vol *v1alpha1.Volume, message string
 }
 
 func setVolumePhase(vol *v1alpha1.Volume, phase v1alpha1.VolumePhaseType) {
-	if vol.Status.Phase == phase {
-		return
-	}
-	vol.Status.Phase = phase
-	transitionTime := metav1.Now()
-	vol.Status.StateTransitionTime = &transitionTime
+	setState(&vol.Status.Phase, &vol.Status.StateTransitionTime, phase, metav1.Now())
 }
 
 // handleDelete runs when the Volume CR has a deletion timestamp. It calls the

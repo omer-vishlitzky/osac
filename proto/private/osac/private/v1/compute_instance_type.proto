@@ -260,7 +260,6 @@ message ComputeInstanceStatus {
 
   // Identifier of the hub that was selected for this compute instance.
   string hub = 7 [(cleanapi.field).private = true];
-
   // The instance type whose configuration has been applied to the VM.
   string instance_type = 8 [
     (cleanapi.field).private = true,

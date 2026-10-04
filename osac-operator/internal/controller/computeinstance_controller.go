@@ -665,22 +665,22 @@ func (r *ComputeInstanceReconciler) handleDelete(ctx context.Context, _ reconcil
 }
 
 func setComputeInstancePhase(instance *v1alpha1.ComputeInstance, phase v1alpha1.ComputeInstancePhaseType) {
-	if instance.Status.Phase == phase {
-		return
-	}
-	instance.Status.Phase = phase
-	transitionTime := metav1.NewTime(time.Now().UTC())
-	instance.Status.StateTransitionTime = &transitionTime
+	setState(&instance.Status.Phase, &instance.Status.StateTransitionTime, phase, metav1.Now())
 }
 
 func syncAppliedInstanceType(instance *v1alpha1.ComputeInstance) {
-	condition := instance.GetStatusCondition(v1alpha1.ComputeInstanceConditionConfigurationApplied)
-	if condition == nil || condition.Status != metav1.ConditionTrue || instance.Spec.InstanceType == "" ||
+	configurationApplied := instance.GetStatusCondition(v1alpha1.ComputeInstanceConditionConfigurationApplied)
+	restartRequired := instance.GetStatusCondition(v1alpha1.ComputeInstanceConditionRestartRequired)
+	if configurationApplied == nil || configurationApplied.Status != metav1.ConditionTrue ||
+		restartRequired == nil || restartRequired.Status != metav1.ConditionFalse || instance.Spec.InstanceType == "" ||
 		instance.Status.InstanceType == instance.Spec.InstanceType {
 		return
 	}
 	instance.Status.InstanceType = instance.Spec.InstanceType
-	transitionTime := condition.LastTransitionTime
+	transitionTime := configurationApplied.LastTransitionTime
+	if restartRequired.LastTransitionTime.After(transitionTime.Time) {
+		transitionTime = restartRequired.LastTransitionTime
+	}
 	instance.Status.InstanceTypeTransitionTime = &transitionTime
 }
 
