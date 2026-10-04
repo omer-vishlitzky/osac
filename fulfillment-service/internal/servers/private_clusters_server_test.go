@@ -110,6 +110,24 @@ func expectAddOnOperatorFieldViolation(err error, field string) {
 
 var _ = Describe("Private clusters server", func() {
 	Describe("node-set validation", func() {
+		It("keeps legacy host_type immutable on existing node sets", func() {
+			err := (&PrivateClustersServer{}).validateNodeSetHostTypeImmutability(
+				map[string]*privatev1.ClusterNodeSet{
+					"workers": privatev1.ClusterNodeSet_builder{
+						HostType: privatev1.HostTypeReference_builder{Id: "host-a"}.Build(),
+					}.Build(),
+				},
+				map[string]*privatev1.ClusterNodeSet{
+					"workers": privatev1.ClusterNodeSet_builder{
+						HostType: privatev1.HostTypeReference_builder{Id: "host-b"}.Build(),
+					}.Build(),
+				},
+			)
+
+			Expect(grpcstatus.Code(err)).To(Equal(grpccodes.InvalidArgument))
+			Expect(err.Error()).To(ContainSubstring("host_type is immutable"))
+		})
+
 		It("validates the resolved node-set map", func() {
 			size := int32(2)
 			valid := map[string]*privatev1.ClusterNodeSet{

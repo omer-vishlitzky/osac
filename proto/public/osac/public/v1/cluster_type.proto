@@ -325,6 +325,7 @@ message ClusterStatus {
   // Per-operator installation state, synced from the ClusterOrder's
   // AddOnOperatorJobs via the feedback controller.
   repeated AddOnOperatorStatus add_on_operators = 12;
+
 }
 
 // Represents the overall state of a cluster.

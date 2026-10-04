@@ -846,8 +846,8 @@ func validateNodeSetNames[V any](nodeSets map[string]V) error {
 	return nil
 }
 
-// validateNodeSetHostTypeImmutability ensures that the baremetal_instance_type field of existing node sets
-// cannot be changed. This is an existing documented restriction in the API specification.
+// validateNodeSetHostTypeImmutability ensures the hardware type of existing node sets
+// cannot be changed. Newer node sets use baremetal_instance_type; older ones use host_type.
 func (s *PrivateClustersServer) validateNodeSetHostTypeImmutability(
 	existingNodeSets map[string]*privatev1.ClusterNodeSet,
 	newNodeSets map[string]*privatev1.ClusterNodeSet) error {
@@ -857,19 +857,39 @@ func (s *PrivateClustersServer) validateNodeSetHostTypeImmutability(
 			// Node set is being removed, which is allowed (if at least one remains)
 			continue
 		}
-		existingBMIT := existingNodeSet.GetBaremetalInstanceType()
-		newBMIT := newNodeSet.GetBaremetalInstanceType()
-		if refKey(existingBMIT) != refKey(newBMIT) {
+		if newNodeSet.GetBaremetalInstanceType() == nil && newNodeSet.GetHostType() == nil {
+			if existingNodeSet.GetBaremetalInstanceType() != nil {
+				newNodeSet.SetBaremetalInstanceType(proto.Clone(existingNodeSet.GetBaremetalInstanceType()).(*privatev1.BareMetalInstanceTypeLocalReference))
+			} else if existingNodeSet.GetHostType() != nil {
+				newNodeSet.SetHostType(proto.Clone(existingNodeSet.GetHostType()).(*privatev1.HostTypeReference))
+			}
+		}
+		existingType := clusterNodeSetHardwareType(existingNodeSet)
+		newType := clusterNodeSetHardwareType(newNodeSet)
+		if existingType != newType {
+			field := "host_type"
+			if existingNodeSet.GetBaremetalInstanceType() != nil || newNodeSet.GetBaremetalInstanceType() != nil {
+				field = "baremetal_instance_type"
+			}
 			return grpcstatus.Errorf(
 				grpccodes.InvalidArgument,
-				"cannot change baremetal_instance_type for node set '%s' from '%s' to '%s': baremetal_instance_type is immutable",
+				"cannot change %s for node set '%s' from '%s' to '%s': %s is immutable",
+				field,
 				nodeSetName,
-				refKey(existingBMIT),
-				refKey(newBMIT),
+				existingType,
+				newType,
+				field,
 			)
 		}
 	}
 	return nil
+}
+
+func clusterNodeSetHardwareType(nodeSet *privatev1.ClusterNodeSet) string {
+	if nodeSet.GetBaremetalInstanceType() != nil {
+		return refKey(nodeSet.GetBaremetalInstanceType())
+	}
+	return refKey(nodeSet.GetHostType())
 }
 
 // validateClusterTemplateImmutability checks that Update keeps the Cluster's original Template

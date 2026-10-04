@@ -95,7 +95,9 @@ func newComputeInstanceFeedbackBridge(hubClient clnt.Client, ciClient privatev1.
 			_, err := ciClient.Update(ctx, privatev1.ComputeInstancesUpdateRequest_builder{
 				Object: remote,
 				UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{
-					"status.conditions", feedbackStatusStatePath, "status.external_ip_address", "status.internal_ip_address", "status.last_restarted_at",
+					"status.conditions", feedbackStatusStatePath, feedbackStatusStateTransitionTimePath,
+					"status.external_ip_address", "status.internal_ip_address", "status.last_restarted_at",
+					"status.instance_type", "status.instance_type_transition_time",
 				}},
 			}.Build())
 			return err
@@ -113,7 +115,12 @@ func newComputeInstanceFeedbackBridge(hubClient clnt.Client, ciClient privatev1.
 
 func syncComputeInstanceUpdate(ctx context.Context, obj *ckv1alpha1.ComputeInstance, remote *privatev1.ComputeInstance) error {
 	syncCIConditions(obj, remote)
-	syncCIPhase(ctx, obj, remote)
+	if err := syncCIPhase(ctx, obj, remote); err != nil {
+		return err
+	}
+	if err := syncCIAppliedInstanceType(obj, remote); err != nil {
+		return err
+	}
 	syncCIIPAddresses(obj, remote)
 	syncCILastRestartedAt(obj, remote)
 	return nil
@@ -167,26 +174,51 @@ func mapCIConditionStatus(status metav1.ConditionStatus) privatev1.ConditionStat
 	}
 }
 
-func syncCIPhase(ctx context.Context, obj *ckv1alpha1.ComputeInstance, remote *privatev1.ComputeInstance) {
+func syncCIPhase(ctx context.Context, obj *ckv1alpha1.ComputeInstance, remote *privatev1.ComputeInstance) error {
+	var state privatev1.ComputeInstanceState
 	switch obj.Status.Phase {
 	case ckv1alpha1.ComputeInstancePhaseStarting:
-		remote.GetStatus().SetState(privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_STARTING)
+		state = privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_STARTING
 	case ckv1alpha1.ComputeInstancePhaseFailed:
-		remote.GetStatus().SetState(privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_FAILED)
+		state = privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_FAILED
 	case ckv1alpha1.ComputeInstancePhaseRunning:
-		remote.GetStatus().SetState(privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_RUNNING)
+		state = privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_RUNNING
 	case ckv1alpha1.ComputeInstancePhaseDeleting:
-		remote.GetStatus().SetState(privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_DELETING)
+		state = privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_DELETING
 	case ckv1alpha1.ComputeInstancePhaseStopping:
-		remote.GetStatus().SetState(privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_STOPPING)
+		state = privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_STOPPING
 	case ckv1alpha1.ComputeInstancePhaseStopped:
-		remote.GetStatus().SetState(privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_STOPPED)
+		state = privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_STOPPED
 	case ckv1alpha1.ComputeInstancePhasePaused:
-		remote.GetStatus().SetState(privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_PAUSED)
+		state = privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_PAUSED
 	default:
 		log := ctrllog.FromContext(ctx)
 		log.Info("Unknown phase, will ignore it", "phase", obj.Status.Phase)
+		return nil
 	}
+	changed := remote.GetStatus().GetState() != state
+	if changed {
+		if obj.Status.StateTransitionTime == nil {
+			return fmt.Errorf("compute instance phase changed to %q without stateTransitionTime", obj.Status.Phase)
+		}
+		remote.GetStatus().SetState(state)
+	}
+	if obj.Status.StateTransitionTime != nil {
+		remote.GetStatus().SetStateTransitionTime(timestamppb.New(obj.Status.StateTransitionTime.Time))
+	}
+	return nil
+}
+
+func syncCIAppliedInstanceType(obj *ckv1alpha1.ComputeInstance, remote *privatev1.ComputeInstance) error {
+	if obj.Status.InstanceType == "" {
+		return nil
+	}
+	if obj.Status.InstanceTypeTransitionTime == nil {
+		return errors.New("applied instance type has no instanceTypeTransitionTime")
+	}
+	remote.GetStatus().SetInstanceType(obj.Status.InstanceType)
+	remote.GetStatus().SetInstanceTypeTransitionTime(timestamppb.New(obj.Status.InstanceTypeTransitionTime.Time))
+	return nil
 }
 
 func findComputeInstanceCondition(remote *privatev1.ComputeInstance, kind privatev1.ComputeInstanceConditionType) *privatev1.ComputeInstanceCondition {

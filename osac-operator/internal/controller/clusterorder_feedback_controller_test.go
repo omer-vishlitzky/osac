@@ -25,6 +25,7 @@ import (
 	"google.golang.org/grpc/codes"
 	grpcstatus "google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
+	"google.golang.org/protobuf/types/known/timestamppb"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -48,6 +49,15 @@ type mockClustersClient struct {
 	signalCount    int
 	signalID       string
 	signalError    error
+}
+
+func setClusterOrderFeedbackPhase(order *osacv1alpha1.ClusterOrder, phase osacv1alpha1.ClusterOrderPhaseType) {
+	if order.Status.Phase == phase {
+		return
+	}
+	order.Status.Phase = phase
+	transitionTime := metav1.Now()
+	order.Status.StateTransitionTime = &transitionTime
 }
 
 func (m *mockClustersClient) List(_ context.Context, _ *privatev1.ClustersListRequest, _ ...grpc.CallOption) (*privatev1.ClustersListResponse, error) {
@@ -228,7 +238,7 @@ var _ = Describe("ClusterOrder FeedbackReconciler", func() {
 			Expect(k8sClient.Create(testCtx, clusterOrder)).To(Succeed())
 
 			Expect(k8sClient.Get(testCtx, typeNamespacedName, clusterOrder)).To(Succeed())
-			clusterOrder.Status.Phase = osacv1alpha1.ClusterOrderPhaseDeleting
+			setClusterOrderFeedbackPhase(clusterOrder, osacv1alpha1.ClusterOrderPhaseDeleting)
 			Expect(k8sClient.Status().Update(testCtx, clusterOrder)).To(Succeed())
 
 			Expect(k8sClient.Get(testCtx, typeNamespacedName, clusterOrder)).To(Succeed())
@@ -309,7 +319,7 @@ var _ = Describe("ClusterOrder FeedbackReconciler", func() {
 			Expect(k8sClient.Create(testCtx, clusterOrder)).To(Succeed())
 
 			Expect(k8sClient.Get(testCtx, typeNamespacedName, clusterOrder)).To(Succeed())
-			clusterOrder.Status.Phase = osacv1alpha1.ClusterOrderPhaseProgressing
+			setClusterOrderFeedbackPhase(clusterOrder, osacv1alpha1.ClusterOrderPhaseProgressing)
 			Expect(k8sClient.Status().Update(testCtx, clusterOrder)).To(Succeed())
 
 			Expect(k8sClient.Get(testCtx, typeNamespacedName, clusterOrder)).To(Succeed())
@@ -364,7 +374,7 @@ var _ = Describe("ClusterOrder FeedbackReconciler", func() {
 			Expect(k8sClient.Create(testCtx, clusterOrder)).To(Succeed())
 
 			Expect(k8sClient.Get(testCtx, typeNamespacedName, clusterOrder)).To(Succeed())
-			clusterOrder.Status.Phase = osacv1alpha1.ClusterOrderPhaseDeleting
+			setClusterOrderFeedbackPhase(clusterOrder, osacv1alpha1.ClusterOrderPhaseDeleting)
 			Expect(k8sClient.Status().Update(testCtx, clusterOrder)).To(Succeed())
 
 			Expect(k8sClient.Get(testCtx, typeNamespacedName, clusterOrder)).To(Succeed())
@@ -417,7 +427,7 @@ var _ = Describe("ClusterOrder FeedbackReconciler", func() {
 			Expect(k8sClient.Create(testCtx, clusterOrder)).To(Succeed())
 
 			Expect(k8sClient.Get(testCtx, typeNamespacedName, clusterOrder)).To(Succeed())
-			clusterOrder.Status.Phase = osacv1alpha1.ClusterOrderPhaseDeleting
+			setClusterOrderFeedbackPhase(clusterOrder, osacv1alpha1.ClusterOrderPhaseDeleting)
 			Expect(k8sClient.Status().Update(testCtx, clusterOrder)).To(Succeed())
 
 			Expect(k8sClient.Get(testCtx, typeNamespacedName, clusterOrder)).To(Succeed())
@@ -465,7 +475,7 @@ var _ = Describe("ClusterOrder FeedbackReconciler", func() {
 			Expect(k8sClient.Create(testCtx, clusterOrder)).To(Succeed())
 
 			Expect(k8sClient.Get(testCtx, typeNamespacedName, clusterOrder)).To(Succeed())
-			clusterOrder.Status.Phase = osacv1alpha1.ClusterOrderPhaseDeleting
+			setClusterOrderFeedbackPhase(clusterOrder, osacv1alpha1.ClusterOrderPhaseDeleting)
 			Expect(k8sClient.Status().Update(testCtx, clusterOrder)).To(Succeed())
 
 			Expect(k8sClient.Get(testCtx, typeNamespacedName, clusterOrder)).To(Succeed())
@@ -584,7 +594,7 @@ var _ = Describe("ClusterOrder FeedbackReconciler", func() {
 		It("should sync Progressing phase", func() {
 			clusterOrder := &osacv1alpha1.ClusterOrder{}
 			Expect(k8sClient.Get(testCtx, typeNamespacedName, clusterOrder)).To(Succeed())
-			clusterOrder.Status.Phase = osacv1alpha1.ClusterOrderPhaseProgressing
+			setClusterOrderFeedbackPhase(clusterOrder, osacv1alpha1.ClusterOrderPhaseProgressing)
 			Expect(k8sClient.Status().Update(testCtx, clusterOrder)).To(Succeed())
 
 			request := reconcile.Request{
@@ -599,7 +609,7 @@ var _ = Describe("ClusterOrder FeedbackReconciler", func() {
 		It("should sync Failed phase", func() {
 			clusterOrder := &osacv1alpha1.ClusterOrder{}
 			Expect(k8sClient.Get(testCtx, typeNamespacedName, clusterOrder)).To(Succeed())
-			clusterOrder.Status.Phase = osacv1alpha1.ClusterOrderPhaseFailed
+			setClusterOrderFeedbackPhase(clusterOrder, osacv1alpha1.ClusterOrderPhaseFailed)
 			Expect(k8sClient.Status().Update(testCtx, clusterOrder)).To(Succeed())
 
 			request := reconcile.Request{
@@ -637,10 +647,13 @@ var _ = Describe("ClusterOrder FeedbackReconciler", func() {
 		It("should not call update when reconciled twice with same data", func() {
 			clusterOrder := &osacv1alpha1.ClusterOrder{}
 			Expect(k8sClient.Get(testCtx, typeNamespacedName, clusterOrder)).To(Succeed())
-			clusterOrder.Status.Phase = osacv1alpha1.ClusterOrderPhaseProgressing
+			setClusterOrderFeedbackPhase(clusterOrder, osacv1alpha1.ClusterOrderPhaseProgressing)
 			Expect(k8sClient.Status().Update(testCtx, clusterOrder)).To(Succeed())
 
 			mockClient.getResponse.GetObject().GetStatus().SetState(privatev1.ClusterState_CLUSTER_STATE_PROGRESSING)
+			mockClient.getResponse.GetObject().GetStatus().SetStateTransitionTime(
+				timestamppb.New(clusterOrder.Status.StateTransitionTime.Time),
+			)
 
 			request := reconcile.Request{
 				NamespacedName: typeNamespacedName,
@@ -844,7 +857,7 @@ var _ = Describe("ClusterOrder FeedbackReconciler", func() {
 			// stage. Phase forces an update so the (empty) conditions list can be asserted.
 			clusterOrder := &osacv1alpha1.ClusterOrder{}
 			Expect(k8sClient.Get(testCtx, typeNamespacedName, clusterOrder)).To(Succeed())
-			clusterOrder.Status.Phase = osacv1alpha1.ClusterOrderPhaseProgressing
+			setClusterOrderFeedbackPhase(clusterOrder, osacv1alpha1.ClusterOrderPhaseProgressing)
 			clusterOrder.Status.Conditions = append(clusterOrder.Status.Conditions, metav1.Condition{
 				Type:               osacv1alpha1.ConditionControlPlaneCreated,
 				Status:             metav1.ConditionTrue,
@@ -865,7 +878,7 @@ var _ = Describe("ClusterOrder FeedbackReconciler", func() {
 		It("should explicitly ignore NamespaceCreated without producing a proto condition", func() {
 			clusterOrder := &osacv1alpha1.ClusterOrder{}
 			Expect(k8sClient.Get(testCtx, typeNamespacedName, clusterOrder)).To(Succeed())
-			clusterOrder.Status.Phase = osacv1alpha1.ClusterOrderPhaseProgressing
+			setClusterOrderFeedbackPhase(clusterOrder, osacv1alpha1.ClusterOrderPhaseProgressing)
 			clusterOrder.Status.Conditions = append(clusterOrder.Status.Conditions, metav1.Condition{
 				Type:               osacv1alpha1.ConditionNamespaceCreated,
 				Status:             metav1.ConditionTrue,
@@ -886,7 +899,7 @@ var _ = Describe("ClusterOrder FeedbackReconciler", func() {
 		It("should not surface an unmapped, non-ignored condition as a proto condition (no silent default)", func() {
 			clusterOrder := &osacv1alpha1.ClusterOrder{}
 			Expect(k8sClient.Get(testCtx, typeNamespacedName, clusterOrder)).To(Succeed())
-			clusterOrder.Status.Phase = osacv1alpha1.ClusterOrderPhaseProgressing
+			setClusterOrderFeedbackPhase(clusterOrder, osacv1alpha1.ClusterOrderPhaseProgressing)
 			clusterOrder.Status.Conditions = append(clusterOrder.Status.Conditions, metav1.Condition{
 				Type:               "SomeFutureCondition",
 				Status:             metav1.ConditionTrue,
@@ -1023,6 +1036,8 @@ var _ = Describe("ClusterOrder FeedbackReconciler", func() {
 	})
 
 	Context("When reconciling a ready ClusterOrder with node requests", func() {
+		var resizeTime metav1.Time
+
 		BeforeEach(func() {
 			clusterOrder := &osacv1alpha1.ClusterOrder{
 				ObjectMeta: metav1.ObjectMeta{
@@ -1040,10 +1055,18 @@ var _ = Describe("ClusterOrder FeedbackReconciler", func() {
 			}
 			Expect(k8sClient.Create(testCtx, clusterOrder)).To(Succeed())
 			Expect(k8sClient.Get(testCtx, typeNamespacedName, clusterOrder)).To(Succeed())
-			clusterOrder.Status.Phase = osacv1alpha1.ClusterOrderPhaseReady
-			clusterOrder.Status.NodeRequests = []osacv1alpha1.NodeRequest{
-				{ResourceClass: "m5.xlarge", NumberOfNodes: 3},
+			setClusterOrderFeedbackPhase(clusterOrder, osacv1alpha1.ClusterOrderPhaseReady)
+			clusterOrder.Status.NodeRequests = []osacv1alpha1.NodeRequestStatus{
+				{NodeSetID: "workers", ResourceClass: "m5.xlarge", NumberOfNodes: 3},
 			}
+			resizeTime = metav1.NewTime(time.Date(2026, time.January, 1, 12, 0, 0, 0, time.UTC))
+			clusterOrder.Status.NodeSets = []osacv1alpha1.NodeSetStatus{{
+				Name:               "workers",
+				Size:               3,
+				SizeTransitionTime: &resizeTime,
+			}}
+			clusterOrder.Status.ReleaseImage = "quay.io/release:applied"
+			clusterOrder.Status.ReleaseImageTransitionTime = &resizeTime
 			Expect(k8sClient.Status().Update(testCtx, clusterOrder)).To(Succeed())
 
 			mockClient.getResponse = &privatev1.ClustersGetResponse{
@@ -1081,6 +1104,9 @@ var _ = Describe("ClusterOrder FeedbackReconciler", func() {
 			Expect(result.IsZero()).To(BeTrue())
 			Expect(mockClient.updateCalled).To(BeTrue())
 			Expect(mockClient.lastUpdate.GetStatus().GetNodeSets()["workers"].GetSize()).To(Equal(int32(3)))
+			Expect(mockClient.lastUpdate.GetStatus().GetNodeSets()["workers"].GetSizeTransitionTime().AsTime()).To(Equal(resizeTime.Time))
+			Expect(mockClient.lastUpdate.GetStatus().GetReleaseImage()).To(Equal("quay.io/release:applied"))
+			Expect(mockClient.lastUpdate.GetStatus().GetReleaseImageTransitionTime().AsTime()).To(Equal(resizeTime.Time))
 
 			hasNodeSetsPath := false
 			for _, path := range mockClient.lastUpdateMask.GetPaths() {
@@ -1089,6 +1115,49 @@ var _ = Describe("ClusterOrder FeedbackReconciler", func() {
 				}
 			}
 			Expect(hasNodeSetsPath).To(BeTrue())
+		})
+
+		It("publishes a removed node set's zero boundary under its existing identity", func() {
+			clusterOrder := &osacv1alpha1.ClusterOrder{}
+			Expect(k8sClient.Get(testCtx, typeNamespacedName, clusterOrder)).To(Succeed())
+			removedAt := metav1.NewTime(time.Date(2026, time.January, 1, 13, 0, 0, 0, time.UTC))
+			clusterOrder.Status.NodeRequests = []osacv1alpha1.NodeRequestStatus{{
+				NodeSetID: "workers-new", ResourceClass: "m5.xlarge", NumberOfNodes: 3,
+			}}
+			clusterOrder.Status.NodeSets = []osacv1alpha1.NodeSetStatus{
+				{Name: "workers-old", Size: 0, SizeTransitionTime: &removedAt},
+				{Name: "workers-new", Size: 3, SizeTransitionTime: &resizeTime},
+			}
+			Expect(k8sClient.Status().Update(testCtx, clusterOrder)).To(Succeed())
+
+			oldSize := int32(3)
+			mockClient.getResponse = &privatev1.ClustersGetResponse{Object: privatev1.Cluster_builder{
+				Spec: privatev1.ClusterSpec_builder{NodeSets: map[string]*privatev1.ClusterNodeSet{
+					"workers-new": privatev1.ClusterNodeSet_builder{
+						BaremetalInstanceType: privatev1.BareMetalInstanceTypeLocalReference_builder{Name: "m5.xlarge"}.Build(),
+					}.Build(),
+				}}.Build(),
+				Status: privatev1.ClusterStatus_builder{NodeSets: map[string]*privatev1.ClusterNodeSet{
+					"workers-old": privatev1.ClusterNodeSet_builder{
+						BaremetalInstanceType: privatev1.BareMetalInstanceTypeLocalReference_builder{Name: "m5.xlarge"}.Build(),
+						Size:                  &oldSize,
+						SizeTransitionTime:    timestamppb.New(resizeTime.Time),
+					}.Build(),
+				}}.Build(),
+			}.Build()}
+			mockClient.updateResponse = &privatev1.ClustersUpdateResponse{}
+
+			result, err := reconciler.Reconcile(testCtx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.IsZero()).To(BeTrue())
+			removed := mockClient.lastUpdate.GetStatus().GetNodeSets()["workers-old"]
+			Expect(removed).NotTo(BeNil())
+			Expect(removed.HasSize()).To(BeFalse())
+			Expect(removed.GetSizeTransitionTime().AsTime()).To(Equal(removedAt.Time))
+			current := mockClient.lastUpdate.GetStatus().GetNodeSets()["workers-new"]
+			Expect(current).NotTo(BeNil())
+			Expect(current.GetSize()).To(Equal(int32(3)))
+			Expect(current.GetSizeTransitionTime().AsTime()).To(Equal(resizeTime.Time))
 		})
 
 		It("should match node sets by HostType when BMIT is absent", func() {
@@ -1167,4 +1236,117 @@ var _ = Describe("humanizeConditionName", func() {
 		Entry("acronym then word", "TLSReady", "TLS Ready"),
 		Entry("empty string", "", ""),
 	)
+})
+
+var _ = Describe("ClusterOrder billing phase feedback", func() {
+	DescribeTable("copies each phase transition time", func(
+		phase osacv1alpha1.ClusterOrderPhaseType,
+		previous privatev1.ClusterState,
+		current privatev1.ClusterState,
+	) {
+		transitionTime := metav1.NewTime(time.Date(2026, time.January, 1, 12, 0, 0, 0, time.UTC))
+		clusterOrder := &osacv1alpha1.ClusterOrder{Status: osacv1alpha1.ClusterOrderStatus{
+			Phase:               phase,
+			StateTransitionTime: &transitionTime,
+		}}
+		remote := privatev1.Cluster_builder{Status: privatev1.ClusterStatus_builder{
+			State: previous,
+		}.Build()}.Build()
+
+		Expect(syncClusterOrderPhase(context.Background(), clusterOrder, remote)).To(Succeed())
+		Expect(remote.GetStatus().GetState()).To(Equal(current))
+		Expect(remote.GetStatus().GetStateTransitionTime().AsTime()).To(Equal(transitionTime.Time))
+
+		Expect(syncClusterOrderPhase(context.Background(), clusterOrder, remote)).To(Succeed())
+		Expect(remote.GetStatus().GetStateTransitionTime().AsTime()).To(Equal(transitionTime.Time))
+	},
+		Entry("PROGRESSING", osacv1alpha1.ClusterOrderPhaseProgressing,
+			privatev1.ClusterState_CLUSTER_STATE_UNSPECIFIED, privatev1.ClusterState_CLUSTER_STATE_PROGRESSING),
+		Entry("READY", osacv1alpha1.ClusterOrderPhaseReady,
+			privatev1.ClusterState_CLUSTER_STATE_PROGRESSING, privatev1.ClusterState_CLUSTER_STATE_READY),
+		Entry("FAILED", osacv1alpha1.ClusterOrderPhaseFailed,
+			privatev1.ClusterState_CLUSTER_STATE_PROGRESSING, privatev1.ClusterState_CLUSTER_STATE_FAILED),
+		Entry("DELETING", osacv1alpha1.ClusterOrderPhaseDeleting,
+			privatev1.ClusterState_CLUSTER_STATE_READY, privatev1.ClusterState_CLUSTER_STATE_DELETING),
+	)
+})
+
+var _ = Describe("ClusterOrder removed node-set feedback", func() {
+	It("publishes an observed zero boundary under the private node-set identity", func() {
+		removedAt := metav1.NewTime(time.Date(2026, time.January, 1, 13, 0, 0, 0, time.UTC))
+		previousSizeTime := timestamppb.New(time.Date(2026, time.January, 1, 12, 0, 0, 0, time.UTC))
+		previousSize := int32(4)
+		clusterOrder := &osacv1alpha1.ClusterOrder{
+			Status: osacv1alpha1.ClusterOrderStatus{
+				NodeRequests: []osacv1alpha1.NodeRequestStatus{{NodeSetID: "current-node-set", ResourceClass: "current-class", NumberOfNodes: 2}},
+				NodeSets: []osacv1alpha1.NodeSetStatus{
+					{Name: "current-node-set", Size: 2, SizeTransitionTime: &removedAt},
+					{Name: "removed-node-set-id", Size: 0, SizeTransitionTime: &removedAt},
+				},
+			},
+		}
+		remote := privatev1.Cluster_builder{
+			Spec: privatev1.ClusterSpec_builder{NodeSets: map[string]*privatev1.ClusterNodeSet{
+				"current-node-set": privatev1.ClusterNodeSet_builder{
+					BaremetalInstanceType: privatev1.BareMetalInstanceTypeLocalReference_builder{Name: "current-class"}.Build(),
+				}.Build(),
+			}}.Build(),
+			Status: privatev1.ClusterStatus_builder{NodeSets: map[string]*privatev1.ClusterNodeSet{
+				"removed-node-set-id": privatev1.ClusterNodeSet_builder{
+					BaremetalInstanceType: privatev1.BareMetalInstanceTypeLocalReference_builder{Name: "removed-class"}.Build(),
+					Size:                  &previousSize,
+					SizeTransitionTime:    previousSizeTime,
+				}.Build(),
+			}}.Build(),
+		}.Build()
+
+		Expect(syncClusterOrderNodeRequests(context.Background(), clusterOrder, remote)).To(Succeed())
+		removed := remote.GetStatus().GetNodeSets()["removed-node-set-id"]
+		Expect(removed).NotTo(BeNil())
+		Expect(removed.HasSize()).To(BeFalse(), "zero is represented by clearing the positive-only size field")
+		Expect(removed.GetSize()).To(BeZero())
+		Expect(removed.GetSizeTransitionTime().AsTime()).To(Equal(removedAt.Time))
+		Expect(remote.GetStatus().GetNodeSets()).To(HaveKey("removed-node-set-id"))
+	})
+
+	DescribeTable("requires an observed removal boundary instead of guessing one",
+		func(observed []osacv1alpha1.NodeSetStatus) {
+			oldSize := int32(2)
+			clusterOrder := &osacv1alpha1.ClusterOrder{Status: osacv1alpha1.ClusterOrderStatus{NodeSets: observed}}
+			remote := privatev1.Cluster_builder{
+				Spec: privatev1.ClusterSpec_builder{}.Build(),
+				Status: privatev1.ClusterStatus_builder{NodeSets: map[string]*privatev1.ClusterNodeSet{
+					"workers-id": privatev1.ClusterNodeSet_builder{
+						HostType: privatev1.HostTypeReference_builder{Name: "worker-class"}.Build(),
+						Size:     &oldSize,
+					}.Build(),
+				}}.Build(),
+			}.Build()
+
+			Expect(syncClusterOrderNodeRequests(context.Background(), clusterOrder, remote)).To(MatchError(ContainSubstring("no observed size transition")))
+			Expect(remote.GetStatus().GetNodeSets()["workers-id"].GetSize()).To(Equal(oldSize))
+		},
+		Entry("local observed status is absent", []osacv1alpha1.NodeSetStatus(nil)),
+		Entry("local observed status has no transition time", []osacv1alpha1.NodeSetStatus{{Name: "workers-id", Size: 0}}),
+	)
+
+	It("preserves an existing zero-size transition on an unchanged removal", func() {
+		removedAt := metav1.NewTime(time.Date(2026, time.January, 1, 13, 0, 0, 0, time.UTC))
+		remoteTime := timestamppb.New(removedAt.Time)
+		clusterOrder := &osacv1alpha1.ClusterOrder{Status: osacv1alpha1.ClusterOrderStatus{
+			NodeSets: []osacv1alpha1.NodeSetStatus{{Name: "workers-id", SizeTransitionTime: &removedAt}},
+		}}
+		remote := privatev1.Cluster_builder{
+			Spec: privatev1.ClusterSpec_builder{}.Build(),
+			Status: privatev1.ClusterStatus_builder{NodeSets: map[string]*privatev1.ClusterNodeSet{
+				"workers-id": privatev1.ClusterNodeSet_builder{
+					BaremetalInstanceType: privatev1.BareMetalInstanceTypeLocalReference_builder{Name: "worker-class"}.Build(),
+					SizeTransitionTime:    remoteTime,
+				}.Build(),
+			}}.Build(),
+		}.Build()
+
+		Expect(syncClusterOrderNodeRequests(context.Background(), clusterOrder, remote)).To(Succeed())
+		Expect(remote.GetStatus().GetNodeSets()["workers-id"].GetSizeTransitionTime().AsTime()).To(Equal(removedAt.Time))
+	})
 })

@@ -331,6 +331,18 @@ message ClusterStatus {
   // Per-operator installation state, synced from the ClusterOrder's
   // AddOnOperatorJobs via the feedback controller.
   repeated AddOnOperatorStatus add_on_operators = 12;
+
+  // The release image currently applied to the cluster.
+  string release_image = 13 [
+    (cleanapi.field).private = true,
+    (google.api.field_behavior) = OUTPUT_ONLY
+  ];
+
+  // Time at which the applied release image changed.
+  optional google.protobuf.Timestamp release_image_transition_time = 14 [
+    (cleanapi.field).private = true,
+    (google.api.field_behavior) = OUTPUT_ONLY
+  ];
 }
 
 // Represents the overall state of a cluster.
@@ -433,6 +445,12 @@ message ClusterNodeSet {
   // Set by the system when the cluster is initially created, according to the template selected
   // by the user. The user will not have permission to change this field.
   BareMetalInstanceTypeLocalReference baremetal_instance_type = 4;
+
+  // Time at which the observed node-set size changed. Populated only in status.
+  optional google.protobuf.Timestamp size_transition_time = 5 [
+    (cleanapi.field).private = true,
+    (google.api.field_behavior) = OUTPUT_ONLY
+  ];
 }
 
 // Local reference to a Cluster resource.
