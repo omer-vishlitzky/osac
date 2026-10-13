@@ -52,7 +52,11 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
         with:
-          go-version-file: osac-ui/proxy/go.mod
+          # golangci-lint loads the whole go.work from osac-ui/proxy, so the
+          # toolchain must satisfy the workspace's go directive, not just the
+          # proxy module's (the proxy module alone would install an older Go
+          # and GOTOOLCHAIN=local would reject go.work).
+          go-version-file: go.work
           cache: false
 
       - name: Run golangci-lint
