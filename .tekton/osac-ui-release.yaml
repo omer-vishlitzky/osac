@@ -226,6 +226,13 @@ spec:
           - $(tasks.clone-repository.results.SOURCE_ARTIFACT)=/var/workdir/source
         - name: remove-go-work
           image: quay.io/konflux-ci/konflux-build-cli@sha256:85141954209ee158fe9e559869a0da196ff08c5d4bb15b1a6c2e54d4fcd6b52f
+          # clone-repository's own "clone" step runs as root (same reason:
+          # see git-clone-oci-ta's task definition), so the restored
+          # .git/ directory is root-owned with restrictive permissions --
+          # confirmed live: `git rm` failed with "Unable to create
+          # .git/index.lock: Permission denied" without this.
+          securityContext:
+            runAsUser: 0
           volumeMounts:
           - name: workdir
             mountPath: /var/workdir
