@@ -298,6 +298,13 @@ func (s *BareMetalInstancesServer) Update(ctx context.Context,
 
 func (s *BareMetalInstancesServer) Delete(ctx context.Context,
 	request *publicv1.BareMetalInstancesDeleteRequest) (response *publicv1.BareMetalInstancesDeleteResponse, err error) {
+	// Only the system component that created an owned resource may delete it. Users call this
+	// public API, so refuse the delete when the instance records an owner reference; the
+	// worker controller deletes workers through the private API.
+	if err = s.rejectOwnedResourceDelete(ctx, request.GetId()); err != nil {
+		return nil, err
+	}
+
 	privateRequest := &privatev1.BareMetalInstancesDeleteRequest{}
 	privateRequest.SetId(request.GetId())
 
@@ -308,4 +315,29 @@ func (s *BareMetalInstancesServer) Delete(ctx context.Context,
 
 	response = &publicv1.BareMetalInstancesDeleteResponse{}
 	return
+}
+
+// rejectOwnedResourceDelete fails when the identified bare metal instance was created for another
+// resource. A missing instance is not an error here: the delegated delete reports it. Any other
+// lookup failure fails closed, because this check is the only guard for user-initiated deletes.
+func (s *BareMetalInstancesServer) rejectOwnedResourceDelete(ctx context.Context, id string) error {
+	if id == "" {
+		return nil
+	}
+	privateRequest := &privatev1.BareMetalInstancesGetRequest{}
+	privateRequest.SetId(id)
+	privateResponse, err := s.delegate.Get(ctx, privateRequest)
+	if err != nil {
+		if grpcstatus.Code(err) == grpccodes.NotFound {
+			return nil
+		}
+		return err
+	}
+	if privateResponse.GetObject().GetStatus().GetCluster() != nil {
+		return grpcstatus.Errorf(grpccodes.PermissionDenied,
+			"bare metal instance '%s' was created for another resource and can only be deleted by the system",
+			id,
+		)
+	}
+	return nil
 }
