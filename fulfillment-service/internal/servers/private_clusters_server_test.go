@@ -4303,6 +4303,109 @@ var _ = Describe("Private clusters server", func() {
 			})
 		})
 
+		Describe("Version transition time", func() {
+			createCluster := func() *privatev1.Cluster {
+				response, err := server.Create(ctx, privatev1.ClustersCreateRequest_builder{
+					Object: privatev1.Cluster_builder{
+						Metadata: privatev1.Metadata_builder{Name: "test-cluster"}.Build(),
+						Spec: privatev1.ClusterSpec_builder{
+							Template: privatev1.ClusterTemplateReference_builder{Id: "my-template-id"}.Build(),
+						}.Build(),
+						Status: privatev1.ClusterStatus_builder{
+							Hub: "my-hub-id",
+						}.Build(),
+					}.Build(),
+				}.Build())
+				Expect(err).ToNot(HaveOccurred())
+				return response.GetObject()
+			}
+
+			seedNextVersion := func() {
+				seedClusterVersion(ctx, privatev1.ClusterVersion_builder{
+					Id: "cv-next",
+					Metadata: privatev1.Metadata_builder{
+						Name:   "4-18-0",
+						Tenant: testTenant,
+					}.Build(),
+					Spec: privatev1.ClusterVersionSpec_builder{
+						Image:   "quay.io/openshift-release-dev/ocp-release:4.18.0-multi",
+						Enabled: proto.Bool(true),
+						Version: "4.18.0",
+					}.Build(),
+				}.Build())
+			}
+
+			updateVersion := func(id, name string) *privatev1.Cluster {
+				response, err := server.Update(ctx, privatev1.ClustersUpdateRequest_builder{
+					Object: privatev1.Cluster_builder{
+						Id: id,
+						Spec: privatev1.ClusterSpec_builder{
+							Version: privatev1.ClusterVersionReference_builder{Name: name}.Build(),
+						}.Build(),
+					}.Build(),
+					UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"spec.version"}},
+				}.Build())
+				Expect(err).ToNot(HaveOccurred())
+				return response.GetObject()
+			}
+
+			It("Is unset until the version changes", func() {
+				object := createCluster()
+				Expect(object.GetStatus().GetVersionTransitionTime()).To(BeNil())
+			})
+
+			It("Is stamped when a version change is accepted", func() {
+				object := createCluster()
+				seedNextVersion()
+
+				updated := updateVersion(object.GetId(), "4-18-0")
+
+				Expect(updated.GetSpec().GetVersion().GetName()).To(Equal("4-18-0"))
+				Expect(updated.GetStatus().GetVersionTransitionTime()).ToNot(BeNil())
+			})
+
+			It("Is not re-stamped when the same version is set again", func() {
+				object := createCluster()
+				seedNextVersion()
+
+				updated := updateVersion(object.GetId(), "4-18-0")
+				stamp := updated.GetStatus().GetVersionTransitionTime()
+				Expect(stamp).ToNot(BeNil())
+
+				again := updateVersion(updated.GetId(), "4-18-0")
+
+				Expect(again.GetStatus().GetVersionTransitionTime().AsTime()).To(Equal(stamp.AsTime()))
+			})
+
+			It("Is preserved by updates that do not change the version", func() {
+				object := createCluster()
+				seedNextVersion()
+
+				updated := updateVersion(object.GetId(), "4-18-0")
+				stamp := updated.GetStatus().GetVersionTransitionTime()
+				Expect(stamp).ToNot(BeNil())
+
+				response, err := server.Update(ctx, privatev1.ClustersUpdateRequest_builder{
+					Object: privatev1.Cluster_builder{
+						Id: updated.GetId(),
+						Spec: privatev1.ClusterSpec_builder{
+							Version: privatev1.ClusterVersionReference_builder{Name: "4-18-0"}.Build(),
+							NodeSets: map[string]*privatev1.ClusterNodeSet{
+								"compute": privatev1.ClusterNodeSet_builder{
+									Size:                  proto.Int32(3),
+									BaremetalInstanceType: privatev1.BareMetalInstanceTypeReference_builder{Id: "acme-bmit-id", Shared: true}.Build(),
+								}.Build(),
+							},
+						}.Build(),
+					}.Build(),
+					UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"spec.node_sets"}},
+				}.Build())
+				Expect(err).ToNot(HaveOccurred())
+
+				Expect(response.GetObject().GetStatus().GetVersionTransitionTime().AsTime()).To(Equal(stamp.AsTime()))
+			})
+		})
+
 		Describe("Dry run", func() {
 			It("Returns resolved cluster with template path", func() {
 				response, err := server.Create(dryRunCtx(), privatev1.ClustersCreateRequest_builder{

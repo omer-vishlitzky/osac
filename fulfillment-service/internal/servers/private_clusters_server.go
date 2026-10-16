@@ -29,6 +29,7 @@ import (
 	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"k8s.io/apimachinery/pkg/util/validation"
 
@@ -446,6 +447,13 @@ func (s *PrivateClustersServer) Update(ctx context.Context,
 		if updateIncludesField(mask, "spec.version") &&
 			current.GetSpec().GetVersion().GetName() != candidate.GetSpec().GetVersion().GetName() {
 			populateUnsetNodeSetVersions(candidate.GetSpec().GetNodeSets(), current.GetSpec().GetVersion())
+			// Metering splits version-dimensioned usage at the acceptance time, so stamp it in
+			// the same transaction that applies the new version. Same-version updates never
+			// re-stamp: validateVersionUpdate already normalized them to the stored reference.
+			if !candidate.HasStatus() {
+				candidate.SetStatus(privatev1.ClusterStatus_builder{}.Build())
+			}
+			candidate.GetStatus().SetVersionTransitionTime(timestamppb.Now())
 		}
 		if updateIncludesField(mask, "spec.ssh_public_key") {
 			if key := candidate.GetSpec().GetSshPublicKey(); key != "" {
