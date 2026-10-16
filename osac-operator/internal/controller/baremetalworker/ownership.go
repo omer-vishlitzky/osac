@@ -27,8 +27,9 @@ import (
 const (
 	// clusterOrderIDLabel is the label set by the fulfillment-service provisioning flow, carrying
 	// the fulfillment-service Cluster UUID. Same key as controller.osacClusterOrderIDLabel (unexported).
-	clusterOrderIDLabel = "osac.openshift.io/clusterorder-uuid"
-	clusterOrderLabel   = "osac.openshift.io/cluster-order"
+	clusterOrderIDLabel      = "osac.openshift.io/clusterorder-uuid"
+	clusterOrderLabel        = "osac.openshift.io/cluster-order"
+	ownerReferenceAnnotation = "osac.openshift.io/owner-reference"
 )
 
 // authoritativeCluster loads the fulfillment Cluster that owns this order's workers. Neither the
@@ -83,18 +84,12 @@ func (r *Reconciler) rejectWorkerIdentity(co *v1alpha1.ClusterOrder, reason stri
 	return fmt.Errorf("worker ownership: %s", reason)
 }
 
-// workerBMIFilter selects the BareMetalInstances created for the order's Cluster. Workers record
-// their cluster in status.cluster at creation; the former cluster-order label is gone.
-func workerBMIFilter(co *v1alpha1.ClusterOrder) string {
-	return fmt.Sprintf(`this.status.cluster.id == %q`, co.Labels[clusterOrderIDLabel])
-}
-
 func checkWorkerBMI(co *v1alpha1.ClusterOrder, tenant, name string, bmi *privatev1.BareMetalInstance) error {
 	if bmi == nil || bmi.GetId() == "" || bmi.GetMetadata().GetTenant() != tenant ||
 		bmi.GetMetadata().GetName() != name ||
-		bmi.GetStatus().GetCluster().GetId() != co.Labels[clusterOrderIDLabel] {
-		return fmt.Errorf("BMI %s is not owned by Cluster %s in tenant %s",
-			bmi.GetId(), co.Labels[clusterOrderIDLabel], tenant)
+		bmi.GetMetadata().GetAnnotations()["osac.openshift.io/owner-reference"] != "ClusterOrder/"+co.Name ||
+		bmi.GetMetadata().GetLabels()[clusterOrderLabel] != co.Name {
+		return fmt.Errorf("BMI %s is not owned by ClusterOrder %s in tenant %s", bmi.GetId(), co.Name, tenant)
 	}
 	return nil
 }

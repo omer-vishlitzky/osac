@@ -426,9 +426,6 @@ var _ = Describe("Event publisher", Ordered, func() {
 		})
 
 		It("Publishes a worker's owner-reference attribution on the tenant's topic", func() {
-			// A worker lives in its cluster's tenant, so its events land on that tenant's
-			// topic, never the system tenant's, and metering can read the cluster and node
-			// set from the event payload.
 			tenant := "workers-" + uuid.New()
 			topic := DefaultEventTopicPrefix + tenant
 			changeID := insertChange("bare_metal_instances", tenant, "w-1", fmt.Sprintf(`{

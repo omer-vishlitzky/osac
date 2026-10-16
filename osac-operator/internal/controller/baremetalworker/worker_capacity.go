@@ -271,7 +271,7 @@ func (r *Reconciler) createSelectedWorker(
 			return ctrl.Result{}, err
 		}
 	}
-	filter := workerBMIFilter(co)
+	filter := fmt.Sprintf(`this.metadata.labels["%s"] == "%s"`, clusterOrderLabel, co.Name)
 	if err := r.checkCurrentCapacityPlan(ctx, co); err != nil {
 		return ctrl.Result{}, err
 	}

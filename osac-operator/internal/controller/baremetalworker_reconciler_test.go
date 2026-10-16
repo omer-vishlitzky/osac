@@ -904,8 +904,9 @@ var _ = Describe("BareMetalWorkerReconciler reconcileWorkers", Label("baremetalw
 		bmi := fc.CreateCalls()[0]
 		Expect(bmi.GetMetadata().GetTenant()).To(Equal("tenant1"))
 		Expect(bmi.GetMetadata().GetProject()).To(Equal("team1"))
-		Expect(bmi.GetMetadata().GetLabels()).To(BeEmpty())
-		Expect(bmi.GetMetadata().GetAnnotations()).To(BeEmpty())
+		Expect(bmi.GetMetadata().GetLabels()).To(HaveKeyWithValue("osac.openshift.io/cluster-order", co.Name))
+		Expect(bmi.GetMetadata().GetAnnotations()).To(HaveKeyWithValue(
+			"osac.openshift.io/owner-reference", "ClusterOrder/bmw-tenant-owned"))
 		Expect(bmi.GetStatus().GetCluster().GetId()).To(Equal(clusterUUID))
 		Expect(bmi.GetStatus().GetNodeSet()).To(Equal("bm-standard"))
 		Expect(bmi.GetSpec().GetCatalogItem()).To(BeNil())
@@ -930,6 +931,9 @@ var _ = Describe("BareMetalWorkerReconciler reconcileWorkers", Label("baremetalw
 		bmi := calls[0]
 		Expect(bmi.GetMetadata().GetTenant()).To(Equal("tenant1"))
 		Expect(bmi.GetMetadata().GetName()).To(Equal(getClusterOrder("bmw-create").Status.Workers[0].BareMetalInstance.Name))
+		Expect(bmi.GetMetadata().GetLabels()).To(HaveKeyWithValue("osac.openshift.io/cluster-order", "bmw-create"))
+		Expect(bmi.GetMetadata().GetAnnotations()).To(HaveKeyWithValue(
+			"osac.openshift.io/owner-reference", "ClusterOrder/bmw-create"))
 		Expect(bmi.GetStatus().GetCluster().GetId()).To(Equal(clusterUUID))
 		Expect(bmi.GetStatus().GetNodeSet()).To(Equal("bm-standard"))
 		Expect(bmi.GetSpec().GetCatalogItem()).To(BeNil())
@@ -1097,10 +1101,11 @@ var _ = Describe("BareMetalWorkerReconciler reconcileWorkers", Label("baremetalw
 		// reconcile in makeInfraEnvReady reaches reconcileWorkers.
 		_, err := fc.CreateBareMetalInstance(ctx, privatev1.BareMetalInstance_builder{
 			Metadata: privatev1.Metadata_builder{
-				Tenant: "tenant1",
-				Name:   "bmw-idem-worker-0",
+				Tenant:      "tenant1",
+				Name:        "bmw-idem-worker-0",
+				Labels:      map[string]string{"osac.openshift.io/cluster-order": "bmw-idem"},
+				Annotations: map[string]string{"osac.openshift.io/owner-reference": "ClusterOrder/bmw-idem"},
 			}.Build(),
-			Status: ownedWorkerStatus(clusterUUID),
 		}.Build())
 		Expect(err).ToNot(HaveOccurred())
 
@@ -1130,10 +1135,11 @@ var _ = Describe("BareMetalWorkerReconciler reconcileWorkers", Label("baremetalw
 		// Pre-create the tenant-owned BMI; no catalog item should be needed.
 		_, err := fc.CreateBareMetalInstance(ctx, privatev1.BareMetalInstance_builder{
 			Metadata: privatev1.Metadata_builder{
-				Tenant: "tenant1",
-				Name:   "bmw-catalog-heal-worker-0",
+				Tenant:      "tenant1",
+				Name:        "bmw-catalog-heal-worker-0",
+				Labels:      map[string]string{"osac.openshift.io/cluster-order": "bmw-catalog-heal"},
+				Annotations: map[string]string{"osac.openshift.io/owner-reference": "ClusterOrder/bmw-catalog-heal"},
 			}.Build(),
-			Status: ownedWorkerStatus(clusterUUID),
 		}.Build())
 		Expect(err).ToNot(HaveOccurred())
 

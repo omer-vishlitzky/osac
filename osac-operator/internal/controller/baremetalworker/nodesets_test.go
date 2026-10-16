@@ -281,8 +281,9 @@ var _ = It("rejects pending BMI recovery without a recorded name", func() {
 	fc.bmis = []*privatev1.BareMetalInstance{privatev1.BareMetalInstance_builder{
 		Id: "unrelated-bmi", Metadata: privatev1.Metadata_builder{
 			Name: "worker-slot", Tenant: "tenant",
+			Labels:      map[string]string{clusterOrderLabel: co.Name},
+			Annotations: map[string]string{"osac.openshift.io/owner-reference": "ClusterOrder/" + co.Name},
 		}.Build(),
-		Status: ownedBMIStatus(co),
 	}.Build()}
 	if err := runDeletionBMIStage(context.Background(), r, co); err == nil || !strings.Contains(err.Error(), "bareMetalInstance.name") {
 		Fail(fmt.Sprintf("expected a missing-reference error, got %v", err))
@@ -301,8 +302,9 @@ var _ = It("uses the recorded BMI name rather than the worker name for recovery"
 	fc.bmis = []*privatev1.BareMetalInstance{privatev1.BareMetalInstance_builder{
 		Id: "recorded-id", Metadata: privatev1.Metadata_builder{
 			Name: "actual-bmi", Tenant: "tenant",
+			Labels:      map[string]string{clusterOrderLabel: co.Name},
+			Annotations: map[string]string{"osac.openshift.io/owner-reference": "ClusterOrder/" + co.Name},
 		}.Build(),
-		Status: ownedBMIStatus(co),
 	}.Build()}
 	if _, err := r.reserveWorkerSlots(context.Background(), co); err != nil {
 		Expect(err).NotTo(HaveOccurred())
