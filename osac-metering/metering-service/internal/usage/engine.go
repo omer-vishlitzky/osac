@@ -36,6 +36,12 @@ type Piece struct {
 	EndTime   time.Time
 	RateMicro int64
 	Pending   bool
+
+	// Unit is the meter's unit, carried on heartbeats.
+	Unit string
+
+	// Revision is the rule revision that produced the piece.
+	Revision string
 }
 
 // QuantityMicro returns the piece's quantity in micro units of the meter's unit: the rate
@@ -171,8 +177,8 @@ func (e *Engine) Expected(
 				continue
 			}
 			runPieces, err := e.meterPieces(
-				meter, tenant, resourceType, resourceID, timelines, wStart, wEnd, end, upTo,
-				deletion,
+				meter, tenant, resourceType, resourceID, revision.Number, timelines,
+				wStart, wEnd, end, upTo, deletion,
 			)
 			if err != nil {
 				return nil, err
@@ -188,7 +194,7 @@ func (e *Engine) Expected(
 // boundary bills its earlier part under the revision that was in effect then.
 func (e *Engine) meterPieces(
 	meter rules.Meter,
-	tenant, resourceType, resourceID string,
+	tenant, resourceType, resourceID, revisionNumber string,
 	timelines map[string]timeline,
 	wStart, wEnd, end, upTo time.Time,
 	deletion time.Time,
@@ -217,7 +223,8 @@ func (e *Engine) meterPieces(
 				continue
 			}
 			piece, err := e.piece(
-				meter, tenant, resourceType, resourceID, timelines, start, stop, true,
+				meter, tenant, resourceType, resourceID, revisionNumber, timelines,
+				start, stop, true,
 			)
 			if err != nil {
 				return nil, err
@@ -227,7 +234,7 @@ func (e *Engine) meterPieces(
 		}
 		for _, span := range splitByDimensionsAndMidnights(meter, resourceType, timelines, start, stop) {
 			piece, err := e.piece(
-				meter, tenant, resourceType, resourceID, timelines,
+				meter, tenant, resourceType, resourceID, revisionNumber, timelines,
 				span[0], span[1], false,
 			)
 			if err != nil {
@@ -414,7 +421,7 @@ func nextMidnight(moment time.Time) time.Time {
 // piece builds one usage piece with its dimensions and multiplier at the interval's start.
 func (e *Engine) piece(
 	meter rules.Meter,
-	tenant, resourceType, resourceID string,
+	tenant, resourceType, resourceID, revisionNumber string,
 	timelines map[string]timeline,
 	start, stop time.Time,
 	pending bool,
@@ -476,6 +483,8 @@ func (e *Engine) piece(
 		EndTime:   stop,
 		RateMicro: rate,
 		Pending:   pending,
+		Unit:      meter.Unit,
+		Revision:  revisionNumber,
 	}, nil
 }
 

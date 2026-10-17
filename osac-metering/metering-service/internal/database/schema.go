@@ -53,7 +53,7 @@ CREATE TABLE IF NOT EXISTS ledger (
     resource_id    TEXT        NOT NULL,
     meter          TEXT        NOT NULL,
     component      TEXT        NOT NULL,
-    dimensions     JSONB       NOT NULL,
+    dimensions     TEXT        NOT NULL,
     start_time     TIMESTAMPTZ NOT NULL,
     end_time       TIMESTAMPTZ NOT NULL,
     quantity_micro BIGINT      NOT NULL,

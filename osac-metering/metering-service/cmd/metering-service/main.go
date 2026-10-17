@@ -29,14 +29,16 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
+	kafkapkg "github.com/osac-project/osac-metering/internal/kafka"
+
 	"github.com/osac-project/osac-metering/internal/database"
-	"github.com/osac-project/osac-metering/internal/kafka"
-	"github.com/osac-project/osac-metering/internal/topics"
+	"github.com/osac-project/osac-metering/internal/rules"
+	"github.com/osac-project/osac-metering/internal/service"
 )
 
 type config struct {
 	healthAddr      string
-	kafka           kafka.ConnectionConfig
+	kafka           kafkapkg.ConnectionConfig
 	dbURLFile       string
 	heartbeatTick   time.Duration
 	deploymentID    string
@@ -65,7 +67,7 @@ func main() {
 func configFromEnv() *config {
 	return &config{
 		healthAddr: envOrDefault("HEALTH_ADDR", ":8080"),
-		kafka: kafka.ConnectionConfig{
+		kafka: kafkapkg.ConnectionConfig{
 			Brokers:      os.Getenv("KAFKA_BROKERS"),
 			TLSCACert:    os.Getenv("KAFKA_TLS_CA_CERT"),
 			SASLUser:     os.Getenv("KAFKA_SASL_USERNAME"),
@@ -141,21 +143,35 @@ func run(ctx context.Context, logger logr.Logger, cfg *config) error {
 		return fmt.Errorf("initializing database schema: %w", err)
 	}
 
-	tenants, err := kafka.ListEventTenants(ctx, cfg.kafka)
+	rulesSource, err := rulesSource(cfg)
 	if err != nil {
-		return fmt.Errorf("listing tenant event topics: %w", err)
+		return err
 	}
-	logger.Info("discovered tenant event topics", "count", len(tenants))
-	for _, tenant := range tenants {
-		logger.Info("tenant discovered", "tenant", tenant, "events", topics.Events(tenant))
+	metering, err := service.New(ctx, service.Config{
+		Kafka:         cfg.kafka,
+		Store:         database.NewStore(dbPool),
+		Rules:         rulesSource,
+		HeartbeatTick: cfg.heartbeatTick,
+		DeploymentID:  cfg.deploymentID,
+		Logger:        logger,
+	})
+	if err != nil {
+		return err
 	}
 
 	health.ready.Store(true)
 	logger.Info("service ready")
 
-	<-ctx.Done()
-	logger.Info("shutting down")
-	return nil
+	return metering.Run(ctx)
+}
+
+// rulesSource picks where metering reads rule revisions: ConfigMaps in a namespace, or a
+// directory of ConfigMap manifests for development.
+func rulesSource(cfg *config) (rules.Source, error) {
+	if cfg.rulesConfigMaps != "" {
+		return rules.NewDirectorySource(cfg.rulesConfigMaps), nil
+	}
+	return rules.NewConfigMapSource(cfg.rulesNamespace)
 }
 
 func setupLogger() logr.Logger {

@@ -109,13 +109,20 @@ const (
 
 	// LockRound serializes a tenant's heartbeat rounds.
 	LockRound
+
+	// LockRelay serializes sending a tenant's heartbeats.
+	LockRelay
 )
 
 func (k LockKind) name() string {
-	if k == LockRound {
+	switch k {
+	case LockRound:
 		return "metering-round"
+	case LockRelay:
+		return "metering-relay"
+	default:
+		return "metering-fold"
 	}
-	return "metering-fold"
 }
 
 // TakeTenantLock takes the tenant's advisory lock for a loop kind and holds it until the
