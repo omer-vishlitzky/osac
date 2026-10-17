@@ -67,6 +67,7 @@ create or replace function metering_tracked_fields(source_table text) returns js
       [
         {"path": "status.state", "kind": "changing", "transition_time": "status.state_transition_time"},
         {"path": "spec.storage_tier", "kind": "fixed_at_creation"},
+        {"path": "status.protocol", "kind": "fixed_at_creation"},
         {"path": "status.provisioned_size_gib", "kind": "set_once_later"},
         {"path": "status.vendor_volume_id", "kind": "set_once_later"}
       ]

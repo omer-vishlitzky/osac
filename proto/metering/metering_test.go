@@ -76,6 +76,7 @@ func TestResources(t *testing.T) {
 			Message: "osac.private.v1.Volume",
 			Fields: []Field{
 				{Path: "spec.storage_tier", Kind: KindFixedAtCreation},
+				{Path: "status.protocol", Kind: KindFixedAtCreation},
 				{Path: "status.provisioned_size_gib", Kind: KindSetOnceLater},
 				{Path: "status.state", Kind: KindChanging, TransitionTime: "status.state_transition_time"},
 				{Path: "status.vendor_volume_id", Kind: KindSetOnceLater},
