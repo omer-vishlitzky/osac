@@ -252,7 +252,7 @@ func syncCIRunningInstanceType(obj *ckv1alpha1.ComputeInstance, remote *privatev
 	if obj.Labels[osacComputeInstanceTypeNameLabel] != requested.GetName() {
 		return
 	}
-	if runningInstanceTypeMatches(remote.GetStatus().GetInstanceType(), requested) {
+	if sameInstanceTypeRef(remote.GetStatus().GetInstanceType(), requested) {
 		return
 	}
 	if !ciRunningWithAppliedConfig(obj) {
@@ -266,14 +266,20 @@ func syncCIRunningInstanceType(obj *ckv1alpha1.ComputeInstance, remote *privatev
 	remote.GetStatus().SetInstanceTypeTransitionTime(timestamppb.New(since.Time))
 }
 
-// runningInstanceTypeMatches reports whether the recorded running type is the requested type.
-// References are compared by id and name; project and shared flags are resolution details that
-// don't change what is running.
-func runningInstanceTypeMatches(running, requested *privatev1.InstanceTypeReference) bool {
-	if running == nil {
+// sameInstanceTypeRef reports whether two references point to the same instance type. Identity
+// is the id, falling back to the name when either side carries none; this mirrors the
+// reference-key convention used across the fulfillment service (RefKeyStr, refKey), which the
+// operator cannot import. Project and shared are resolution hints, not identity: the same type
+// can be referenced with different hints, and treating those as a different type would re-stamp
+// the billing transition time for a resize that never happened.
+func sameInstanceTypeRef(a, b *privatev1.InstanceTypeReference) bool {
+	if a == nil || b == nil {
 		return false
 	}
-	return running.GetId() == requested.GetId() && running.GetName() == requested.GetName()
+	if a.GetId() != "" && b.GetId() != "" {
+		return a.GetId() == b.GetId()
+	}
+	return a.GetName() != "" && a.GetName() == b.GetName()
 }
 
 // ciRunningWithAppliedConfig reports whether the CR confirms the instance is running with the

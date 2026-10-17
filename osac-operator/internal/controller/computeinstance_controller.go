@@ -1071,6 +1071,11 @@ func (r *ComputeInstanceReconciler) handleDesiredConfigVersion(ctx context.Conte
 // running rather than from when the change was reported downstream. The version is recorded
 // once per configuration: while it is unchanged the recorded time stays put.
 func recordRunningConfig(instance *v1alpha1.ComputeInstance) {
+	// Cheap equality first: in the steady state every reconcile re-enters here with the
+	// versions already equal, and the condition checks below walk the conditions list.
+	if instance.Status.RunningConfigVersion == instance.Status.DesiredConfigVersion {
+		return
+	}
 	if instance.Status.Phase != v1alpha1.ComputeInstancePhaseRunning {
 		return
 	}
@@ -1078,9 +1083,6 @@ func recordRunningConfig(instance *v1alpha1.ComputeInstance) {
 		return
 	}
 	if instance.IsStatusConditionTrue(v1alpha1.ComputeInstanceConditionRestartRequired) {
-		return
-	}
-	if instance.Status.RunningConfigVersion == instance.Status.DesiredConfigVersion {
 		return
 	}
 	since := metav1.NewTime(time.Now().UTC())
