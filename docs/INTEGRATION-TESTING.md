@@ -556,29 +556,24 @@ Touched-area requirements: [component guide](../osac-metering/AGENTS.md#integrat
 
 | Tier | Location / command | Exercises for real | Faked or omitted |
 |---|---|---|---|
-| Unit | Co-located Ginkgo tests in `schema/`, `metering-service/`, and `adapters/`, plus `metering-service/cmd/metering-service`; `make test` | Schema, mapping, runner, retry, ordering, adapter behavior, Keycloak token acquisition/use/cache/refresh, credential rotation, and OAuth CA-bundle rotation | Kafka, fulfillment Watch, and most external services are mocked; OAuth uses a local TLS test endpoint. |
-| Component integration (database) | `metering-service/internal/projection/postgres_test.go`; included by `make test` | A real PostgreSQL testcontainer, schema, persistence, versioning, and queries | Kafka and fulfillment event delivery are not exercised. `SKIP_DB_TESTS` disables this tier. |
-| Component integration | No dedicated real-Kafka component suite currently exists | — | Kafka, CloudEvents delivery, fulfillment Watch, offset commits, retries, and DLQ behavior are currently tested with mocks. |
-| Contract | No dedicated contract suite; track [OSAC-4843](https://redhat.atlassian.net/browse/OSAC-4843)/[OSAC-4846](https://redhat.atlassian.net/browse/OSAC-4846) for fulfillment Watch and Kafka boundaries | No deployed Watch or Kafka protocol endpoint is exercised | Mock streams and Kafka mocks are used. |
+| Unit | Co-located tests in `schema/`, `metering-service/` (rules, usage evaluation), and `adapters/`; `make test` | Schema, rule revision parsing and startup checks, usage evaluation (meters, once semantics, duration arithmetic), adapter translation, runner, retry, ordering | Kafka and PostgreSQL are not required. |
+| Component integration (database) | `metering-service/internal/database`; included by `make test` | A real PostgreSQL testcontainer, the event-log schema, idempotent fact writes, ledger and outbox round trips | Kafka is not exercised. |
+| Component integration (Kafka and database) | `metering-service/internal/fold` and `metering-service/internal/round`; included by `make test` | A real Kafka broker and PostgreSQL: fold determinism across restarts, duplicates, and shuffles; heartbeat rounds, catch-up and recovery, relay resend with the same IDs | The billing provider and fulfillment are not exercised; events are produced directly. |
+| Contract | `adapters/m360/contract_test.go`; runs when `M360_TEST_API_URL`, `M360_TEST_API_KEY`, and `M360_TEST_TENANT` are set, skips otherwise | A real M360 tenant: submits positive and negative quantities, duplicate IDs, dated heartbeats, invalid heartbeats, and invoiced-period corrections, and asserts synchronous acceptance or rejection | Reading the tenant's usage totals back is a gap: the adapter has no query path, so rate and deduplication arithmetic is not verified end to end. Deploying the M360 tenant is out of scope for this repository. |
 | E2E | Cross-component OSAC metering/E2E deployment | The deployed metering pipeline and its configured Kafka/provider dependencies | Depends on the installer environment and enabled metering path. |
-| Helm render | `make -C osac-installer metering-auth-render-test` | Issuer ConfigMap, existing credential Secret references, and absence of projected service-account token wiring in the vmaas-ci, caas-ci, full-ci, and cudn-evpn-netris-test profiles | Does not verify deployed cross-cluster OAuth; QE owns that check through [OSAC-4843](https://redhat.atlassian.net/browse/OSAC-4843). |
+| Helm render and lint | `make -C osac-metering helm-lint` | Chart templates, rule revision 0001, and the admission policy that protects it | Deployed behavior. |
 
 ### Coverage notes
 
-- **Event schema or transition mapping:** Schema changes affect `schema/`, `metering-service/`, and `adapters/`.
-- **Projection/database code:** Do not set `SKIP_DB_TESTS` when validating database behavior.
-- **Fulfillment client TLS:** `metering-service/cmd/metering-service/verified_fulfillment_test.go` probes a local TLS endpoint with valid and invalid CA/hostname cases and checks bundle rotation and last-client retention. `fulfillment_oauth_test.go` also verifies that the OAuth HTTP client reloads the mounted CA bundle before its next token request. The production render check covers the CA mount and gate; the deployed Watch contract remains with [OSAC-4843](https://redhat.atlassian.net/browse/OSAC-4843).
-- **Fulfillment client OAuth:** `metering-service/cmd/metering-service/fulfillment_oauth_test.go` covers client-credentials token acquisition, gRPC bearer metadata, token reuse and refresh, Secret rotation, and sanitized errors. The installer profile render checks configuration for all supported metering profiles. Deployed cross-cluster authentication remains QE work through [OSAC-4843](https://redhat.atlassian.net/browse/OSAC-4843).
-- **Kafka producer/consumer, CloudEvents transport, offsets, retries, or DLQ:** Mock Kafka tests alone do not prove the pipeline boundary.
-- **Fulfillment Watch or gRPC event ingestion:** Mock streams validate local handling, not the wire contract.
-- **Provider adapters:** The shared runner must remain the owner of ordering, retry, deduplication, and DLQ behavior.
+- **Event schema or usage evaluation:** Schema changes affect `schema/`, `metering-service/`, and `adapters/`; run the root `make test` after schema changes.
+- **Fold, database, rounds, or relay:** Do not skip the real PostgreSQL and Kafka suites; they are the determinism gate for billing.
+- **Rule revisions:** `metering-service/internal/rules` checks that shipped revisions parse, use only tracked fields, never change, and that the chart's meters match the ones in code.
+- **Provider adapters:** The shared runner must remain the owner of ordering, retry, deduplication, and DLQ behavior; the DLQ is mandatory.
 
 ### Coverage gaps
 
-There is no component-level suite that runs the full fulfillment Watch → Kafka
-→ CloudEvents pipeline. Changes to that path must not claim integration
-coverage from mock-based tests; add or extend the real-Kafka coverage under
-[OSAC-4846](https://redhat.atlassian.net/browse/OSAC-4846).
+- Deployed cross-component journeys (tenant onboarding creating the three topics, a full event-to-heartbeat path on a hub) belong to the `[QE]` E2E work.
+- The M360 contract test needs a real tenant configured per environment; it is skipped when the variables are absent. It verifies submission and synchronous acceptance or rejection; verifying the billed totals needs a usage query path the adapter does not have yet.
 
 ## tests/e2e
 

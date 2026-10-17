@@ -20,11 +20,17 @@ global:
 database:
   connection: []
 
+# Heartbeat round interval. One minute by default; each heartbeat is a rated
+# transaction in the billing provider, so a longer interval sends fewer of
+# them and keeps running totals staler.
 heartbeat:
   interval: "60s"
 
-reconciliation:
-  interval: "60m"
+# Rule revisions live as immutable ConfigMaps in this namespace. The chart
+# ships revision 0001; a new revision is a new ConfigMap with a future
+# effective_at and a metering restart.
+rules:
+  namespace: ""
 
 certs:
   caBundle:

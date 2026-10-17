@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sort"
 	"sync"
 	"time"
 
@@ -38,10 +39,13 @@ type RunnerConfig struct {
 	Brokers       string
 	ConsumerGroup string
 	Topics        []string
-	FlushInterval time.Duration // default 10s
-	DedupTTL      time.Duration // default 10m
-	MaxRetries    int           // default 10
-	Kafka         kafka.KafkaConfig
+	// TopicsProvider discovers the topics to consume on every subscription. When set it
+	// replaces Topics, so the runner follows tenants as they come and go.
+	TopicsProvider func(ctx context.Context) ([]string, error)
+	FlushInterval  time.Duration // default 10s
+	DedupTTL       time.Duration // default 10m
+	MaxRetries     int           // default 10
+	Kafka          kafka.KafkaConfig
 }
 
 type topicPartition struct {
@@ -128,10 +132,30 @@ func (r *Runner) Run(ctx context.Context) error {
 		go r.dlqDepthMetricsLoop(ctx, occ)
 	}
 
-	r.logger.Info("starting consumer group", "topics", r.cfg.Topics)
+	topics := r.cfg.Topics
+	r.logger.Info("starting consumer group", "topics", topics)
 
 	for {
-		if err := group.Consume(ctx, r.cfg.Topics, r); err != nil {
+		if r.cfg.TopicsProvider != nil {
+			discovered, err := r.cfg.TopicsProvider(ctx)
+			if err != nil {
+				r.logger.Error(err, "discovering topics, retrying with the previous set")
+			} else if !sameTopics(discovered, topics) {
+				r.logger.Info("topic set changed", "topics", discovered)
+				topics = discovered
+			}
+		}
+		if len(topics) == 0 {
+			select {
+			case <-ctx.Done():
+			case <-time.After(consumeErrorBackoff):
+			}
+			if ctx.Err() != nil {
+				break
+			}
+			continue
+		}
+		if err := group.Consume(ctx, topics, r); err != nil {
 			if errors.Is(err, sarama.ErrClosedConsumerGroup) {
 				r.logger.Info("consumer group closed, exiting")
 				break
@@ -245,6 +269,23 @@ func (r *Runner) flush(ctx context.Context) error {
 	session.Commit()
 
 	return nil
+}
+
+// sameTopics reports whether two topic sets are equal, ignoring order.
+func sameTopics(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	sorted := append([]string(nil), a...)
+	sort.Strings(sorted)
+	other := append([]string(nil), b...)
+	sort.Strings(other)
+	for i := range sorted {
+		if sorted[i] != other[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // --- sarama.ConsumerGroupHandler ---

@@ -1825,14 +1825,14 @@
           },
           "additionalProperties": false
         },
-        "reconciliation": {
+        "rules": {
           "type": "object",
-          "description": "Metering reconciliation configuration",
+          "description": "Metering rule revisions configuration",
           "properties": {
-            "interval": {
+            "namespace": {
               "type": "string",
-              "description": "Reconciliation interval (Go duration format)",
-              "default": "60m"
+              "description": "Namespace holding the rule revision ConfigMaps (defaults to the release namespace)",
+              "default": ""
             }
           },
           "additionalProperties": false
