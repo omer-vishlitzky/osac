@@ -323,6 +323,33 @@ var _ = DescribeMigration("Add metering source contract", func() {
 		)
 	})
 
+	It("keeps the old attachment time when a write changes only the time", func(ctx context.Context) {
+		// Attached and attribution share attachment_transition_time, so the time belongs to the
+		// group, not to either field.
+		insert(ctx, "external_ips", "ip-1", `{
+			"status": {
+				"state": "EXTERNAL_IP_STATE_ALLOCATED",
+				"state_transition_time": "2026-01-01T10:00:00Z",
+				"attached": true,
+				"attribution": {"resource_type": "COMPUTE_INSTANCE", "resource_id": "vm-1"},
+				"attachment_transition_time": "2026-01-01T10:00:00Z"
+			}
+		}`)
+		Expect(update(ctx, "external_ips", "ip-1", `{
+			"status": {
+				"state": "EXTERNAL_IP_STATE_ALLOCATED",
+				"state_transition_time": "2026-01-01T10:00:00Z",
+				"attached": true,
+				"attribution": {"resource_type": "COMPUTE_INSTANCE", "resource_id": "vm-1"},
+				"attachment_transition_time": "2026-01-02T10:00:00Z"
+			}
+		}`)).To(Succeed())
+		Expect(storedPath(ctx, "external_ips", "ip-1", "status.attached")).To(HaveValue(Equal("true")))
+		Expect(storedPath(ctx, "external_ips", "ip-1", "status.attachment_transition_time")).To(
+			HaveValue(Equal("2026-01-01T10:00:00Z")),
+		)
+	})
+
 	It("drops a new time when the value has none yet and doesn't change", func(ctx context.Context) {
 		insert(ctx, "compute_instances", "vm-1",
 			`{"status": {"state": "COMPUTE_INSTANCE_STATE_RUNNING"}}`)
@@ -376,6 +403,37 @@ var _ = DescribeMigration("Add metering source contract", func() {
 			"volumes", "volume-1",
 			`{"spec": {"storage_tier": "tier-1"}, "status": {"state": "VOLUME_STATE_AVAILABLE", "state_transition_time": "2026-01-01T10:00:00Z", "provisioned_size_gib": 100}}`,
 			`{"spec": {"storage_tier": "tier-1"}, "status": {"state": "VOLUME_STATE_AVAILABLE", "state_transition_time": "2026-01-01T10:00:00Z", "provisioned_size_gib": 200}}`),
+		Entry("external ip address",
+			"external_ips", "ip-1",
+			`{
+				"status": {
+					"state": "EXTERNAL_IP_STATE_ALLOCATED",
+					"state_transition_time": "2026-01-01T10:00:00Z",
+					"address": "192.0.2.10"
+				}
+			}`,
+			`{
+				"status": {
+					"state": "EXTERNAL_IP_STATE_ALLOCATED",
+					"state_transition_time": "2026-01-01T10:00:00Z",
+					"address": "192.0.2.11"
+				}
+			}`),
+		Entry("external ip address cleared",
+			"external_ips", "ip-1",
+			`{
+				"status": {
+					"state": "EXTERNAL_IP_STATE_ALLOCATED",
+					"state_transition_time": "2026-01-01T10:00:00Z",
+					"address": "192.0.2.10"
+				}
+			}`,
+			`{
+				"status": {
+					"state": "EXTERNAL_IP_STATE_ALLOCATED",
+					"state_transition_time": "2026-01-01T10:00:00Z"
+				}
+			}`),
 		Entry("external ip pool",
 			"external_ips", "ip-1",
 			`{"spec": {"pool": {"id": "pool-1"}}, "status": {"state": "EXTERNAL_IP_STATE_ALLOCATED", "state_transition_time": "2026-01-01T10:00:00Z"}}`,
@@ -395,6 +453,21 @@ var _ = DescribeMigration("Add metering source contract", func() {
 			insert(ctx, table, id, oldData)
 			Expect(update(ctx, table, id, newData)).To(Succeed())
 		},
+		Entry("external ip address",
+			"external_ips", "ip-1",
+			`{
+				"status": {
+					"state": "EXTERNAL_IP_STATE_PENDING",
+					"state_transition_time": "2026-01-01T10:00:00Z"
+				}
+			}`,
+			`{
+				"status": {
+					"state": "EXTERNAL_IP_STATE_PENDING",
+					"state_transition_time": "2026-01-01T10:00:00Z",
+					"address": "192.0.2.10"
+				}
+			}`),
 		Entry("volume vendor volume id",
 			"volumes", "volume-1",
 			`{"spec": {"storage_tier": "tier-1"}, "status": {"state": "VOLUME_STATE_CREATING", "state_transition_time": "2026-01-01T10:00:00Z"}}`,

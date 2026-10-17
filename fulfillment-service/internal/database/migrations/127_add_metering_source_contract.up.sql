@@ -73,6 +73,7 @@ create or replace function metering_tracked_fields(source_table text) returns js
     $tracked$::jsonb
     when 'external_ips' then $tracked$
       [
+        {"path": "status.address", "kind": "set_once_later"},
         {"path": "status.attached", "kind": "changing", "transition_time": "status.attachment_transition_time"},
         {"path": "status.attribution", "kind": "changing", "transition_time": "status.attachment_transition_time"},
         {"path": "status.state", "kind": "changing", "transition_time": "status.state_transition_time"},
