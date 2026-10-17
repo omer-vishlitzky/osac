@@ -89,12 +89,14 @@ create or replace function metering_tracked_fields(source_table text) returns js
   end;
 $$ language sql immutable;
 
--- The source contract checks. Attached before update on the tables with tracked fields. The
--- change time is kept per time field, not per tracked field, because changing fields can share
--- one: an external IP's attachment and attribution both move 'attachment_transition_time'. The
--- trigger also fixes the row before the change event is enqueued, so the published event
--- carries the time the contract kept.
-create function check_metering_fields() returns trigger as $$
+-- The source contract checks. The trigger is named to fire after 'check_owner_reference' and
+-- before 'enqueue_change': triggers on the same event fire in name order. The owner-reference
+-- trigger rejects a changed owner reference with its own error, so this trigger only sees
+-- writes that pass it, and the change event is enqueued after this trigger has kept the old
+-- time. The change time is kept per time field, not per tracked field, because changing fields
+-- can share one: an external IP's attachment and attribution both move
+-- 'attachment_transition_time'.
+create function enforce_metering_fields() returns trigger as $$
 declare
   tracked jsonb;
   field jsonb;
@@ -207,10 +209,10 @@ begin
   loop
     if metering_tracked_fields(tbl) is not null then
       execute format(
-        'create trigger check_metering_fields
+        'create trigger enforce_metering_fields
            before update on %I
            for each row
-           execute function check_metering_fields()',
+           execute function enforce_metering_fields()',
         tbl);
     end if;
   end loop;

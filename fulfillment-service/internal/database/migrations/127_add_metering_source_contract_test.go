@@ -293,6 +293,18 @@ var _ = DescribeMigration("Add metering source contract", func() {
 			`{"status": {"state": "BARE_METAL_INSTANCE_STATE_RUNNING", "state_transition_time": "2026-01-01T10:00:00Z"}}`),
 	)
 
+	It("rejects changing a bare metal instance node set with the owner-reference error", func(ctx context.Context) {
+		// The owner-reference trigger of migration 125 guards the same status fields and, by
+		// trigger name order, fires before the metering trigger, so the caller sees its error.
+		insert(ctx, "bare_metal_instances", "bmi-1",
+			`{"status": {"state": "BARE_METAL_INSTANCE_STATE_RUNNING", "state_transition_time": "2026-01-01T10:00:00Z", "node_set": "compute"}}`)
+		err := update(ctx, "bare_metal_instances", "bmi-1",
+			`{"status": {"state": "BARE_METAL_INSTANCE_STATE_RUNNING", "state_transition_time": "2026-01-01T10:00:00Z", "node_set": "gpu"}}`)
+		var pgErr *pgconn.PgError
+		Expect(errors.As(err, &pgErr)).To(BeTrue())
+		Expect(pgErr.Code).To(Equal("Z0005"))
+	})
+
 	It("keeps the old time when a write changes only the time", func(ctx context.Context) {
 		insert(ctx, "compute_instances", "vm-1", runningVM)
 		Expect(update(ctx, "compute_instances", "vm-1", `{
@@ -348,10 +360,6 @@ var _ = DescribeMigration("Add metering source contract", func() {
 			"bare_metal_instances", "bmi-1",
 			`{"spec": {"instance_type": {"id": "type-1"}}, "status": {"state": "BARE_METAL_INSTANCE_STATE_RUNNING", "state_transition_time": "2026-01-01T10:00:00Z"}}`,
 			`{"spec": {"instance_type": {"id": "type-2"}}, "status": {"state": "BARE_METAL_INSTANCE_STATE_RUNNING", "state_transition_time": "2026-01-01T10:00:00Z"}}`),
-		Entry("bare metal instance node set",
-			"bare_metal_instances", "bmi-1",
-			`{"status": {"state": "BARE_METAL_INSTANCE_STATE_RUNNING", "state_transition_time": "2026-01-01T10:00:00Z", "node_set": "compute"}}`,
-			`{"status": {"state": "BARE_METAL_INSTANCE_STATE_RUNNING", "state_transition_time": "2026-01-01T10:00:00Z", "node_set": "gpu"}}`),
 		Entry("volume storage tier",
 			"volumes", "volume-1",
 			`{"spec": {"storage_tier": "tier-1"}, "status": {"state": "VOLUME_STATE_AVAILABLE", "state_transition_time": "2026-01-01T10:00:00Z"}}`,

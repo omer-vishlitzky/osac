@@ -1019,7 +1019,7 @@ const (
 )
 
 // meteringTriggerName is the trigger that enforces the metering source contract.
-const meteringTriggerName = "check_metering_fields"
+const meteringTriggerName = "enforce_metering_fields"
 
 // ownerReferences maps each object table that records an owner reference in its status to the
 // table holding the referenced resource. Extend together with the table and JSON-path mapping
