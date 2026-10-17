@@ -86,7 +86,7 @@ var _ = Describe("Metering source contract drift", Ordered, func() {
 				pg_catalog.pg_namespace n on n.oid = c.relnamespace
 			left join
 				pg_catalog.pg_trigger t
-				on t.tgrelid = c.oid and t.tgname = 'check_metering_fields' and not t.tgisinternal
+				on t.tgrelid = c.oid and t.tgname = 'enforce_metering_fields' and not t.tgisinternal
 			where
 				n.nspname = 'public' and
 				c.relkind = 'r' and
