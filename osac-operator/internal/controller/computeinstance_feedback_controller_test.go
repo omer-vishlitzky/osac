@@ -379,6 +379,38 @@ var _ = Describe("ComputeInstanceFeedbackReconciler", func() {
 			Expect(remote.GetStatus().GetInstanceTypeTransitionTime().AsTime()).To(Equal(oldStamp.AsTime()))
 		})
 
+		It("keeps the stamp when the same type is referenced by id under a different name", func() {
+			oldStamp := timestamppb.New(time.Now().Add(-time.Hour))
+			remote := remoteWithRequestedType(typeRef("standard-8-32", "old-name"), oldStamp)
+
+			syncCIRunningInstanceType(runningCR(false, true), remote)
+
+			Expect(remote.GetStatus().GetInstanceTypeTransitionTime().AsTime()).To(Equal(oldStamp.AsTime()))
+		})
+
+		It("keeps the stamp when the recorded type carries no id and only the name matches", func() {
+			oldStamp := timestamppb.New(time.Now().Add(-time.Hour))
+			remote := remoteWithRequestedType(typeRef("", "standard-8-32"), oldStamp)
+
+			syncCIRunningInstanceType(runningCR(false, true), remote)
+
+			Expect(remote.GetStatus().GetInstanceTypeTransitionTime().AsTime()).To(Equal(oldStamp.AsTime()))
+		})
+
+		It("keeps the stamp when only the resolution hints differ", func() {
+			oldStamp := timestamppb.New(time.Now().Add(-time.Hour))
+			remote := remoteWithRequestedType(privatev1.InstanceTypeReference_builder{
+				Id:      "standard-8-32",
+				Name:    "standard-8-32",
+				Project: "other-project",
+				Shared:  true,
+			}.Build(), oldStamp)
+
+			syncCIRunningInstanceType(runningCR(false, true), remote)
+
+			Expect(remote.GetStatus().GetInstanceTypeTransitionTime().AsTime()).To(Equal(oldStamp.AsTime()))
+		})
+
 		It("sends the running instance type paths in the update mask", func() {
 			vm := &osacv1alpha1.ComputeInstance{
 				ObjectMeta: metav1.ObjectMeta{
