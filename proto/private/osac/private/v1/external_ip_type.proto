@@ -21,6 +21,7 @@ import "google/protobuf/timestamp.proto";
 import "osac/private/v1/metadata_type.proto";
 import "osac/private/v1/external_ip_pool_type.proto";
 import "osac/private/v1/external_ip_attribution_type.proto";
+import "osac/private/v1/metering_type.proto";
 
 option (cleanapi.file).package = "osac.public.v1";
 
@@ -62,7 +63,8 @@ message ExternalIPSpec {
   // available IP address from this pool's CIDR ranges during provisioning.
   ExternalIPPoolReference pool = 1 [
     (google.api.field_behavior) = REQUIRED,
-    (google.api.field_behavior) = IMMUTABLE
+    (google.api.field_behavior) = IMMUTABLE,
+    (osac.private.v1.metering) = {kind: METERING_FIELD_KIND_FIXED_AT_CREATION}
   ];
 }
 
@@ -72,7 +74,7 @@ message ExternalIPSpec {
 // updates them based on reconciliation of the spec and feedback from the cluster controller.
 message ExternalIPStatus {
   // Current lifecycle state of the external IP.
-  ExternalIPState state = 1;
+  ExternalIPState state = 1 [(osac.private.v1.metering) = {kind: METERING_FIELD_KIND_CHANGING transition_time: "status.state_transition_time"}];
 
   // Human-readable message providing additional details about the current state.
   //
@@ -96,7 +98,7 @@ message ExternalIPStatus {
   // Set to true when an ExternalIPAttachment referencing this ExternalIP reaches READY state.
   // Set to false when the ExternalIPAttachment is deleted. An ExternalIP with attached = true
   // cannot be deleted; the ExternalIPAttachment must be deleted first.
-  bool attached = 5;
+  bool attached = 5 [(osac.private.v1.metering) = {kind: METERING_FIELD_KIND_CHANGING transition_time: "status.attachment_transition_time"}];
 
   // Identifier of the hub cluster that this external IP is deployed to.
   //
@@ -106,7 +108,8 @@ message ExternalIPStatus {
 
   // Settled target attribution reported by the operator.
   ExternalIPAttribution attribution = 7 [
-    (cleanapi.field).private = true
+    (cleanapi.field).private = true,
+    (osac.private.v1.metering) = {kind: METERING_FIELD_KIND_CHANGING transition_time: "status.attachment_transition_time"}
   ];
 
   // Time at which the settled attachment attribution changed, as reported by the operator.

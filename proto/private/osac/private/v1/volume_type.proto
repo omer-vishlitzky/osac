@@ -20,6 +20,7 @@ import "cleanapi/cleanapi.proto";
 import "google/api/field_behavior.proto";
 import "google/protobuf/timestamp.proto";
 import "osac/private/v1/metadata_type.proto";
+import "osac/private/v1/metering_type.proto";
 import "osac/private/v1/storage_common_type.proto";
 
 option (cleanapi.file).private = true;
@@ -103,7 +104,7 @@ message VolumeTopology {
 // Defines the desired configuration for a Volume. All fields are immutable after creation.
 message VolumeSpec {
   // Name of the StorageTier that determines which provider and protocol serve this volume.
-  string storage_tier = 1 [(buf.validate.field).string.min_len = 1];
+  string storage_tier = 1 [(buf.validate.field).string.min_len = 1, (osac.private.v1.metering) = {kind: METERING_FIELD_KIND_FIXED_AT_CREATION}];
 
   // Requested storage capacity in gibibytes (GiB).
   int64 size_gib = 2 [(buf.validate.field).int64.gt = 0];
@@ -118,14 +119,14 @@ message VolumeSpec {
 // Represents the current operational state of a Volume.
 message VolumeStatus {
   // Current lifecycle state of the volume.
-  VolumeState state = 1;
+  VolumeState state = 1 [(osac.private.v1.metering) = {kind: METERING_FIELD_KIND_CHANGING transition_time: "status.state_transition_time"}];
 
   // Human-readable message providing additional details about the current state.
   optional string message = 2;
 
   // Opaque identifier assigned by the vendor storage array. Set by the osac-operator after vendor
   // CSI CreateVolume succeeds. Visible only through the private API.
-  string vendor_volume_id = 3 [(cleanapi.field).private = true];
+  string vendor_volume_id = 3 [(cleanapi.field).private = true, (osac.private.v1.metering) = {kind: METERING_FIELD_KIND_SET_ONCE_LATER}];
 
   // Storage protocol used for this volume. Resolved during tier resolution at creation time.
   // Visible only through the private API.
@@ -155,6 +156,7 @@ message VolumeStatus {
   // Capacity successfully committed on the vendor storage array. Visible only
   // through the private API.
   int64 provisioned_size_gib = 10 [
-    (cleanapi.field).private = true
+    (cleanapi.field).private = true,
+    (osac.private.v1.metering) = {kind: METERING_FIELD_KIND_SET_ONCE_LATER}
   ];
 }
