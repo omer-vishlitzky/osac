@@ -95,6 +95,19 @@ var _ = Describe("Output-only interceptor", func() {
 			Expect(handlerCalled).To(BeFalse())
 		})
 
+		It("Rejects a public update whose mask names the status field itself", func() {
+			_, err := runInterceptor(
+				interceptor,
+				publicUpdateMethod,
+				computeUpdateRequest("status"),
+			)
+			Expect(err).To(HaveOccurred())
+			grpcErr, ok := grpcstatus.FromError(err)
+			Expect(ok).To(BeTrue())
+			Expect(grpcErr.Code()).To(Equal(grpccodes.InvalidArgument))
+			Expect(grpcErr.Message()).To(ContainSubstring("output-only"))
+		})
+
 		It("Rejects a public update whose mask touches a subpath of an output-only field", func() {
 			_, err := runInterceptor(
 				interceptor,

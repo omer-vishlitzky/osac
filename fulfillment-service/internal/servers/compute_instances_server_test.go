@@ -815,50 +815,6 @@ var _ = Describe("Compute instances server", func() {
 			Expect(getResponse.GetObject().GetStatus().GetInstanceType()).To(BeNil())
 			Expect(getResponse.GetObject().GetStatus().GetInstanceTypeTransitionTime()).To(BeNil())
 		})
-
-		DescribeTable("Rejects a public update of the output-only running instance type fields",
-			func(path string) {
-				createTemplate("running-type-update-template")
-
-				createResponse, err := server.Create(ctx, publicv1.ComputeInstancesCreateRequest_builder{
-					Object: publicv1.ComputeInstance_builder{
-						Metadata: publicv1.Metadata_builder{
-							Name: "test-compute-instance",
-						}.Build(),
-						Spec: publicv1.ComputeInstanceSpec_builder{
-							Template: publicv1.ComputeInstanceTemplateReference_builder{Id: "running-type-update-template"}.Build(),
-							NetworkAttachments: []*publicv1.ComputeNetworkAttachment{
-								publicv1.ComputeNetworkAttachment_builder{
-									Subnet: publicv1.SubnetLocalReference_builder{Id: "test-subnet"}.Build(),
-								}.Build(),
-							},
-						}.Build(),
-					}.Build(),
-				}.Build())
-				Expect(err).ToNot(HaveOccurred())
-
-				_, err = server.Update(ctx, publicv1.ComputeInstancesUpdateRequest_builder{
-					Object: publicv1.ComputeInstance_builder{
-						Id: createResponse.GetObject().GetId(),
-						Status: publicv1.ComputeInstanceStatus_builder{
-							InstanceType: publicv1.InstanceTypeReference_builder{
-								Id: "standard-4-16", Name: "standard-4-16",
-							}.Build(),
-							InstanceTypeTransitionTime: timestamppb.Now(),
-						}.Build(),
-					}.Build(),
-					UpdateMask: &fieldmaskpb.FieldMask{
-						Paths: []string{path},
-					},
-				}.Build())
-				Expect(status.Code(err)).To(Equal(codes.InvalidArgument))
-				Expect(err.Error()).To(ContainSubstring(path + " is output-only"))
-			},
-			Entry("instance type", "status.instance_type"),
-			Entry("instance type transition time", "status.instance_type_transition_time"),
-			Entry("instance type name subpath", "status.instance_type.name"),
-			Entry("instance type transition time subpath", "status.instance_type_transition_time.seconds"),
-		)
 	})
 })
 

@@ -17,7 +17,6 @@ import (
 	"context"
 	"errors"
 	"log/slog"
-	"strings"
 
 	"github.com/prometheus/client_golang/prometheus"
 	grpccodes "google.golang.org/grpc/codes"
@@ -277,25 +276,9 @@ func (s *ComputeInstancesServer) Update(ctx context.Context,
 		err = grpcstatus.Errorf(grpccodes.InvalidArgument, "object identifier is mandatory")
 		return
 	}
-	const networkAttachmentStatusFieldPath = "status.compute_network_attachment_statuses"
-	const instanceTypeFieldPath = "status.instance_type"
-	const instanceTypeTransitionTimeFieldPath = "status.instance_type_transition_time"
-	for _, path := range request.GetUpdateMask().GetPaths() {
-		path = normalizeFieldMaskPath(path)
-		// The system sets the running instance type fields when it observes the instance
-		// running; users can read them but never supply them. Subpaths are rejected too,
-		// otherwise a mask like status.instance_type.name would slip past the guard.
-		if path == instanceTypeFieldPath || path == instanceTypeTransitionTimeFieldPath ||
-			strings.HasPrefix(path, instanceTypeFieldPath+".") ||
-			strings.HasPrefix(path, instanceTypeTransitionTimeFieldPath+".") {
-			err = grpcstatus.Errorf(grpccodes.InvalidArgument, "%s is output-only", path)
-			return
-		}
-		if path == "status" || path == networkAttachmentStatusFieldPath || strings.HasPrefix(path, networkAttachmentStatusFieldPath+".") {
-			err = grpcstatus.Errorf(grpccodes.InvalidArgument, "%s is output-only", networkAttachmentStatusFieldPath)
-			return
-		}
-	}
+
+	// Output-only fields, including the whole status, are kept out of update masks by the
+	// output-only interceptor; see internal/outputonly.
 
 	// Determine how to prepare the private compute instance based on whether there's a field mask.
 	// When there's a field mask, copy to a new object and let the generic server handle the merge
@@ -361,17 +344,6 @@ func (s *ComputeInstancesServer) Update(ctx context.Context,
 	response.SetObject(updatedPublicComputeInstance)
 	response.SetWarnings(privateResponse.GetWarnings())
 	return
-}
-
-func normalizeFieldMaskPath(path string) string {
-	parts := strings.Split(path, ".")
-	normalizedParts := make([]string, 0, len(parts))
-	for _, part := range parts {
-		if part = strings.TrimSpace(part); part != "" {
-			normalizedParts = append(normalizedParts, part)
-		}
-	}
-	return strings.Join(normalizedParts, ".")
 }
 
 func (s *ComputeInstancesServer) Delete(ctx context.Context,
