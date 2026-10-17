@@ -54,7 +54,7 @@ func (r *Relay) RunTenant(ctx context.Context, tenant string) error {
 	for {
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return nil
 		default:
 		}
 		sent, err := r.drainOnce(ctx, tenant, topic)
@@ -66,7 +66,7 @@ func (r *Relay) RunTenant(ctx context.Context, tenant string) error {
 		if sent == 0 {
 			select {
 			case <-ctx.Done():
-				return ctx.Err()
+				return nil
 			case <-time.After(IdleWait):
 			}
 		}

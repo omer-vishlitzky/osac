@@ -63,8 +63,8 @@ func (f *Fold) RunTenant(ctx context.Context, tenant string) error {
 	topic := eventsTopic(tenant)
 
 	for {
-		if err := ctx.Err(); err != nil {
-			return err
+		if ctx.Err() != nil {
+			return nil
 		}
 		progress, err := f.store.GetTenantProgress(ctx, tenant)
 		if err != nil {
@@ -112,7 +112,7 @@ func (f *Fold) drain(
 				if len(messages) > 0 {
 					return f.apply(ctx, tenant, messages)
 				}
-				return ctx.Err()
+				return nil
 			case message, ok := <-partition.Messages():
 				if !ok {
 					break collect

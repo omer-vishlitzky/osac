@@ -35,12 +35,12 @@ const DiscoverInterval = 30 * time.Second
 
 // Config configures the service.
 type Config struct {
-	Kafka            kafkaconn.ConnectionConfig
-	Store            *database.Store
-	Rules            rules.Source
-	HeartbeatTick    time.Duration
-	DeploymentID     string
-	Logger           logr.Logger
+	Kafka         kafkaconn.ConnectionConfig
+	Store         *database.Store
+	Rules         rules.Source
+	HeartbeatTick time.Duration
+	DeploymentID  string
+	Logger        logr.Logger
 }
 
 // Service owns the per-tenant loops.
@@ -220,16 +220,16 @@ func (s *Service) runTenant(ctx context.Context, tenant string, loops *tenantLoo
 	}
 
 	go func() {
-		if err := foldLoop.RunTenant(ctx, tenant); err != nil && ctx.Err() == nil {
+		if err := foldLoop.RunTenant(ctx, tenant); err != nil {
 			s.cfg.Logger.Error(err, "fold exited", "tenant", tenant)
 		}
 	}()
 	go func() {
-		if err := roundLoop.RunTenant(ctx, tenant, s.cfg.HeartbeatTick); err != nil && ctx.Err() == nil {
+		if err := roundLoop.RunTenant(ctx, tenant, s.cfg.HeartbeatTick); err != nil {
 			s.cfg.Logger.Error(err, "round exited", "tenant", tenant)
 		}
 	}()
-	if err := relayLoop.RunTenant(ctx, tenant); err != nil && ctx.Err() == nil {
+	if err := relayLoop.RunTenant(ctx, tenant); err != nil {
 		s.cfg.Logger.Error(err, "relay exited", "tenant", tenant)
 	}
 }

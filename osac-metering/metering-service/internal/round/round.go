@@ -88,7 +88,7 @@ func (r *Round) RunTenant(ctx context.Context, tenant string, interval time.Dura
 	for {
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return nil
 		case <-ticker.C:
 			if err := r.Once(ctx, tenant); err != nil && !errors.Is(err, context.Canceled) {
 				r.logger.Error(err, "round failed", "tenant", tenant)
