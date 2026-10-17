@@ -133,6 +133,86 @@ var _ = Describe("Output-only interceptor", func() {
 			Expect(grpcErr.Code()).To(Equal(grpccodes.InvalidArgument))
 		})
 
+		It("Rejects masks with whitespace the server's path compiler trims", func() {
+			// The generic server normalizes mask paths (masks.SplitPath) before
+			// resolving them, so " status" reaches the status field there. The
+			// interceptor must resolve the same paths it does.
+			for _, path := range []string{" status", "status ", " status.state", "status.  state"} {
+				_, err := runInterceptor(
+					interceptor,
+					publicUpdateMethod,
+					computeUpdateRequest(path),
+				)
+				Expect(err).To(HaveOccurred(), "path %q must be rejected", path)
+				grpcErr, ok := grpcstatus.FromError(err)
+				Expect(ok).To(BeTrue())
+				Expect(grpcErr.Code()).To(Equal(grpccodes.InvalidArgument))
+			}
+		})
+
+		It("Rejects masks with empty segments the server's path compiler drops", func() {
+			_, err := runInterceptor(
+				interceptor,
+				publicUpdateMethod,
+				computeUpdateRequest("spec..instance_type", "status..instance_type"),
+			)
+			Expect(err).To(HaveOccurred())
+			grpcErr, ok := grpcstatus.FromError(err)
+			Expect(ok).To(BeTrue())
+			Expect(grpcErr.Code()).To(Equal(grpccodes.InvalidArgument))
+		})
+
+		It("Rejects masks that reach annotated fields nested in maps", func() {
+			// ClusterNodeSet.observed_version is annotated OUTPUT_ONLY and lives
+			// inside the spec.node_sets map; the segment after a map field is its
+			// key, so the walk must descend into the map's value message.
+			_, err := runInterceptor(
+				interceptor,
+				"/osac.public.v1.Clusters/Update",
+				publicv1.ClustersUpdateRequest_builder{
+					Object: publicv1.Cluster_builder{Id: "test-cluster"}.Build(),
+					UpdateMask: &fieldmaskpb.FieldMask{
+						Paths: []string{"spec.node_sets.workers.observed_version"},
+					},
+				}.Build(),
+			)
+			Expect(err).To(HaveOccurred())
+			grpcErr, ok := grpcstatus.FromError(err)
+			Expect(ok).To(BeTrue())
+			Expect(grpcErr.Code()).To(Equal(grpccodes.InvalidArgument))
+			Expect(grpcErr.Message()).To(ContainSubstring("observed_version"))
+		})
+
+		It("Allows masks that set a whole map entry, without touching annotated fields", func() {
+			handlerCalled, err := runInterceptor(
+				interceptor,
+				"/osac.public.v1.Clusters/Update",
+				publicv1.ClustersUpdateRequest_builder{
+					Object: publicv1.Cluster_builder{Id: "test-cluster"}.Build(),
+					UpdateMask: &fieldmaskpb.FieldMask{
+						Paths: []string{"spec.node_sets.workers"},
+					},
+				}.Build(),
+			)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(handlerCalled).To(BeTrue())
+		})
+
+		It("Allows masks with list indexes and passes invalid ones to the server", func() {
+			handlerCalled, err := runInterceptor(
+				interceptor,
+				"/osac.public.v1.Clusters/Update",
+				publicv1.ClustersUpdateRequest_builder{
+					Object: publicv1.Cluster_builder{Id: "test-cluster"}.Build(),
+					UpdateMask: &fieldmaskpb.FieldMask{
+						Paths: []string{"spec.node_sets.workers.size"},
+					},
+				}.Build(),
+			)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(handlerCalled).To(BeTrue())
+		})
+
 		It("Allows a public update whose mask only touches writable fields", func() {
 			handlerCalled, err := runInterceptor(
 				interceptor,

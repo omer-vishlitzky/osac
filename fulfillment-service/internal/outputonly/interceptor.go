@@ -22,6 +22,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"strconv"
 	"strings"
 
 	"google.golang.org/genproto/googleapis/api/annotations"
@@ -31,6 +32,8 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
+
+	"github.com/osac-project/osac/fulfillment-service/internal/masks"
 )
 
 const (
@@ -160,19 +163,18 @@ func objectDescriptorOf(value protoreflect.Message) protoreflect.MessageDescript
 }
 
 // outputOnlyPath walks the mask path over the resource descriptor and reports the first field
-// it touches that is annotated as OUTPUT_ONLY. Path segments are matched by proto name and by
-// JSON name, so both snake_case and camelCase masks are covered. List index and map key
-// selectors are stripped from the segment before the lookup.
+// it touches that is annotated as OUTPUT_ONLY. Segments are normalized exactly like the
+// server's path compiler (masks.SplitPath: trimmed, empty chunks dropped) and are matched by
+// proto name and by JSON name, so both snake_case and camelCase masks are covered. Map fields
+// are followed by their key segment and list fields by their index segment, mirroring the
+// compiler, so annotated fields nested in maps and lists are covered too.
 func outputOnlyPath(desc protoreflect.MessageDescriptor, path string) (protoreflect.FieldDescriptor, bool) {
+	segments := masks.SplitPath(path)
 	current := desc
-	for _, segment := range strings.Split(path, ".") {
-		name := pathSegmentField(segment)
-		if name == "" {
-			return nil, false
-		}
-		field := current.Fields().ByName(protoreflect.Name(name))
+	for i := 0; i < len(segments); i++ {
+		field := current.Fields().ByName(protoreflect.Name(segments[i]))
 		if field == nil {
-			field = current.Fields().ByJSONName(name)
+			field = current.Fields().ByJSONName(segments[i])
 		}
 		if field == nil {
 			return nil, false
@@ -180,20 +182,33 @@ func outputOnlyPath(desc protoreflect.MessageDescriptor, path string) (protorefl
 		if hasOutputOnlyBehavior(field) {
 			return field, true
 		}
-		if field.Kind() != protoreflect.MessageKind {
-			return nil, false
+		switch {
+		case field.IsMap():
+			value := field.MapValue()
+			if value.Kind() != protoreflect.MessageKind {
+				return nil, false
+			}
+			i++ // the segment after a map field is its key, not a field
+			current = value.Message()
+		case field.IsList():
+			if field.Kind() != protoreflect.MessageKind {
+				return nil, false
+			}
+			if i+1 < len(segments) {
+				if _, err := strconv.Atoi(segments[i+1]); err != nil {
+					return nil, false // invalid index: the server rejects the path
+				}
+				i++
+			}
+			current = field.Message()
+		default:
+			if field.Kind() != protoreflect.MessageKind {
+				return nil, false
+			}
+			current = field.Message()
 		}
-		current = field.Message()
 	}
 	return nil, false
-}
-
-// pathSegmentField strips list index and map key selectors from a mask path segment.
-func pathSegmentField(segment string) string {
-	if index := strings.IndexAny(segment, "[{"); index >= 0 {
-		return segment[:index]
-	}
-	return segment
 }
 
 // hasOutputOnlyBehavior reports whether the field is annotated as OUTPUT_ONLY.
