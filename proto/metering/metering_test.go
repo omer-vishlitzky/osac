@@ -58,6 +58,7 @@ func TestResources(t *testing.T) {
 			Message: "osac.private.v1.ExternalIP",
 			Fields: []Field{
 				{Path: "spec.pool", Kind: KindFixedAtCreation},
+				{Path: "status.address", Kind: KindSetOnceLater},
 				{Path: "status.attached", Kind: KindChanging, TransitionTime: "status.attachment_transition_time"},
 				{Path: "status.attribution", Kind: KindChanging, TransitionTime: "status.attachment_transition_time"},
 				{Path: "status.state", Kind: KindChanging, TransitionTime: "status.state_transition_time"},

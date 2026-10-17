@@ -86,7 +86,7 @@ message ExternalIPStatus {
   //
   // Populated once the IP transitions to ALLOCATED state. Remains stable for the lifetime of
   // the ExternalIP. Cleared only when the IP is deallocated.
-  string address = 3;
+  string address = 3 [(osac.private.v1.metering) = {kind: METERING_FIELD_KIND_SET_ONCE_LATER}];
 
   // Parent ExternalIPPool ID that this IP was allocated from.
   //
