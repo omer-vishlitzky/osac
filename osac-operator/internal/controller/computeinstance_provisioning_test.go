@@ -622,3 +622,37 @@ var _ = Describe("ComputeInstance running config", func() {
 		Expect(instance.Status.RunningConfigVersion).To(Equal("v1"))
 	})
 })
+
+var _ = Describe("ComputeInstance phase transition time", func() {
+	It("stamps the time when the phase changes", func() {
+		instance := &osacv1alpha1.ComputeInstance{Status: osacv1alpha1.ComputeInstanceStatus{
+			Phase: osacv1alpha1.ComputeInstancePhaseStarting,
+		}}
+
+		setComputeInstancePhase(&instance.Status, osacv1alpha1.ComputeInstancePhaseRunning)
+
+		Expect(instance.Status.Phase).To(Equal(osacv1alpha1.ComputeInstancePhaseRunning))
+		Expect(instance.Status.PhaseTransitionTime).NotTo(BeNil())
+	})
+
+	It("stamps the first phase of a new instance", func() {
+		instance := &osacv1alpha1.ComputeInstance{}
+
+		setComputeInstancePhase(&instance.Status, osacv1alpha1.ComputeInstancePhaseStarting)
+
+		Expect(instance.Status.Phase).To(Equal(osacv1alpha1.ComputeInstancePhaseStarting))
+		Expect(instance.Status.PhaseTransitionTime).NotTo(BeNil())
+	})
+
+	It("keeps the time while the phase is unchanged", func() {
+		stamped := metav1.NewTime(time.Now().Add(-time.Hour).UTC())
+		instance := &osacv1alpha1.ComputeInstance{Status: osacv1alpha1.ComputeInstanceStatus{
+			Phase:               osacv1alpha1.ComputeInstancePhaseRunning,
+			PhaseTransitionTime: &stamped,
+		}}
+
+		setComputeInstancePhase(&instance.Status, osacv1alpha1.ComputeInstancePhaseRunning)
+
+		Expect(instance.Status.PhaseTransitionTime.Time).To(Equal(stamped.Time))
+	})
+})

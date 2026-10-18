@@ -145,7 +145,24 @@ var _ = Describe("ComputeInstanceFeedbackReconciler", func() {
 			}.Build()
 		}
 
-		It("stamps a later transition time when the state changes", func() {
+		It("copies the CR's phase transition time when the state changes", func() {
+			oldStamp := timestamppb.New(time.Now().Add(-2 * time.Hour))
+			phaseStamp := metav1.NewTime(time.Now().Add(-time.Hour).UTC())
+			remote := remoteWithState(privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_RUNNING, oldStamp)
+			obj := &osacv1alpha1.ComputeInstance{Status: osacv1alpha1.ComputeInstanceStatus{
+				Phase:               osacv1alpha1.ComputeInstancePhaseFailed,
+				PhaseTransitionTime: &phaseStamp,
+			}}
+
+			syncCIPhase(ctx, obj, remote)
+
+			Expect(remote.GetStatus().GetState()).To(Equal(privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_FAILED))
+			// The copied time is the CR's recorded transition, not the feedback moment:
+			// feedback can run long after the phase moved.
+			Expect(remote.GetStatus().GetStateTransitionTime().AsTime()).To(Equal(phaseStamp.Time))
+		})
+
+		It("falls back to the observation time when the CR carries no phase transition time", func() {
 			oldStamp := timestamppb.New(time.Now().Add(-time.Hour))
 			remote := remoteWithState(privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_RUNNING, oldStamp)
 			obj := &osacv1alpha1.ComputeInstance{Status: osacv1alpha1.ComputeInstanceStatus{

@@ -360,7 +360,7 @@ func (r *ComputeInstanceReconciler) handleProvisioning(ctx context.Context, inst
 				// If the VM already exists (re-provisioning failure), the phase is driven by KubeVirt
 				// PrintableStatus and the failed job is visible in status.provisioningJobs.
 				if instance.Status.VirtualMachineReference == nil {
-					instance.Status.Phase = v1alpha1.ComputeInstancePhaseFailed
+					setComputeInstancePhase(&instance.Status, v1alpha1.ComputeInstancePhaseFailed)
 				}
 				instance.SetStatusCondition(v1alpha1.ComputeInstanceConditionProvisioned, metav1.ConditionFalse, message, v1alpha1.ReasonProvisioningFailed)
 			},
@@ -510,7 +510,7 @@ func (r *ComputeInstanceReconciler) handleUpdate(ctx context.Context, _ reconcil
 	// Initialize phase to Starting for brand-new CIs (Phase is empty until first set).
 	// Overridden by determinePhaseFromPrintableStatus() once a KubeVirt VM exists.
 	if instance.Status.Phase == "" {
-		instance.Status.Phase = v1alpha1.ComputeInstancePhaseStarting
+		setComputeInstancePhase(&instance.Status, v1alpha1.ComputeInstancePhaseStarting)
 	}
 
 	// Get the tenant (on local cluster)
@@ -552,10 +552,10 @@ func (r *ComputeInstanceReconciler) handleUpdate(ctx context.Context, _ reconcil
 		if err := r.handleKubeVirtVM(ctx, targetClient, instance, kv); err != nil {
 			return ctrl.Result{}, err
 		}
-		instance.Status.Phase = determinePhaseFromPrintableStatus(ctx, kv, instance.Status.Phase)
+		setComputeInstancePhase(&instance.Status, determinePhaseFromPrintableStatus(ctx, kv, instance.Status.Phase))
 	} else {
 		// No KubeVirt VM exists yet: infrastructure is being provisioned.
-		instance.Status.Phase = v1alpha1.ComputeInstancePhaseStarting
+		setComputeInstancePhase(&instance.Status, v1alpha1.ComputeInstancePhaseStarting)
 		instance.SetStatusCondition(v1alpha1.ComputeInstanceConditionProvisioned, metav1.ConditionFalse, "VirtualMachine not yet created, waiting for provisioning", v1alpha1.ReasonWaitingForVM)
 		instance.SetStatusCondition(v1alpha1.ComputeInstanceConditionReady, metav1.ConditionFalse, "", v1alpha1.ReasonAsExpected)
 		instance.SetStatusCondition(v1alpha1.ComputeInstanceConditionRestartRequired, metav1.ConditionFalse, "", v1alpha1.ReasonAsExpected)
@@ -645,7 +645,7 @@ func (r *ComputeInstanceReconciler) handleDelete(ctx context.Context, _ reconcil
 	log := ctrllog.FromContext(ctx)
 	log.Info("deleting compute instance")
 
-	instance.Status.Phase = v1alpha1.ComputeInstancePhaseDeleting
+	setComputeInstancePhase(&instance.Status, v1alpha1.ComputeInstancePhaseDeleting)
 
 	// Base finalizer has already been removed, cleanup complete
 	if !controllerutil.ContainsFinalizer(instance, osacComputeInstanceFinalizer) {
@@ -1088,6 +1088,19 @@ func recordRunningConfig(instance *v1alpha1.ComputeInstance) {
 	since := metav1.NewTime(time.Now().UTC())
 	instance.Status.RunningConfigVersion = instance.Status.DesiredConfigVersion
 	instance.Status.RunningConfigSince = &since
+}
+
+// setComputeInstancePhase records the phase and, when it changes, the time of the change, so
+// metering can bill the state transition from the moment it happened rather than from when
+// feedback noticed it. The time is stamped once per phase change and kept while the phase is
+// unchanged, the same recordRunningConfig pattern as RunningConfigSince.
+func setComputeInstancePhase(status *v1alpha1.ComputeInstanceStatus, phase v1alpha1.ComputeInstancePhaseType) {
+	if status.Phase == phase {
+		return
+	}
+	status.Phase = phase
+	now := metav1.Now()
+	status.PhaseTransitionTime = &now
 }
 
 func conditionReason(instance *v1alpha1.ComputeInstance, condType v1alpha1.ComputeInstanceConditionType) string {

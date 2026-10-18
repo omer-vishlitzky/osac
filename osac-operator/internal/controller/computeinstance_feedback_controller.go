@@ -174,10 +174,13 @@ func mapCIConditionStatus(status metav1.ConditionStatus) privatev1.ConditionStat
 	}
 }
 
-// syncCIPhase maps the CR phase to the fulfillment state. The CR records no phase
-// transition time, so a state change is stamped at the moment feedback observes it:
-// the metering source contract rejects a state change whose status.state_transition_time
-// is not later than the stored one. An unchanged state keeps the stored time.
+// syncCIPhase maps the CR phase to the fulfillment state. The transition time is the CR's
+// recorded phase transition time (PhaseTransitionTime), not the moment feedback observed the
+// change: feedback can run long after the phase moved, and those hours belong to the state that
+// was actually current. The metering source contract rejects a state change whose
+// status.state_transition_time is not later than the stored one. An unchanged state keeps the
+// stored time. A CR that predates PhaseTransitionTime carries none; feedback then falls back
+// to its own observation time so the change is still stamped later than the stored one.
 func syncCIPhase(ctx context.Context, obj *ckv1alpha1.ComputeInstance, remote *privatev1.ComputeInstance) {
 	var state privatev1.ComputeInstanceState
 	switch obj.Status.Phase {
@@ -201,9 +204,19 @@ func syncCIPhase(ctx context.Context, obj *ckv1alpha1.ComputeInstance, remote *p
 		return
 	}
 	if remote.GetStatus().GetState() != state {
-		remote.GetStatus().SetStateTransitionTime(timestamppb.Now())
+		remote.GetStatus().SetStateTransitionTime(phaseTransitionTime(obj.Status.PhaseTransitionTime))
 	}
 	remote.GetStatus().SetState(state)
+}
+
+// phaseTransitionTime returns the CR's recorded phase transition time, falling back to the
+// current time when the CR carries none (created before the field existed and not yet
+// re-stamped by a phase change).
+func phaseTransitionTime(since *metav1.Time) *timestamppb.Timestamp {
+	if since == nil || since.IsZero() {
+		return timestamppb.Now()
+	}
+	return timestamppb.New(since.Time)
 }
 
 func findComputeInstanceCondition(remote *privatev1.ComputeInstance, kind privatev1.ComputeInstanceConditionType) *privatev1.ComputeInstanceCondition {

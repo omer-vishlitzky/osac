@@ -202,18 +202,22 @@ func syncClusterOrderDelete(ctx context.Context, clusterOrder *ckv1alpha1.Cluste
 	syncClusterOrderWorkerConditions(clusterOrder, remote)
 	syncClusterOrderPhase(ctx, clusterOrder, remote)
 	syncClusterOrderNodeRequests(ctx, clusterOrder, remote)
-	setClusterStateWithTransitionTime(remote, privatev1.ClusterState_CLUSTER_STATE_DELETING)
+	setClusterStateWithTransitionTime(clusterOrder, remote, privatev1.ClusterState_CLUSTER_STATE_DELETING)
 	return nil
 }
 
 // setClusterStateWithTransitionTime records the state and stamps its transition time when
-// the stored state changes. The metering source contract rejects a state change whose
-// status.state_transition_time is not later than the stored one, so an update that changes
-// the state must carry a fresh time in the same sync; an unchanged state keeps the stored
-// time.
-func setClusterStateWithTransitionTime(remote *privatev1.Cluster, state privatev1.ClusterState) {
+// the stored state changes. The time is the ClusterOrder's recorded phase transition time
+// (PhaseTransitionTime), not the moment feedback observed the change: feedback can run long
+// after the phase moved, and those hours belong to the state that was actually current. The
+// metering source contract rejects a state change whose status.state_transition_time is not
+// later than the stored one, so an update that changes the state must carry a fresh time in
+// the same sync; an unchanged state keeps the stored time. A CR that predates
+// PhaseTransitionTime carries none; feedback then falls back to its own observation time so
+// the change is still stamped later than the stored one.
+func setClusterStateWithTransitionTime(clusterOrder *ckv1alpha1.ClusterOrder, remote *privatev1.Cluster, state privatev1.ClusterState) {
 	if remote.GetStatus().GetState() != state {
-		remote.GetStatus().SetStateTransitionTime(timestamppb.Now())
+		remote.GetStatus().SetStateTransitionTime(phaseTransitionTime(clusterOrder.Status.PhaseTransitionTime))
 	}
 	remote.GetStatus().SetState(state)
 }
@@ -524,11 +528,12 @@ func mapClusterConditionStatus(status metav1.ConditionStatus) privatev1.Conditio
 	}
 }
 
-// syncClusterOrderPhase maps the ClusterOrder phase to the fulfillment state. The CR
-// records no phase transition time, so a state change is stamped at the moment feedback
-// observes it: the metering source contract rejects a state change whose
-// status.state_transition_time is not later than the stored one. An unchanged state
-// keeps the stored time.
+// syncClusterOrderPhase maps the ClusterOrder phase to the fulfillment state. The transition
+// time is the CR's recorded phase transition time (PhaseTransitionTime), not the moment
+// feedback observed the change: feedback can run long after the phase moved, and those hours
+// belong to the state that was actually current. The metering source contract rejects a state
+// change whose status.state_transition_time is not later than the stored one. An unchanged
+// state keeps the stored time.
 func syncClusterOrderPhase(ctx context.Context, clusterOrder *ckv1alpha1.ClusterOrder, remote *privatev1.Cluster) {
 	log := ctrllog.FromContext(ctx)
 	var state privatev1.ClusterState
@@ -547,7 +552,7 @@ func syncClusterOrderPhase(ctx context.Context, clusterOrder *ckv1alpha1.Cluster
 		log.Info("Unknown phase, will ignore it", "phase", clusterOrder.Status.Phase)
 	}
 	if knownPhase {
-		setClusterStateWithTransitionTime(remote, state)
+		setClusterStateWithTransitionTime(clusterOrder, remote, state)
 	}
 	if clusterOrder.Status.Phase != ckv1alpha1.ClusterOrderPhaseReady {
 		if ready := findExistingClusterCondition(remote,

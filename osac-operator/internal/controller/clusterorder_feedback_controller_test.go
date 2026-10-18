@@ -149,7 +149,24 @@ var _ = Describe("ClusterOrder FeedbackReconciler", func() {
 			}
 		}
 
-		It("stamps a later transition time when the phase changes the state", func() {
+		It("copies the CR's phase transition time when the phase changes the state", func() {
+			oldStamp := timestamppb.New(time.Now().Add(-2 * time.Hour))
+			phaseStamp := metav1.NewTime(time.Now().Add(-time.Hour).UTC())
+			remote := remoteWithState(privatev1.ClusterState_CLUSTER_STATE_PROGRESSING, oldStamp)
+			clusterOrder := &osacv1alpha1.ClusterOrder{Status: osacv1alpha1.ClusterOrderStatus{
+				Phase:               osacv1alpha1.ClusterOrderPhaseReady,
+				PhaseTransitionTime: &phaseStamp,
+			}}
+
+			syncClusterOrderPhase(testCtx, clusterOrder, remote)
+
+			Expect(remote.GetStatus().GetState()).To(Equal(privatev1.ClusterState_CLUSTER_STATE_READY))
+			// The copied time is the CR's recorded transition, not the feedback moment:
+			// feedback can run long after the phase moved.
+			Expect(remote.GetStatus().GetStateTransitionTime().AsTime()).To(Equal(phaseStamp.Time))
+		})
+
+		It("falls back to the observation time when the phase changes and the CR carries no time", func() {
 			oldStamp := timestamppb.New(time.Now().Add(-time.Hour))
 			remote := remoteWithState(privatev1.ClusterState_CLUSTER_STATE_PROGRESSING, oldStamp)
 			clusterOrder := &osacv1alpha1.ClusterOrder{Status: osacv1alpha1.ClusterOrderStatus{
@@ -186,6 +203,22 @@ var _ = Describe("ClusterOrder FeedbackReconciler", func() {
 
 			Expect(remote.GetStatus().GetState()).To(Equal(privatev1.ClusterState_CLUSTER_STATE_PROGRESSING))
 			Expect(remote.GetStatus().GetStateTransitionTime().AsTime()).To(Equal(oldStamp.AsTime()))
+		})
+
+		It("copies the CR's phase transition time when the delete path forces DELETING", func() {
+			oldStamp := timestamppb.New(time.Now().Add(-2 * time.Hour))
+			phaseStamp := metav1.NewTime(time.Now().Add(-time.Hour).UTC())
+			remote := remoteWithState(privatev1.ClusterState_CLUSTER_STATE_PROGRESSING, oldStamp)
+			clusterOrder := &osacv1alpha1.ClusterOrder{Status: osacv1alpha1.ClusterOrderStatus{
+				Phase:               osacv1alpha1.ClusterOrderPhaseDeleting,
+				PhaseTransitionTime: &phaseStamp,
+			}}
+
+			Expect(syncClusterOrderDelete(testCtx, clusterOrder, remote)).To(Succeed())
+
+			Expect(remote.GetStatus().GetState()).To(Equal(privatev1.ClusterState_CLUSTER_STATE_DELETING))
+			// The copied time is the CR's recorded transition, not the feedback moment.
+			Expect(remote.GetStatus().GetStateTransitionTime().AsTime()).To(Equal(phaseStamp.Time))
 		})
 
 		It("stamps a later transition time when the delete path forces DELETING", func() {
