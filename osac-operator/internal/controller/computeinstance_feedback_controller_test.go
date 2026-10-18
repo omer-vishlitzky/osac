@@ -135,6 +135,56 @@ var _ = Describe("ComputeInstanceFeedbackReconciler", func() {
 		}
 	})
 
+	Context("state transition time feedback", func() {
+		remoteWithState := func(state privatev1.ComputeInstanceState, transitionTime *timestamppb.Timestamp) *privatev1.ComputeInstance {
+			return privatev1.ComputeInstance_builder{
+				Status: privatev1.ComputeInstanceStatus_builder{
+					State:               state,
+					StateTransitionTime: transitionTime,
+				}.Build(),
+			}.Build()
+		}
+
+		It("stamps a later transition time when the state changes", func() {
+			oldStamp := timestamppb.New(time.Now().Add(-time.Hour))
+			remote := remoteWithState(privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_RUNNING, oldStamp)
+			obj := &osacv1alpha1.ComputeInstance{Status: osacv1alpha1.ComputeInstanceStatus{
+				Phase: osacv1alpha1.ComputeInstancePhaseFailed,
+			}}
+
+			syncCIPhase(ctx, obj, remote)
+
+			Expect(remote.GetStatus().GetState()).To(Equal(privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_FAILED))
+			Expect(remote.GetStatus().GetStateTransitionTime().AsTime()).To(BeTemporally(">", oldStamp.AsTime()))
+		})
+
+		It("keeps the existing transition time when the state is unchanged", func() {
+			oldStamp := timestamppb.New(time.Now().Add(-time.Hour))
+			remote := remoteWithState(privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_RUNNING, oldStamp)
+			obj := &osacv1alpha1.ComputeInstance{Status: osacv1alpha1.ComputeInstanceStatus{
+				Phase: osacv1alpha1.ComputeInstancePhaseRunning,
+			}}
+
+			syncCIPhase(ctx, obj, remote)
+
+			Expect(remote.GetStatus().GetState()).To(Equal(privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_RUNNING))
+			Expect(remote.GetStatus().GetStateTransitionTime().AsTime()).To(Equal(oldStamp.AsTime()))
+		})
+
+		It("leaves the state and time untouched for an unknown phase", func() {
+			oldStamp := timestamppb.New(time.Now().Add(-time.Hour))
+			remote := remoteWithState(privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_RUNNING, oldStamp)
+			obj := &osacv1alpha1.ComputeInstance{Status: osacv1alpha1.ComputeInstanceStatus{
+				Phase: osacv1alpha1.ComputeInstancePhaseType("unexpected"),
+			}}
+
+			syncCIPhase(ctx, obj, remote)
+
+			Expect(remote.GetStatus().GetState()).To(Equal(privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_RUNNING))
+			Expect(remote.GetStatus().GetStateTransitionTime().AsTime()).To(Equal(oldStamp.AsTime()))
+		})
+	})
+
 	Context("network attachment IP feedback", func() {
 		It("copies attachment Subnet ID and IP into the Fulfillment status", func() {
 			obj := &osacv1alpha1.ComputeInstance{Status: osacv1alpha1.ComputeInstanceStatus{
@@ -456,8 +506,12 @@ var _ = Describe("ComputeInstanceFeedbackReconciler", func() {
 			Expect(mockClient.updateCalled).To(BeTrue())
 			Expect(mockClient.lastUpdateMask.GetPaths()).To(ContainElement("status.instance_type"))
 			Expect(mockClient.lastUpdateMask.GetPaths()).To(ContainElement("status.instance_type_transition_time"))
+			// The state changes from unspecified to running, so the sync must also stamp the
+			// state transition time and its mask path must be sent along.
+			Expect(mockClient.lastUpdateMask.GetPaths()).To(ContainElement("status.state_transition_time"))
 			Expect(mockClient.lastUpdate.GetStatus().GetInstanceType().GetId()).To(Equal("standard-8-32"))
 			Expect(mockClient.lastUpdate.GetStatus().GetInstanceTypeTransitionTime()).ToNot(BeNil())
+			Expect(mockClient.lastUpdate.GetStatus().GetStateTransitionTime()).ToNot(BeNil())
 		})
 	})
 

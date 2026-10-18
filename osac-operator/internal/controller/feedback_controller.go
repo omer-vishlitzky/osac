@@ -202,8 +202,20 @@ func syncClusterOrderDelete(ctx context.Context, clusterOrder *ckv1alpha1.Cluste
 	syncClusterOrderWorkerConditions(clusterOrder, remote)
 	syncClusterOrderPhase(ctx, clusterOrder, remote)
 	syncClusterOrderNodeRequests(ctx, clusterOrder, remote)
-	remote.GetStatus().SetState(privatev1.ClusterState_CLUSTER_STATE_DELETING)
+	setClusterStateWithTransitionTime(remote, privatev1.ClusterState_CLUSTER_STATE_DELETING)
 	return nil
+}
+
+// setClusterStateWithTransitionTime records the state and stamps its transition time when
+// the stored state changes. The metering source contract rejects a state change whose
+// status.state_transition_time is not later than the stored one, so an update that changes
+// the state must carry a fresh time in the same sync; an unchanged state keeps the stored
+// time.
+func setClusterStateWithTransitionTime(remote *privatev1.Cluster, state privatev1.ClusterState) {
+	if remote.GetStatus().GetState() != state {
+		remote.GetStatus().SetStateTransitionTime(timestamppb.Now())
+	}
+	remote.GetStatus().SetState(state)
 }
 
 // clusterOrderConditionMappings maps a ClusterOrder condition to the fulfillment
@@ -512,19 +524,30 @@ func mapClusterConditionStatus(status metav1.ConditionStatus) privatev1.Conditio
 	}
 }
 
+// syncClusterOrderPhase maps the ClusterOrder phase to the fulfillment state. The CR
+// records no phase transition time, so a state change is stamped at the moment feedback
+// observes it: the metering source contract rejects a state change whose
+// status.state_transition_time is not later than the stored one. An unchanged state
+// keeps the stored time.
 func syncClusterOrderPhase(ctx context.Context, clusterOrder *ckv1alpha1.ClusterOrder, remote *privatev1.Cluster) {
 	log := ctrllog.FromContext(ctx)
+	var state privatev1.ClusterState
+	knownPhase := true
 	switch clusterOrder.Status.Phase {
 	case ckv1alpha1.ClusterOrderPhaseProgressing:
-		remote.GetStatus().SetState(privatev1.ClusterState_CLUSTER_STATE_PROGRESSING)
+		state = privatev1.ClusterState_CLUSTER_STATE_PROGRESSING
 	case ckv1alpha1.ClusterOrderPhaseFailed:
-		remote.GetStatus().SetState(privatev1.ClusterState_CLUSTER_STATE_FAILED)
+		state = privatev1.ClusterState_CLUSTER_STATE_FAILED
 	case ckv1alpha1.ClusterOrderPhaseReady:
-		remote.GetStatus().SetState(privatev1.ClusterState_CLUSTER_STATE_READY)
+		state = privatev1.ClusterState_CLUSTER_STATE_READY
 	case ckv1alpha1.ClusterOrderPhaseDeleting:
-		remote.GetStatus().SetState(privatev1.ClusterState_CLUSTER_STATE_DELETING)
+		state = privatev1.ClusterState_CLUSTER_STATE_DELETING
 	default:
+		knownPhase = false
 		log.Info("Unknown phase, will ignore it", "phase", clusterOrder.Status.Phase)
+	}
+	if knownPhase {
+		setClusterStateWithTransitionTime(remote, state)
 	}
 	if clusterOrder.Status.Phase != ckv1alpha1.ClusterOrderPhaseReady {
 		if ready := findExistingClusterCondition(remote,

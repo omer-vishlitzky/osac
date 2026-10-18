@@ -25,6 +25,7 @@ import (
 	"google.golang.org/grpc/codes"
 	grpcstatus "google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
+	"google.golang.org/protobuf/types/known/timestamppb"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
@@ -137,6 +138,68 @@ var _ = Describe("ClusterOrder FeedbackReconciler", func() {
 		if err != nil && apierrors.IsNotFound(err) {
 			Expect(k8sClient.Create(testCtx, namespace)).To(Succeed())
 		}
+	})
+
+	Context("state transition time feedback", func() {
+		remoteWithState := func(state privatev1.ClusterState, transitionTime *timestamppb.Timestamp) *privatev1.Cluster {
+			return &privatev1.Cluster{
+				Id:     clusterID,
+				Spec:   &privatev1.ClusterSpec{},
+				Status: &privatev1.ClusterStatus{State: state, StateTransitionTime: transitionTime},
+			}
+		}
+
+		It("stamps a later transition time when the phase changes the state", func() {
+			oldStamp := timestamppb.New(time.Now().Add(-time.Hour))
+			remote := remoteWithState(privatev1.ClusterState_CLUSTER_STATE_PROGRESSING, oldStamp)
+			clusterOrder := &osacv1alpha1.ClusterOrder{Status: osacv1alpha1.ClusterOrderStatus{
+				Phase: osacv1alpha1.ClusterOrderPhaseReady,
+			}}
+
+			syncClusterOrderPhase(testCtx, clusterOrder, remote)
+
+			Expect(remote.GetStatus().GetState()).To(Equal(privatev1.ClusterState_CLUSTER_STATE_READY))
+			Expect(remote.GetStatus().GetStateTransitionTime().AsTime()).To(BeTemporally(">", oldStamp.AsTime()))
+		})
+
+		It("keeps the existing transition time when the state is unchanged", func() {
+			oldStamp := timestamppb.New(time.Now().Add(-time.Hour))
+			remote := remoteWithState(privatev1.ClusterState_CLUSTER_STATE_READY, oldStamp)
+			clusterOrder := &osacv1alpha1.ClusterOrder{Status: osacv1alpha1.ClusterOrderStatus{
+				Phase: osacv1alpha1.ClusterOrderPhaseReady,
+			}}
+
+			syncClusterOrderPhase(testCtx, clusterOrder, remote)
+
+			Expect(remote.GetStatus().GetState()).To(Equal(privatev1.ClusterState_CLUSTER_STATE_READY))
+			Expect(remote.GetStatus().GetStateTransitionTime().AsTime()).To(Equal(oldStamp.AsTime()))
+		})
+
+		It("leaves the state and time untouched for an unknown phase", func() {
+			oldStamp := timestamppb.New(time.Now().Add(-time.Hour))
+			remote := remoteWithState(privatev1.ClusterState_CLUSTER_STATE_PROGRESSING, oldStamp)
+			clusterOrder := &osacv1alpha1.ClusterOrder{Status: osacv1alpha1.ClusterOrderStatus{
+				Phase: "unexpected",
+			}}
+
+			syncClusterOrderPhase(testCtx, clusterOrder, remote)
+
+			Expect(remote.GetStatus().GetState()).To(Equal(privatev1.ClusterState_CLUSTER_STATE_PROGRESSING))
+			Expect(remote.GetStatus().GetStateTransitionTime().AsTime()).To(Equal(oldStamp.AsTime()))
+		})
+
+		It("stamps a later transition time when the delete path forces DELETING", func() {
+			oldStamp := timestamppb.New(time.Now().Add(-time.Hour))
+			remote := remoteWithState(privatev1.ClusterState_CLUSTER_STATE_PROGRESSING, oldStamp)
+			clusterOrder := &osacv1alpha1.ClusterOrder{Status: osacv1alpha1.ClusterOrderStatus{
+				Phase: osacv1alpha1.ClusterOrderPhaseDeleting,
+			}}
+
+			Expect(syncClusterOrderDelete(testCtx, clusterOrder, remote)).To(Succeed())
+
+			Expect(remote.GetStatus().GetState()).To(Equal(privatev1.ClusterState_CLUSTER_STATE_DELETING))
+			Expect(remote.GetStatus().GetStateTransitionTime().AsTime()).To(BeTemporally(">", oldStamp.AsTime()))
+		})
 	})
 
 	Context("When reconciling a resource that doesn't exist", func() {

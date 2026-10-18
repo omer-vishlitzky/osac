@@ -98,7 +98,7 @@ func newComputeInstanceFeedbackBridge(hubClient clnt.Client, ciClient privatev1.
 			_, err := ciClient.Update(ctx, privatev1.ComputeInstancesUpdateRequest_builder{
 				Object: remote,
 				UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{
-					feedbackStatusConditionsPath, feedbackStatusStatePath,
+					feedbackStatusConditionsPath, feedbackStatusStatePath, feedbackStatusStateTransitionTimePath,
 					"status.external_ip_address", "status.internal_ip_address",
 					"status.compute_network_attachment_statuses", "status.last_restarted_at",
 					"status.instance_type", "status.instance_type_transition_time",
@@ -174,26 +174,36 @@ func mapCIConditionStatus(status metav1.ConditionStatus) privatev1.ConditionStat
 	}
 }
 
+// syncCIPhase maps the CR phase to the fulfillment state. The CR records no phase
+// transition time, so a state change is stamped at the moment feedback observes it:
+// the metering source contract rejects a state change whose status.state_transition_time
+// is not later than the stored one. An unchanged state keeps the stored time.
 func syncCIPhase(ctx context.Context, obj *ckv1alpha1.ComputeInstance, remote *privatev1.ComputeInstance) {
+	var state privatev1.ComputeInstanceState
 	switch obj.Status.Phase {
 	case ckv1alpha1.ComputeInstancePhaseStarting:
-		remote.GetStatus().SetState(privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_STARTING)
+		state = privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_STARTING
 	case ckv1alpha1.ComputeInstancePhaseFailed:
-		remote.GetStatus().SetState(privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_FAILED)
+		state = privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_FAILED
 	case ckv1alpha1.ComputeInstancePhaseRunning:
-		remote.GetStatus().SetState(privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_RUNNING)
+		state = privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_RUNNING
 	case ckv1alpha1.ComputeInstancePhaseDeleting:
-		remote.GetStatus().SetState(privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_DELETING)
+		state = privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_DELETING
 	case ckv1alpha1.ComputeInstancePhaseStopping:
-		remote.GetStatus().SetState(privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_STOPPING)
+		state = privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_STOPPING
 	case ckv1alpha1.ComputeInstancePhaseStopped:
-		remote.GetStatus().SetState(privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_STOPPED)
+		state = privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_STOPPED
 	case ckv1alpha1.ComputeInstancePhasePaused:
-		remote.GetStatus().SetState(privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_PAUSED)
+		state = privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_PAUSED
 	default:
 		log := ctrllog.FromContext(ctx)
 		log.Info("Unknown phase, will ignore it", "phase", obj.Status.Phase)
+		return
 	}
+	if remote.GetStatus().GetState() != state {
+		remote.GetStatus().SetStateTransitionTime(timestamppb.Now())
+	}
+	remote.GetStatus().SetState(state)
 }
 
 func findComputeInstanceCondition(remote *privatev1.ComputeInstance, kind privatev1.ComputeInstanceConditionType) *privatev1.ComputeInstanceCondition {
