@@ -365,6 +365,25 @@ var _ = Describe("ComputeInstanceFeedbackReconciler", func() {
 			Expect(remote.GetStatus().GetInstanceTypeTransitionTime()).To(BeNil())
 		})
 
+		It("does not stamp when the label is missing and the request carries no name", func() {
+			// A request reference without a name and a CR without the label both read as
+			// the empty string; comparing them would pass the gate vacuously, without the
+			// reconciler ever having recorded the applied type.
+			remote := privatev1.ComputeInstance_builder{
+				Spec: privatev1.ComputeInstanceSpec_builder{
+					InstanceType: typeRef("standard-8-32", ""),
+				}.Build(),
+				Status: privatev1.ComputeInstanceStatus_builder{}.Build(),
+			}.Build()
+			cr := runningCR(false, true)
+			cr.Labels = nil
+
+			syncCIRunningInstanceType(cr, remote)
+
+			Expect(remote.GetStatus().GetInstanceType()).To(BeNil())
+			Expect(remote.GetStatus().GetInstanceTypeTransitionTime()).To(BeNil())
+		})
+
 		It("does not stamp while a restart is still required", func() {
 			oldStamp := timestamppb.New(time.Now().Add(-time.Hour))
 			remote := remoteWithRequestedType(typeRef("standard-4-16", "standard-4-16"), oldStamp)

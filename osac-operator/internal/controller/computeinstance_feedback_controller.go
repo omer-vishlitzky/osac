@@ -295,7 +295,12 @@ func syncCIRunningInstanceType(obj *ckv1alpha1.ComputeInstance, remote *privatev
 	if requested == nil {
 		return
 	}
-	if obj.Labels[osacComputeInstanceTypeNameLabel] != requested.GetName() {
+	// The label must exist and be non-empty for the gate to pass: a request reference
+	// without a name and a CR without the label both read as the empty string, and
+	// comparing them would pass the gate without the reconciler ever having recorded the
+	// type it applied.
+	label := obj.Labels[osacComputeInstanceTypeNameLabel]
+	if label == "" || label != requested.GetName() {
 		return
 	}
 	if sameInstanceTypeRef(remote.GetStatus().GetInstanceType(), requested) {
