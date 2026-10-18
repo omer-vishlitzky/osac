@@ -127,6 +127,34 @@ var _ = Describe("Bare metal instances server", func() {
 			Expect(response.GetObject().GetSpec().GetInstanceType().GetId()).To(Equal("default-type"))
 		})
 
+		It("Drops a caller-supplied status on create", func() {
+			// The insert is not checked by the metering source contract, so a spoofed state
+			// with a future transition time must never reach the stored object as a
+			// fabricated fact.
+			response, err := server.Create(ctx, publicv1.BareMetalInstancesCreateRequest_builder{
+				Object: publicv1.BareMetalInstance_builder{
+					Metadata: publicv1.Metadata_builder{
+						Name: "test-baremetal-instance-spoofed-status",
+					}.Build(),
+					Spec: publicv1.BareMetalInstanceSpec_builder{
+						DiskImage:    publicv1.DiskImageReference_builder{Id: "default-bmi-disk-image"}.Build(),
+						CatalogItem:  publicv1.BareMetalInstanceCatalogItemReference_builder{Id: catalogItemID}.Build(),
+						SshPublicKey: new(testSSHPublicKey),
+					}.Build(),
+					Status: publicv1.BareMetalInstanceStatus_builder{
+						State: publicv1.BareMetalInstanceState_BARE_METAL_INSTANCE_STATE_RUNNING,
+						StateTransitionTime: timestamppb.New(
+							time.Now().Add(24 * time.Hour)),
+					}.Build(),
+				}.Build(),
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+			object := response.GetObject()
+			Expect(object.GetStatus().GetState()).To(
+				Equal(publicv1.BareMetalInstanceState_BARE_METAL_INSTANCE_STATE_UNSPECIFIED))
+			Expect(object.GetStatus().GetStateTransitionTime()).To(BeNil())
+		})
+
 		It("Returns a warning for a deprecated disk_image", func() {
 			createDiskImageWithLifecycle("deprecated-bmi-disk-image",
 				privatev1.DiskImageLifecycle_DISK_IMAGE_LIFECYCLE_DEPRECATED, nil)

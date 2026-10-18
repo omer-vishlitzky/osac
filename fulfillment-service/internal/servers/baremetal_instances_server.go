@@ -207,6 +207,10 @@ func (s *BareMetalInstancesServer) Create(ctx context.Context,
 		err = grpcstatus.Errorf(grpccodes.Internal, "failed to process bare metal instance")
 		return
 	}
+	// The status is output-only: only the system writes it. The metering source contract
+	// is not enforced on inserts, so a caller-supplied status must never reach the
+	// database as a fabricated fact.
+	privateBMI.ClearStatus()
 
 	privateRequest := &privatev1.BareMetalInstancesCreateRequest{}
 	privateRequest.SetObject(privateBMI)

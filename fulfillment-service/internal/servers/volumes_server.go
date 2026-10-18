@@ -264,6 +264,10 @@ func (s *VolumesServer) Create(ctx context.Context,
 		err = grpcstatus.Errorf(grpccodes.Internal, "failed to process volume")
 		return
 	}
+	// The status is output-only: only the system writes it. The metering source contract
+	// is not enforced on inserts, so a caller-supplied status must never reach the
+	// database as a fabricated fact.
+	privateVolume.ClearStatus()
 
 	// Delegate to the private server:
 	privateRequest := &privatev1.VolumesCreateRequest{}
