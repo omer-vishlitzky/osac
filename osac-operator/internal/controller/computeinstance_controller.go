@@ -1073,6 +1073,14 @@ func (r *ComputeInstanceReconciler) handleDesiredConfigVersion(ctx context.Conte
 // type name is part of the recorded identity: two types with identical resources hash to the
 // same config version, and a resize between them must still move the stamp.
 func recordRunningConfig(instance *v1alpha1.ComputeInstance) {
+	// KubeVirt reports RestartRequired asynchronously, so the running config may have been
+	// recorded before the restart requirement surfaced. That observation cannot vouch for
+	// what runs after the restart: it is cleared here and re-recorded once the restart
+	// completes and the configuration is observed running again.
+	if instance.IsStatusConditionTrue(v1alpha1.ComputeInstanceConditionRestartRequired) {
+		clearRecordedRunningConfig(instance)
+		return
+	}
 	// Cheap equality first: in the steady state every reconcile re-enters here with the
 	// versions already equal, and the condition checks below walk the conditions list.
 	if instance.Status.RunningConfigVersion == instance.Status.DesiredConfigVersion &&
@@ -1085,13 +1093,19 @@ func recordRunningConfig(instance *v1alpha1.ComputeInstance) {
 	if !instance.IsStatusConditionTrue(v1alpha1.ComputeInstanceConditionConfigurationApplied) {
 		return
 	}
-	if instance.IsStatusConditionTrue(v1alpha1.ComputeInstanceConditionRestartRequired) {
-		return
-	}
 	since := metav1.NewTime(time.Now().UTC())
 	instance.Status.RunningConfigVersion = instance.Status.DesiredConfigVersion
 	instance.Status.RunningInstanceTypeName = instance.Labels[osacComputeInstanceTypeNameLabel]
 	instance.Status.RunningConfigSince = &since
+}
+
+// clearRecordedRunningConfig drops the recorded running-config observation. Used when a
+// pending restart invalidates it: the observation predates the restart and cannot vouch for
+// the configuration that runs after it.
+func clearRecordedRunningConfig(instance *v1alpha1.ComputeInstance) {
+	instance.Status.RunningConfigVersion = ""
+	instance.Status.RunningInstanceTypeName = ""
+	instance.Status.RunningConfigSince = nil
 }
 
 // setComputeInstancePhase records the phase and, when it changes, the time of the change, so
