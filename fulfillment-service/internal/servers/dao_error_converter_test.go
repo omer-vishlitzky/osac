@@ -165,11 +165,11 @@ var _ = Describe("ConvertDAOErrorToGRPC", func() {
 	Context("with metering source contract errors", func() {
 		It("converts to FailedPrecondition", func() {
 			err := &dao.ErrMetering{
-				Reason: "a change of compute_instances 'abc' needs a later status.state_transition_time",
+				Reason: "cannot change spec.disk_image of compute_instances 'abc': it never changes after it is set",
 			}
 			result := ConvertDAOErrorToGRPC(err, "update", "test-id")
 			Expect(grpcstatus.Code(result)).To(Equal(grpccodes.FailedPrecondition))
-			Expect(result.Error()).To(ContainSubstring("state_transition_time"))
+			Expect(result.Error()).To(ContainSubstring("never changes"))
 		})
 
 		It("converts an empty reason to the contract description", func() {
