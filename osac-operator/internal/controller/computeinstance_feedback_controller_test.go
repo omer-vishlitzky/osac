@@ -162,6 +162,25 @@ var _ = Describe("ComputeInstanceFeedbackReconciler", func() {
 			Expect(remote.GetStatus().GetStateTransitionTime().AsTime()).To(Equal(phaseStamp.Time))
 		})
 
+		It("bumps the stored time by one microsecond when the CR stamp equals it", func() {
+			// Two phase changes within one second carry the same whole-second CR stamp; the
+			// source contract rejects a changed value with a time equal to the stored one,
+			// so the write must land past the stored time instead.
+			phaseStamp := metav1.NewTime(time.Now().Add(-time.Hour).UTC().Truncate(time.Second))
+			stored := timestamppb.New(phaseStamp.Time)
+			remote := remoteWithState(privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_RUNNING, stored)
+			obj := &osacv1alpha1.ComputeInstance{Status: osacv1alpha1.ComputeInstanceStatus{
+				Phase:               osacv1alpha1.ComputeInstancePhaseFailed,
+				PhaseTransitionTime: &phaseStamp,
+			}}
+
+			syncCIPhase(ctx, obj, remote)
+
+			Expect(remote.GetStatus().GetState()).To(Equal(privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_FAILED))
+			Expect(remote.GetStatus().GetStateTransitionTime().AsTime()).To(
+				Equal(phaseStamp.Time.Add(time.Microsecond)))
+		})
+
 		It("falls back to the observation time when the CR carries no phase transition time", func() {
 			oldStamp := timestamppb.New(time.Now().Add(-time.Hour))
 			remote := remoteWithState(privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_RUNNING, oldStamp)

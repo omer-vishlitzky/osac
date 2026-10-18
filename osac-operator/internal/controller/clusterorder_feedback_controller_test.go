@@ -166,6 +166,25 @@ var _ = Describe("ClusterOrder FeedbackReconciler", func() {
 			Expect(remote.GetStatus().GetStateTransitionTime().AsTime()).To(Equal(phaseStamp.Time))
 		})
 
+		It("bumps the stored time by one microsecond when the CR stamp equals it", func() {
+			// Two phase changes within one second carry the same whole-second CR stamp; the
+			// source contract rejects a changed value with a time equal to the stored one,
+			// so the write must land past the stored time instead.
+			phaseStamp := metav1.NewTime(time.Now().Add(-time.Hour).UTC().Truncate(time.Second))
+			stored := timestamppb.New(phaseStamp.Time)
+			remote := remoteWithState(privatev1.ClusterState_CLUSTER_STATE_PROGRESSING, stored)
+			clusterOrder := &osacv1alpha1.ClusterOrder{Status: osacv1alpha1.ClusterOrderStatus{
+				Phase:               osacv1alpha1.ClusterOrderPhaseReady,
+				PhaseTransitionTime: &phaseStamp,
+			}}
+
+			syncClusterOrderPhase(testCtx, clusterOrder, remote)
+
+			Expect(remote.GetStatus().GetState()).To(Equal(privatev1.ClusterState_CLUSTER_STATE_READY))
+			Expect(remote.GetStatus().GetStateTransitionTime().AsTime()).To(
+				Equal(phaseStamp.Time.Add(time.Microsecond)))
+		})
+
 		It("falls back to the observation time when the phase changes and the CR carries no time", func() {
 			oldStamp := timestamppb.New(time.Now().Add(-time.Hour))
 			remote := remoteWithState(privatev1.ClusterState_CLUSTER_STATE_PROGRESSING, oldStamp)

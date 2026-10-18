@@ -202,7 +202,7 @@ func syncClusterOrderDelete(ctx context.Context, clusterOrder *ckv1alpha1.Cluste
 	syncClusterOrderWorkerConditions(clusterOrder, remote)
 	syncClusterOrderPhase(ctx, clusterOrder, remote)
 	syncClusterOrderNodeRequests(ctx, clusterOrder, remote)
-	setClusterStateWithTransitionTime(clusterOrder, remote, privatev1.ClusterState_CLUSTER_STATE_DELETING)
+	setClusterStateWithTransitionTime(ctx, clusterOrder, remote, privatev1.ClusterState_CLUSTER_STATE_DELETING)
 	return nil
 }
 
@@ -212,12 +212,14 @@ func syncClusterOrderDelete(ctx context.Context, clusterOrder *ckv1alpha1.Cluste
 // after the phase moved, and those hours belong to the state that was actually current. The
 // metering source contract rejects a state change whose status.state_transition_time is not
 // later than the stored one, so an update that changes the state must carry a fresh time in
-// the same sync; an unchanged state keeps the stored time. A CR that predates
-// PhaseTransitionTime carries none; feedback then falls back to its own observation time so
-// the change is still stamped later than the stored one.
-func setClusterStateWithTransitionTime(clusterOrder *ckv1alpha1.ClusterOrder, remote *privatev1.Cluster, state privatev1.ClusterState) {
+// the same sync, and a CR stamp that is not later than the stored time is bumped by one
+// microsecond (see copyPhaseTransitionTime); an unchanged state keeps the stored time. A CR
+// that predates PhaseTransitionTime carries none; feedback then falls back to its own
+// observation time so the change is still stamped later than the stored one.
+func setClusterStateWithTransitionTime(ctx context.Context, clusterOrder *ckv1alpha1.ClusterOrder, remote *privatev1.Cluster, state privatev1.ClusterState) {
 	if remote.GetStatus().GetState() != state {
-		remote.GetStatus().SetStateTransitionTime(phaseTransitionTime(clusterOrder.Status.PhaseTransitionTime))
+		remote.GetStatus().SetStateTransitionTime(copyPhaseTransitionTime(
+			ctrllog.FromContext(ctx), clusterOrder.Status.PhaseTransitionTime, remote.GetStatus().GetStateTransitionTime()))
 	}
 	remote.GetStatus().SetState(state)
 }
@@ -552,7 +554,7 @@ func syncClusterOrderPhase(ctx context.Context, clusterOrder *ckv1alpha1.Cluster
 		log.Info("Unknown phase, will ignore it", "phase", clusterOrder.Status.Phase)
 	}
 	if knownPhase {
-		setClusterStateWithTransitionTime(clusterOrder, remote, state)
+		setClusterStateWithTransitionTime(ctx, clusterOrder, remote, state)
 	}
 	if clusterOrder.Status.Phase != ckv1alpha1.ClusterOrderPhaseReady {
 		if ready := findExistingClusterCondition(remote,

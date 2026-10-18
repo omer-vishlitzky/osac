@@ -17,7 +17,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
+	"github.com/go-logr/logr"
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
@@ -178,9 +180,11 @@ func mapCIConditionStatus(status metav1.ConditionStatus) privatev1.ConditionStat
 // recorded phase transition time (PhaseTransitionTime), not the moment feedback observed the
 // change: feedback can run long after the phase moved, and those hours belong to the state that
 // was actually current. The metering source contract rejects a state change whose
-// status.state_transition_time is not later than the stored one. An unchanged state keeps the
-// stored time. A CR that predates PhaseTransitionTime carries none; feedback then falls back
-// to its own observation time so the change is still stamped later than the stored one.
+// status.state_transition_time is not later than the stored one, so a CR stamp that is not
+// later than the stored time is bumped by one microsecond (see copyPhaseTransitionTime). An
+// unchanged state keeps the stored time. A CR that predates PhaseTransitionTime carries none;
+// feedback then falls back to its own observation time so the change is still stamped later
+// than the stored one.
 func syncCIPhase(ctx context.Context, obj *ckv1alpha1.ComputeInstance, remote *privatev1.ComputeInstance) {
 	var state privatev1.ComputeInstanceState
 	switch obj.Status.Phase {
@@ -204,7 +208,8 @@ func syncCIPhase(ctx context.Context, obj *ckv1alpha1.ComputeInstance, remote *p
 		return
 	}
 	if remote.GetStatus().GetState() != state {
-		remote.GetStatus().SetStateTransitionTime(phaseTransitionTime(obj.Status.PhaseTransitionTime))
+		remote.GetStatus().SetStateTransitionTime(copyPhaseTransitionTime(
+			ctrllog.FromContext(ctx), obj.Status.PhaseTransitionTime, remote.GetStatus().GetStateTransitionTime()))
 	}
 	remote.GetStatus().SetState(state)
 }
@@ -217,6 +222,24 @@ func phaseTransitionTime(since *metav1.Time) *timestamppb.Timestamp {
 		return timestamppb.Now()
 	}
 	return timestamppb.New(since.Time)
+}
+
+// copyPhaseTransitionTime copies the CR's recorded phase transition time into the fulfillment
+// status. The CR stores whole seconds, so two phase changes within one second carry the same
+// stamp, and the metering source contract rejects a changed value whose time is not later than
+// the stored one: the write would fail and retry forever, because the CR stamp never moves.
+// When the CR stamp is not later than the stored time, the copied time becomes the stored time
+// plus one microsecond instead. A CR stamp earlier than the stored one should not happen (the
+// controller stamps monotonically); the same bump guards it without backdating. The distortion
+// is bounded by one second, unlike the backdating the contract rejects.
+func copyPhaseTransitionTime(log logr.Logger, since *metav1.Time, stored *timestamppb.Timestamp) *timestamppb.Timestamp {
+	copied := phaseTransitionTime(since)
+	if stored == nil || copied.AsTime().After(stored.AsTime()) {
+		return copied
+	}
+	log.Info("phase transition time is not later than the stored one, bumping it by one microsecond",
+		"phaseTransitionTime", copied.AsTime(), "storedTransitionTime", stored.AsTime())
+	return timestamppb.New(stored.AsTime().Add(time.Microsecond))
 }
 
 func findComputeInstanceCondition(remote *privatev1.ComputeInstance, kind privatev1.ComputeInstanceConditionType) *privatev1.ComputeInstanceCondition {
