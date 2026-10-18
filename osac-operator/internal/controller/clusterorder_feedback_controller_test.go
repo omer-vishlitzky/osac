@@ -252,6 +252,89 @@ var _ = Describe("ClusterOrder FeedbackReconciler", func() {
 			Expect(remote.GetStatus().GetState()).To(Equal(privatev1.ClusterState_CLUSTER_STATE_DELETING))
 			Expect(remote.GetStatus().GetStateTransitionTime().AsTime()).To(BeTemporally(">", oldStamp.AsTime()))
 		})
+
+		It("dates DELETING at the deletionTimestamp when the CR phase has not moved yet", func() {
+			// The delete path can sync before the ClusterOrder CR records Phase=Deleting.
+			// The CR's PhaseTransitionTime then still belongs to the previous phase, and
+			// copying it (or a one-microsecond bump of it) would date DELETING at the old
+			// phase's moment, billing the entire READY span as DELETING.
+			readyStamp := metav1.NewTime(time.Now().Add(-2 * time.Hour).UTC())
+			deletedAt := metav1.NewTime(time.Now().Add(-5 * time.Minute).UTC())
+			remote := remoteWithState(privatev1.ClusterState_CLUSTER_STATE_READY, timestamppb.New(readyStamp.Time))
+			clusterOrder := &osacv1alpha1.ClusterOrder{
+				ObjectMeta: metav1.ObjectMeta{
+					DeletionTimestamp: &deletedAt,
+				},
+				Status: osacv1alpha1.ClusterOrderStatus{
+					Phase:               osacv1alpha1.ClusterOrderPhaseReady,
+					PhaseTransitionTime: &readyStamp,
+				},
+			}
+
+			Expect(syncClusterOrderDelete(testCtx, clusterOrder, remote)).To(Succeed())
+
+			Expect(remote.GetStatus().GetState()).To(Equal(privatev1.ClusterState_CLUSTER_STATE_DELETING))
+			Expect(remote.GetStatus().GetStateTransitionTime().AsTime()).To(Equal(deletedAt.Time))
+			Expect(remote.GetStatus().GetStateTransitionTime().AsTime()).To(BeTemporally(">", readyStamp.Time))
+		})
+
+		It("dates DELETING at the observation time when the CR phase has not moved and carries no deletionTimestamp", func() {
+			readyStamp := metav1.NewTime(time.Now().Add(-2 * time.Hour).UTC())
+			remote := remoteWithState(privatev1.ClusterState_CLUSTER_STATE_READY, timestamppb.New(readyStamp.Time))
+			clusterOrder := &osacv1alpha1.ClusterOrder{Status: osacv1alpha1.ClusterOrderStatus{
+				Phase:               osacv1alpha1.ClusterOrderPhaseReady,
+				PhaseTransitionTime: &readyStamp,
+			}}
+
+			observed := time.Now()
+			Expect(syncClusterOrderDelete(testCtx, clusterOrder, remote)).To(Succeed())
+
+			Expect(remote.GetStatus().GetState()).To(Equal(privatev1.ClusterState_CLUSTER_STATE_DELETING))
+			Expect(remote.GetStatus().GetStateTransitionTime().AsTime()).To(BeTemporally(">=", observed))
+		})
+
+		It("dates DELETING at the deletionTimestamp when deleting from a PROGRESSING phase", func() {
+			// The delete path stamps only DELETING, never an intermediate state derived
+			// from the phase the CR still carries.
+			progressingStamp := metav1.NewTime(time.Now().Add(-30 * time.Minute).UTC())
+			deletedAt := metav1.NewTime(time.Now().Add(-5 * time.Minute).UTC())
+			remote := remoteWithState(privatev1.ClusterState_CLUSTER_STATE_READY, timestamppb.New(progressingStamp.Time))
+			clusterOrder := &osacv1alpha1.ClusterOrder{
+				ObjectMeta: metav1.ObjectMeta{
+					DeletionTimestamp: &deletedAt,
+				},
+				Status: osacv1alpha1.ClusterOrderStatus{
+					Phase:               osacv1alpha1.ClusterOrderPhaseProgressing,
+					PhaseTransitionTime: &progressingStamp,
+				},
+			}
+
+			Expect(syncClusterOrderDelete(testCtx, clusterOrder, remote)).To(Succeed())
+
+			Expect(remote.GetStatus().GetState()).To(Equal(privatev1.ClusterState_CLUSTER_STATE_DELETING))
+			Expect(remote.GetStatus().GetStateTransitionTime().AsTime()).To(Equal(deletedAt.Time))
+			Expect(remote.GetStatus().GetStateTransitionTime().AsTime()).To(BeTemporally(">", progressingStamp.Time))
+		})
+
+		It("bumps the stored time by one microsecond when the deletionTimestamp is not later than it", func() {
+			readyStamp := timestamppb.New(time.Now().Add(-2 * time.Hour))
+			deletedAt := metav1.NewTime(readyStamp.AsTime().Add(-time.Minute).UTC())
+			remote := remoteWithState(privatev1.ClusterState_CLUSTER_STATE_READY, readyStamp)
+			clusterOrder := &osacv1alpha1.ClusterOrder{
+				ObjectMeta: metav1.ObjectMeta{
+					DeletionTimestamp: &deletedAt,
+				},
+				Status: osacv1alpha1.ClusterOrderStatus{
+					Phase: osacv1alpha1.ClusterOrderPhaseReady,
+				},
+			}
+
+			Expect(syncClusterOrderDelete(testCtx, clusterOrder, remote)).To(Succeed())
+
+			Expect(remote.GetStatus().GetState()).To(Equal(privatev1.ClusterState_CLUSTER_STATE_DELETING))
+			Expect(remote.GetStatus().GetStateTransitionTime().AsTime()).To(
+				Equal(readyStamp.AsTime().Add(time.Microsecond)))
+		})
 	})
 
 	Context("When reconciling a resource that doesn't exist", func() {

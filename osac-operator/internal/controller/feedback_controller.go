@@ -19,9 +19,11 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"time"
 	"unicode"
 
 	hypershiftv1beta1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
+	"github.com/go-logr/logr"
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
@@ -200,9 +202,9 @@ func addOnOperatorInstallState(state ckv1alpha1.JobState) privatev1.AddOnOperato
 func syncClusterOrderDelete(ctx context.Context, clusterOrder *ckv1alpha1.ClusterOrder, remote *privatev1.Cluster) error {
 	syncClusterOrderConditions(ctx, clusterOrder, remote)
 	syncClusterOrderWorkerConditions(clusterOrder, remote)
-	syncClusterOrderPhase(ctx, clusterOrder, remote)
+	clearClusterReadyConditionWhenNotReady(clusterOrder, remote)
 	syncClusterOrderNodeRequests(ctx, clusterOrder, remote)
-	setClusterStateWithTransitionTime(ctx, clusterOrder, remote, privatev1.ClusterState_CLUSTER_STATE_DELETING)
+	setClusterDeletingStateWithTransitionTime(ctx, clusterOrder, remote)
 	return nil
 }
 
@@ -222,6 +224,52 @@ func setClusterStateWithTransitionTime(ctx context.Context, clusterOrder *ckv1al
 			ctrllog.FromContext(ctx), clusterOrder.Status.PhaseTransitionTime, remote.GetStatus().GetStateTransitionTime()))
 	}
 	remote.GetStatus().SetState(state)
+}
+
+// setClusterDeletingStateWithTransitionTime forces the DELETING state on the delete path.
+// The ClusterOrder CR may not have recorded Phase=Deleting yet when feedback first syncs a
+// deletion; the CR's PhaseTransitionTime then belongs to the previous phase (for example a
+// READY stamped hours ago), and copying it would date DELETING at that old moment, billing
+// the entire prior state's span as DELETING. When the CR has not recorded Deleting, the
+// transition is dated at the CR's deletionTimestamp when present, else at the feedback
+// observation time, so DELETING is stamped at or after the deletion began (see
+// deletionTransitionTime). When the CR has recorded Deleting, its stamp is copied like the
+// update path. The delete path does not map the CR phase to a state at all: the state is
+// DELETING regardless of the phase the CR still carries, so no intermediate state is
+// stamped in memory within one pass.
+func setClusterDeletingStateWithTransitionTime(ctx context.Context, clusterOrder *ckv1alpha1.ClusterOrder, remote *privatev1.Cluster) {
+	state := privatev1.ClusterState_CLUSTER_STATE_DELETING
+	if remote.GetStatus().GetState() != state {
+		log := ctrllog.FromContext(ctx)
+		var stamp *timestamppb.Timestamp
+		if clusterOrder.Status.Phase == ckv1alpha1.ClusterOrderPhaseDeleting {
+			stamp = copyPhaseTransitionTime(log, clusterOrder.Status.PhaseTransitionTime, remote.GetStatus().GetStateTransitionTime())
+		} else {
+			stamp = deletionTransitionTime(log, clusterOrder, remote.GetStatus().GetStateTransitionTime())
+		}
+		remote.GetStatus().SetStateTransitionTime(stamp)
+	}
+	remote.GetStatus().SetState(state)
+}
+
+// deletionTransitionTime dates a deletion that the ClusterOrder CR has not yet recorded as
+// Phase=Deleting. The CR's deletionTimestamp, when present, is when the deletion began;
+// otherwise the feedback observation time is used. The result is never earlier than what
+// the metering source contract accepts: a time not later than the stored transition time
+// is bumped by one microsecond, mirroring copyPhaseTransitionTime.
+func deletionTransitionTime(log logr.Logger, clusterOrder *ckv1alpha1.ClusterOrder, stored *timestamppb.Timestamp) *timestamppb.Timestamp {
+	var observed *timestamppb.Timestamp
+	if clusterOrder.DeletionTimestamp != nil && !clusterOrder.DeletionTimestamp.IsZero() {
+		observed = timestamppb.New(clusterOrder.DeletionTimestamp.Time)
+	} else {
+		observed = timestamppb.Now()
+	}
+	if stored == nil || observed.AsTime().After(stored.AsTime()) {
+		return observed
+	}
+	log.Info("deletion transition time is not later than the stored one, bumping it by one microsecond",
+		"deletionTransitionTime", observed.AsTime(), "storedTransitionTime", stored.AsTime())
+	return timestamppb.New(stored.AsTime().Add(time.Microsecond))
 }
 
 // clusterOrderConditionMappings maps a ClusterOrder condition to the fulfillment
@@ -556,6 +604,12 @@ func syncClusterOrderPhase(ctx context.Context, clusterOrder *ckv1alpha1.Cluster
 	if knownPhase {
 		setClusterStateWithTransitionTime(ctx, clusterOrder, remote, state)
 	}
+	clearClusterReadyConditionWhenNotReady(clusterOrder, remote)
+}
+
+// clearClusterReadyConditionWhenNotReady drops the fulfillment READY condition once the
+// ClusterOrder phase is no longer Ready.
+func clearClusterReadyConditionWhenNotReady(clusterOrder *ckv1alpha1.ClusterOrder, remote *privatev1.Cluster) {
 	if clusterOrder.Status.Phase != ckv1alpha1.ClusterOrderPhaseReady {
 		if ready := findExistingClusterCondition(remote,
 			privatev1.ClusterConditionType_CLUSTER_CONDITION_TYPE_READY); ready != nil {
