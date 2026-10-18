@@ -429,7 +429,7 @@ var _ = Describe("setDefaults", func() {
 		externalIP := privatev1.ExternalIP_builder{
 			Id: "eip-existing-stamp",
 			Status: privatev1.ExternalIPStatus_builder{
-				State:              privatev1.ExternalIPState_EXTERNAL_IP_STATE_ALLOCATED,
+				State:               privatev1.ExternalIPState_EXTERNAL_IP_STATE_ALLOCATED,
 				StateTransitionTime: stamp,
 			}.Build(),
 		}.Build()
@@ -450,7 +450,7 @@ var _ = Describe("setPending", func() {
 		externalIP := privatev1.ExternalIP_builder{
 			Id: "eip-pending-stamp",
 			Status: privatev1.ExternalIPStatus_builder{
-				State:              privatev1.ExternalIPState_EXTERNAL_IP_STATE_ALLOCATED,
+				State:               privatev1.ExternalIPState_EXTERNAL_IP_STATE_ALLOCATED,
 				StateTransitionTime: stamp,
 			}.Build(),
 		}.Build()
@@ -471,7 +471,7 @@ var _ = Describe("setPending", func() {
 		externalIP := privatev1.ExternalIP_builder{
 			Id: "eip-pending-keep",
 			Status: privatev1.ExternalIPStatus_builder{
-				State:              privatev1.ExternalIPState_EXTERNAL_IP_STATE_PENDING,
+				State:               privatev1.ExternalIPState_EXTERNAL_IP_STATE_PENDING,
 				StateTransitionTime: stamp,
 			}.Build(),
 		}.Build()
@@ -509,7 +509,7 @@ var _ = Describe("setFailed", func() {
 		externalIP := privatev1.ExternalIP_builder{
 			Id: "eip-failed-stamp",
 			Status: privatev1.ExternalIPStatus_builder{
-				State:              privatev1.ExternalIPState_EXTERNAL_IP_STATE_ALLOCATED,
+				State:               privatev1.ExternalIPState_EXTERNAL_IP_STATE_ALLOCATED,
 				StateTransitionTime: stamp,
 			}.Build(),
 		}.Build()
@@ -530,7 +530,7 @@ var _ = Describe("setFailed", func() {
 		externalIP := privatev1.ExternalIP_builder{
 			Id: "eip-failed-keep",
 			Status: privatev1.ExternalIPStatus_builder{
-				State:              privatev1.ExternalIPState_EXTERNAL_IP_STATE_FAILED,
+				State:               privatev1.ExternalIPState_EXTERNAL_IP_STATE_FAILED,
 				StateTransitionTime: stamp,
 			}.Build(),
 		}.Build()
