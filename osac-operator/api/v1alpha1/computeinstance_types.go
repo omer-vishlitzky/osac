@@ -317,6 +317,14 @@ type ComputeInstanceStatus struct {
 	// +kubebuilder:validation:Type=string
 	RunningConfigVersion string `json:"runningConfigVersion,omitempty"`
 
+	// RunningInstanceTypeName is the instance type name that was current when
+	// RunningConfigVersion was recorded. It is part of the running-config identity:
+	// the config version hashes the resolved resources, so two types with identical
+	// cores and memory hash to the same version, and a resize between them must still
+	// move RunningConfigSince.
+	// +kubebuilder:validation:Optional
+	RunningInstanceTypeName string `json:"runningInstanceTypeName,omitempty"`
+
 	// RunningConfigSince records when the controller observed the configuration named
 	// by RunningConfigVersion running. It moves only when RunningConfigVersion changes,
 	// so metering can bill the running instance type from the time it actually started

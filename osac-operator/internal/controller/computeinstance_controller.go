@@ -1069,11 +1069,14 @@ func (r *ComputeInstanceReconciler) handleDesiredConfigVersion(ctx context.Conte
 // recordRunningConfig records the desired config version that is actually running, with the
 // time of that observation, so the running instance type can be billed from when it started
 // running rather than from when the change was reported downstream. The version is recorded
-// once per configuration: while it is unchanged the recorded time stays put.
+// once per configuration: while it is unchanged the recorded time stays put. The instance
+// type name is part of the recorded identity: two types with identical resources hash to the
+// same config version, and a resize between them must still move the stamp.
 func recordRunningConfig(instance *v1alpha1.ComputeInstance) {
 	// Cheap equality first: in the steady state every reconcile re-enters here with the
 	// versions already equal, and the condition checks below walk the conditions list.
-	if instance.Status.RunningConfigVersion == instance.Status.DesiredConfigVersion {
+	if instance.Status.RunningConfigVersion == instance.Status.DesiredConfigVersion &&
+		instance.Status.RunningInstanceTypeName == instance.Labels[osacComputeInstanceTypeNameLabel] {
 		return
 	}
 	if instance.Status.Phase != v1alpha1.ComputeInstancePhaseRunning {
@@ -1087,6 +1090,7 @@ func recordRunningConfig(instance *v1alpha1.ComputeInstance) {
 	}
 	since := metav1.NewTime(time.Now().UTC())
 	instance.Status.RunningConfigVersion = instance.Status.DesiredConfigVersion
+	instance.Status.RunningInstanceTypeName = instance.Labels[osacComputeInstanceTypeNameLabel]
 	instance.Status.RunningConfigSince = &since
 }
 

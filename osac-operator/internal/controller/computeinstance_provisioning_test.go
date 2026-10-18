@@ -614,6 +614,26 @@ var _ = Describe("ComputeInstance running config", func() {
 		Expect(instance.Status.RunningConfigVersion).To(Equal("v1"))
 	})
 
+	It("moves the stamp when the instance type name changes with identical resources", func() {
+		// The config version hashes the resolved resources, so a resize between two
+		// types with identical cores and memory keeps the version; the type name is
+		// part of the running-config identity so the stamp still moves and the new
+		// type bills from the observation.
+		instance := runningInstance(osacv1alpha1.ComputeInstancePhaseRunning, true, false)
+		instance.Labels = map[string]string{osacComputeInstanceTypeNameLabel: "standard-8-32"}
+		recordRunningConfig(instance)
+		recorded := instance.Status.RunningConfigSince.Time
+		Expect(instance.Status.RunningInstanceTypeName).To(Equal("standard-8-32"))
+
+		instance.Labels[osacComputeInstanceTypeNameLabel] = "standard-8-32-flavored"
+
+		recordRunningConfig(instance)
+
+		Expect(instance.Status.RunningConfigVersion).To(Equal("v2"))
+		Expect(instance.Status.RunningInstanceTypeName).To(Equal("standard-8-32-flavored"))
+		Expect(instance.Status.RunningConfigSince.Time).ToNot(Equal(recorded))
+	})
+
 	It("does not record while the instance is not running", func() {
 		instance := runningInstance(osacv1alpha1.ComputeInstancePhaseStarting, true, false)
 
