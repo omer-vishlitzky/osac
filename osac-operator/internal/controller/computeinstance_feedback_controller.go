@@ -127,7 +127,26 @@ func syncComputeInstanceUpdate(ctx context.Context, obj *ckv1alpha1.ComputeInsta
 }
 
 func syncComputeInstanceDelete(ctx context.Context, obj *ckv1alpha1.ComputeInstance, remote *privatev1.ComputeInstance) error {
-	return syncComputeInstanceUpdate(ctx, obj, remote)
+	syncComputeInstanceUpdate(ctx, obj, remote)
+	// The CR may not have reached Phase=Deleting yet when feedback observes the deletion.
+	// Force the DELETING state so the billing stops and the transition is recorded, dated
+	// at the deletion rather than at the stale phase's transition time.
+	if remote.GetStatus().GetState() != privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_DELETING {
+		remote.GetStatus().SetState(privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_DELETING)
+		remote.GetStatus().SetStateTransitionTime(
+			copyPhaseTransitionTime(ctrllog.FromContext(ctx), computeDeletionTransitionTime(obj), remote.GetStatus().GetStateTransitionTime()))
+	}
+	return nil
+}
+
+// computeDeletionTransitionTime returns the time to date a forced DELETING transition at: the CR's
+// deletion timestamp when present, else the observation time.
+func computeDeletionTransitionTime(obj *ckv1alpha1.ComputeInstance) *metav1.Time {
+	if !obj.GetDeletionTimestamp().IsZero() {
+		return &metav1.Time{Time: obj.GetDeletionTimestamp().Time}
+	}
+	now := metav1.Now()
+	return &now
 }
 
 func syncCIConditions(obj *ckv1alpha1.ComputeInstance, remote *privatev1.ComputeInstance) {

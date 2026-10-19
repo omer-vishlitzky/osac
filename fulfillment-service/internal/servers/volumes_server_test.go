@@ -452,6 +452,27 @@ var _ = Describe("Public volumes server", func() {
 			Expect(response.GetObject().GetSpec().GetStorageTier()).To(Equal("standard-block"))
 		})
 
+		It("Keeps the stored status on a maskless update carrying a spoofed status", func() {
+			created := createVolumeViaPublic("pub-vol-spoof")
+
+			response, err := server.Update(ctx, publicv1.VolumesUpdateRequest_builder{
+				Object: publicv1.Volume_builder{
+					Id: created.GetId(),
+					Metadata: publicv1.Metadata_builder{
+						Name: "pub-vol-spoof",
+					}.Build(),
+					Spec: created.GetSpec(),
+					Status: publicv1.VolumeStatus_builder{
+						State: publicv1.VolumeState_VOLUME_STATE_AVAILABLE,
+					}.Build(),
+				}.Build(),
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+			// The spoofed status never reached the database: the state is the system-written
+			// CREATING, not the caller's AVAILABLE.
+			Expect(response.GetObject().GetStatus().GetState()).To(Equal(publicv1.VolumeState_VOLUME_STATE_CREATING))
+		})
+
 		// TC-U2: Update that changes spec.storage_tier returns InvalidArgument.
 		It("Returns InvalidArgument for update changing storage tier", func() {
 			created := createVolumeViaPublic("pub-vol-immut-tier")
