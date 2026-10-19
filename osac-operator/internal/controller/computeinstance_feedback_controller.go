@@ -127,7 +127,9 @@ func syncComputeInstanceUpdate(ctx context.Context, obj *ckv1alpha1.ComputeInsta
 }
 
 func syncComputeInstanceDelete(ctx context.Context, obj *ckv1alpha1.ComputeInstance, remote *privatev1.ComputeInstance) error {
-	syncComputeInstanceUpdate(ctx, obj, remote)
+	if err := syncComputeInstanceUpdate(ctx, obj, remote); err != nil {
+		return err
+	}
 	// The CR may not have reached Phase=Deleting yet when feedback observes the deletion.
 	// Force the DELETING state so the billing stops and the transition is recorded, dated
 	// at the deletion rather than at the stale phase's transition time.
