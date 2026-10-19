@@ -104,7 +104,7 @@ message VolumeTopology {
 // Defines the desired configuration for a Volume. All fields are immutable after creation.
 message VolumeSpec {
   // Name of the StorageTier that determines which provider and protocol serve this volume.
-  string storage_tier = 1 [(buf.validate.field).string.min_len = 1, (osac.private.v1.metering) = {kind: METERING_FIELD_KIND_FIXED_AT_CREATION}];
+  string storage_tier = 1 [(buf.validate.field).string.min_len = 1, (osac.private.v1.metering) = {kind: METERING_FIELD_KIND_CONSTANT}];
 
   // Requested storage capacity in gibibytes (GiB).
   int64 size_gib = 2 [(buf.validate.field).int64.gt = 0];
@@ -119,20 +119,20 @@ message VolumeSpec {
 // Represents the current operational state of a Volume.
 message VolumeStatus {
   // Current lifecycle state of the volume.
-  VolumeState state = 1 [(osac.private.v1.metering) = {kind: METERING_FIELD_KIND_CHANGING transition_time: "status.state_transition_time"}];
+  VolumeState state = 1 [(osac.private.v1.metering) = {kind: METERING_FIELD_KIND_VARIES transition_time: "status.state_transition_time"}];
 
   // Human-readable message providing additional details about the current state.
   optional string message = 2;
 
   // Opaque identifier assigned by the vendor storage array. Set by the osac-operator after vendor
   // CSI CreateVolume succeeds. Visible only through the private API.
-  string vendor_volume_id = 3 [(cleanapi.field).private = true, (osac.private.v1.metering) = {kind: METERING_FIELD_KIND_SET_ONCE_LATER}];
+  string vendor_volume_id = 3 [(cleanapi.field).private = true, (osac.private.v1.metering) = {kind: METERING_FIELD_KIND_FIXED_ONCE_SET}];
 
   // Storage protocol used for this volume. Resolved during tier resolution at creation time.
   // Visible only through the private API.
   StorageProtocol protocol = 5 [
     (cleanapi.field).private = true,
-    (osac.private.v1.metering) = {kind: METERING_FIELD_KIND_FIXED_AT_CREATION}
+    (osac.private.v1.metering) = {kind: METERING_FIELD_KIND_CONSTANT}
   ];
 
   // Identifier of the hub cluster where the Volume CR is created. Set by the fulfillment-service
@@ -160,6 +160,6 @@ message VolumeStatus {
   // through the private API.
   int64 provisioned_size_gib = 10 [
     (cleanapi.field).private = true,
-    (osac.private.v1.metering) = {kind: METERING_FIELD_KIND_SET_ONCE_LATER}
+    (osac.private.v1.metering) = {kind: METERING_FIELD_KIND_FIXED_ONCE_SET}
   ];
 }

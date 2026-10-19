@@ -73,7 +73,7 @@ var _ = DescribeMigration("Clamp metering change times", func() {
 		}
 	}`
 
-	DescribeTable("accepts a changed changing field without a later time and clamps the stored time",
+	DescribeTable("accepts a changed varying field without a later time and clamps the stored time",
 		func(ctx context.Context, table, id, timePath, oldData, newData string) {
 			insert(ctx, table, id, oldData)
 			Expect(update(ctx, table, id, newData)).To(Succeed())

@@ -69,7 +69,7 @@ message NATGatewaySpec {
   VirtualNetworkLocalReference virtual_network = 1 [
     (google.api.field_behavior) = REQUIRED,
     (google.api.field_behavior) = IMMUTABLE,
-    (osac.private.v1.metering) = {kind: METERING_FIELD_KIND_FIXED_AT_CREATION}
+    (osac.private.v1.metering) = {kind: METERING_FIELD_KIND_CONSTANT}
   ];
 
   // ExternalIP reference to use as the SNAT source address. Required and immutable after creation.
@@ -80,7 +80,7 @@ message NATGatewaySpec {
   ExternalIPLocalReference external_ip = 2 [
     (google.api.field_behavior) = REQUIRED,
     (google.api.field_behavior) = IMMUTABLE,
-    (osac.private.v1.metering) = {kind: METERING_FIELD_KIND_FIXED_AT_CREATION}
+    (osac.private.v1.metering) = {kind: METERING_FIELD_KIND_CONSTANT}
   ];
 }
 
@@ -90,7 +90,7 @@ message NATGatewaySpec {
 // updates them based on reconciliation of the spec and feedback from the cluster controller.
 message NATGatewayStatus {
   // Current lifecycle state of the NAT gateway.
-  NATGatewayState state = 1 [(osac.private.v1.metering) = {kind: METERING_FIELD_KIND_CHANGING transition_time: "status.state_transition_time"}];
+  NATGatewayState state = 1 [(osac.private.v1.metering) = {kind: METERING_FIELD_KIND_VARIES transition_time: "status.state_transition_time"}];
 
   // Human-readable message providing additional details about the current state.
   //

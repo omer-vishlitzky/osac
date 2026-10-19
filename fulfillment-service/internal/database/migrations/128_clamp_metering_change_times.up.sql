@@ -13,12 +13,12 @@
 
 -- This migration replaces the metering source contract trigger function: a timestamp never
 -- blocks a status update. A change time only records when a change happened, so a write that
--- changes a changing value is accepted whatever time it carries, and a wrong time distorts the
+-- changes a varying value is accepted whatever time it carries, and a wrong time distorts the
 -- record by at most the writer's clock skew, which is bounded and visible in the logs.
 --
 -- Rule 1 of the contract becomes:
 --
--- 1. A changed changing field with a time that is missing or not later than the stored time is
+-- 1. A changed varying field with a time that is missing or not later than the stored time is
 --    accepted, and the stored time becomes the old stored time plus one microsecond. When no
 --    time is stored yet, the stored time becomes the database clock.
 --
@@ -27,7 +27,7 @@
 -- those warnings is tracked in OSAC-6481.
 --
 -- The other rules are unchanged: a time-only write still keeps the old time, and fixed and
--- set-once violations still roll back with SQLSTATE 'Z0006'.
+-- fixed-once-set violations still roll back with SQLSTATE 'Z0006'.
 
 create or replace function enforce_metering_fields() returns trigger as $$
 declare
@@ -49,7 +49,7 @@ begin
 
   -- Collect the change times whose value changed:
   for field in select * from jsonb_array_elements(tracked) loop
-    if field->>'kind' != 'changing' then
+    if field->>'kind' != 'varies' then
       continue;
     end if;
     field_path := string_to_array(field->>'path', '.');
@@ -60,14 +60,14 @@ begin
     end if;
   end loop;
 
-  -- Fixed fields never change, and set-once fields never change once they are set:
+  -- Constant fields never change, and fixed-once-set fields never change once they are set:
   for field in select * from jsonb_array_elements(tracked) loop
-    if field->>'kind' = 'changing' then
+    if field->>'kind' = 'varies' then
       continue;
     end if;
     field_path := string_to_array(field->>'path', '.');
     if old.data #> field_path is distinct from new.data #> field_path then
-      if field->>'kind' = 'fixed_at_creation' or old.data #> field_path is not null then
+      if field->>'kind' = 'constant' or old.data #> field_path is not null then
         raise exception using
           errcode = 'Z0006',
           message = format(
@@ -80,7 +80,7 @@ begin
 
   -- Check each change time once:
   for field in select * from jsonb_array_elements(tracked) loop
-    if field->>'kind' != 'changing' then
+    if field->>'kind' != 'varies' then
       continue;
     end if;
     if field->>'transition_time' = any(seen_times) then

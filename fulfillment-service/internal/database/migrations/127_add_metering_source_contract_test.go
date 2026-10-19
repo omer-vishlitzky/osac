@@ -84,7 +84,7 @@ var _ = DescribeMigration("Add metering source contract", func() {
 		}
 	}`
 
-	DescribeTable("accepts a changed changing field with a later time",
+	DescribeTable("accepts a changed varying field with a later time",
 		func(ctx context.Context, table, id, oldData, newData string) {
 			insert(ctx, table, id, oldData)
 			Expect(update(ctx, table, id, newData)).To(Succeed())
@@ -192,7 +192,7 @@ var _ = DescribeMigration("Add metering source contract", func() {
 			`{"status": {"state": "NAT_GATEWAY_STATE_READY", "state_transition_time": "2026-01-01T11:00:00Z"}}`),
 	)
 
-	DescribeTable("rejects a changed changing field without a later time",
+	DescribeTable("rejects a changed varying field without a later time",
 		func(ctx context.Context, table, id, oldData, newData string) {
 			insert(ctx, table, id, oldData)
 			expectContractViolation(update(ctx, table, id, newData))

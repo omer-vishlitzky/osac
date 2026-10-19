@@ -11,14 +11,14 @@
 -- specific language governing permissions and limitations under the License.
 --
 
--- This migration extends the clamp of migration 128 to the first change time of a changing
+-- This migration extends the clamp of migration 128 to the first change time of a varying
 -- field. The trigger does nothing on INSERT, so a resource can be created with a tracked value
 -- and no time, and the fold keys that fact at the resource's creation timestamp. The first
 -- update was then unchecked: a supplied time on or before the creation timestamp produced a
 -- second fact with the same key as the creation-time fact, and shuffled delivery kept either
 -- one, so the same history could bill from creation or not bill at all.
 --
--- On UPDATE, when a changing value changes, no time is stored yet, and the supplied time is on
+-- On UPDATE, when a varying value changes, no time is stored yet, and the supplied time is on
 -- or before the resource's creation timestamp, the stored time becomes the creation timestamp
 -- plus one microsecond. A first time after creation passes as supplied. For symmetry, the
 -- database-clock stamp that migration 128 writes for a missing first time is never below the
@@ -46,7 +46,7 @@ begin
 
   -- Collect the change times whose value changed:
   for field in select * from jsonb_array_elements(tracked) loop
-    if field->>'kind' != 'changing' then
+    if field->>'kind' != 'varies' then
       continue;
     end if;
     field_path := string_to_array(field->>'path', '.');
@@ -57,14 +57,14 @@ begin
     end if;
   end loop;
 
-  -- Fixed fields never change, and set-once fields never change once they are set:
+  -- Constant fields never change, and fixed-once-set fields never change once they are set:
   for field in select * from jsonb_array_elements(tracked) loop
-    if field->>'kind' = 'changing' then
+    if field->>'kind' = 'varies' then
       continue;
     end if;
     field_path := string_to_array(field->>'path', '.');
     if not metering_field_equal(old.data #> field_path, new.data #> field_path) then
-      if field->>'kind' = 'fixed_at_creation' or old.data #> field_path is not null then
+      if field->>'kind' = 'constant' or old.data #> field_path is not null then
         raise exception using
           errcode = 'Z0006',
           message = format(
@@ -77,7 +77,7 @@ begin
 
   -- Check each change time once:
   for field in select * from jsonb_array_elements(tracked) loop
-    if field->>'kind' != 'changing' then
+    if field->>'kind' != 'varies' then
       continue;
     end if;
     if field->>'transition_time' = any(seen_times) then

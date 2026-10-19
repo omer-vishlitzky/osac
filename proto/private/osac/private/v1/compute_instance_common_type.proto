@@ -41,7 +41,7 @@ message StorageTierReference {
 // Contains the disk configuration for a compute instance.
 message ComputeInstanceDisk {
   // Disk size in GiB.
-  optional int32 size_gib = 1 [(buf.validate.field).int32.gt = 0, (osac.private.v1.metering) = {kind: METERING_FIELD_KIND_FIXED_AT_CREATION}];
+  optional int32 size_gib = 1 [(buf.validate.field).int32.gt = 0, (osac.private.v1.metering) = {kind: METERING_FIELD_KIND_CONSTANT}];
 
   // Reference to the storage tier for this disk.
   optional StorageTierReference storage_tier = 2;

@@ -11,9 +11,33 @@ an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express o
 specific language governing permissions and limitations under the License.
 */
 
-// Package metering exposes the fields of each billable resource that metering tracks, as
-// declared by the metering annotations on the private protos. Fulfillment's database triggers
-// and the metering service both take their list from here, so the two can't drift apart.
+// Package metering is the shared registry of the fields metering tracks on each billable
+// resource, built from the metering annotations on the private protos (see
+// osac/private/v1/metering_type.proto for what the annotations mean and examples of each
+// kind).
+//
+// Resources() walks the compiled proto descriptors of the private package, collects every
+// field carrying a metering annotation, validates it (a varying field must name a real
+// timestamp field as its transition time), and returns the list per resource. It fails loudly
+// on an annotation that is invalid or not reachable from a resource message, so a typo in an
+// annotation is a startup failure, not a silently untracked field.
+//
+// Two consumers read this one list, which is the point of the registry: fulfillment's
+// database and the metering service agree on what is tracked without either importing the
+// other's configuration.
+//
+//   - Fulfillment maps resources to tables (internal/database/metering.go), the migration
+//     tests compare the installed trigger configuration against the registry (the drift
+//     test), and the schema check refuses to start when a tracked table lacks the
+//     source-contract trigger. The SQL triggers embed a copy of the list because SQL cannot
+//     import Go; the drift test keeps that copy honest.
+//   - The metering service's fold decides which fields of each event payload update a
+//     resource's history, and the billing rules reference the same field paths.
+//
+// Adding a tracked field is therefore three coordinated edits: the annotation on the proto,
+// the table mapping in internal/database/metering.go, and the tracked-field mapping in the
+// migration that installs the trigger. The drift test and the schema check fail until all
+// three agree.
 package metering
 
 import (
@@ -36,17 +60,23 @@ const privatePackage protoreflect.FullName = "osac.private.v1"
 type Kind string
 
 const (
-	// KindChanging marks a field whose value changes over the life of the resource. Another
-	// field of the resource holds the time of each change.
-	KindChanging Kind = "changing"
+	// KindVaries marks a field whose value varies over the life of the resource. Another field
+	// of the resource holds the time of the last change. Examples: every resource's state with
+	// its state_transition_time, a compute instance's running instance type, a cluster's
+	// version, an external IP's attachment and attribution.
+	KindVaries Kind = "varies"
 
-	// KindFixedAtCreation marks a field that is set when the resource is created and never
-	// changes.
-	KindFixedAtCreation Kind = "fixed_at_creation"
+	// KindConstant marks a field that is set when the resource is created and never changes.
+	// Examples: a compute instance's boot disk size and disk image, a cluster's template, a
+	// volume's storage tier, a NAT gateway's external IP. Only annotate a field this way when
+	// the API already rejects changing it.
+	KindConstant Kind = "constant"
 
-	// KindSetOnceLater marks a field that starts empty, is set once, and never changes after.
-	// Its value is treated as known from creation.
-	KindSetOnceLater Kind = "set_once_later"
+	// KindFixedOnceSet marks a field that starts empty, is set once when the system first
+	// observes the value, and never changes after. Its value is treated as known from
+	// creation. Examples: a volume's vendor volume ID and provisioned capacity, an external
+	// IP's allocated address, a bare metal instance's cluster and node set.
+	KindFixedOnceSet Kind = "fixed_once_set"
 )
 
 // Field is one field of a resource that metering tracks.
@@ -58,7 +88,7 @@ type Field struct {
 	Kind Kind `json:"kind"`
 
 	// TransitionTime is the proto path of the field that holds the time of the last change of
-	// this field. Set only for changing fields.
+	// this field. Set only for varying fields.
 	TransitionTime string `json:"transition_time"`
 }
 
@@ -188,12 +218,12 @@ func newField(resource protoreflect.MessageDescriptor, annotated annotatedField)
 
 	var kind Kind
 	switch options.GetKind() {
-	case privatev1.MeteringFieldKind_METERING_FIELD_KIND_CHANGING:
-		kind = KindChanging
-	case privatev1.MeteringFieldKind_METERING_FIELD_KIND_FIXED_AT_CREATION:
-		kind = KindFixedAtCreation
-	case privatev1.MeteringFieldKind_METERING_FIELD_KIND_SET_ONCE_LATER:
-		kind = KindSetOnceLater
+	case privatev1.MeteringFieldKind_METERING_FIELD_KIND_VARIES:
+		kind = KindVaries
+	case privatev1.MeteringFieldKind_METERING_FIELD_KIND_CONSTANT:
+		kind = KindConstant
+	case privatev1.MeteringFieldKind_METERING_FIELD_KIND_FIXED_ONCE_SET:
+		kind = KindFixedOnceSet
 	default:
 		return Field{}, fmt.Errorf(
 			"field '%s' has an unknown metering kind '%s'", annotated.path, options.GetKind(),
@@ -206,23 +236,23 @@ func newField(resource protoreflect.MessageDescriptor, annotated annotatedField)
 		TransitionTime: options.GetTransitionTime(),
 	}
 
-	if kind == KindChanging {
+	if kind == KindVaries {
 		if result.TransitionTime == "" {
 			return Field{}, fmt.Errorf(
-				"changing field '%s' of '%s' must name its transition time field",
+				"varying field '%s' of '%s' must name its transition time field",
 				annotated.path, resource.FullName(),
 			)
 		}
 		transitionTime, err := resolveField(resource, result.TransitionTime)
 		if err != nil {
 			return Field{}, fmt.Errorf(
-				"changing field '%s' of '%s' has an invalid transition time path: %w",
+				"varying field '%s' of '%s' has an invalid transition time path: %w",
 				annotated.path, resource.FullName(), err,
 			)
 		}
 		if transitionTime.Message() == nil || transitionTime.Message().FullName() != "google.protobuf.Timestamp" {
 			return Field{}, fmt.Errorf(
-				"transition time '%s' of changing field '%s' of '%s' isn't a timestamp",
+				"transition time '%s' of varying field '%s' of '%s' isn't a timestamp",
 				result.TransitionTime, annotated.path, resource.FullName(),
 			)
 		}

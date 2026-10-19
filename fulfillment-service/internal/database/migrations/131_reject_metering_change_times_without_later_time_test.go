@@ -95,7 +95,7 @@ var _ = DescribeMigration("Reject metering change times without a later time", f
 		}
 	}`
 
-	DescribeTable("rejects a changed changing field whose time is missing or equal to the stored one",
+	DescribeTable("rejects a changed varying field whose time is missing or equal to the stored one",
 		func(ctx context.Context, table, id, timePath, oldData, newData string, wantStored *string) {
 			insert(ctx, table, id, oldData)
 			expectRejection(ctx, table, id, timePath, newData, wantStored)
@@ -150,7 +150,7 @@ var _ = DescribeMigration("Reject metering change times without a later time", f
 			proto.String("2026-01-01T10:00:00Z")),
 	)
 
-	It("clamps a changed changing field with an earlier time", func(ctx context.Context) {
+	It("clamps a changed varying field with an earlier time", func(ctx context.Context) {
 		insert(ctx, "compute_instances", "vm-1", runningVM)
 		Expect(update(ctx, "compute_instances", "vm-1", `{
 			"status": {
