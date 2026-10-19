@@ -221,6 +221,76 @@ var _ = Describe("ComputeInstanceFeedbackReconciler", func() {
 		})
 	})
 
+	Context("delete path feedback", func() {
+		remoteWithState := func(state privatev1.ComputeInstanceState, transitionTime *timestamppb.Timestamp) *privatev1.ComputeInstance {
+			return privatev1.ComputeInstance_builder{
+				Status: privatev1.ComputeInstanceStatus_builder{
+					State:               state,
+					StateTransitionTime: transitionTime,
+				}.Build(),
+			}.Build()
+		}
+
+		It("copies the CR's phase transition time when the delete path forces DELETING", func() {
+			oldStamp := timestamppb.New(time.Now().Add(-2 * time.Hour))
+			phaseStamp := metav1.NewTime(time.Now().Add(-time.Hour).UTC())
+			remote := remoteWithState(privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_RUNNING, oldStamp)
+			obj := &osacv1alpha1.ComputeInstance{Status: osacv1alpha1.ComputeInstanceStatus{
+				Phase:               osacv1alpha1.ComputeInstancePhaseDeleting,
+				PhaseTransitionTime: &phaseStamp,
+			}}
+
+			Expect(syncComputeInstanceDelete(ctx, obj, remote)).To(Succeed())
+
+			Expect(remote.GetStatus().GetState()).To(Equal(privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_DELETING))
+			// The copied time is the CR's recorded transition, not the feedback moment.
+			Expect(remote.GetStatus().GetStateTransitionTime().AsTime()).To(Equal(phaseStamp.Time))
+		})
+
+		It("dates DELETING at the deletionTimestamp when the CR phase has not moved yet", func() {
+			// The delete path can sync before the ComputeInstance CR records Phase=Deleting.
+			// The CR's PhaseTransitionTime then still belongs to the previous phase, and
+			// copying it (or a one-microsecond bump of it) would date DELETING at the old
+			// phase's moment, billing the entire RUNNING span as DELETING.
+			runningStamp := metav1.NewTime(time.Now().Add(-2 * time.Hour).UTC())
+			deletedAt := metav1.NewTime(time.Now().Add(-5 * time.Minute).UTC())
+			remote := remoteWithState(
+				privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_RUNNING,
+				timestamppb.New(runningStamp.Time))
+			obj := &osacv1alpha1.ComputeInstance{
+				ObjectMeta: metav1.ObjectMeta{
+					DeletionTimestamp: &deletedAt,
+				},
+				Status: osacv1alpha1.ComputeInstanceStatus{
+					Phase:               osacv1alpha1.ComputeInstancePhaseRunning,
+					PhaseTransitionTime: &runningStamp,
+				},
+			}
+
+			Expect(syncComputeInstanceDelete(ctx, obj, remote)).To(Succeed())
+
+			Expect(remote.GetStatus().GetState()).To(Equal(privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_DELETING))
+			Expect(remote.GetStatus().GetStateTransitionTime().AsTime()).To(Equal(deletedAt.Time))
+			Expect(remote.GetStatus().GetStateTransitionTime().AsTime()).To(BeTemporally(">", runningStamp.Time))
+		})
+
+		It("stamps an observation-time transition when the deletion carries no timestamp", func() {
+			runningStamp := metav1.NewTime(time.Now().Add(-2 * time.Hour).UTC())
+			remote := remoteWithState(
+				privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_RUNNING,
+				timestamppb.New(runningStamp.Time))
+			obj := &osacv1alpha1.ComputeInstance{Status: osacv1alpha1.ComputeInstanceStatus{
+				Phase:               osacv1alpha1.ComputeInstancePhaseRunning,
+				PhaseTransitionTime: &runningStamp,
+			}}
+
+			Expect(syncComputeInstanceDelete(ctx, obj, remote)).To(Succeed())
+
+			Expect(remote.GetStatus().GetState()).To(Equal(privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_DELETING))
+			Expect(remote.GetStatus().GetStateTransitionTime().AsTime()).To(BeTemporally(">", runningStamp.Time))
+		})
+	})
+
 	Context("network attachment IP feedback", func() {
 		It("copies attachment Subnet ID and IP into the Fulfillment status", func() {
 			obj := &osacv1alpha1.ComputeInstance{Status: osacv1alpha1.ComputeInstanceStatus{
