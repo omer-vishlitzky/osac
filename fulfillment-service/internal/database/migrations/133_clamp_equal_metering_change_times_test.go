@@ -27,7 +27,7 @@ import (
 
 var _ = DescribeMigration("Clamp equal metering change times", func() {
 	BeforeEach(func(ctx context.Context) {
-		Expect(tool.Migrate(ctx, 132)).To(Succeed())
+		Expect(tool.Migrate(ctx, 133)).To(Succeed())
 		_, err := conn.Exec(ctx, `
 			insert into tenants (id, name, tenant, creator, data)
 			values ('tenant-a', 'tenant-a', 'tenant-a', 'system', '{}');

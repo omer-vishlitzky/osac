@@ -26,7 +26,7 @@ import (
 
 var _ = DescribeMigration("Compare metering references by identity", func() {
 	BeforeEach(func(ctx context.Context) {
-		Expect(tool.Migrate(ctx, 129)).To(Succeed())
+		Expect(tool.Migrate(ctx, 130)).To(Succeed())
 		_, err := conn.Exec(ctx, `
 			insert into tenants (id, name, tenant, creator, data)
 			values ('tenant-a', 'tenant-a', 'tenant-a', 'system', '{}');

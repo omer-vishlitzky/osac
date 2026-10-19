@@ -26,7 +26,7 @@ import (
 
 var _ = DescribeMigration("Add metering source contract", func() {
 	BeforeEach(func(ctx context.Context) {
-		Expect(tool.Migrate(ctx, 127)).To(Succeed())
+		Expect(tool.Migrate(ctx, 128)).To(Succeed())
 		_, err := conn.Exec(ctx, `
 			insert into tenants (id, name, tenant, creator, data)
 			values ('tenant-a', 'tenant-a', 'tenant-a', 'system', '{}');

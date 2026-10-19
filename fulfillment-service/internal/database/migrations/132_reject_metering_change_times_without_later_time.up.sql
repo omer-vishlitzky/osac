@@ -12,18 +12,18 @@
 --
 
 -- This migration tightens the metering source contract on changed values: a write that changes a
--- varying value must carry a time strictly later than the stored one. Migrations 128 and 130
+-- varying value must carry a time strictly later than the stored one. Migrations 129 and 131
 -- accepted a missing time, or a time equal to the stored one, and clamped the stored time to the
 -- old stored time plus one microsecond. That backdated the new state to the start of the previous
 -- one and erased the span between them: an instance RUNNING since 10:00 whose FAILED state is
 -- written at 15:00 without a time was stored FAILED since 10:00:00.000001, erasing five hours of
 -- billing. A writer that changes a tracked value without knowing when the change happened is a
--- bug worth hearing about, so those writes roll back with SQLSTATE 'Z0006', as migration 127
+-- bug worth hearing about, so those writes roll back with SQLSTATE 'Z0006', as migration 128
 -- originally required.
 --
 -- A supplied time earlier than the stored one remains the clock-skew case: wrong by at most the
 -- writer's clock skew, bounded and visible in the logs, so the write is accepted and the stored
--- time clamped to the old stored time plus one microsecond. The first-time clamp of migration 130
+-- time clamped to the old stored time plus one microsecond. The first-time clamp of migration 131
 -- is unchanged: a supplied first time on or before the resource's creation timestamp still moves
 -- past the creation fallback, because it would otherwise collide with the fold's creation-time
 -- fact.

@@ -11,7 +11,7 @@
 -- specific language governing permissions and limitations under the License.
 --
 
--- This migration extends the clamp of migration 128 to the first change time of a varying
+-- This migration extends the clamp of migration 129 to the first change time of a varying
 -- field. The trigger does nothing on INSERT, so a resource can be created with a tracked value
 -- and no time, and the fold keys that fact at the resource's creation timestamp. The first
 -- update was then unchecked: a supplied time on or before the creation timestamp produced a
@@ -21,10 +21,10 @@
 -- On UPDATE, when a varying value changes, no time is stored yet, and the supplied time is on
 -- or before the resource's creation timestamp, the stored time becomes the creation timestamp
 -- plus one microsecond. A first time after creation passes as supplied. For symmetry, the
--- database-clock stamp that migration 128 writes for a missing first time is never below the
+-- database-clock stamp that migration 129 writes for a missing first time is never below the
 -- creation fallback either.
 --
--- The clamp logs the same WARNING shape as migration 128, so it is visible like the others.
+-- The clamp logs the same WARNING shape as migration 129, so it is visible like the others.
 
 create or replace function enforce_metering_fields() returns trigger as $$
 declare
