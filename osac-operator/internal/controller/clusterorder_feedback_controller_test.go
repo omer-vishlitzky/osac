@@ -546,6 +546,77 @@ var _ = Describe("ClusterOrder FeedbackReconciler", func() {
 		})
 	})
 
+	Context("When reconciling a resource deleted while still in Ready phase", func() {
+		BeforeEach(func() {
+			clusterOrder := &osacv1alpha1.ClusterOrder{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      resourceName,
+					Namespace: clusterOrderNS,
+					Labels: map[string]string{
+						osacClusterOrderIDLabel: clusterID,
+					},
+					Finalizers: []string{osacClusterOrderFeedbackFinalizer},
+				},
+				Spec: osacv1alpha1.ClusterOrderSpec{
+					TemplateID: "test_template",
+				},
+			}
+			Expect(k8sClient.Create(testCtx, clusterOrder)).To(Succeed())
+
+			Expect(k8sClient.Get(testCtx, typeNamespacedName, clusterOrder)).To(Succeed())
+			clusterOrder.Status.Phase = osacv1alpha1.ClusterOrderPhaseReady
+			Expect(k8sClient.Status().Update(testCtx, clusterOrder)).To(Succeed())
+
+			Expect(k8sClient.Get(testCtx, typeNamespacedName, clusterOrder)).To(Succeed())
+			Expect(k8sClient.Delete(testCtx, clusterOrder)).To(Succeed())
+
+			// The remote still reports READY true: feedback handles the deletion
+			// before the resource controller records Phase=Deleting.
+			mockClient.getResponse = &privatev1.ClustersGetResponse{
+				Object: &privatev1.Cluster{
+					Id:   clusterID,
+					Spec: &privatev1.ClusterSpec{},
+					Status: &privatev1.ClusterStatus{
+						State: privatev1.ClusterState_CLUSTER_STATE_READY,
+						Conditions: []*privatev1.ClusterCondition{
+							{
+								Type:   privatev1.ClusterConditionType_CLUSTER_CONDITION_TYPE_READY,
+								Status: privatev1.ConditionStatus_CONDITION_STATUS_TRUE,
+							},
+						},
+					},
+				},
+			}
+			mockClient.updateResponse = &privatev1.ClustersUpdateResponse{}
+		})
+
+		AfterEach(func() {
+			clusterOrder := &osacv1alpha1.ClusterOrder{}
+			err := k8sClient.Get(testCtx, typeNamespacedName, clusterOrder)
+			if err == nil {
+				clusterOrder.Finalizers = nil
+				Expect(k8sClient.Update(testCtx, clusterOrder)).To(Succeed())
+			}
+		})
+
+		It("should clear the READY condition while forcing DELETING", func() {
+			request := reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			}
+			result, err := reconciler.Reconcile(testCtx, request)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.IsZero()).To(BeTrue())
+			Expect(mockClient.updateCalled).To(BeTrue())
+			Expect(mockClient.lastUpdate.GetStatus().GetState()).To(Equal(privatev1.ClusterState_CLUSTER_STATE_DELETING))
+			// The reported condition must agree with the reported state: the READY
+			// condition cannot stay true while the state is DELETING.
+			ready := findExistingClusterCondition(mockClient.lastUpdate,
+				privatev1.ClusterConditionType_CLUSTER_CONDITION_TYPE_READY)
+			Expect(ready).ToNot(BeNil())
+			Expect(ready.GetStatus()).To(Equal(privatev1.ConditionStatus_CONDITION_STATUS_FALSE))
+		})
+	})
+
 	Context("When reconciling a resource being deleted with multiple finalizers", func() {
 		BeforeEach(func() {
 			clusterOrder := &osacv1alpha1.ClusterOrder{

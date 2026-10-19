@@ -26,6 +26,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -1072,19 +1073,29 @@ func (r *ComputeInstanceReconciler) handleDesiredConfigVersion(ctx context.Conte
 // once per configuration: while it is unchanged the recorded time stays put. The instance
 // type name is part of the recorded identity: two types with identical resources hash to the
 // same config version, and a resize between them must still move the stamp.
+//
+// The record is the CR-side half of crConfirmsRunningType: recording establishes the name and
+// time that the predicate later vouches with. A pending restart invalidates any earlier
+// observation, so it is cleared; KubeVirt reports RestartRequired asynchronously, so an
+// absent or unknown condition vouches for nothing yet, and the record waits for it to become
+// explicitly false before it can confirm anything.
 func recordRunningConfig(instance *v1alpha1.ComputeInstance) {
-	// KubeVirt reports RestartRequired asynchronously, so the running config may have been
-	// recorded before the restart requirement surfaced. That observation cannot vouch for
-	// what runs after the restart: it is cleared here and re-recorded once the restart
-	// completes and the configuration is observed running again.
-	if instance.IsStatusConditionTrue(v1alpha1.ComputeInstanceConditionRestartRequired) {
+	restart, present := restartRequired(instance)
+	switch {
+	case present && restart == metav1.ConditionTrue:
 		clearRecordedRunningConfig(instance)
 		return
+	case !present || restart != metav1.ConditionFalse:
+		return
 	}
-	// Cheap equality first: in the steady state every reconcile re-enters here with the
-	// versions already equal, and the condition checks below walk the conditions list.
-	if instance.Status.RunningConfigVersion == instance.Status.DesiredConfigVersion &&
-		instance.Status.RunningInstanceTypeName == instance.Labels[osacComputeInstanceTypeNameLabel] {
+	label := instance.Labels[osacComputeInstanceTypeNameLabel]
+	if label == "" {
+		return
+	}
+	// Steady state: the CR already confirms the labeled type running with the current
+	// desired config, so the recorded observation stays put.
+	if crConfirmsRunningType(instance, label) &&
+		instance.Status.RunningConfigVersion == instance.Status.DesiredConfigVersion {
 		return
 	}
 	if instance.Status.Phase != v1alpha1.ComputeInstancePhaseRunning {
@@ -1095,8 +1106,41 @@ func recordRunningConfig(instance *v1alpha1.ComputeInstance) {
 	}
 	since := metav1.NewTime(time.Now().UTC())
 	instance.Status.RunningConfigVersion = instance.Status.DesiredConfigVersion
-	instance.Status.RunningInstanceTypeName = instance.Labels[osacComputeInstanceTypeNameLabel]
+	instance.Status.RunningInstanceTypeName = label
 	instance.Status.RunningConfigSince = &since
+}
+
+// crConfirmsRunningType reports whether the CR confirms that the requested instance type is
+// the one actually running. All three clauses must hold: the instance-type label exists and
+// names the requested type, so the reconciler has applied it; the recorded running-config
+// observation names the same type, so recordRunningConfig observed it running; and the
+// RestartRequired condition exists and is explicitly false, so no restart is pending that the
+// observation would predate. A label that names another type describes a resize the
+// reconciler has not applied, a recorded name that lags the label describes the previous
+// type, and a missing or unknown restart condition vouches for nothing.
+func crConfirmsRunningType(instance *v1alpha1.ComputeInstance, requested string) bool {
+	if requested == "" {
+		return false
+	}
+	if instance.Labels[osacComputeInstanceTypeNameLabel] != requested {
+		return false
+	}
+	if instance.Status.RunningInstanceTypeName != requested {
+		return false
+	}
+	restart, present := restartRequired(instance)
+	return present && restart == metav1.ConditionFalse
+}
+
+// restartRequired reads the RestartRequired condition. The second result is false when the
+// condition is absent.
+func restartRequired(instance *v1alpha1.ComputeInstance) (metav1.ConditionStatus, bool) {
+	condition := meta.FindStatusCondition(instance.Status.Conditions,
+		string(v1alpha1.ComputeInstanceConditionRestartRequired))
+	if condition == nil {
+		return "", false
+	}
+	return condition.Status, true
 }
 
 // clearRecordedRunningConfig drops the recorded running-config observation. Used when a

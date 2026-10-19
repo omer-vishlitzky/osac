@@ -296,11 +296,12 @@ var _ = Describe("ComputeInstanceFeedbackReconciler", func() {
 					},
 				},
 				Status: osacv1alpha1.ComputeInstanceStatus{
-					Phase:                osacv1alpha1.ComputeInstancePhaseRunning,
-					DesiredConfigVersion: version,
-					RunningConfigVersion: version,
-					RunningConfigSince:   &runningSince,
-					Conditions:           conditions,
+					Phase:                   osacv1alpha1.ComputeInstancePhaseRunning,
+					DesiredConfigVersion:    version,
+					RunningConfigVersion:    version,
+					RunningInstanceTypeName: "standard-8-32",
+					RunningConfigSince:      &runningSince,
+					Conditions:              conditions,
 				}}
 		}
 
@@ -384,80 +385,61 @@ var _ = Describe("ComputeInstanceFeedbackReconciler", func() {
 			Expect(remote.GetStatus().GetInstanceTypeTransitionTime()).To(BeNil())
 		})
 
-		It("does not stamp while a restart is still required", func() {
+		It("does not stamp when the restart condition is absent", func() {
+			// KubeVirt reports RestartRequired asynchronously: an absent condition
+			// vouches for nothing, so the recorded observation cannot confirm the
+			// requested type running yet.
 			oldStamp := timestamppb.New(time.Now().Add(-time.Hour))
 			remote := remoteWithRequestedType(typeRef("standard-4-16", "standard-4-16"), oldStamp)
-
-			syncCIRunningInstanceType(runningCR(true, true), remote)
-
-			Expect(remote.GetStatus().GetInstanceType().GetId()).To(Equal("standard-4-16"))
-			Expect(remote.GetStatus().GetInstanceTypeTransitionTime().AsTime()).To(Equal(oldStamp.AsTime()))
-		})
-
-		It("does not stamp before the new configuration is applied", func() {
-			remote := remoteWithRequestedType(nil, nil)
-
-			syncCIRunningInstanceType(runningCR(false, false), remote)
-
-			Expect(remote.GetStatus().GetInstanceType()).To(BeNil())
-			Expect(remote.GetStatus().GetInstanceTypeTransitionTime()).To(BeNil())
-		})
-
-		It("does not stamp while the instance is not running", func() {
-			notRunning := runningCR(false, true)
-			notRunning.Status.Phase = osacv1alpha1.ComputeInstancePhaseStarting
-			remote := remoteWithRequestedType(nil, nil)
-
-			syncCIRunningInstanceType(notRunning, remote)
-
-			Expect(remote.GetStatus().GetInstanceType()).To(BeNil())
-			Expect(remote.GetStatus().GetInstanceTypeTransitionTime()).To(BeNil())
-		})
-
-		It("does not stamp while the status still describes the previous spec", func() {
-			oldStamp := timestamppb.New(time.Now().Add(-time.Hour))
-			remote := remoteWithRequestedType(typeRef("standard-4-16", "standard-4-16"), oldStamp)
-			stale := runningCR(false, true)
-			// The reconciler patched the resized spec, but the CR controller has not
-			// recomputed the desired config version, so the conditions still vouch
-			// for the old spec.
-			stale.Status.DesiredConfigVersion = "hash-of-the-previous-spec"
-
-			syncCIRunningInstanceType(stale, remote)
-
-			Expect(remote.GetStatus().GetInstanceType().GetId()).To(Equal("standard-4-16"))
-			Expect(remote.GetStatus().GetInstanceTypeTransitionTime().AsTime()).To(Equal(oldStamp.AsTime()))
-		})
-
-		It("does not stamp when the applied-config condition is missing", func() {
-			oldStamp := timestamppb.New(time.Now().Add(-time.Hour))
-			remote := remoteWithRequestedType(typeRef("standard-4-16", "standard-4-16"), oldStamp)
-			noCondition := runningCR(false, true)
-			noCondition.Status.Conditions = []metav1.Condition{
+			cr := runningCR(false, true)
+			cr.Status.Conditions = []metav1.Condition{
 				{
-					Type:               string(osacv1alpha1.ComputeInstanceConditionRestartRequired),
-					Status:             metav1.ConditionFalse,
+					Type:               string(osacv1alpha1.ComputeInstanceConditionConfigurationApplied),
+					Status:             metav1.ConditionTrue,
 					Reason:             "AsExpected",
 					LastTransitionTime: metav1.NewTime(time.Now().UTC()),
 				},
 			}
 
-			syncCIRunningInstanceType(noCondition, remote)
+			syncCIRunningInstanceType(cr, remote)
 
 			Expect(remote.GetStatus().GetInstanceType().GetId()).To(Equal("standard-4-16"))
 			Expect(remote.GetStatus().GetInstanceTypeTransitionTime().AsTime()).To(Equal(oldStamp.AsTime()))
 		})
 
-		It("does not stamp when the running-config observation is for the previous spec", func() {
+		It("does not stamp when the restart condition is unknown", func() {
 			oldStamp := timestamppb.New(time.Now().Add(-time.Hour))
 			remote := remoteWithRequestedType(typeRef("standard-4-16", "standard-4-16"), oldStamp)
-			staleObservation := runningCR(false, true)
-			// The conditions describe the current spec, but the controller has not yet
-			// observed this configuration running: the recorded observation names the
-			// previous one, so its time cannot vouch for the new type.
-			staleObservation.Status.RunningConfigVersion = "hash-of-the-previous-spec"
+			cr := runningCR(false, true)
+			cr.Status.Conditions[0].Status = metav1.ConditionUnknown
 
-			syncCIRunningInstanceType(staleObservation, remote)
+			syncCIRunningInstanceType(cr, remote)
+
+			Expect(remote.GetStatus().GetInstanceType().GetId()).To(Equal("standard-4-16"))
+			Expect(remote.GetStatus().GetInstanceTypeTransitionTime().AsTime()).To(Equal(oldStamp.AsTime()))
+		})
+
+		It("does not stamp while the recorded name lags the label", func() {
+			// After the label moves to the new type but before recordRunningConfig
+			// records it, the recorded observation still describes the previous type:
+			// accepting it would assign the previous type's running time to the new
+			// one, and the fulfillment contract would keep the wrong time forever.
+			oldStamp := timestamppb.New(time.Now().Add(-time.Hour))
+			remote := remoteWithRequestedType(typeRef("standard-4-16", "standard-4-16"), oldStamp)
+			cr := runningCR(false, true)
+			cr.Status.RunningInstanceTypeName = "standard-4-16"
+
+			syncCIRunningInstanceType(cr, remote)
+
+			Expect(remote.GetStatus().GetInstanceType().GetId()).To(Equal("standard-4-16"))
+			Expect(remote.GetStatus().GetInstanceTypeTransitionTime().AsTime()).To(Equal(oldStamp.AsTime()))
+		})
+
+		It("does not stamp while a restart is still required", func() {
+			oldStamp := timestamppb.New(time.Now().Add(-time.Hour))
+			remote := remoteWithRequestedType(typeRef("standard-4-16", "standard-4-16"), oldStamp)
+
+			syncCIRunningInstanceType(runningCR(true, true), remote)
 
 			Expect(remote.GetStatus().GetInstanceType().GetId()).To(Equal("standard-4-16"))
 			Expect(remote.GetStatus().GetInstanceTypeTransitionTime().AsTime()).To(Equal(oldStamp.AsTime()))

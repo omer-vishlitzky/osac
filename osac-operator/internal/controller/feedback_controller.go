@@ -202,7 +202,10 @@ func addOnOperatorInstallState(state ckv1alpha1.JobState) privatev1.AddOnOperato
 func syncClusterOrderDelete(ctx context.Context, clusterOrder *ckv1alpha1.ClusterOrder, remote *privatev1.Cluster) error {
 	syncClusterOrderConditions(ctx, clusterOrder, remote)
 	syncClusterOrderWorkerConditions(clusterOrder, remote)
-	clearClusterReadyConditionWhenNotReady(clusterOrder, remote)
+	// The state is forced to DELETING regardless of the CR phase, so the READY condition
+	// must go too: the CR may still report Ready when feedback handles the deletion first,
+	// and the reported condition must agree with the reported state.
+	clearClusterReadyCondition(remote)
 	syncClusterOrderNodeRequests(ctx, clusterOrder, remote)
 	setClusterDeletingStateWithTransitionTime(ctx, clusterOrder, remote)
 	return nil
@@ -611,15 +614,22 @@ func syncClusterOrderPhase(ctx context.Context, clusterOrder *ckv1alpha1.Cluster
 // ClusterOrder phase is no longer Ready.
 func clearClusterReadyConditionWhenNotReady(clusterOrder *ckv1alpha1.ClusterOrder, remote *privatev1.Cluster) {
 	if clusterOrder.Status.Phase != ckv1alpha1.ClusterOrderPhaseReady {
-		if ready := findExistingClusterCondition(remote,
-			privatev1.ClusterConditionType_CLUSTER_CONDITION_TYPE_READY); ready != nil {
-			oldStatus := ready.GetStatus()
-			ready.SetStatus(privatev1.ConditionStatus_CONDITION_STATUS_FALSE)
-			ready.SetReason("")
-			ready.SetMessage("")
-			if oldStatus != privatev1.ConditionStatus_CONDITION_STATUS_FALSE {
-				ready.SetLastTransitionTime(timestamppb.Now())
-			}
+		clearClusterReadyCondition(remote)
+	}
+}
+
+// clearClusterReadyCondition drops the fulfillment READY condition, whatever the ClusterOrder
+// phase reports: the reported condition must agree with the reported state, and the delete
+// path forces DELETING while the CR may still carry Phase=Ready.
+func clearClusterReadyCondition(remote *privatev1.Cluster) {
+	if ready := findExistingClusterCondition(remote,
+		privatev1.ClusterConditionType_CLUSTER_CONDITION_TYPE_READY); ready != nil {
+		oldStatus := ready.GetStatus()
+		ready.SetStatus(privatev1.ConditionStatus_CONDITION_STATUS_FALSE)
+		ready.SetReason("")
+		ready.SetMessage("")
+		if oldStatus != privatev1.ConditionStatus_CONDITION_STATUS_FALSE {
+			ready.SetLastTransitionTime(timestamppb.Now())
 		}
 	}
 }

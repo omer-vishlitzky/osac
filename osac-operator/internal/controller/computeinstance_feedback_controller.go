@@ -31,8 +31,6 @@ import (
 	ctrllog "sigs.k8s.io/controller-runtime/pkg/log"
 	mcmanager "sigs.k8s.io/multicluster-runtime/pkg/manager"
 
-	"github.com/osac-project/osac/osac-operator/pkg/provisioning"
-
 	ckv1alpha1 "github.com/osac-project/osac/osac-operator/api/v1alpha1"
 	"github.com/osac-project/osac/osac-operator/internal/controller/feedback"
 	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
@@ -280,12 +278,10 @@ func syncCILastRestartedAt(obj *ckv1alpha1.ComputeInstance, remote *privatev1.Co
 // it changes as soon as a resize is requested, while the VM keeps running the old type until any
 // restart the resize requires has completed.
 //
-// The CR's osac.openshift.io/instance-type-name label names the type its spec was last reconciled
-// toward; the stamp only moves once that label names the requested type, so a requested resize
-// that the reconciler has not applied yet cannot be billed as running. The CR reports the resize
-// complete when the instance is Running, the provisioning job that applies the new configuration
-// has finished (ConfigurationApplied), and KubeVirt no longer reports a pending restart
-// (RestartRequired). Until then the previous stamp is left untouched.
+// The gate is crConfirmsRunningType, the same predicate recordRunningConfig establishes: the
+// instance-type label names the requested type, the recorded running-config observation names
+// it too, and the RestartRequired condition is explicitly false. Until all three hold, the
+// previous stamp is left untouched.
 //
 // The transition time is the CR's recorded observation of the running configuration changing
 // (RunningConfigSince), not the time of this reconciliation: feedback can run long after the
@@ -295,18 +291,10 @@ func syncCIRunningInstanceType(obj *ckv1alpha1.ComputeInstance, remote *privatev
 	if requested == nil {
 		return
 	}
-	// The label must exist and be non-empty for the gate to pass: a request reference
-	// without a name and a CR without the label both read as the empty string, and
-	// comparing them would pass the gate without the reconciler ever having recorded the
-	// type it applied.
-	label := obj.Labels[osacComputeInstanceTypeNameLabel]
-	if label == "" || label != requested.GetName() {
-		return
-	}
 	if sameInstanceTypeRef(remote.GetStatus().GetInstanceType(), requested) {
 		return
 	}
-	if !ciRunningWithAppliedConfig(obj) {
+	if !crConfirmsRunningType(obj, requested.GetName()) {
 		return
 	}
 	since := obj.Status.RunningConfigSince
@@ -331,41 +319,4 @@ func sameInstanceTypeRef(a, b *privatev1.InstanceTypeReference) bool {
 		return a.GetId() == b.GetId()
 	}
 	return a.GetName() != "" && a.GetName() == b.GetName()
-}
-
-// ciRunningWithAppliedConfig reports whether the CR confirms the instance is running with the
-// configuration currently in its spec: the status was computed for that spec, the phase is
-// Running, the configuration has been applied, and no restart is pending that would still be
-// required to realize it.
-//
-// The desiredConfigVersion check is the freshness gate: status.desiredConfigVersion is the hash
-// of the spec the CR controller last reconciled, and the conditions describe that spec. Right
-// after the reconciler patches a resized spec, the stored version still names the old one, so
-// the conditions cannot yet vouch for the new spec and the stamp waits.
-func ciRunningWithAppliedConfig(obj *ckv1alpha1.ComputeInstance) bool {
-	if obj.Status.Phase != ckv1alpha1.ComputeInstancePhaseRunning {
-		return false
-	}
-	version, err := provisioning.ComputeDesiredConfigVersion(obj.Spec)
-	if err != nil || version != obj.Status.DesiredConfigVersion {
-		return false
-	}
-	// The recorded observation must be of this spec as well, so the time sent downstream is
-	// the moment this configuration was observed running.
-	if obj.Status.RunningConfigVersion != version {
-		return false
-	}
-	applied := false
-	for _, condition := range obj.Status.Conditions {
-		switch condition.Type {
-		case string(ckv1alpha1.ComputeInstanceConditionConfigurationApplied):
-			// The condition must exist and be true: a missing condition vouches for nothing.
-			applied = condition.Status == metav1.ConditionTrue
-		case string(ckv1alpha1.ComputeInstanceConditionRestartRequired):
-			if condition.Status == metav1.ConditionTrue {
-				return false
-			}
-		}
-	}
-	return applied
 }
