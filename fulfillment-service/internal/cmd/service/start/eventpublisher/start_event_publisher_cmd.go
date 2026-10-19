@@ -43,6 +43,7 @@ import (
 // Cmd creates and returns the `start event-publisher` command.
 func Cmd() *cobra.Command {
 	runner := &runnerContext{}
+	runner.args.topicRetention.retention = servers.DefaultTopicRetention
 	command := &cobra.Command{
 		Use:                   "event-publisher [FLAG...]",
 		Short:                 shortHelp,
@@ -68,11 +69,10 @@ func Cmd() *cobra.Command {
 		servers.DefaultEventTopicPrefix,
 		topicPrefixFlagHelp,
 	)
-	flags.StringVar(
-		&runner.args.topicRetentionMS,
-		"kafka-topic-retention-ms",
-		"-1",
-		"How long a topic the publisher creates keeps records, in milliseconds. -1 keeps them indefinitely.",
+	flags.Var(
+		&runner.args.topicRetention,
+		"kafka-topic-retention",
+		topicRetentionFlagHelp,
 	)
 	return command
 }
@@ -82,10 +82,43 @@ type runnerContext struct {
 	logger *slog.Logger
 	flags  *pflag.FlagSet
 	args   struct {
-		caFiles          []string
-		topicPrefix      string
-		topicRetentionMS string
+		caFiles        []string
+		topicPrefix    string
+		topicRetention topicRetentionValue
 	}
+}
+
+// topicRetentionValue is the value of the --kafka-topic-retention flag. It accepts either a Go duration, for
+// example '168h', or the Kafka-style '-1', which keeps records indefinitely.
+type topicRetentionValue struct {
+	retention time.Duration
+}
+
+// String returns the Kafka-style representation of the retention, so that indefinite retention is shown as '-1'.
+func (v *topicRetentionValue) String() string {
+	if v.retention < 0 {
+		return "-1"
+	}
+	return v.retention.String()
+}
+
+// Set parses the retention from either the Kafka-style '-1' or a Go duration such as '168h'.
+func (v *topicRetentionValue) Set(text string) error {
+	if text == "-1" {
+		v.retention = servers.DefaultTopicRetention
+		return nil
+	}
+	retention, err := time.ParseDuration(text)
+	if err != nil {
+		return fmt.Errorf("should be '-1' or a duration like '168h': %w", err)
+	}
+	v.retention = retention
+	return nil
+}
+
+// Type returns the name of the flag value type.
+func (v *topicRetentionValue) Type() string {
+	return "duration"
 }
 
 // run runs the `start event-publisher` command.
@@ -155,7 +188,7 @@ func (c *runnerContext) run(cmd *cobra.Command, argv []string) (err error) {
 		SetKafkaConfig(kafkaConfig).
 		SetKafkaBrokers(kafkaBrokers...).
 		SetKafkaTopicPrefix(c.args.topicPrefix).
-		SetTopicRetentionMS(c.args.topicRetentionMS).
+		SetTopicRetention(c.args.topicRetention.retention).
 		SetMetricsRegisterer(metricsRegisterer).
 		Build()
 	if err != nil {
@@ -268,4 +301,9 @@ _FILE_ - Files or directories containing trusted CA certificates in PEM format. 
 
 const topicPrefixFlagHelp = `
 _PREFIX_ - Prefix prepended to the tenant identifier to form Kafka topic names.
+`
+
+const topicRetentionFlagHelp = `
+_DURATION_ - How long a topic the publisher creates keeps records, for example '168h' for one week. '-1' keeps them
+indefinitely.
 `
