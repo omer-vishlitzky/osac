@@ -553,6 +553,9 @@ var _ = Describe("ComputeInstance running config", func() {
 			return metav1.ConditionFalse
 		}
 		return &osacv1alpha1.ComputeInstance{
+			ObjectMeta: metav1.ObjectMeta{
+				Labels: map[string]string{osacComputeInstanceTypeNameLabel: "standard-8-32"},
+			},
 			Status: osacv1alpha1.ComputeInstanceStatus{
 				Phase:                phase,
 				DesiredConfigVersion: "v2",
