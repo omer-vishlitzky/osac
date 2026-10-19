@@ -113,7 +113,7 @@ func (e *Extractor) Facts(tenant string, event *privatev1.Event) ([]database.Fac
 			continue
 		}
 		switch field.Kind {
-		case metering.KindChanging:
+		case metering.KindVaries:
 			since := timestampAt(payload, field.TransitionTime)
 			if since.IsZero() {
 				if creation.IsZero() || !nonZero(value, descriptor) {
@@ -122,7 +122,7 @@ func (e *Extractor) Facts(tenant string, event *privatev1.Event) ([]database.Fac
 				since = creation
 			}
 			add(field.Path, since, formatValue(value, descriptor))
-		case metering.KindFixedAtCreation, metering.KindSetOnceLater:
+		case metering.KindConstant, metering.KindFixedOnceSet:
 			if !nonZero(value, descriptor) {
 				continue
 			}
