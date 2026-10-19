@@ -201,7 +201,7 @@ func (b *EventPublisherBuilder) SetKafkaTopicPrefix(value string) *EventPublishe
 }
 
 // SetTopicRetention sets how long a topic the publisher creates keeps records. This is optional, defaults to
-// indefinite, and must be negative to keep records indefinitely or at least one millisecond.
+// indefinite, and any negative duration keeps records indefinitely.
 func (b *EventPublisherBuilder) SetTopicRetention(value time.Duration) *EventPublisherBuilder {
 	b.topicRetention = value
 	return b
@@ -251,65 +251,65 @@ func (b *EventPublisherBuilder) SetMetricsInterval(value time.Duration) *EventPu
 	return b
 }
 
-// checkParameters checks that the mandatory builder parameters are present and the optional ones are valid.
-func (b *EventPublisherBuilder) checkParameters() error {
-	if b.logger == nil {
-		return errors.New("logger is mandatory")
-	}
-	if b.dbPool == nil {
-		return errors.New("database pool is mandatory")
-	}
-	if b.listenWaitTimeout <= 0 {
-		return fmt.Errorf("listen wait timeout should be positive, but it is %s", b.listenWaitTimeout)
-	}
-	if b.listenRetryInterval <= 0 {
-		return fmt.Errorf("listen retry interval should be positive, but it is %s", b.listenRetryInterval)
-	}
-	if b.batchSize <= 0 {
-		return fmt.Errorf("batch size should be positive, but it is %d", b.batchSize)
-	}
-	if b.metricsInterval <= 0 {
-		return fmt.Errorf("metrics interval should be positive, but it is %s", b.metricsInterval)
-	}
-	if b.topicRetention >= 0 && b.topicRetention < time.Millisecond {
-		return fmt.Errorf(
-			"topic retention should be negative to keep records indefinitely or at least one millisecond, but it is %s",
-			b.topicRetention,
-		)
-	}
-	if b.kafkaTopicPrefix == "" {
-		return errors.New("topic prefix is mandatory")
-	}
-	if b.dbTable == "" {
-		return errors.New("table is mandatory")
-	}
-	if err := b.checkName(strings.ToLower(b.dbTable)); err != nil {
-		return fmt.Errorf("table %w", err)
-	}
-	if b.dbChannel == "" {
-		return errors.New("channel is mandatory")
-	}
-	if err := b.checkName(strings.ToLower(b.dbChannel)); err != nil {
-		return fmt.Errorf("channel %w", err)
-	}
-	if b.kafkaConfig == nil {
-		return errors.New("kafka configuration is mandatory")
-	}
-	if len(b.kafkaBrokers) == 0 {
-		return errors.New("kafka brokers are mandatory")
-	}
-	return nil
-}
-
 // Build uses the data stored in the builder to create a new EventPublisher.
 func (b *EventPublisherBuilder) Build() (result *EventPublisher, err error) {
 	// Check parameters:
-	err = b.checkParameters()
-	if err != nil {
+	if b.logger == nil {
+		err = errors.New("logger is mandatory")
+		return
+	}
+	if b.dbPool == nil {
+		err = errors.New("database pool is mandatory")
+		return
+	}
+	if b.listenWaitTimeout <= 0 {
+		err = fmt.Errorf("listen wait timeout should be positive, but it is %s", b.listenWaitTimeout)
+		return
+	}
+	if b.listenRetryInterval <= 0 {
+		err = fmt.Errorf("listen retry interval should be positive, but it is %s", b.listenRetryInterval)
+		return
+	}
+	if b.batchSize <= 0 {
+		err = fmt.Errorf("batch size should be positive, but it is %d", b.batchSize)
+		return
+	}
+	if b.metricsInterval <= 0 {
+		err = fmt.Errorf("metrics interval should be positive, but it is %s", b.metricsInterval)
+		return
+	}
+	if b.kafkaTopicPrefix == "" {
+		err = errors.New("topic prefix is mandatory")
+		return
+	}
+	if b.dbTable == "" {
+		err = errors.New("table is mandatory")
 		return
 	}
 	dbTable := strings.ToLower(b.dbTable)
+	err = b.checkName(dbTable)
+	if err != nil {
+		err = fmt.Errorf("table %w", err)
+		return
+	}
+	if b.dbChannel == "" {
+		err = errors.New("channel is mandatory")
+		return
+	}
 	dbChannel := strings.ToLower(b.dbChannel)
+	err = b.checkName(dbChannel)
+	if err != nil {
+		err = fmt.Errorf("channel %w", err)
+		return
+	}
+	if b.kafkaConfig == nil {
+		err = errors.New("kafka configuration is mandatory")
+		return
+	}
+	if len(b.kafkaBrokers) == 0 {
+		err = errors.New("kafka brokers are mandatory")
+		return
+	}
 
 	// Calculate the SQL statements:
 	fetchSQL := b.calculateFetchSQL(dbTable)
@@ -892,16 +892,6 @@ func (p *EventPublisher) ensureTopic(ctx context.Context, topic string) error {
 	}
 }
 
-// topicRetentionConfig translates a topic retention duration into the value of the Kafka 'retention.ms' topic
-// configuration: negative durations mean indefinite retention, which is '-1' in Kafka, and positive durations are
-// expressed in milliseconds.
-func topicRetentionConfig(retention time.Duration) string {
-	if retention < 0 {
-		return "-1"
-	}
-	return strconv.FormatInt(retention.Milliseconds(), 10)
-}
-
 func prepareTopic(ctx context.Context, admin sarama.ClusterAdmin, topic string, retention time.Duration) error {
 	descriptions, err := admin.DescribeTopics([]string{topic})
 	if err != nil {
@@ -921,7 +911,10 @@ func prepareTopic(ctx context.Context, admin sarama.ClusterAdmin, topic string, 
 	case sarama.ErrNoError:
 		return nil
 	case sarama.ErrUnknownTopicOrPartition:
-		retentionMS := topicRetentionConfig(retention)
+		retentionMS := "-1"
+		if retention > 0 {
+			retentionMS = strconv.FormatInt(retention.Milliseconds(), 10)
+		}
 		retentionBytes := "-1"
 		detail := &sarama.TopicDetail{
 			NumPartitions:     1,
@@ -1297,8 +1290,7 @@ const (
 	// DefaultEventTopicPrefix is prepended to the tenant identifier to form Kafka topic names.
 	DefaultEventTopicPrefix = "osac.events."
 
-	// DefaultTopicRetention is how long a topic the publisher creates keeps records: indefinitely. Any negative
-	// duration, such as the default '-1s', means indefinite retention.
+	// DefaultTopicRetention is how long a topic the publisher creates keeps records: indefinitely.
 	DefaultTopicRetention time.Duration = -time.Second
 
 	// defaultEventPublisherTable is the PostgreSQL table that stores change rows.

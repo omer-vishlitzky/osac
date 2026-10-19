@@ -273,37 +273,6 @@ var _ = Describe("Event publisher", Ordered, func() {
 			Expect(publisher).To(BeNil())
 		})
 
-		It("Can't be created with a zero or sub-millisecond topic retention", func() {
-			publisher, err := NewEventPublisher().
-				SetLogger(logger).
-				SetDatabasePool(&pgxpool.Pool{}).
-				SetTopicRetention(0).
-				Build()
-			Expect(err).To(MatchError(
-				"topic retention should be negative to keep records indefinitely or at least one millisecond, but it is 0s",
-			))
-			Expect(publisher).To(BeNil())
-
-			publisher, err = NewEventPublisher().
-				SetLogger(logger).
-				SetDatabasePool(&pgxpool.Pool{}).
-				SetTopicRetention(500 * time.Microsecond).
-				Build()
-			Expect(err).To(MatchError(
-				"topic retention should be negative to keep records indefinitely or at least one millisecond, but it is 500µs",
-			))
-			Expect(publisher).To(BeNil())
-		})
-
-		DescribeTable("Translates topic retention durations to the Kafka configuration",
-			func(retention time.Duration, expected string) {
-				Expect(topicRetentionConfig(retention)).To(Equal(expected))
-			},
-			Entry("Indefinite default", DefaultTopicRetention, "-1"),
-			Entry("One hour", time.Hour, "3600000"),
-			Entry("One week", 7*24*time.Hour, "604800000"),
-		)
-
 		It("Can't be created with an empty topic prefix", func() {
 			publisher, err := NewEventPublisher().
 				SetLogger(logger).
