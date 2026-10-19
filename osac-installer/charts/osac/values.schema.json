@@ -844,6 +844,11 @@
               "type": "boolean",
               "description": "Deploy the Kafka-backed event publisher (disable for API-only environments)",
               "default": true
+            },
+            "topicRetention": {
+              "type": "string",
+              "description": "How long a tenant's event topic keeps records: '-1' keeps them indefinitely, or a Go duration like '168h'",
+              "default": "-1"
             }
           }
         },
