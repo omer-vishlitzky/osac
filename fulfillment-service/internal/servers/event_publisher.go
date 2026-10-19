@@ -74,6 +74,7 @@ type EventPublisherBuilder struct {
 	kafkaConfig         *sarama.Config
 	kafkaBrokers        []string
 	kafkaTopicPrefix    string
+	topicRetentionMS    string
 	listenWaitTimeout   time.Duration
 	listenRetryInterval time.Duration
 	batchSize           int
@@ -101,6 +102,7 @@ type EventPublisher struct {
 	kafkaAdmin       sarama.ClusterAdmin
 	kafkaProducer    sarama.SyncProducer
 	kafkaTopicPrefix string
+	topicRetentionMS string
 	publishedTopics  map[string]bool
 	batchSize        int
 	publishCallback  func(context.Context, *privatev1.Event) error
@@ -143,6 +145,7 @@ type eventPublisherObjectJson struct {
 func NewEventPublisher() *EventPublisherBuilder {
 	return &EventPublisherBuilder{
 		kafkaTopicPrefix:    DefaultEventTopicPrefix,
+		topicRetentionMS:    defaultTopicRetentionMS,
 		dbTable:             defaultEventPublisherTable,
 		dbChannel:           defaultEventPublisherChannel,
 		listenWaitTimeout:   defaultListenWaitTimeout,
@@ -193,6 +196,13 @@ func (b *EventPublisherBuilder) SetKafkaBrokers(value ...string) *EventPublisher
 // and defaults to DefaultEventTopicPrefix.
 func (b *EventPublisherBuilder) SetKafkaTopicPrefix(value string) *EventPublisherBuilder {
 	b.kafkaTopicPrefix = value
+	return b
+}
+
+// SetTopicRetentionMS sets how long a topic the publisher creates keeps records, in milliseconds. This is optional,
+// defaults to indefinite (-1), and must be -1 or a positive number.
+func (b *EventPublisherBuilder) SetTopicRetentionMS(value string) *EventPublisherBuilder {
+	b.topicRetentionMS = value
 	return b
 }
 
@@ -365,6 +375,7 @@ func (b *EventPublisherBuilder) Build() (result *EventPublisher, err error) {
 		kafkaAdmin:       kafkaAdmin,
 		kafkaProducer:    kafkaProducer,
 		kafkaTopicPrefix: b.kafkaTopicPrefix,
+		topicRetentionMS: b.topicRetentionMS,
 		publishedTopics:  map[string]bool{},
 		fetchSQL:         fetchSQL,
 		deleteSQL:        deleteSQL,
@@ -867,7 +878,7 @@ func (p *EventPublisher) ensureTopic(ctx context.Context, topic string) error {
 	admin := p.kafkaAdmin
 	done := make(chan error, 1)
 	go func() {
-		done <- prepareTopic(ctx, admin, topic)
+		done <- prepareTopic(ctx, admin, topic, p.topicRetentionMS)
 	}()
 	select {
 	case <-ctx.Done():
@@ -880,7 +891,7 @@ func (p *EventPublisher) ensureTopic(ctx context.Context, topic string) error {
 	}
 }
 
-func prepareTopic(ctx context.Context, admin sarama.ClusterAdmin, topic string) error {
+func prepareTopic(ctx context.Context, admin sarama.ClusterAdmin, topic, retentionMS string) error {
 	descriptions, err := admin.DescribeTopics([]string{topic})
 	if err != nil {
 		return fmt.Errorf("failed to describe topic '%s': %w", topic, err)
@@ -899,9 +910,14 @@ func prepareTopic(ctx context.Context, admin sarama.ClusterAdmin, topic string) 
 	case sarama.ErrNoError:
 		return nil
 	case sarama.ErrUnknownTopicOrPartition:
+		retentionBytes := "-1"
 		detail := &sarama.TopicDetail{
 			NumPartitions:     1,
 			ReplicationFactor: -1,
+			ConfigEntries: map[string]*string{
+				"retention.ms":    &retentionMS,
+				"retention.bytes": &retentionBytes,
+			},
 		}
 		err = admin.CreateTopic(topic, detail, false)
 		if err != nil && !errors.Is(err, sarama.ErrTopicAlreadyExists) {
@@ -1268,6 +1284,9 @@ func (p *EventPublisher) registerPublishErrorsMetric(registerer prometheus.Regis
 const (
 	// DefaultEventTopicPrefix is prepended to the tenant identifier to form Kafka topic names.
 	DefaultEventTopicPrefix = "osac.events."
+
+	// defaultTopicRetentionMS is how long a topic the publisher creates keeps records: indefinitely.
+	defaultTopicRetentionMS = "-1"
 
 	// defaultEventPublisherTable is the PostgreSQL table that stores change rows.
 	defaultEventPublisherTable = "changes"
