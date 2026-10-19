@@ -870,8 +870,8 @@
             },
             "topicRetention": {
               "type": "string",
-              "description": "How long a tenant's event topic keeps records: '-1' keeps them indefinitely, or a Go duration like '168h'",
-              "default": "-1"
+              "description": "How long a tenant's event topic keeps records: a negative duration like '-1s' keeps them indefinitely, or a positive one like '168h'",
+              "default": "-1s"
             }
           }
         },

@@ -1298,8 +1298,8 @@ const (
 	DefaultEventTopicPrefix = "osac.events."
 
 	// DefaultTopicRetention is how long a topic the publisher creates keeps records: indefinitely. Any negative
-	// duration means indefinite retention.
-	DefaultTopicRetention time.Duration = -1
+	// duration, such as the default '-1s', means indefinite retention.
+	DefaultTopicRetention time.Duration = -time.Second
 
 	// defaultEventPublisherTable is the PostgreSQL table that stores change rows.
 	defaultEventPublisherTable = "changes"
