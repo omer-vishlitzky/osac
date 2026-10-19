@@ -25,9 +25,9 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-var _ = DescribeMigration("Reject metering change times without a later time", func() {
+var _ = DescribeMigration("Clamp equal metering change times", func() {
 	BeforeEach(func(ctx context.Context) {
-		Expect(tool.Migrate(ctx, 131)).To(Succeed())
+		Expect(tool.Migrate(ctx, 132)).To(Succeed())
 		_, err := conn.Exec(ctx, `
 			insert into tenants (id, name, tenant, creator, data)
 			values ('tenant-a', 'tenant-a', 'tenant-a', 'system', '{}');
@@ -95,7 +95,7 @@ var _ = DescribeMigration("Reject metering change times without a later time", f
 		}
 	}`
 
-	DescribeTable("rejects a changed changing field whose time is missing",
+	DescribeTable("rejects a changed varying field whose time is missing",
 		func(ctx context.Context, table, id, timePath, oldData, newData string, wantStored *string) {
 			insert(ctx, table, id, oldData)
 			expectRejection(ctx, table, id, timePath, newData, wantStored)
@@ -120,12 +120,29 @@ var _ = DescribeMigration("Reject metering change times without a later time", f
 			nil),
 	)
 
-	It("clamps a changed changing field with an earlier time", func(ctx context.Context) {
+	It("clamps a changed varying field with an earlier time", func(ctx context.Context) {
 		insert(ctx, "compute_instances", "vm-1", runningVM)
 		Expect(update(ctx, "compute_instances", "vm-1", `{
 			"status": {
 				"state": "COMPUTE_INSTANCE_STATE_STOPPED",
 				"state_transition_time": "2026-01-01T09:00:00Z",
+				"instance_type": {"id": "type-small"},
+				"instance_type_transition_time": "2026-01-01T10:00:00Z"
+			}
+		}`)).To(Succeed())
+		Expect(storedPath(ctx, "compute_instances", "vm-1", "status.state_transition_time")).To(
+			HaveValue(Equal("2026-01-01T10:00:00.000001Z")),
+		)
+	})
+
+	// The granularity collision this migration exists for: two changes of a whole-second CR
+	// timestamp land on the same second, so the supplied time equals the stored one.
+	It("clamps a changed varying field with a time equal to the stored one", func(ctx context.Context) {
+		insert(ctx, "compute_instances", "vm-1", runningVM)
+		Expect(update(ctx, "compute_instances", "vm-1", `{
+			"status": {
+				"state": "COMPUTE_INSTANCE_STATE_STOPPED",
+				"state_transition_time": "2026-01-01T10:00:00Z",
 				"instance_type": {"id": "type-small"},
 				"instance_type_transition_time": "2026-01-01T10:00:00Z"
 			}
