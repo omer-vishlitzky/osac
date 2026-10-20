@@ -289,6 +289,20 @@ var _ = Describe("Event publisher", Ordered, func() {
 			Expect(publisher).To(BeNil())
 		})
 
+		It("Can't be created with a retention the broker cannot parse", func() {
+			// A quoted value reaches this check when a chart template quotes a
+			// command-line argument: container args carry the quote characters.
+			publisher, err := NewEventPublisher().
+				SetLogger(logger).
+				SetDatabasePool(&pgxpool.Pool{}).
+				SetKafkaTopicPrefix("osac.events.").
+				SetTopicRetentionMS(`"-1"`).
+				Build()
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("topic retention should be a whole number"))
+			Expect(publisher).To(BeNil())
+		})
+
 		It("Can't be created with an empty table", func() {
 			publisher, err := NewEventPublisher().
 				SetLogger(logger).
@@ -968,6 +982,9 @@ var _ = Describe("Event publisher", Ordered, func() {
 							for name, detail := range request.TopicDetails {
 								Expect(detail.NumPartitions).To(Equal(int32(1)))
 								Expect(detail.ReplicationFactor).To(Equal(int16(-1)))
+								Expect(detail.ConfigEntries).To(HaveLen(2))
+								Expect(*detail.ConfigEntries["retention.ms"]).To(Equal("-1"))
+								Expect(*detail.ConfigEntries["retention.bytes"]).To(Equal("-1"))
 								topics = append(topics, name)
 							}
 						}
