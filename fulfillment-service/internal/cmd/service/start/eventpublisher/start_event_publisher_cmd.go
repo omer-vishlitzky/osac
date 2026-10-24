@@ -68,11 +68,11 @@ func Cmd() *cobra.Command {
 		servers.DefaultEventTopicPrefix,
 		topicPrefixFlagHelp,
 	)
-	flags.DurationVar(
-		&runner.args.topicRetention,
-		"kafka-topic-retention",
-		servers.DefaultTopicRetention,
-		topicRetentionFlagHelp,
+	flags.StringVar(
+		&runner.args.topicRetentionMS,
+		"kafka-topic-retention-ms",
+		"-1",
+		"How long a topic the publisher creates keeps records, in milliseconds. -1 keeps them indefinitely.",
 	)
 	return command
 }
@@ -82,9 +82,9 @@ type runnerContext struct {
 	logger *slog.Logger
 	flags  *pflag.FlagSet
 	args   struct {
-		caFiles        []string
-		topicPrefix    string
-		topicRetention time.Duration
+		caFiles          []string
+		topicPrefix      string
+		topicRetentionMS string
 	}
 }
 
@@ -155,7 +155,7 @@ func (c *runnerContext) run(cmd *cobra.Command, argv []string) (err error) {
 		SetKafkaConfig(kafkaConfig).
 		SetKafkaBrokers(kafkaBrokers...).
 		SetKafkaTopicPrefix(c.args.topicPrefix).
-		SetTopicRetention(c.args.topicRetention).
+		SetTopicRetentionMS(c.args.topicRetentionMS).
 		SetMetricsRegisterer(metricsRegisterer).
 		Build()
 	if err != nil {
@@ -268,9 +268,4 @@ _FILE_ - Files or directories containing trusted CA certificates in PEM format. 
 
 const topicPrefixFlagHelp = `
 _PREFIX_ - Prefix prepended to the tenant identifier to form Kafka topic names.
-`
-
-const topicRetentionFlagHelp = `
-_DURATION_ - How long a topic the publisher creates keeps records, for example '168h' for one week. '-1s' keeps them
-indefinitely.
 `
