@@ -61,14 +61,16 @@ spec:
               another tenant, or a range Kafka retention deleted. Skipped
               events are usage that cannot be billed.
         - alert: MeteringDeadLetterQueue
-          expr: osac_metering_adapter_dlq_depth > 0
-          for: 10m
+          # The depth gauge is log occupancy and only shrinks through topic
+          # retention, which is indefinite by default: alert on new dead
+          # letters, not on retained ones.
+          expr: increase(osac_metering_adapter_dlq_events_total[15m]) > 0
           labels:
             severity: warning
           annotations:
-            summary: Metering dead-letter queue is not empty
+            summary: Metering dead-letter queue received new records
             description: >-
-              A metering adapter moved events to the dead-letter topic and they
-              stay there. These are billable events the provider never
+              A metering adapter moved events to the dead-letter topic in the
+              last 15 minutes. These are billable events the provider never
               received.
 {{- end }}

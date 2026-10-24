@@ -229,7 +229,6 @@ hubAccess:
 
 # --- Metering ---
 metering:
-  enabled: true
   echoAdapter:
     enabled: true
     image:

@@ -1789,11 +1789,6 @@
       "type": "object",
       "description": "OSAC Metering Service configuration",
       "properties": {
-        "enabled": {
-          "type": "boolean",
-          "description": "Deploy the OSAC Metering Service (opt-in)",
-          "default": false
-        },
         "image": {
           "type": "object",
           "properties": {
@@ -2351,7 +2346,7 @@
         "enabled": {
           "type": "boolean",
           "description": "Create hub-access resources and register local cluster as hub",
-          "default": true
+          "default": false
         }
       },
       "additionalProperties": false

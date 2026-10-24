@@ -49,21 +49,35 @@ Use this only for a revision metering has never billed under: a revision
 that already produced heartbeats must never be removed, or past usage can
 no longer be reproduced exactly.
 
+## Upgrading from the shared-topic pipeline
+
+Earlier releases of this chart created shared `osac.metering.lifecycle`,
+`osac.metering.heartbeat`, `osac.metering.corrections`, and
+`osac.metering.dlq` topics. This chart no longer renders those
+`KafkaTopic` resources, so `helm upgrade` deletes them, and the broker
+deletes the topics and their records with them. The per-tenant topics the
+current pipeline uses are not affected. Export anything you still need
+from the old topics — especially unreplayed dead-letter records — before
+upgrading.
+
 ## Uninstalling
 
-The chart never deletes rule revisions automatically: they are the record of
-what was billed under which rules, and `helm uninstall` removing them by
-routine would destroy that record. The delete-protection admission policy
-enforces this, which also means a plain `helm uninstall` cannot remove the
-revision ConfigMaps it owns. To remove an installation, delete the protection
-first, explicitly, using the names helm rendered for this release (by default
-`<release>-osac-metering-protect-rules`):
+`helm uninstall` succeeds and leaves the rule revisions, the
+delete-protection policy, and its binding in place: revisions are the
+record of what was billed under which rules, and all three resources
+carry `helm.sh/resource-policy: keep`, so no routine uninstall destroys
+that record. Removing an installation completely is an explicit operator
+action. Delete the protection first, then the revisions, using the names
+helm rendered for this release (by default
+`<release>-osac-metering-protect-rules` and `osac-metering-rules-<NNNN>`):
 
 ```sh
 kubectl delete validatingadmissionpolicybinding <release>-osac-metering-protect-rules
 kubectl delete validatingadmissionpolicy <release>-osac-metering-protect-rules
+kubectl delete configmap osac-metering-rules-0001
 helm uninstall <release>
 ```
 
-Deleting the namespace works the same way: remove the policy and binding
-before the namespace's resources can be garbage collected.
+Deleting the namespace removes the revisions with it once the policy is
+gone; the policy and binding are cluster-scoped and must be deleted
+explicitly either way.

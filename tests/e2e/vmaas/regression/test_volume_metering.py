@@ -31,10 +31,6 @@ pytestmark = [pytest.mark.regression, pytest.mark.metering]
 VOLUME_SIZE_GIB = 5
 HEARTBEAT_TIMEOUT: int = 300
 
-# The tenant the JWT fixtures authenticate as (conftest maps tenant1_admin to
-# tenant1); the private Create carries it explicitly, like the CSI driver does.
-METERING_TENANT = "tenant1"
-
 # The topology segment the LVMS provisioner requires: a node-local volume pins
 # its node, and the cluster under test is single-node.
 NODE_TOPOLOGY_SEGMENT = "osac.io/node"
@@ -68,7 +64,7 @@ def _interval_seconds(start: datetime, end: datetime) -> Decimal:
 
 
 def test_volume_bills_gibibyte_seconds(
-    grpc: GRPCClient, private_grpc: GRPCClient, metering: MeteringCollector, metering_project: str
+    grpc: GRPCClient, private_grpc: GRPCClient, metering: MeteringCollector, metering_project: str, jwt_tenant: str
 ) -> None:
     """An AVAILABLE volume bills capacity x size per interval; deletion ends billing."""
     node = run("kubectl", "get", "nodes", "-o", "jsonpath={.items[0].metadata.name}")
@@ -77,7 +73,9 @@ def test_volume_bills_gibibyte_seconds(
         service=f"{PRIVATE_API}.Volumes/Create",
         data={
             "object": {
-                "metadata": {"name": name, "tenant": METERING_TENANT, "project": metering_project},
+                # The tenant the JWT authenticates as; the private Create carries
+                # it explicitly, like the CSI driver does.
+                "metadata": {"name": name, "tenant": jwt_tenant, "project": metering_project},
                 "spec": {
                     "storageTier": "local",
                     "sizeGib": VOLUME_SIZE_GIB,

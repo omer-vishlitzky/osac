@@ -108,6 +108,7 @@ class TestExternalIPPoolLifecycle:
         attached_to = parse_time(str(attached_event["data"]["usage"]["to"]))
         detached_event = metering.heartbeat_with_dimensions(ip_id, {"attached": "false"}, after=attached_to, delay=5)
         assert detached_event is not None, "no heartbeat with the detached dimensions arrived"
+        detached_to = parse_time(str(detached_event["data"]["usage"]["to"]))
 
         # --- Re-attach same IP to ComputeInstance 2 ---
         att2_id: str = grpc.create_external_ip_attachment(
@@ -126,7 +127,7 @@ class TestExternalIPPoolLifecycle:
             description="reattached ExternalIP attribution settlement",
         )
         assert second_private_ip["status"]["attribution"]["computeInstance"]["id"] == ci2_uuid
-        reattached_event = metering.heartbeat_with_dimensions(ip_id, {"attached": "true"}, after=attached_to, delay=5)
+        reattached_event = metering.heartbeat_with_dimensions(ip_id, {"attached": "true"}, after=detached_to, delay=5)
         assert reattached_event is not None, "no heartbeat with the reattached dimensions arrived"
 
         ip_obj = grpc.get_external_ip(external_ip_id=ip_id)
@@ -138,15 +139,41 @@ class TestExternalIPPoolLifecycle:
         # dimension set bills never overlap, so no second is billed on both during
         # a transition. A wrong attachment transition time bills both meters over
         # the same span, which the per-phase existence checks above cannot see.
-        spans_by_dimensions: dict[tuple[tuple[str, str], ...], list[tuple[datetime, datetime]]] = {}
+        positive: dict[tuple[tuple[str, str], ...], list[tuple[datetime, datetime]]] = {}
+        negative: dict[tuple[tuple[str, str], ...], list[tuple[datetime, datetime]]] = {}
         for event in metering.get_all_events(HEARTBEAT_TYPE, ip_id):
             dimensions = event.get("data", {}).get("billing_dimensions", {})
             key = tuple(sorted((name, str(value)) for name, value in dimensions.items()))
             usage = event["data"]["usage"]
-            spans_by_dimensions.setdefault(key, []).append((parse_time(usage["from"]), parse_time(usage["to"])))
-        for spans in spans_by_dimensions.values():
-            spans.sort()
-        dimension_sets = list(spans_by_dimensions.values())
+            span = (parse_time(usage["from"]), parse_time(usage["to"]))
+            target = negative if str(usage["quantity"]).startswith("-") else positive
+            target.setdefault(key, []).append(span)
+
+        def _net_spans(
+            spans: list[tuple[datetime, datetime]], cuts: list[tuple[datetime, datetime]]
+        ) -> list[tuple[datetime, datetime]]:
+            # Subtract each negative correction from the positive spans: a round
+            # that ran before a transition was folded bills the old value past
+            # it, and the correction cancels only the tail. The raw spans would
+            # overlap on correct billing; the net does not.
+            kept: list[tuple[datetime, datetime]] = []
+            for start, end in spans:
+                pieces = [(start, end)]
+                for cut_start, cut_end in cuts:
+                    remainder = []
+                    for piece_start, piece_end in pieces:
+                        if cut_end <= piece_start or cut_start >= piece_end:
+                            remainder.append((piece_start, piece_end))
+                            continue
+                        if piece_start < cut_start:
+                            remainder.append((piece_start, cut_start))
+                        if cut_end < piece_end:
+                            remainder.append((cut_end, piece_end))
+                    pieces = remainder
+                kept.extend(pieces)
+            return sorted(kept)
+
+        dimension_sets = [_net_spans(spans, negative.get(key, [])) for key, spans in positive.items()]
         for first, second in itertools.combinations(dimension_sets, 2):
             for first_start, first_end in first:
                 for second_start, second_end in second:

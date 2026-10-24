@@ -77,3 +77,29 @@ func TestRulesMetrics(t *testing.T) {
 		t.Fatalf("check reload failures is %v, want 1", got)
 	}
 }
+
+func TestDeleteTenantHealthMetrics(t *testing.T) {
+	tenant := "metrics-delete"
+
+	RoundSucceeded(tenant, time.Unix(1000, 0))
+	RoundFailed(tenant)
+	OutboxDepth(tenant, 7)
+
+	// Other tests in this package add series to the same global vecs, so the
+	// check is on the series each deletion removes, not on a total count.
+	lastBefore := testutil.CollectAndCount(lastRoundTime)
+	failuresBefore := testutil.CollectAndCount(roundFailures)
+	outboxBefore := testutil.CollectAndCount(outboxDepth)
+
+	DeleteTenantHealthMetrics(tenant)
+
+	if got := testutil.CollectAndCount(lastRoundTime); got != lastBefore-1 {
+		t.Fatalf("last round time series count is %v, want %v", got, lastBefore-1)
+	}
+	if got := testutil.CollectAndCount(roundFailures); got != failuresBefore-1 {
+		t.Fatalf("round failures series count is %v, want %v", got, failuresBefore-1)
+	}
+	if got := testutil.CollectAndCount(outboxDepth); got != outboxBefore-1 {
+		t.Fatalf("outbox depth series count is %v, want %v", got, outboxBefore-1)
+	}
+}

@@ -26,9 +26,6 @@ rules:
   - apiGroups: ["metal3.io"]
     resources: ["provisionings"]
     verbs: ["get", "list", "create", "patch"]
-  - apiGroups: [""]
-    resources: ["pods"]
-    verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -43,6 +40,44 @@ metadata:
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
+  name: osac-infra-configure-metal3
+subjects:
+  - kind: ServiceAccount
+    name: osac-infra-configure-metal3
+    namespace: {{ .Release.Namespace }}
+---
+# The hook waits on pods only in openshift-machine-api, so that grant is
+# namespaced. Only the provisionings resource is cluster-scoped.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: osac-infra-configure-metal3
+  namespace: openshift-machine-api
+  labels:
+    {{- include "osac-infra.hookLabels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-delete-policy": before-hook-creation
+    "helm.sh/hook-weight": "10"
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: osac-infra-configure-metal3
+  namespace: openshift-machine-api
+  labels:
+    {{- include "osac-infra.hookLabels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-delete-policy": before-hook-creation
+    "helm.sh/hook-weight": "10"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
   name: osac-infra-configure-metal3
 subjects:
   - kind: ServiceAccount
@@ -71,6 +106,10 @@ spec:
     spec:
       serviceAccountName: osac-infra-configure-metal3
       restartPolicy: OnFailure
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
       volumes:
         - name: tmp
           emptyDir: {}

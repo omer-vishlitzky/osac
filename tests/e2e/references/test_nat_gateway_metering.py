@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import itertools
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 from uuid import uuid4
@@ -90,6 +90,9 @@ def test_nat_gateway_bills_allocation(
         heartbeat = metering.heartbeat_with_dimensions(
             nat_id, {"virtual_network": ref_virtual_network["name"]}, timeout=HEARTBEAT_TIMEOUT
         )
+        # The gateway was created without a project, so its heartbeats carry no
+        # project dimension: the engine emits only the facts a resource carries.
+        metering.without_project()
         metering.verify_event(heartbeat, resource_id=nat_id)
 
         data = heartbeat["data"]
@@ -139,6 +142,6 @@ def test_nat_gateway_bills_allocation(
             grpc.delete_external_ip(external_ip_id=eip_id)
             wait_for_external_ip_deletion(k8s=k8s_hub_client, name=eip_cr_name)
 
-    deleted_after = datetime.now(datetime.UTC).isoformat()
+    deleted_after = datetime.now(UTC).isoformat()
     if nat_id is not None:
         metering.assert_no_events(HEARTBEAT_TYPE, nat_id, since=deleted_after, within=120)
