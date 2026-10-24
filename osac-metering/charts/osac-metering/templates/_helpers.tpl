@@ -55,10 +55,6 @@ osac-metering
 osac-metering
 {{- end -}}
 
-{{- define "osac-metering.kafkaReplicas" -}}
-3
-{{- end -}}
-
 {{/*
 Init container that waits for the Kafka SASL secret in the cluster namespace
 and copies its password into the shared kafka-secrets emptyDir.
@@ -82,6 +78,11 @@ Args: list of [context, saslSecretName]
     - name: tmp
       mountPath: /tmp
   securityContext:
+    # The CLI image defaults to root; the pod requires non-root, so pin the
+    # same nonroot UID the workload images use. Plain Kubernetes (kind)
+    # refuses a runAsNonRoot pod whose image would run as UID 0.
+    runAsUser: 65532
+    runAsNonRoot: true
     allowPrivilegeEscalation: false
     readOnlyRootFilesystem: true
     capabilities:

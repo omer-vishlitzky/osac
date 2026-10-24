@@ -4,7 +4,7 @@ import contextlib
 import itertools
 import time
 from collections.abc import Iterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 from uuid import uuid4
@@ -42,6 +42,11 @@ pytestmark = pytest.mark.sanity
 
 # A round ticks every 60s; heartbeats may need a few rounds to surface.
 HEARTBEAT_TIMEOUT: int = 180
+
+# The CR stamps the API server writes carry whole seconds, while heartbeat
+# intervals carry microseconds: comparisons between the two allow one second,
+# like the stop test's net-usage tolerance.
+CR_STAMP_TOLERANCE = timedelta(seconds=1)
 
 RESIZE_IT_VCPUS: int = 4
 RESIZE_IT_MEMORY_GIB: int = 8
@@ -156,11 +161,33 @@ def _wait_for_running_vm(k8s: K8sClient, *, uuid: str) -> str:
     return ci_name
 
 
-def _delete_vm(cli: OsacCLI, grpc: GRPCClient, k8s: K8sClient, *, uuid: str, ci_name: str | None) -> None:
+def _delete_vm(cli: OsacCLI, grpc: GRPCClient, k8s: K8sClient, *, uuid: str, ci_name: str | None) -> datetime | None:
+    """Delete the VM and return the deletion time the API server recorded.
+
+    The operator's delete feedback dates the billing stop at the CR's deletion
+    timestamp, so the final interval ends at that value: anchoring the
+    assertions on the recorded time compares one clock, never the test
+    container's wall clock against the cluster's. None when the instance never
+    had a CR to read (the cleanup path); callers that assert on billing always
+    waited for the CR.
+    """
     cli.delete_compute_instance(uuid=uuid)
+    deletion_recorded: datetime | None = None
     if ci_name is not None:
+        deletion_recorded = parse_time(
+            poll_until(
+                fn=lambda: k8s.get_jsonpath(
+                    resource="computeinstance", name=ci_name, jsonpath="{.metadata.deletionTimestamp}"
+                ),
+                until=lambda stamp: bool(stamp),
+                retries=30,
+                delay=2,
+                description=f"deletion timestamp of {ci_name}",
+            )
+        )
         wait_for_deletion(k8s=k8s, name=ci_name)
     wait_for_grpc_removal(grpc=grpc, uuid=uuid)
+    return deletion_recorded
 
 
 def _usage_interval(event: dict[str, Any]) -> tuple[datetime, datetime, Decimal]:
@@ -363,14 +390,14 @@ def test_metering_stop_ends_billing(
         _delete_vm(cli, grpc, k8s_hub_client, uuid=uuid, ci_name=ci_name)
 
 
-def _final_heartbeat(metering: MeteringCollector, resource_id: str, halt_requested: datetime) -> dict[str, Any] | None:
+def _final_heartbeat(metering: MeteringCollector, resource_id: str, halt: datetime) -> dict[str, Any] | None:
     latest_end: datetime | None = None
     latest: dict[str, Any] | None = None
     for event in metering.get_all_events(HEARTBEAT_TYPE, resource_id):
         _, to, _ = _usage_interval(event)
         if latest_end is None or to > latest_end:
             latest_end, latest = to, event
-    if latest is None or latest_end is None or latest_end < halt_requested:
+    if latest is None or latest_end is None or latest_end < halt - CR_STAMP_TOLERANCE:
         return None
     return latest
 
@@ -549,9 +576,8 @@ def test_metering_delete_ends_billing(
 
     The billed life is internally consistent and complete: the typed heartbeats
     collapse into contiguous net intervals whose quantities equal their exact
-    lengths, the last interval reaches at or past the delete request (the final
-    partial interval is billed, not dropped), and nothing bills past the
-    deletion.
+    lengths, the last interval reaches the recorded deletion (the final
+    partial interval is billed, not dropped), and nothing bills past it.
     """
     uuid = _create_vm(
         cli, vm_template=vm_template, network_attachment=metering_network_attachment, project=metering_project
@@ -567,21 +593,17 @@ def test_metering_delete_ends_billing(
         metering.verify_event(heartbeat, resource_id=uuid)
         running_since, _, _ = _usage_interval(heartbeat)
 
-        delete_requested = datetime.now(UTC)
-        _delete_vm(cli, grpc, k8s_hub_client, uuid=uuid, ci_name=ci_name)
-        # Capture the silence window only after the deletion is fully through, so
-        # the final partial-interval heartbeat and any correction it triggers land
-        # before the window starts; the stop test uses the same ordering.
-        deleted_after = datetime.now(UTC)
+        deletion_recorded = _delete_vm(cli, grpc, k8s_hub_client, uuid=uuid, ci_name=ci_name)
+        assert deletion_recorded is not None, "the running VM's CR vanished before its deletion timestamp was read"
 
         # The deletion reaches metering through the same steps as a stop, so wait
         # past a full round before picking the final heartbeat.
         time.sleep(90)
 
         # The final heartbeat covers the partial interval up to the recorded
-        # deletion, so its interval ends at or after the delete was requested.
+        # deletion, so its interval ends at that timestamp.
         final = poll_until(
-            fn=lambda: _final_heartbeat(metering, uuid, delete_requested),
+            fn=lambda: _final_heartbeat(metering, uuid, deletion_recorded),
             until=lambda event: event is not None,
             retries=HEARTBEAT_TIMEOUT // 10,
             delay=10,
@@ -609,23 +631,25 @@ def test_metering_delete_ends_billing(
         assert billed_total == _interval_seconds(net[0][0], net[-1][1]), (
             f"the billed total {billed_total} does not equal the billed span {_interval_seconds(net[0][0], net[-1][1])}"
         )
-        assert net[-1][1] >= delete_requested, (
-            f"the final interval ends at {net[-1][1]}, before the delete was requested "
-            f"at {delete_requested}: the partial final interval was dropped"
+        assert net[-1][1] >= deletion_recorded - CR_STAMP_TOLERANCE, (
+            f"the final interval ends at {net[-1][1]}, before the recorded deletion "
+            f"at {deletion_recorded}: the partial final interval was dropped"
         )
         assert net[0][0] <= running_since, (
             f"billing starts at {net[0][0]}, after the first typed heartbeat at "
             f"{running_since}: the start of the billed life was dropped"
         )
 
-        # Nothing bills past the deletion: net usage past the moment the deletion
-        # completed is zero.
+        # Nothing bills past the recorded deletion: the final interval ends at
+        # that timestamp, so the net usage past it is zero.
         poll_until(
-            fn=lambda: net_usage_past_by_dimension(metering.get_all_events(HEARTBEAT_TYPE, uuid), past=deleted_after),
+            fn=lambda: net_usage_past_by_dimension(
+                metering.get_all_events(HEARTBEAT_TYPE, uuid), past=deletion_recorded
+            ),
             until=lambda nets: all(abs(net) <= 1 for net in nets.values()),
             retries=HEARTBEAT_TIMEOUT // 10,
             delay=10,
-            description=f"net billing of {uuid} to end at the deletion",
+            description=f"net billing of {uuid} to end at the recorded deletion",
         )
 
         # Past the final interval nothing more arrives: the meter stopped.

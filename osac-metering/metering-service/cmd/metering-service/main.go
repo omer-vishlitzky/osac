@@ -73,8 +73,10 @@ func configFromEnv() *config {
 	return &config{
 		healthAddr: envOrDefault("HEALTH_ADDR", ":8080"),
 		kafka: kafkapkg.ConnectionConfig{
-			Brokers:      os.Getenv("KAFKA_BROKERS"),
-			TLSEnabled:   os.Getenv("KAFKA_TLS_ENABLED") != "false",
+			Brokers: os.Getenv("KAFKA_BROKERS"),
+			// TLS is always on: the Strimzi broker the chart deploys against
+			// only listens with TLS, and no configuration turns it off.
+			TLSEnabled:   true,
 			TLSCACert:    os.Getenv("KAFKA_TLS_CA_CERT"),
 			SASLUser:     os.Getenv("KAFKA_SASL_USERNAME"),
 			SASLPassFile: os.Getenv("KAFKA_SASL_PASSWORD_FILE"),

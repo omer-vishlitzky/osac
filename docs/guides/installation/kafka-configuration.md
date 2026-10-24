@@ -333,8 +333,8 @@ the `osac.events.` topic prefix (the fold consumes the event topics) and
 `Create`, `Read`, `Write`, `Describe`, and `DescribeConfigs` on the
 per-tenant `osac.metering.heartbeat.` and `osac.metering.dlq.` prefixes.
 It creates the shared inference topic and its dead-letter topic with a
-replication factor of **3**, so the target cluster needs at least
-three brokers. The per-tenant heartbeat and dead-letter topics are created
+single replica, so the target cluster needs only one broker. The
+per-tenant heartbeat and dead-letter topics are created
 by the metering service itself when it first serves a tenant. Enabled
 adapters receive separate users with topic read
 access, DLQ write access, and access to their own consumer groups; these

@@ -85,7 +85,6 @@ m360Adapter:
 ## loop logs its errors and keeps going, so liveness alone proves nothing.
 serviceMonitor:
   enabled: false
-  interval: 60s
   # Extra labels for Prometheus instances that select monitors by label.
   labels: {}
 

@@ -46,7 +46,7 @@ type RunnerConfig struct {
 	TopicsProvider func(ctx context.Context) ([]string, error)
 	// SessionInterval bounds one consume session, so topics created after the session
 	// started are picked up on the next one. Defaults to one minute; zero means the
-	// default.
+	// default. Tests shrink it; production uses the default.
 	SessionInterval time.Duration
 	FlushInterval   time.Duration // default 10s
 	DedupTTL        time.Duration // default 10m
@@ -124,6 +124,10 @@ func (r *Runner) MetricsHandler() http.Handler {
 func (r *Runner) Run(ctx context.Context, group sarama.ConsumerGroup) error {
 	defer func() { _ = group.Close() }()
 
+	if r.cfg.TopicsProvider == nil {
+		return errors.New("RunnerConfig.TopicsProvider is required: without it the runner has no topics")
+	}
+
 	go r.dedup.startEviction(ctx)
 	go r.order.startEviction(ctx)
 	go r.retries.startEviction(ctx)
@@ -139,14 +143,12 @@ func (r *Runner) Run(ctx context.Context, group sarama.ConsumerGroup) error {
 	r.logger.Info("starting consumer group")
 
 	for {
-		if r.cfg.TopicsProvider != nil {
-			discovered, err := r.cfg.TopicsProvider(ctx)
-			if err != nil {
-				r.logger.Error(err, "discovering topics, retrying with the previous set")
-			} else if !sameTopics(discovered, topics) {
-				r.logger.Info("topic set changed", "topics", discovered)
-				topics = discovered
-			}
+		discovered, err := r.cfg.TopicsProvider(ctx)
+		if err != nil {
+			r.logger.Error(err, "discovering topics, retrying with the previous set")
+		} else if !sameTopics(discovered, topics) {
+			r.logger.Info("topic set changed", "topics", discovered)
+			topics = discovered
 		}
 		if len(topics) == 0 {
 			select {
@@ -162,7 +164,7 @@ func (r *Runner) Run(ctx context.Context, group sarama.ConsumerGroup) error {
 		// topic created later never triggers the rebalance that would pick it up, so
 		// the session restarts periodically and discovery runs again.
 		sessionCtx, cancelSession := context.WithTimeout(ctx, r.cfg.SessionInterval)
-		err := group.Consume(sessionCtx, topics, r)
+		err = group.Consume(sessionCtx, topics, r)
 		cancelSession()
 		if err != nil {
 			if errors.Is(err, sarama.ErrClosedConsumerGroup) {
