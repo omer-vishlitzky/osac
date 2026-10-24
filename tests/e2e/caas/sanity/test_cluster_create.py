@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import itertools
 import logging
 import os
 import subprocess
@@ -9,6 +10,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -172,6 +174,7 @@ class _AvailableCluster(_ClusterResources):
 
     node_sets: dict[str, Any]
     worker_node_set: str
+    worker_instance_type: str
     original_size: int
 
 
@@ -456,6 +459,7 @@ def assert_cluster_available(
         co_name=co_name,
         node_sets=node_sets,
         worker_node_set=worker_node_set,
+        worker_instance_type=worker_instance_type,
         original_size=original_size,
         owned_bmi_ids=owned_bmi_ids,
         infra_env_name=infra_env_name,
@@ -476,6 +480,90 @@ def _assert_cluster_metering(*, metering: MeteringCollector, uuid: str, cluster_
     assert heartbeat_bd.get("template") == cluster_template, (
         f"template mismatch: {heartbeat_bd.get('template')!r} != {cluster_template!r}"
     )
+
+
+def _assert_worker_metering(*, metering: MeteringCollector, uuid: str, cluster: _AvailableCluster) -> None:
+    """Verify the cluster's workers bill as bare metal instances, attributed to the cluster.
+
+    Every worker heartbeat carries the cluster reference and the node set it
+    belongs to, so the bill names what the hardware ran for. Each worker's
+    billed life is contiguous per meter with exact quantities, so no second of
+    a worker bills twice.
+    """
+    assert cluster.owned_bmi_ids, "the available cluster has no workers to assert billing on"
+    for bmi_id in sorted(cluster.owned_bmi_ids):
+        heartbeat = metering.heartbeat_with_dimensions(
+            bmi_id, {"cluster": uuid, "node_set": cluster.worker_node_set}, timeout=180
+        )
+        dimensions = heartbeat["data"]["billing_dimensions"]
+        assert dimensions.get("instance_type") == cluster.worker_instance_type, (
+            f"worker {bmi_id} bills with instance type {dimensions.get('instance_type')!r}, "
+            f"want {cluster.worker_instance_type!r}"
+        )
+        assert heartbeat["data"]["usage"]["unit"] == "second"
+
+        by_meter: dict[str, list[dict[str, Any]]] = {}
+        for event in metering.get_all_events(HEARTBEAT_TYPE, bmi_id):
+            by_meter.setdefault(event["data"]["meter"], []).append(event)
+        assert set(by_meter) <= {"allocation", "consumption"}, f"worker {bmi_id} bills under meters {sorted(by_meter)}"
+        assert "allocation" in by_meter, f"worker {bmi_id} never billed its host reservation"
+        for meter, events in by_meter.items():
+            net = _net_intervals(events)
+            assert net, f"worker {bmi_id} has {meter} heartbeats but no net intervals"
+            for start, end, quantity in net:
+                assert quantity == _interval_seconds(start, end), (
+                    f"worker {bmi_id}: net {meter} interval {start}..{end} bills {quantity}, "
+                    "not its exact length: a second billed twice or lost"
+                )
+            for (_, previous_end, _), (start, _, _) in itertools.pairwise(net):
+                assert start == previous_end, (
+                    f"worker {bmi_id}: {meter} intervals are not contiguous: {previous_end} then {start}"
+                )
+
+
+def _assert_worker_billing_stops(*, metering: MeteringCollector, cluster: _ClusterResources, since: str) -> None:
+    """The cluster's deletion clamps its workers' billing: nothing arrives after it."""
+    for bmi_id in sorted(cluster.owned_bmi_ids):
+        metering.assert_no_events(HEARTBEAT_TYPE, resource_id=bmi_id, since=since, within=120)
+
+
+def _heartbeat_interval(event: dict[str, Any]) -> tuple[datetime, datetime, Decimal]:
+    usage = event["data"]["usage"]
+    return (datetime.fromisoformat(usage["from"]), datetime.fromisoformat(usage["to"]), Decimal(usage["quantity"]))
+
+
+def _interval_seconds(start: datetime, end: datetime) -> Decimal:
+    """The exact interval length in seconds, kept in decimal: heartbeat
+    quantities carry microseconds and a float total loses the tail."""
+    delta = end - start
+    micros = (delta.days * 86400 + delta.seconds) * 1_000_000 + delta.microseconds
+    return Decimal(micros) / Decimal(1_000_000)
+
+
+def _net_intervals(events: list[dict[str, Any]]) -> list[tuple[datetime, datetime, Decimal]]:
+    """Collapse signed heartbeats into the intervals the meter actually bills.
+
+    Each heartbeat bills its quantity over its usage interval and a negative
+    correction cancels the overlap, so a canceled tail disappears from the net
+    instead of showing up as a gap or an overlap between raw intervals.
+    """
+    rates = [
+        (start, end, quantity / _interval_seconds(start, end))
+        for start, end, quantity in (_heartbeat_interval(event) for event in events)
+    ]
+    boundaries = sorted({moment for start, end, _ in rates for moment in (start, end)})
+    intervals: list[tuple[datetime, datetime, Decimal]] = []
+    for start, end in itertools.pairwise(boundaries):
+        rate = sum(r for r_start, r_end, r in rates if r_start <= start and r_end >= end)
+        if rate <= 0:
+            continue
+        quantity = rate * _interval_seconds(start, end)
+        if intervals and intervals[-1][1] == start:
+            previous_start, _, previous_quantity = intervals[-1]
+            intervals[-1] = (previous_start, end, previous_quantity + quantity)
+        else:
+            intervals.append((start, end, quantity))
+    return intervals
 
 
 def _assert_cluster_deleted(
@@ -528,6 +616,8 @@ def _assert_cluster_deleted(
     # past the moment the record was removed is zero, and nothing arrives after.
     deleted_after = datetime.now(UTC).isoformat()
     metering.assert_no_events(HEARTBEAT_TYPE, resource_id=uuid, since=deleted_after, within=120)
+    # The deletion also clamps the workers' billing, whatever their own state.
+    _assert_worker_billing_stops(metering=metering, cluster=cluster, since=deleted_after)
 
 
 def _assert_catalog_created_cluster(
@@ -613,6 +703,7 @@ def test_cluster_create(
             assert_management_tls(k8s_hub_client, require_metering=True)
             assert_cluster_trust(k8s_hub_client, cluster.co_name)
         _assert_cluster_metering(metering=metering, uuid=uuid, cluster_template=cluster_template)
+        _assert_worker_metering(metering=metering, uuid=uuid, cluster=cluster)
 
         scaled_size = cluster.original_size + 1
         cli.scale_cluster(uuid=uuid, node_set=cluster.worker_node_set, size=scaled_size)

@@ -1910,11 +1910,6 @@
               "description": "Create ServiceMonitors scraping the /metrics endpoints",
               "default": false
             },
-            "interval": {
-              "type": "string",
-              "description": "Scrape interval, for example 60s",
-              "default": "60s"
-            },
             "labels": {
               "type": "object",
               "description": "Extra labels for Prometheus instances that select monitors by label",

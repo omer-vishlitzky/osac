@@ -17,10 +17,11 @@ import (
 
 type ConnectionConfig struct {
 	Brokers string
-	// TLSEnabled turns TLS on, like the adapters' KAFKA_TLS_ENABLED: the deployment
-	// defaults it to true, and a plaintext broker needs an explicit false. An empty
-	// TLSCACert with TLS on trusts the system root store, for brokers whose
-	// certificate a public authority signed.
+	// TLSEnabled turns TLS on. Production always sets it: main constructs the
+	// config with TLS on and no environment variable can turn it off. Tests
+	// connect to a plaintext broker and leave it unset. An empty TLSCACert
+	// with TLS on trusts the system root store, for brokers whose certificate
+	// a public authority signed.
 	TLSEnabled   bool
 	TLSCACert    string
 	SASLUser     string

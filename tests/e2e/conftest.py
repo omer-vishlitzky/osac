@@ -191,7 +191,7 @@ def jwt_tenant(jwt_username: str) -> str:
     The mapping mirrors ensure_jwt_users: every fixture user of tenant1 maps
     to the tenant1 tenant, and tenant2's users to tenant2.
     """
-    return env("OSAC_JWT_TENANT", f"tenant{jwt_username.removeprefix('tenant').split('_')[0]}")
+    return f"tenant{jwt_username.removeprefix('tenant').split('_')[0]}"
 
 
 @pytest.fixture(scope="session")

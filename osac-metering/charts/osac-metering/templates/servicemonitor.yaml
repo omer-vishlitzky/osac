@@ -34,6 +34,6 @@ spec:
   endpoints:
     - port: {{ $monitor.port }}
       path: /metrics
-      interval: {{ $.Values.serviceMonitor.interval }}
+      interval: 60s
 {{- end }}
 {{- end }}
