@@ -375,7 +375,8 @@ jobs:
           helm template osac-deps charts/osac-deps/ --values values/dev/infra.yaml
           helm template osac-infra charts/osac-infra/ --values values/dev/infra.yaml \
             --set trustManager.upstream.enabled=true
-          helm template osac charts/osac/ --values values/dev/kind-instance.yaml
+          helm template osac charts/osac/ --values values/dev/kind-instance.yaml \
+            --set-string global.osacDeploymentId=ci/osac
 
       # Same real command (and cluster: `make install-infra` creates its own
       # Kind cluster, config, cert-manager/trust-manager/envoy-gateway/osac-infra
