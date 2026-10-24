@@ -157,9 +157,6 @@ service:
   certs:
     caBundle:
       configMap: osac-kafka-ca-bundle
-
-metering:
-  enabled: false
 ```
 
 `brokers`, `user`, and `password` are the three required connection
@@ -331,8 +328,10 @@ configuration as required by the [customer install guide](customer-install-guide
 The installing account needs permission to create the Strimzi resources
 and credential-access RBAC in `messaging`.
 
-The chart provisions the `osac-metering` user with `Write` and `Describe`
-on the `osac.metering.` topic prefix and cluster `IdempotentWrite`.
+The chart provisions the `osac-metering` user with `Read` and `Describe` on
+the `osac.events.` topic prefix (the fold consumes the event topics) and
+`Create`, `Read`, `Write`, `Describe`, and `DescribeConfigs` on the
+per-tenant `osac.metering.heartbeat.` and `osac.metering.dlq.` prefixes.
 It creates the shared inference topic and its dead-letter topic with a
 replication factor of **3**, so the target cluster needs at least
 three brokers. The per-tenant heartbeat and dead-letter topics are created

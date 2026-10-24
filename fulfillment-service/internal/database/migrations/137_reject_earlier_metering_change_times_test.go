@@ -36,51 +36,51 @@ var _ = DescribeMigration("Reject earlier metering change times", func() {
 		Expect(err).ToNot(HaveOccurred())
 	})
 
-	insert := func(ctx context.Context, table, id, data string) {
-		_, err := conn.Exec(ctx, fmt.Sprintf(`
-			insert into %s (id, name, tenant, project, data)
-			values ($1, $1, 'tenant-a', 'team-a', $2::jsonb)`, table), id, data)
+	insert := func(ctx context.Context, id, data string) {
+		_, err := conn.Exec(ctx, `
+			insert into compute_instances (id, name, tenant, project, data)
+			values ($1, $1, 'tenant-a', 'team-a', $2::jsonb)`, id, data)
 		Expect(err).ToNot(HaveOccurred())
 	}
 
 	// insertCreated inserts a resource created with a tracked value and no time, at a controlled
 	// creation timestamp: the state the fold keys at the creation fallback.
-	insertCreated := func(ctx context.Context, table, id, data string) {
-		_, err := conn.Exec(ctx, fmt.Sprintf(`
-			insert into %s (id, name, tenant, project, creation_timestamp, data)
-			values ($1, $1, 'tenant-a', 'team-a', '2026-01-01T10:00:00Z', $2::jsonb)`, table), id, data)
+	insertCreated := func(ctx context.Context, id, data string) {
+		_, err := conn.Exec(ctx, `
+			insert into compute_instances (id, name, tenant, project, creation_timestamp, data)
+			values ($1, $1, 'tenant-a', 'team-a', '2026-01-01T10:00:00Z', $2::jsonb)`, id, data)
 		Expect(err).ToNot(HaveOccurred())
 	}
 
 	// update replaces the whole data document, the way a writer that read the row, changed one
 	// field and wrote it back would.
-	update := func(ctx context.Context, table, id, data string) error {
-		tag, err := conn.Exec(ctx, fmt.Sprintf(`
-			update %s set data = $2::jsonb where id = $1`, table), id, data)
+	update := func(ctx context.Context, id, data string) error {
+		tag, err := conn.Exec(ctx, `
+			update compute_instances set data = $2::jsonb where id = $1`, id, data)
 		if err == nil {
 			Expect(tag.RowsAffected()).To(Equal(int64(1)))
 		}
 		return err
 	}
 
-	expectRejection := func(ctx context.Context, table, id, timePath, newData string, wantStored *string) {
-		err := update(ctx, table, id, newData)
+	expectRejection := func(ctx context.Context, id, timePath, newData string, wantStored *string) {
+		err := update(ctx, id, newData)
 		var pgErr *pgconn.PgError
 		Expect(errors.As(err, &pgErr)).To(BeTrue())
 		Expect(pgErr.Code).To(Equal("Z0006"))
 		Expect(pgErr.Message).To(ContainSubstring(timePath))
 		// The rejected write left the stored time untouched:
 		var value *string
-		err = conn.QueryRow(ctx, fmt.Sprintf(`
-			select data #>> string_to_array($2, '.') from %s where id = $1`, table), id, timePath).Scan(&value)
+		err = conn.QueryRow(ctx, `
+			select data #>> string_to_array($2, '.') from compute_instances where id = $1`, id, timePath).Scan(&value)
 		Expect(err).ToNot(HaveOccurred())
 		Expect(value).To(Equal(wantStored))
 	}
 
-	storedPath := func(ctx context.Context, table, id, path string) *string {
+	storedPath := func(ctx context.Context, id, path string) *string {
 		var value *string
-		err := conn.QueryRow(ctx, fmt.Sprintf(`
-			select data #>> string_to_array($2, '.') from %s where id = $1`, table), id, path).Scan(&value)
+		err := conn.QueryRow(ctx, `
+			select data #>> string_to_array($2, '.') from compute_instances where id = $1`, id, path).Scan(&value)
 		Expect(err).ToNot(HaveOccurred())
 		return value
 	}
@@ -100,8 +100,8 @@ var _ = DescribeMigration("Reject earlier metering change times", func() {
 	// condition transition time) must be rejected, not silently rewritten just past the previous
 	// type's time, which would move the span between the two times to the new pricing dimension.
 	It("rejects a changed varying field with an earlier time", func(ctx context.Context) {
-		insert(ctx, "compute_instances", "vm-1", runningVM)
-		expectRejection(ctx, "compute_instances", "vm-1", "status.instance_type_transition_time", `{
+		insert(ctx, "vm-1", runningVM)
+		expectRejection(ctx, "vm-1", "status.instance_type_transition_time", `{
 			"status": {
 				"state": "COMPUTE_INSTANCE_STATE_RUNNING",
 				"state_transition_time": "2026-01-01T10:00:00Z",
@@ -112,8 +112,8 @@ var _ = DescribeMigration("Reject earlier metering change times", func() {
 	})
 
 	It("rejects a changed varying field with an earlier state time", func(ctx context.Context) {
-		insert(ctx, "compute_instances", "vm-1", runningVM)
-		expectRejection(ctx, "compute_instances", "vm-1", "status.state_transition_time", `{
+		insert(ctx, "vm-1", runningVM)
+		expectRejection(ctx, "vm-1", "status.state_transition_time", `{
 			"status": {
 				"state": "COMPUTE_INSTANCE_STATE_STOPPED",
 				"state_transition_time": "2026-01-01T09:00:00Z",
@@ -124,15 +124,15 @@ var _ = DescribeMigration("Reject earlier metering change times", func() {
 	})
 
 	DescribeTable("rejects a changed varying field whose time is missing",
-		func(ctx context.Context, table, id, timePath, oldData, newData string, wantStored *string) {
-			insert(ctx, table, id, oldData)
-			expectRejection(ctx, table, id, timePath, newData, wantStored)
+		func(ctx context.Context, id, timePath, oldData, newData string, wantStored *string) {
+			insert(ctx, id, oldData)
+			expectRejection(ctx, id, timePath, newData, wantStored)
 		},
 		// The backdating regression: RUNNING since 10:00, FAILED written at 15:00 with no time,
 		// must be rejected rather than stored as FAILED since 10:00:00.000001, which would erase
 		// five hours of billing.
 		Entry("missing time",
-			"compute_instances", "vm-1", "status.state_transition_time", runningVM,
+			"vm-1", "status.state_transition_time", runningVM,
 			`{
 				"status": {
 					"state": "COMPUTE_INSTANCE_STATE_FAILED",
@@ -142,7 +142,7 @@ var _ = DescribeMigration("Reject earlier metering change times", func() {
 			}`,
 			proto.String("2026-01-01T10:00:00Z")),
 		Entry("missing time on the first change of a value",
-			"compute_instances", "vm-1", "status.state_transition_time",
+			"vm-1", "status.state_transition_time",
 			`{"status": {"state": "COMPUTE_INSTANCE_STATE_STARTING"}}`,
 			`{"status": {"state": "COMPUTE_INSTANCE_STATE_RUNNING"}}`,
 			nil),
@@ -151,8 +151,8 @@ var _ = DescribeMigration("Reject earlier metering change times", func() {
 	// The granularity collision kept from migration 133: two changes of a whole-second CR
 	// timestamp land on the same second, so the supplied time equals the stored one.
 	It("clamps a changed varying field with a time equal to the stored one", func(ctx context.Context) {
-		insert(ctx, "compute_instances", "vm-1", runningVM)
-		Expect(update(ctx, "compute_instances", "vm-1", `{
+		insert(ctx, "vm-1", runningVM)
+		Expect(update(ctx, "vm-1", `{
 			"status": {
 				"state": "COMPUTE_INSTANCE_STATE_STOPPED",
 				"state_transition_time": "2026-01-01T10:00:00Z",
@@ -160,14 +160,14 @@ var _ = DescribeMigration("Reject earlier metering change times", func() {
 				"instance_type_transition_time": "2026-01-01T10:00:00Z"
 			}
 		}`)).To(Succeed())
-		Expect(storedPath(ctx, "compute_instances", "vm-1", "status.state_transition_time")).To(
+		Expect(storedPath(ctx, "vm-1", "status.state_transition_time")).To(
 			HaveValue(Equal("2026-01-01T10:00:00.000001Z")),
 		)
 	})
 
 	It("keeps a supplied time that is later than the stored one", func(ctx context.Context) {
-		insert(ctx, "compute_instances", "vm-1", runningVM)
-		Expect(update(ctx, "compute_instances", "vm-1", `{
+		insert(ctx, "vm-1", runningVM)
+		Expect(update(ctx, "vm-1", `{
 			"status": {
 				"state": "COMPUTE_INSTANCE_STATE_STOPPED",
 				"state_transition_time": "2026-01-01T11:00:00Z",
@@ -175,21 +175,21 @@ var _ = DescribeMigration("Reject earlier metering change times", func() {
 				"instance_type_transition_time": "2026-01-01T10:00:00Z"
 			}
 		}`)).To(Succeed())
-		Expect(storedPath(ctx, "compute_instances", "vm-1", "status.state_transition_time")).To(
+		Expect(storedPath(ctx, "vm-1", "status.state_transition_time")).To(
 			HaveValue(Equal("2026-01-01T11:00:00Z")),
 		)
 	})
 
 	DescribeTable("clamps a first change time that collides with the creation fallback",
 		func(ctx context.Context, suppliedTime string) {
-			insertCreated(ctx, "compute_instances", "vm-1", `{"status": {"state": "COMPUTE_INSTANCE_STATE_STARTING"}}`)
-			Expect(update(ctx, "compute_instances", "vm-1", fmt.Sprintf(`{
+			insertCreated(ctx, "vm-1", `{"status": {"state": "COMPUTE_INSTANCE_STATE_STARTING"}}`)
+			Expect(update(ctx, "vm-1", fmt.Sprintf(`{
 				"status": {
 					"state": "COMPUTE_INSTANCE_STATE_RUNNING",
 					"state_transition_time": %q
 				}
 			}`, suppliedTime))).To(Succeed())
-			Expect(storedPath(ctx, "compute_instances", "vm-1", "status.state_transition_time")).To(
+			Expect(storedPath(ctx, "vm-1", "status.state_transition_time")).To(
 				HaveValue(Equal("2026-01-01T10:00:00.000001Z")),
 			)
 		},
@@ -198,21 +198,21 @@ var _ = DescribeMigration("Reject earlier metering change times", func() {
 	)
 
 	It("passes a first change time after creation unchanged", func(ctx context.Context) {
-		insertCreated(ctx, "compute_instances", "vm-1", `{"status": {"state": "COMPUTE_INSTANCE_STATE_STARTING"}}`)
-		Expect(update(ctx, "compute_instances", "vm-1", `{
+		insertCreated(ctx, "vm-1", `{"status": {"state": "COMPUTE_INSTANCE_STATE_STARTING"}}`)
+		Expect(update(ctx, "vm-1", `{
 			"status": {
 				"state": "COMPUTE_INSTANCE_STATE_RUNNING",
 				"state_transition_time": "2026-01-01T11:00:00Z"
 			}
 		}`)).To(Succeed())
-		Expect(storedPath(ctx, "compute_instances", "vm-1", "status.state_transition_time")).To(
+		Expect(storedPath(ctx, "vm-1", "status.state_transition_time")).To(
 			HaveValue(Equal("2026-01-01T11:00:00Z")),
 		)
 	})
 
 	It("keeps the old time when a write changes only the time", func(ctx context.Context) {
-		insert(ctx, "compute_instances", "vm-1", runningVM)
-		Expect(update(ctx, "compute_instances", "vm-1", `{
+		insert(ctx, "vm-1", runningVM)
+		Expect(update(ctx, "vm-1", `{
 			"status": {
 				"state": "COMPUTE_INSTANCE_STATE_RUNNING",
 				"state_transition_time": "2026-01-02T10:00:00Z",
@@ -220,15 +220,15 @@ var _ = DescribeMigration("Reject earlier metering change times", func() {
 				"instance_type_transition_time": "2026-01-01T10:00:00Z"
 			}
 		}`)).To(Succeed())
-		Expect(storedPath(ctx, "compute_instances", "vm-1", "status.state_transition_time")).To(
+		Expect(storedPath(ctx, "vm-1", "status.state_transition_time")).To(
 			HaveValue(Equal("2026-01-01T10:00:00Z")),
 		)
 	})
 
 	It("still rejects changing a field that never changes after it is set", func(ctx context.Context) {
-		insert(ctx, "compute_instances", "vm-1",
+		insert(ctx, "vm-1",
 			`{"spec": {"disk_image": {"id": "img-1"}}, "status": {"state": "COMPUTE_INSTANCE_STATE_RUNNING", "state_transition_time": "2026-01-01T10:00:00Z"}}`)
-		err := update(ctx, "compute_instances", "vm-1",
+		err := update(ctx, "vm-1",
 			`{"spec": {"disk_image": {"id": "img-2"}}, "status": {"state": "COMPUTE_INSTANCE_STATE_RUNNING", "state_transition_time": "2026-01-01T10:00:00Z"}}`)
 		var pgErr *pgconn.PgError
 		Expect(errors.As(err, &pgErr)).To(BeTrue())

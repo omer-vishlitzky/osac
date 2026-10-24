@@ -112,6 +112,9 @@ def test_baremetal_instance_bills_allocation_and_consumption(
         wait_for_bmi_running(grpc=jwt_grpc_tenant1, bmi_id=bmi_id)
 
         allocation = _wait_for_meter(metering, bmi_id, "allocation", bmi_instance_type)
+        # The instance is created without a project, so its heartbeats carry no
+        # project dimension: the engine emits only the facts a resource carries.
+        metering.without_project()
         metering.verify_event(allocation, resource_id=bmi_id)
         consumption = _wait_for_meter(metering, bmi_id, "consumption", bmi_instance_type)
         metering.verify_event(consumption, resource_id=bmi_id)

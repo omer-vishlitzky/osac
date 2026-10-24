@@ -21,6 +21,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -91,6 +92,7 @@ func NewPipelineWithRevisions(
 	}
 	roundLoop, err := round.New(
 		store, calculator, testenv.NewClient(t), testenv.NewConsumer(t), logr.Discard(),
+		&sync.RWMutex{},
 	)
 	if err != nil {
 		t.Fatalf("creating round: %v", err)

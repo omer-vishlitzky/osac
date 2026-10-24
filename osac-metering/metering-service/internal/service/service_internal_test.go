@@ -788,6 +788,96 @@ func TestCheckRulesLoadsNewRevision(t *testing.T) {
 	}
 }
 
+// setBillingPosition commits a last-round time for one tenant, as a committed round
+// tick would. The database's billing position is the latest across tenants.
+func setBillingPosition(t *testing.T, store *database.Store, tenant string, at time.Time) {
+	t.Helper()
+	ctx := context.Background()
+	if err := store.EnsureProgress(ctx, tenant); err != nil {
+		t.Fatalf("ensuring progress: %v", err)
+	}
+	tx, err := store.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := database.SetLastRound(ctx, tx, tenant, at, 0); err != nil {
+		t.Fatalf("setting the last round: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+}
+
+// TestCheckRulesWaitsForInFlightRound regression-tests the rules race: a revision whose
+// effective time falls inside an in-flight round's span used to be approved mid-round,
+// because the check compared only against the committed billing position. After that
+// round committed, no later round dragged the revision, so the span it covered kept its
+// old pricing forever, and a replay under the final rules disagreed. The check must hold
+// the write side of the rules gate — wait for the tick — and then reject the revision
+// against the position the tick committed.
+func TestCheckRulesWaitsForInFlightRound(t *testing.T) {
+	ctx := context.Background()
+	store := testenv.Database(t)
+
+	dir := t.TempDir()
+	writeRevisionManifest(t, dir, "0001", "1970-01-01T00:00:00Z", testenv.DefaultMetersYAML(t))
+
+	svc, err := New(ctx, Config{
+		Store:  store,
+		Rules:  rules.NewDirectorySource(dir),
+		Kafka:  kafka.ConnectionConfig{Brokers: testenv.Broker(t)},
+		Logger: logr.Discard(),
+	})
+	if err != nil {
+		t.Fatalf("startup: %v", err)
+	}
+	t.Cleanup(svc.stopAll)
+
+	// A tenant whose last round ran a minute ago. A round ticking now spans the last
+	// minute, and the revision below takes effect inside that span: acceptable
+	// against the committed position, but not against the round that is in flight.
+	tenant := strings.ToLower(t.Name())
+	setBillingPosition(t, store, tenant, time.Now().UTC().Add(-time.Minute))
+
+	secondMeters := strings.Replace(
+		testenv.DefaultMetersYAML(t), "states: [RUNNING]", "states: [RUNNING, PAUSED]", 1,
+	)
+	writeRevisionManifest(
+		t, dir, "0002", time.Now().UTC().Add(-30*time.Second).Format(time.RFC3339), secondMeters,
+	)
+
+	// The in-flight tick: Round.Once holds the read side of the rules gate for its
+	// whole run, so the check must not be able to decide or swap meanwhile.
+	svc.rulesGate.RLock()
+	checkDone := make(chan error, 1)
+	go func() { checkDone <- svc.checkRules(ctx) }()
+
+	select {
+	case err := <-checkDone:
+		t.Fatalf("the check must wait for the in-flight round, returned %v", err)
+	case <-time.After(200 * time.Millisecond):
+		// Still waiting: the tick holds the read side.
+	}
+
+	// The tick commits: the billing position moves past the revision's effective
+	// time, as a round that billed the span containing it would.
+	setBillingPosition(t, store, tenant, time.Now().UTC())
+	svc.rulesGate.RUnlock()
+
+	select {
+	case err := <-checkDone:
+		if !errors.Is(err, errRulesDisagree) {
+			t.Fatalf("a revision the in-flight round billed past must be rejected, got %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the check never finished after the round committed")
+	}
+	if got := len(svc.ruleset.Revisions()); got != 1 {
+		t.Fatalf("a rejected revision must not be swapped in, calculator serves %d revisions", got)
+	}
+}
+
 // TestCheckRulesStopsWhenRulesDisagree checks the fatal case: a revision whose effective
 // time the billing position already passed appears for the first time. The spans it
 // covers were never billed under it, so continuing under the loaded rules is wrong; the
@@ -812,19 +902,7 @@ func TestCheckRulesStopsWhenRulesDisagree(t *testing.T) {
 
 	// A tenant's round just ran, so the billing position is now.
 	tenant := strings.ToLower(t.Name())
-	if err := store.EnsureProgress(ctx, tenant); err != nil {
-		t.Fatalf("ensuring progress: %v", err)
-	}
-	tx, err := store.Begin(ctx)
-	if err != nil {
-		t.Fatalf("begin: %v", err)
-	}
-	if err := database.SetLastRound(ctx, tx, tenant, time.Now().UTC(), 0); err != nil {
-		t.Fatalf("setting the last round: %v", err)
-	}
-	if err := tx.Commit(ctx); err != nil {
-		t.Fatalf("commit: %v", err)
-	}
+	setBillingPosition(t, store, tenant, time.Now().UTC())
 
 	// The new revision took effect before the billing position: the rounds after its
 	// effective time were billed under 0001 and cannot be re-based.
