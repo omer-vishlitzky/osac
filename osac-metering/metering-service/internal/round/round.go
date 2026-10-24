@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"math/big"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/IBM/sarama"
@@ -56,7 +57,9 @@ func roundAlreadyRan(roundTime time.Time, lastRound *time.Time) bool {
 
 // Calculator is the subset of the usage calculator a round uses. The service hands the
 // round a swappable implementation, so approving a new rule revision reloads the rules
-// without restarting the tenant loops: every round tick reads whatever set is current.
+// without restarting the tenant loops: each tick holds the read side of the rules gate
+// for its whole run, so it reads one set end to end, and a revision change holds the
+// write side and can only land between ticks.
 type Calculator interface {
 	Revisions() []rules.Revision
 	OwnerOf(resourceType string, facts []database.Fact) (string, string, bool)
@@ -79,6 +82,12 @@ type Round struct {
 	consumer   sarama.Consumer
 	logger     logr.Logger
 
+	// rulesGate is held for its read side by every tick, so a rule-revision change
+	// (which holds the write side) can neither swap the calculator between one
+	// tick's calculator calls nor be decided against a position a tick is about
+	// to advance.
+	rulesGate *sync.RWMutex
+
 	// eventTarget is the event-topic watermark the round waits for the fold to reach,
 	// per tenant. Measured at check time the watermark always moves ahead of the fold
 	// on a tenant with a steady event stream, and the tenant would never bill.
@@ -93,17 +102,19 @@ type Round struct {
 }
 
 // New creates a round runner. The client reads topic watermarks; the consumer reads the
-// heartbeat topic during catch-up.
+// heartbeat topic during catch-up. The rulesGate's read side brackets every tick; the
+// service's rules check holds the write side.
 func New(
 	store *database.Store,
 	calculator Calculator,
 	client sarama.Client,
 	consumer sarama.Consumer,
 	logger logr.Logger,
+	rulesGate *sync.RWMutex,
 ) (*Round, error) {
 	return &Round{
 		store: store, calculator: calculator, client: client, consumer: consumer, logger: logger,
-		eventTarget: map[string]int64{}, catchUpBatch: CatchUpBatch,
+		rulesGate: rulesGate, eventTarget: map[string]int64{}, catchUpBatch: CatchUpBatch,
 	}, nil
 }
 
@@ -171,6 +182,11 @@ func (r *Round) RunTenant(ctx context.Context, tenant string, interval time.Dura
 // topic's end in one pass; it skips when the fold is behind or when roundTime has not
 // passed the last round time. RunTenant reads roundTime from PostgreSQL's clock.
 func (r *Round) Once(ctx context.Context, tenant string, roundTime time.Time) error {
+	// The tick holds the read side of the rules gate for its whole run, so the
+	// calculator cannot change between the tick's calls.
+	r.rulesGate.RLock()
+	defer r.rulesGate.RUnlock()
+
 	if err := r.store.EnsureProgress(ctx, tenant); err != nil {
 		return err
 	}

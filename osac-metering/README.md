@@ -32,7 +32,10 @@ same rows are resent with the same IDs.
 
 Everything is rebuildable: history from the event topics, the ledger from the
 heartbeat topic, revisions from the ConfigMaps. Losing or restoring the
-database never bills usage twice and never loses any.
+database never bills usage twice. It also loses nothing as long as the topics
+still hold their records: the tenant topics keep every record by default
+(`topics.retentionMs: "-1"`). A finite retention bounds the recovery window
+to it — records Kafka deleted cannot be replayed after a restore.
 
 ## Components
 
@@ -108,11 +111,11 @@ when billing through M360, one adapter route.
 
 ## Deployment
 
-The metering subsystem is deployed via the osac-installer umbrella chart with
-`metering.enabled: true`. Prerequisites: AMQ Streams operator and Kafka
-cluster (installed by osac-installer phases 1 and 2 with `kafka.enabled:
-true`), and Kubernetes 1.30 or later for the admission policy that protects
-rule revisions.
+The metering subsystem is deployed by the osac-installer umbrella chart,
+always: billing is not optional, and no value turns it off. Prerequisites:
+AMQ Streams operator and Kafka cluster (installed by osac-installer phases 1
+and 2 with `kafka.enabled: true`), and Kubernetes 1.30 or later for the
+admission policy that protects rule revisions.
 
 Kafka ACLs: the event publisher creates and writes the event topics; metering
 reads them, creates the heartbeat and dead-letter topics of the tenants it

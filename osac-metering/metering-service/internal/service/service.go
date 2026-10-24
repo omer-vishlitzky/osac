@@ -82,13 +82,18 @@ type Config struct {
 type Service struct {
 	cfg Config
 
-	client     sarama.Client
-	consumer   sarama.Consumer
-	producer   sarama.SyncProducer
-	ruleset    *calculatorSet
-	owners     map[string]usage.OwnerSpec
-	loaded     []rules.Revision
-	rulesMutex sync.Mutex
+	client   sarama.Client
+	consumer sarama.Consumer
+	producer sarama.SyncProducer
+	ruleset  *calculatorSet
+	owners   map[string]usage.OwnerSpec
+	loaded   []rules.Revision
+
+	// rulesGate serializes rule-revision changes against round ticks. Every tick
+	// holds the read side for its whole run, so a change cannot swap the calculator
+	// between one tick's calculator calls; checkRules holds the write side, so a
+	// change is both decided and applied only between ticks.
+	rulesGate *sync.RWMutex
 
 	// tenants maps each running tenant to its loops. Guarded by lock.
 	lock    sync.Mutex
@@ -134,9 +139,10 @@ func (s *Service) Healthy() bool {
 }
 
 // calculatorSet serves the rounds the currently loaded rule revisions. The rules check
-// swaps the calculator when it approves a new revision; a round reads whatever set is
-// current on each of its ticks, so a reload needs no loop restart. It implements the
-// round's Calculator interface by delegation.
+// swaps the calculator when it approves a new revision, between rounds: a tick holds the
+// read side of the rules gate for its whole run, so it reads one set for every one of its
+// calculator calls and a reload needs no loop restart. It implements the round's
+// Calculator interface by delegation.
 type calculatorSet struct {
 	current atomic.Pointer[usage.Calculator]
 }
@@ -243,6 +249,7 @@ func New(ctx context.Context, cfg Config) (*Service, error) {
 	metrics.RulesLoaded(len(approved))
 	ruleset := &calculatorSet{}
 	ruleset.swap(calculator)
+	rulesGate := &sync.RWMutex{}
 
 	brokers := kafkaconn.SplitAndTrim(cfg.Kafka.Brokers, ",")
 	saramaConfig, err := kafkaconn.ProducerConfig(cfg.Kafka)
@@ -271,6 +278,7 @@ func New(ctx context.Context, cfg Config) (*Service, error) {
 		consumer:    consumer,
 		producer:    producer,
 		ruleset:     ruleset,
+		rulesGate:   rulesGate,
 		owners:      owners,
 		loaded:      approved,
 		tenants:     map[string]*tenantLoops{},
@@ -338,11 +346,14 @@ func (s *Service) watchRules(ctx context.Context, fatal chan<- error) {
 }
 
 // checkRules approves whatever the ConfigMaps now hold and swaps the calculator when the
-// approved set changed. The swap is atomic: a round either computes with the whole old
-// set or the whole new one.
+// approved set changed. The whole check runs between rounds: it holds the write side of
+// the rules gate, so it waits for every in-flight tick and reads a billing position no
+// round is about to advance. A revision whose effective time a just-finished round billed
+// past is rejected here instead of recorded — recorded, no later round would drag it, and
+// the span it covers would keep its old pricing forever.
 func (s *Service) checkRules(ctx context.Context) error {
-	s.rulesMutex.Lock()
-	defer s.rulesMutex.Unlock()
+	s.rulesGate.Lock()
+	defer s.rulesGate.Unlock()
 	approved, calculator, err := approveRules(ctx, s.cfg.Rules, s.cfg.Store, s.cfg.DeploymentID, s.owners)
 	if err != nil {
 		return err
@@ -528,7 +539,7 @@ func (s *Service) runTenantLoops(ctx context.Context, tenant string, loops *tena
 	}
 	roundLoop, err := round.New(
 		s.cfg.Store, s.ruleset, s.client, s.consumer,
-		s.cfg.Logger.WithValues("loop", "round"),
+		s.cfg.Logger.WithValues("loop", "round"), s.rulesGate,
 	)
 	if err != nil {
 		s.cfg.Logger.Error(err, "creating round", "tenant", tenant)

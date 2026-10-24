@@ -16,22 +16,26 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/IBM/sarama"
+	cloudevents "github.com/cloudevents/sdk-go/v2"
+	"github.com/go-logr/logr"
+	"github.com/jackc/pgx/v5"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
-	"github.com/IBM/sarama"
-	cloudevents "github.com/cloudevents/sdk-go/v2"
-
 	"github.com/osac-project/osac-metering/internal/database"
+	"github.com/osac-project/osac-metering/internal/fold"
 	"github.com/osac-project/osac-metering/internal/heartbeat"
 	"github.com/osac-project/osac-metering/internal/pipelinetest"
 	"github.com/osac-project/osac-metering/internal/round"
 	"github.com/osac-project/osac-metering/internal/rules"
 	"github.com/osac-project/osac-metering/internal/testenv"
 	"github.com/osac-project/osac-metering/internal/topics"
+	"github.com/osac-project/osac-metering/internal/usage"
 	"github.com/osac-project/osac-metering/schema"
 	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
@@ -152,6 +156,140 @@ func TestRoundWithSteadyEventStream(t *testing.T) {
 	p.WaitOutboxEmpty(t)
 	if beats := pipelinetest.SentHeartbeats(t, p.Tenant); len(beats) == 0 {
 		t.Fatal("the steady-stream tenant sent no heartbeats")
+	}
+}
+
+// gatingProbe pauses the round inside its first calculator call, so a test can observe
+// what the rules gate allows while a tick is mid-run. Every later call passes through:
+// the release channel is closed by then.
+type gatingProbe struct {
+	round.Calculator
+	entered chan struct{}
+	release chan struct{}
+	fired   sync.Once
+}
+
+func (g *gatingProbe) probe() {
+	g.fired.Do(func() { close(g.entered) })
+	<-g.release
+}
+
+func (g *gatingProbe) Revisions() []rules.Revision {
+	g.probe()
+	return g.Calculator.Revisions()
+}
+
+func (g *gatingProbe) OwnerOf(resourceType string, facts []database.Fact) (string, string, bool) {
+	g.probe()
+	return g.Calculator.OwnerOf(resourceType, facts)
+}
+
+func (g *gatingProbe) OwnedFieldOf(rootType string) (string, bool) {
+	g.probe()
+	return g.Calculator.OwnedFieldOf(rootType)
+}
+
+func (g *gatingProbe) MeterAt(resourceType, meter string, at time.Time) (rules.Meter, string, bool) {
+	g.probe()
+	return g.Calculator.MeterAt(resourceType, meter, at)
+}
+
+func (g *gatingProbe) Expected(
+	tenant, resourceType, resourceID string, facts []database.Fact, root *usage.Root, upTo time.Time,
+) ([]usage.Piece, error) {
+	g.probe()
+	return g.Calculator.Expected(tenant, resourceType, resourceID, facts, root, upTo)
+}
+
+func (g *gatingProbe) Since(
+	tenant, resourceType, resourceID string, facts []database.Fact, root *usage.Root,
+	from, upTo time.Time, ledger []database.LedgerPiece,
+) ([]usage.Piece, error) {
+	g.probe()
+	return g.Calculator.Since(tenant, resourceType, resourceID, facts, root, from, upTo, ledger)
+}
+
+// TestOnceHoldsRulesGateForWholeTick checks the tick side of the rules race: Once holds
+// the read side of the rules gate from before its first calculator call to its commit,
+// so a rule-revision change — which holds the write side — can neither swap the
+// calculator between two calls of one tick nor be approved against a billing position
+// the tick is about to advance.
+func TestOnceHoldsRulesGateForWholeTick(t *testing.T) {
+	tenant := "rulegate"
+	store := testenv.Database(t)
+
+	// One RUNNING VM, folded, so the round's comparison reaches its calculator calls.
+	total := testenv.ProduceEvents(t, tenant, []*privatev1.Event{
+		testenv.VMEvent("e1", privatev1.EventType_EVENT_TYPE_OBJECT_CREATED,
+			base, base, "web", "RUNNING", base, "small", base),
+	})
+	foldLoop, err := fold.New(store, testenv.NewConsumer(t), logr.Discard())
+	if err != nil {
+		t.Fatalf("creating fold: %v", err)
+	}
+	foldCtx, cancelFold := context.WithCancel(context.Background())
+	defer cancelFold()
+	go func() { _ = foldLoop.RunTenant(foldCtx, tenant) }()
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		progress, err := store.GetTenantProgress(context.Background(), tenant)
+		if err == nil && progress.EventOffset >= int64(total) {
+			break
+		}
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			t.Fatalf("reading progress: %v", err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the fold never reached the produced events")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	owners, err := usage.RegistryOwners()
+	if err != nil {
+		t.Fatalf("reading owners: %v", err)
+	}
+	calculator, err := usage.NewCalculator([]rules.Revision{testenv.DefaultRevision(t)}, "us-east", owners)
+	if err != nil {
+		t.Fatalf("creating calculator: %v", err)
+	}
+	probe := &gatingProbe{
+		Calculator: calculator,
+		entered:    make(chan struct{}),
+		release:    make(chan struct{}),
+	}
+	gate := &sync.RWMutex{}
+	r, err := round.New(
+		store, probe, testenv.NewClient(t), testenv.NewConsumer(t), logr.Discard(), gate,
+	)
+	if err != nil {
+		t.Fatalf("creating round: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- r.Once(context.Background(), tenant, base.Add(time.Minute)) }()
+
+	// The tick is mid-run, blocked inside a calculator call.
+	<-probe.entered
+
+	// A rules change must not be able to start while the tick runs.
+	locked := make(chan struct{})
+	go func() { gate.Lock(); close(locked) }()
+	select {
+	case <-locked:
+		t.Fatal("a rules change was applied while a round tick was mid-run")
+	case <-time.After(100 * time.Millisecond):
+		// Still locked out: the tick holds the read side.
+	}
+
+	close(probe.release)
+	if err := <-done; err != nil {
+		t.Fatalf("round at %s: %v", base.Add(time.Minute), err)
+	}
+	select {
+	case <-locked:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the rules change never proceeded after the tick finished")
 	}
 }
 

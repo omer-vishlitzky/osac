@@ -13,9 +13,10 @@ file="osac-metering/charts/osac-metering/rules/0001-meters.yaml"
 
 [[ -f "$file" ]] || { echo "ERROR: $file does not exist." >&2; exit 1; }
 
-# The most recent tag that ships the rules file, by the tagged commit's date.
+# The most recent tag that ships the rules file, by the tag's creation date
+# (the tagger date of an annotated tag, the commit date of a lightweight one).
 # Mixed tag families (osac/v*, osac-metering/v*) make version sort unreliable,
-# so the newest commit wins.
+# so the newest tag wins.
 latest_with_file() {
 	local tag
 	while IFS= read -r tag; do
@@ -23,7 +24,7 @@ latest_with_file() {
 			echo "$tag"
 			return 0
 		fi
-	done < <(git for-each-ref 'refs/tags' --sort=-committerdate --format='%(refname:short)')
+	done < <(git for-each-ref 'refs/tags' --sort=-creatordate --format='%(refname:short)')
 	return 0
 }
 

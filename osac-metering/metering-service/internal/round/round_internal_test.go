@@ -12,6 +12,7 @@ package round
 import (
 	"context"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -35,7 +36,7 @@ func TestEventsFoldedClearsTargetOnImmediatePass(t *testing.T) {
 			base, base, "web", "RUNNING", base, "small", base),
 	})
 
-	r, err := New(nil, nil, testenv.NewClient(t), testenv.NewConsumer(t), logr.Discard())
+	r, err := New(nil, nil, testenv.NewClient(t), testenv.NewConsumer(t), logr.Discard(), &sync.RWMutex{})
 	if err != nil {
 		t.Fatalf("creating round: %v", err)
 	}
@@ -164,7 +165,7 @@ func TestOverflowingQuantityFailsTheRoundNamingTheResource(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r, err := New(store, calculator, nil, nil, logr.Discard())
+	r, err := New(store, calculator, nil, nil, logr.Discard(), &sync.RWMutex{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -291,7 +292,7 @@ func TestRootOfWalksToTheTopmostOwner(t *testing.T) {
 	if err != nil {
 		t.Fatalf("creating calculator: %v", err)
 	}
-	r, err := New(store, calculator, testenv.NewClient(t), testenv.NewConsumer(t), logr.Discard())
+	r, err := New(store, calculator, testenv.NewClient(t), testenv.NewConsumer(t), logr.Discard(), &sync.RWMutex{})
 	if err != nil {
 		t.Fatalf("creating round: %v", err)
 	}
@@ -359,7 +360,7 @@ func TestScanResourcesDragsOwnedResourcesAlong(t *testing.T) {
 	if err != nil {
 		t.Fatalf("creating calculator: %v", err)
 	}
-	r, err := New(store, calculator, testenv.NewClient(t), testenv.NewConsumer(t), logr.Discard())
+	r, err := New(store, calculator, testenv.NewClient(t), testenv.NewConsumer(t), logr.Discard(), &sync.RWMutex{})
 	if err != nil {
 		t.Fatalf("creating round: %v", err)
 	}
@@ -461,7 +462,7 @@ func TestScanResourcesDragsOwnedThroughRevisionChanges(t *testing.T) {
 	if err != nil {
 		t.Fatalf("creating calculator: %v", err)
 	}
-	r, err := New(store, calculator, testenv.NewClient(t), testenv.NewConsumer(t), logr.Discard())
+	r, err := New(store, calculator, testenv.NewClient(t), testenv.NewConsumer(t), logr.Discard(), &sync.RWMutex{})
 	if err != nil {
 		t.Fatalf("creating round: %v", err)
 	}
