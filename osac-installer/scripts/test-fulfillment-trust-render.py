@@ -48,8 +48,6 @@ def render(
         "--set-string",
         "global.clusterDomain=example.com",
         "--set",
-        "metering.enabled=true",
-        "--set",
         "lvms.enabled=true",
         "--set",
         "hubAccess.enabled=true",

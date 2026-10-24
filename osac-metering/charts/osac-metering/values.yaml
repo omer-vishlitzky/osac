@@ -37,8 +37,9 @@ resources:
     cpu: 500m
     memory: 512Mi
 
-# Kafka connection and topic naming. Override to point at a different
-# Kafka cluster or to prefix topics for per-instance isolation.
+# Kafka connection. Override to point at a different Kafka cluster; the topic
+# names are fixed (the schema's events prefix), so every instance of a shared
+# cluster must use a separate KafkaUser but cannot rename its topics.
 # TLS trust uses certs.caBundle (the shared OSAC CA), not the Strimzi cluster CA.
 kafka:
   brokers: ""          # default: osac-kafka-kafka-bootstrap.osac-kafka.svc.cluster.local:9093

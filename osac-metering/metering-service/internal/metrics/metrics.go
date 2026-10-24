@@ -101,6 +101,15 @@ func RulesReloadFailed(reason string) {
 	rulesReloadFailures.WithLabelValues(reason).Inc()
 }
 
+// DeleteTenantHealthMetrics drops a gone tenant's per-tenant series. Without
+// this, the stalled-round alert keeps firing for a tenant the service no
+// longer serves.
+func DeleteTenantHealthMetrics(tenant string) {
+	lastRoundTime.DeleteLabelValues(tenant)
+	roundFailures.DeleteLabelValues(tenant)
+	outboxDepth.DeleteLabelValues(tenant)
+}
+
 // RulesLoaded records how many rule revisions the service evaluates.
 func RulesLoaded(count int) {
 	rulesLoaded.Set(float64(count))

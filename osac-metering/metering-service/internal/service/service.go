@@ -500,6 +500,13 @@ func (s *Service) stopGone(live map[string]bool) {
 // deleteRows waits for a gone tenant's loops to end, then deletes the tenant's rows.
 func (s *Service) deleteRows(tenant string, loops *tenantLoops) {
 	<-loops.stopped
+	// Drop the tenant's metric series, unless the tenant reappeared and new
+	// loops already took over: those loops own the series now.
+	s.lock.Lock()
+	if _, running := s.tenants[tenant]; !running {
+		metrics.DeleteTenantHealthMetrics(tenant)
+	}
+	s.lock.Unlock()
 	if err := s.cfg.Store.DeleteTenantRows(context.Background(), tenant); err != nil {
 		s.cfg.Logger.Error(err, "deleting rows of a tenant whose topics are gone", "tenant", tenant)
 		return

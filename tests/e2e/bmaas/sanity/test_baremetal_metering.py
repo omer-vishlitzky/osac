@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import contextlib
 import itertools
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
@@ -152,5 +152,5 @@ def test_baremetal_instance_bills_allocation_and_consumption(
         with contextlib.suppress(Exception):
             wait_for_bmi_grpc_removal(grpc=jwt_grpc_tenant1, uuid=bmi_id)
 
-    deleted_after = datetime.now(datetime.UTC).isoformat()
+    deleted_after = datetime.now(UTC).isoformat()
     metering.assert_no_events(HEARTBEAT_TYPE, bmi_id, since=deleted_after, within=180)

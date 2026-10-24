@@ -607,6 +607,7 @@ csi-render-test: helm-deps helm-infra-deps ## Verify CSI and storage-provider ch
 			--set service.externalHostname=fulfillment-api.example.com \
 			--set service.internalHostname=fulfillment-internal-api.example.com \
 			--set global.clusterDomain=example.com \
+			--set-string global.osacDeploymentId=ci/osac \
 			--set ui.auth.oidcIssuerURL=https://keycloak-keycloak.example.com/realms/osac > "$$caas_render"; \
 		test "$$(rg -c '^  OSAC_FULFILLMENT_ENDPOINT:' "$$caas_render")" -eq 1; \
 		helm template osac $(OSAC_CHART) \
@@ -615,6 +616,7 @@ csi-render-test: helm-deps helm-infra-deps ## Verify CSI and storage-provider ch
 			--set service.externalHostname=fulfillment-api.example.com \
 			--set service.internalHostname=fulfillment-internal-api.example.com \
 			--set global.clusterDomain=example.com \
+			--set-string global.osacDeploymentId=ci/osac \
 			--set ui.auth.oidcIssuerURL=https://keycloak-keycloak.example.com/realms/osac > "$$vmaas_render"; \
 		rg -Uq 'name: OSAC_VENDOR_CONTROLLERS\n[[:blank:]]+value: "lvms=none"' "$$vmaas_render"; \
 		test "$$(rg -c '^  OSAC_FULFILLMENT_ENDPOINT:' "$$vmaas_render")" -eq 1; \

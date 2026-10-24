@@ -19,6 +19,7 @@ from tests.e2e.core.helpers import (
     wait_for_deletion,
     wait_for_grpc_removal,
     wait_for_grpc_security_group_ready,
+    wait_for_grpc_subnet_ready,
     wait_for_provision,
     wait_for_restart,
     wait_for_running,
@@ -92,6 +93,9 @@ def metering_network_attachment(
         )
         subnet_cr_name = wait_for_subnet_cr(k8s=k8s_hub_client, uuid=subnet_id)
         wait_for_subnet_ready(k8s=k8s_hub_client, name=subnet_cr_name)
+        # The CR can report Ready while the fulfillment record is still pending;
+        # the first VM creation fails with FailedPrecondition in that window.
+        wait_for_grpc_subnet_ready(grpc=grpc, subnet_id=subnet_id)
 
         sg_id = grpc.create_security_group_with_rules(
             name=unique_name("e2e-metering-sg"),
@@ -438,12 +442,25 @@ def test_metering_resize_splits_dimensions(
         # The new meter starts: a heartbeat with the new dimension arrives.
         metering.heartbeat_with_dimensions(uuid, {"instance_type": new_type})
 
-        events = metering.get_all_events(HEARTBEAT_TYPE, uuid)
-        old_intervals = _net_intervals(
-            [event for event in events if event["data"]["billing_dimensions"].get("instance_type") == old_type]
-        )
-        new_intervals = _net_intervals(
-            [event for event in events if event["data"]["billing_dimensions"].get("instance_type") == new_type]
+        def split_intervals() -> tuple[list, list]:
+            events = metering.get_all_events(HEARTBEAT_TYPE, uuid)
+            old = [e for e in events if e["data"]["billing_dimensions"].get("instance_type") == old_type]
+            new = [e for e in events if e["data"]["billing_dimensions"].get("instance_type") == new_type]
+            return _net_intervals(old), _net_intervals(new)
+
+        # The old meter's tail correction is a separate event from the new
+        # meter's first heartbeat and can arrive a round later: poll until the
+        # nets are disjoint before asserting on them.
+        old_intervals, new_intervals = poll_until(
+            fn=split_intervals,
+            until=lambda split: (
+                bool(split[0])
+                and bool(split[1])
+                and max(to for _, to, _ in split[0]) <= min(start for start, _, _ in split[1])
+            ),
+            retries=HEARTBEAT_TIMEOUT // 10,
+            delay=10,
+            description=f"old meter of {uuid} to end before the new meter starts",
         )
         assert old_intervals, "no heartbeat arrived on the old instance_type meter"
         assert new_intervals, "no heartbeat arrived on the new instance_type meter"

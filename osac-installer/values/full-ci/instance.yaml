@@ -231,7 +231,6 @@ hubAccess:
 
 # --- Metering ---
 metering:
-  enabled: true
   image:
     repository: ghcr.io/osac-project/metering-service
     tag: latest
