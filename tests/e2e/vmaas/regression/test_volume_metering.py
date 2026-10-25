@@ -15,7 +15,7 @@ from __future__ import annotations
 import contextlib
 import itertools
 import subprocess
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -215,20 +215,24 @@ def test_volume_bills_gibibyte_seconds(
     finally:
         deletion_recorded = _delete_volume(private_grpc, k8s_hub_client, volume_id=volume_id, cr_name=volume_cr_name)
 
-    deleted_after = datetime.now(UTC)
-    assert deletion_recorded is not None, "the volume's CR vanished before its deletion timestamp was read"
+    assert deletion_recorded is not None, "the Volume CR was never deleted, so no deletion timestamp was recorded"
 
     # The final heartbeat covers the partial interval up to the recorded
     # deletion; billing runs through DELETING, so the final interval ends at
     # that timestamp or later (at the DELETED transition). It arrives only in
     # the round after the delete, so poll for it.
-    poll_until(
+    final = poll_until(
         fn=lambda: _final_heartbeat(metering, volume_id, deletion_recorded),
         until=lambda event: event is not None,
         retries=HEARTBEAT_TIMEOUT // 10,
         delay=10,
         description=f"final partial-interval heartbeat of volume {volume_id}",
     )
+
+    # The billing end is the final heartbeat's own interval end: a
+    # cluster-recorded time from the metering pipeline. The runner's wall
+    # clock cannot anchor it, because the runner and the pods skew.
+    _, billing_end, _ = _usage_interval(final)
 
     # The billed life is exact: the typed heartbeats collapse into contiguous
     # net intervals, each billing exactly size x its length in seconds, and the
@@ -247,44 +251,52 @@ def test_volume_bills_gibibyte_seconds(
         f"at {deletion_recorded}: the partial final interval was dropped"
     )
 
-    # Nothing bills past the removal. A volume legitimately bills past the
-    # deletion request through DELETING until the physical volume is gone, so
-    # the zero anchor is the post-removal moment, not the deletion timestamp.
+    # Nothing bills past the billing end. A volume legitimately bills past
+    # the deletion request through DELETING until the physical volume is
+    # gone, so the zero anchor is the last heartbeat's end, not the deletion
+    # timestamp. A round that keeps billing past it lands past this anchor,
+    # and a correction that follows cancels it, so the poll passes only once
+    # the meter stops or takes its over-bill back.
     poll_until(
-        fn=lambda: net_usage_past_by_dimension(metering.get_all_events(HEARTBEAT_TYPE, volume_id), past=deleted_after),
+        fn=lambda: net_usage_past_by_dimension(metering.get_all_events(HEARTBEAT_TYPE, volume_id), past=billing_end),
         until=lambda nets: all(abs(net) <= 1 for net in nets.values()),
         retries=HEARTBEAT_TIMEOUT // 10,
         delay=10,
-        description=f"net billing of {volume_id} to end at the removal at {deleted_after}",
+        description=f"net billing of {volume_id} to end at {billing_end}",
     )
 
     # Past the final interval nothing more arrives: the meter stopped.
-    metering.assert_no_events(HEARTBEAT_TYPE, volume_id, since=deleted_after.isoformat(), within=120)
+    metering.assert_no_events(HEARTBEAT_TYPE, volume_id, since=billing_end.isoformat(), within=120)
 
 
 def _delete_volume(grpc: GRPCClient, k8s: K8sClient, *, volume_id: str, cr_name: str | None) -> datetime | None:
     """Delete the volume and return the deletion time the API server recorded.
 
-    The CR lingers on its finalizers after the delete, so its deletion
-    timestamp is readable before it disappears. None when the volume never had
-    a CR to read: the cleanup path after a failed setup.
+    The Volume CR's whole teardown can finish in under a second (the vendor
+    deprovisioning of a node-local thin volume is fast), so the deletion
+    timestamp is read through a watch established before the delete request:
+    the watch always delivers the modification that stamps it, where a plain
+    get can arrive after the object is already gone. None when the volume
+    never had a CR to watch: the cleanup path after a failed setup.
     """
-    with contextlib.suppress(Exception):
-        grpc.call(service=f"{PRIVATE_API}.Volumes/Delete", data={"id": volume_id})
     deletion_recorded: datetime | None = None
-    if cr_name is not None:
+    if cr_name is None:
         with contextlib.suppress(Exception):
-            deletion_recorded = _parse_time(
-                poll_until(
-                    fn=lambda: k8s.get_jsonpath(
-                        resource="volume", name=cr_name, jsonpath="{.metadata.deletionTimestamp}"
-                    ),
-                    until=lambda stamp: bool(stamp),
-                    retries=30,
-                    delay=2,
-                    description=f"deletion timestamp of Volume CR {cr_name}",
+            grpc.call(service=f"{PRIVATE_API}.Volumes/Delete", data={"id": volume_id})
+    else:
+        with k8s.watch_deletion_timestamp(resource="volume", name=cr_name) as deletion_stamp:
+            with contextlib.suppress(Exception):
+                grpc.call(service=f"{PRIVATE_API}.Volumes/Delete", data={"id": volume_id})
+            with contextlib.suppress(Exception):
+                deletion_recorded = _parse_time(
+                    poll_until(
+                        fn=deletion_stamp,
+                        until=lambda stamp: bool(stamp),
+                        retries=30,
+                        delay=2,
+                        description=f"deletion timestamp of Volume CR {cr_name}",
+                    )
                 )
-            )
         with contextlib.suppress(Exception):
             poll_until(
                 fn=lambda: not k8s.is_present(resource="volume", name=cr_name),

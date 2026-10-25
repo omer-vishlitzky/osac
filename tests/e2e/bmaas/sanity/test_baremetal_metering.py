@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import contextlib
 import itertools
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -202,20 +202,26 @@ def test_baremetal_instance_bills_allocation_and_consumption(
             jwt_cli_user, jwt_grpc_tenant1, k8s_hub_client, uuid=bmi_id, cr_name=bmi_cr_name
         )
 
-    deleted_after = datetime.now(UTC)
-    assert deletion_recorded is not None, "the instance's CR vanished before its deletion timestamp was read"
+    assert deletion_recorded is not None, "the instance's CR was never deleted, so no deletion timestamp was recorded"
 
     # Each meter ends at the recorded deletion: its final partial interval is
     # billed, not dropped, and its typed heartbeats collapse into contiguous
-    # net intervals billing exactly their length.
+    # net intervals billing exactly its length. The billing end is the latest
+    # final heartbeat's own interval end: a cluster-recorded time from the
+    # metering pipeline, because the runner's wall clock skews against the
+    # pods and cannot anchor it.
+    billing_end: datetime | None = None
     for meter in ("allocation", "consumption"):
-        poll_until(
+        final = poll_until(
             fn=lambda meter=meter: _final_heartbeat(metering, bmi_id, deletion_recorded, meter=meter),
             until=lambda event: event is not None,
             retries=HEARTBEAT_TIMEOUT // 10,
             delay=10,
             description=f"final partial-interval {meter} heartbeat of {bmi_id}",
         )
+        _, final_to, _ = _usage_interval(final)
+        if billing_end is None or final_to > billing_end:
+            billing_end = final_to
 
         net = _net_intervals(_typed_heartbeats(metering, bmi_id, meter))
         assert net, f"no typed {meter} heartbeats of {bmi_id} to assert the billed life on"
@@ -230,42 +236,49 @@ def test_baremetal_instance_bills_allocation_and_consumption(
             f"deletion at {deletion_recorded}: the partial final interval was dropped"
         )
 
-    # Nothing bills past the removal, on either meter.
+    # Nothing bills past the billing end, on either meter: a round that keeps
+    # billing past it lands past this anchor, and a correction that follows
+    # cancels it, so the poll passes only once both meters stop or take their
+    # over-bill back.
     poll_until(
-        fn=lambda: net_usage_past_by_dimension(metering.get_all_events(HEARTBEAT_TYPE, bmi_id), past=deleted_after),
+        fn=lambda: net_usage_past_by_dimension(metering.get_all_events(HEARTBEAT_TYPE, bmi_id), past=billing_end),
         until=lambda nets: all(abs(net) <= 1 for net in nets.values()),
         retries=HEARTBEAT_TIMEOUT // 10,
         delay=10,
-        description=f"net billing of {bmi_id} to end at the removal at {deleted_after}",
+        description=f"net billing of {bmi_id} to end at {billing_end}",
     )
 
     # Past the final interval nothing more arrives: both meters stopped.
-    metering.assert_no_events(HEARTBEAT_TYPE, bmi_id, since=deleted_after.isoformat(), within=180)
+    metering.assert_no_events(HEARTBEAT_TYPE, bmi_id, since=billing_end.isoformat(), within=180)
 
 
 def _delete_bmi(cli: OsacCLI, grpc: GRPCClient, k8s: K8sClient, *, uuid: str, cr_name: str | None) -> datetime | None:
     """Delete the instance and return the deletion time the API server recorded.
 
-    The CR lingers on its finalizers after the delete, so its deletion
-    timestamp is readable before it disappears. None when the instance never
-    had a CR to read: the cleanup path after a failed setup.
+    The deletion timestamp is read through a watch established before the
+    delete request: the watch always delivers the modification that stamps
+    it, where a plain get can arrive after the object is already gone. None
+    when the instance never had a CR to watch: the cleanup path after a
+    failed setup.
     """
-    with contextlib.suppress(Exception):
-        cli.delete_baremetal_instance(uuid=uuid)
     deletion_recorded: datetime | None = None
-    if cr_name is not None:
+    if cr_name is None:
         with contextlib.suppress(Exception):
-            deletion_recorded = _parse_time(
-                poll_until(
-                    fn=lambda: k8s.get_jsonpath(
-                        resource="baremetalinstance", name=cr_name, jsonpath="{.metadata.deletionTimestamp}"
-                    ),
-                    until=lambda stamp: bool(stamp),
-                    retries=30,
-                    delay=2,
-                    description=f"deletion timestamp of {cr_name}",
+            cli.delete_baremetal_instance(uuid=uuid)
+    else:
+        with k8s.watch_deletion_timestamp(resource="baremetalinstance", name=cr_name) as deletion_stamp:
+            with contextlib.suppress(Exception):
+                cli.delete_baremetal_instance(uuid=uuid)
+            with contextlib.suppress(Exception):
+                deletion_recorded = _parse_time(
+                    poll_until(
+                        fn=deletion_stamp,
+                        until=lambda stamp: bool(stamp),
+                        retries=30,
+                        delay=2,
+                        description=f"deletion timestamp of {cr_name}",
+                    )
                 )
-            )
         with contextlib.suppress(Exception):
             wait_for_bmi_deletion(k8s=k8s, name=cr_name)
     with contextlib.suppress(Exception):
