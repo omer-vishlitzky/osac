@@ -20,6 +20,7 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
+	"google.golang.org/protobuf/types/known/timestamppb"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	clnt "sigs.k8s.io/controller-runtime/pkg/client"
@@ -110,13 +111,35 @@ func syncNATGatewayUpdate(ctx context.Context, obj *v1alpha1.NATGateway, remote 
 	return nil
 }
 
+// syncNATGatewayDelete maps NATGateway CR status during deletion. Failed gateways report
+// FAILED, and everything else reports DELETING: a gateway whose deletion timestamp is set
+// is going away whatever phase its status still carries, including the empty phase of a
+// gateway deleted before any controller status write.
+//
+// The state and its time come from the same place. The Failed phase the CR records dates
+// its own transition, an event the controller observed. The DELETING reported for every
+// other phase is forced: the phase predates the deletion, so its time is not the
+// deletion's — the deletion started at the deletion timestamp, and dating the report at
+// the old phase's time would erase the billed span up to the deletion. A gateway deleted
+// before any controller status write has no phase time either, and the deletion timestamp
+// covers it.
 func syncNATGatewayDelete(_ context.Context, obj *v1alpha1.NATGateway, remote *privatev1.NATGateway) error {
-	syncNATGatewayStateTransitionTime(obj, remote)
-	if obj.Status.Phase == v1alpha1.NATGatewayPhaseFailed {
+	var at *timestamppb.Timestamp
+	switch obj.Status.Phase {
+	case v1alpha1.NATGatewayPhaseFailed:
 		remote.GetStatus().SetState(privatev1.NATGatewayState_NAT_GATEWAY_STATE_FAILED)
-		return nil
+		at = stateTransitionTimeOf(obj.Status.StateTransitionTime, obj.DeletionTimestamp)
+	default:
+		remote.GetStatus().SetState(privatev1.NATGatewayState_NAT_GATEWAY_STATE_DELETING)
+		at = stateTransitionTimeOf(obj.DeletionTimestamp, obj.Status.StateTransitionTime)
 	}
-	remote.GetStatus().SetState(privatev1.NATGatewayState_NAT_GATEWAY_STATE_DELETING)
+	if at == nil {
+		if remote.GetStatus().GetStateTransitionTime() != nil {
+			return nil
+		}
+		return fmt.Errorf("NAT gateway %s has no state transition time", remote.GetId())
+	}
+	remote.GetStatus().SetStateTransitionTime(at)
 	return nil
 }
 

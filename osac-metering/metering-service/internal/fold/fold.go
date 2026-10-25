@@ -67,13 +67,15 @@ func (f *Fold) RunTenant(ctx context.Context, tenant string) error {
 		if err != nil {
 			return err
 		}
+		// skippedFrom is the offset this fold meant to start from: the stored
+		// one, or zero for a fold that has not consumed yet. Retention may
+		// have deleted the records below it in either case — an out-of-range
+		// consume falls back to the oldest retained record, and a fresh fold
+		// starts there directly — and the first message reports the gap.
+		skippedFrom := progress.EventOffset
 		partition, err := f.consumer.ConsumePartition(topic, 0, startOffset(progress.EventOffset))
-		// skippedFrom is the stored offset an out-of-range consume fell back from:
-		// retention deleted the segments below it, so those events are gone.
-		skippedFrom := int64(-1)
 		if err != nil {
 			if errors.Is(err, sarama.ErrOffsetOutOfRange) {
-				skippedFrom = progress.EventOffset
 				partition, err = f.consumer.ConsumePartition(topic, 0, sarama.OffsetOldest)
 			}
 			if err != nil {
@@ -93,8 +95,9 @@ func (f *Fold) RunTenant(ctx context.Context, tenant string) error {
 
 // drain applies events until the context ends. A partition consumer only ends with its
 // context, so the fold reopens it when the stored offset moves, for example after another pod
-// folded ahead. skippedFrom, when not negative, is the stored offset that turned out to be
-// below the oldest retained one; the first message then reports how much retention deleted.
+// folded ahead. skippedFrom, when not negative, is the offset the fold meant to start from;
+// the first message reports how much retention deleted below it, and the sentinel turns off
+// after that one report.
 func (f *Fold) drain(
 	ctx context.Context, tenant string, partition sarama.PartitionConsumer, skippedFrom int64,
 ) error {
@@ -175,11 +178,13 @@ func (f *Fold) apply(ctx context.Context, tenant string, messages []*sarama.Cons
 		}
 		facts, err := f.extractor.Facts(tenant, event)
 		if err != nil {
-			if !errors.Is(err, ErrForeignTenant) {
+			reason, skip := skipReason(err)
+			if !skip {
 				return err
 			}
-			// Misrouted data: billing it here would bill the wrong customer.
-			if err := f.skipEvent(ctx, tx, tenant, metrics.SkipForeignTenant, err, message); err != nil {
+			// Misrouted or undatable data: folding it would bill the wrong customer or
+			// the wrong minutes, so skip it loudly and keep the fold moving.
+			if err := f.skipEvent(ctx, tx, tenant, reason, err, message); err != nil {
 				return err
 			}
 			continue
@@ -197,9 +202,29 @@ func (f *Fold) apply(ctx context.Context, tenant string, messages []*sarama.Cons
 	return tx.Commit(ctx)
 }
 
-// skipEvent drops one record the fold must not bill: an undecodable record, or an event
-// of another tenant. The skip stays loud in the log and the metrics, and the offset
-// still advances, so the fold never stalls on the record.
+// skipReason maps an extraction error the fold must skip loudly, not fail on, to its metric
+// reason. Each is a record that can never be billed correctly: misrouted, unreadable, or
+// undatable data whose offset must still advance.
+func skipReason(err error) (string, bool) {
+	switch {
+	case errors.Is(err, ErrForeignTenant):
+		return metrics.SkipForeignTenant, true
+	case errors.Is(err, ErrUnknownPayload):
+		return metrics.SkipUnknownPayload, true
+	case errors.Is(err, ErrMissingResourceID):
+		return metrics.SkipMissingResourceID, true
+	case errors.Is(err, ErrMissingCreationTime):
+		return metrics.SkipMissingCreationTime, true
+	case errors.Is(err, ErrMissingDeletionTime):
+		return metrics.SkipMissingDeletionTime, true
+	}
+	return "", false
+}
+
+// skipEvent drops one record the fold must not bill: an undecodable record, an event of
+// another tenant, or an event whose facts cannot be read or dated. The skip stays loud in
+// the log and the metrics, and the offset still advances, so the fold never stalls on the
+// record.
 func (f *Fold) skipEvent(
 	ctx context.Context, tx database.Querier, tenant, reason string, err error,
 	message *sarama.ConsumerMessage,

@@ -331,14 +331,14 @@ func (c *Calculator) compute(
 	}
 	if creation.IsZero() {
 		if len(facts) == 0 {
+			// Empty facts are a hold, not corrupt data: a resource whose ownership
+			// root is missing stays unbilled until the root's history arrives.
 			return nil, nil
 		}
-		creation = facts[0].Since
-		for _, entry := range facts {
-			if entry.Since.Before(creation) {
-				creation = entry.Since
-			}
-		}
+		// The fold writes a created fact with every resource's first fact, so facts
+		// that survive without one are corrupt. Guessing the start from the earliest
+		// survivor would under-bill; refuse instead.
+		return nil, fmt.Errorf("%s %s has no creation fact", resourceType, resourceID)
 	}
 	end := upTo
 	if !deletion.IsZero() && deletion.Before(end) {

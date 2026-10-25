@@ -141,25 +141,37 @@ func ensureTopic(admin topicAdmin, topic string, retentionMS string) error {
 	default:
 		return fmt.Errorf("describing topic '%s': %w", topic, descriptions[0].Err)
 	}
-	cleanupPolicy := "delete"
-	retentionBytes := "-1"
 	// The topic is the recovery source, so the entries pin the whole retention
 	// contract: cleanup.policy=delete keeps records a compacting broker default
 	// would discard, and retention.bytes=-1 keeps a broker size limit from
-	// cutting the configured window short.
+	// cutting the configured window short. ensureRetention verifies the same
+	// contract on topics the service did not create.
+	contract := retentionContract(retentionMS)
+	configEntries := make(map[string]*string, len(contract))
+	for name, value := range contract {
+		configEntries[name] = &value
+	}
 	detail := &sarama.TopicDetail{
 		NumPartitions:     1,
 		ReplicationFactor: -1, // the broker default, like the event topics
-		ConfigEntries: map[string]*string{
-			"retention.ms":    &retentionMS,
-			"retention.bytes": &retentionBytes,
-			"cleanup.policy":  &cleanupPolicy,
-		},
+		ConfigEntries:     configEntries,
 	}
 	if err := admin.CreateTopic(topic, detail, false); err != nil && !errors.Is(err, sarama.ErrTopicAlreadyExists) {
 		return fmt.Errorf("creating topic '%s': %w", topic, err)
 	}
 	return nil
+}
+
+// retentionContract is the whole retention contract the create path pins on every topic
+// it creates: retention.ms is the configured recovery window, retention.bytes=-1 keeps a
+// broker size limit from cutting that window short, and cleanup.policy=delete keeps a
+// compacting broker default from discarding records the database rebuild depends on.
+func retentionContract(retentionMS string) map[string]string {
+	return map[string]string{
+		"retention.ms":    retentionMS,
+		"retention.bytes": "-1",
+		"cleanup.policy":  "delete",
+	}
 }
 
 // ListEventTenants returns the tenants that have an event topic, sorted by name. Metering
@@ -257,13 +269,17 @@ func SplitAndTrim(s, sep string) []string {
 	return result
 }
 
-// ensureRetention checks that a topic the service did not create carries the configured
-// retention. A topic created out of band gets the broker default, and the recovery
-// window silently shrinks to that default. The service refuses when it reads a
-// different retention, and when the broker denies the read: without the
+// ensureRetention checks that a topic the service did not create carries the whole
+// retention contract the create path pins, not only retention.ms. A topic created out
+// of band gets the broker defaults, and any of the three entries shrinking the
+// recovery window — a shorter retention, a broker size limit, a compacting policy —
+// silently cuts the window the database rebuild depends on. The service refuses when
+// it reads a different value, and when the broker denies the read: without the
 // DescribeConfigs permission the check can never run, and a denied read is a
 // deployment misconfiguration someone must fix. Other read failures continue:
-// an unreachable broker is an outage, not a signal about the topic.
+// an unreachable broker is an outage, not a signal about the topic. An entry the
+// broker does not report is accepted, as today: the check refuses on what it reads,
+// not on what is missing.
 func ensureRetention(admin topicAdmin, topic, retentionMS string) error {
 	entries, err := admin.DescribeConfig(sarama.ConfigResource{
 		Type: sarama.TopicResource, Name: topic,
@@ -277,17 +293,18 @@ func ensureRetention(admin topicAdmin, topic, retentionMS string) error {
 		}
 		return nil
 	}
+	wanted := retentionContract(retentionMS)
 	for _, entry := range entries {
-		if entry.Name != "retention.ms" {
+		want, checked := wanted[entry.Name]
+		if !checked {
 			continue
 		}
-		if entry.Value != retentionMS {
+		if entry.Value != want {
 			return fmt.Errorf(
-				"topic '%s' has retention.ms %s, want %s: fix the topic's configuration",
-				topic, entry.Value, retentionMS,
+				"topic '%s' has %s %s, want %s: fix the topic's configuration",
+				topic, entry.Name, entry.Value, want,
 			)
 		}
-		return nil
 	}
 	return nil
 }

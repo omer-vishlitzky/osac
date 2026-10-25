@@ -2,9 +2,10 @@
 
 Each regression drives the real collector or journey body with a synthetic
 valid heartbeat trace, so the assertions accept correct billing output:
-corrections and reversals collapse into net usage, project-less resources
-bill without a project dimension, and a setup wait that times out cannot
-leak the resource the journey already created.
+corrections and reversals collapse into net usage, a project-less resource
+bills with no project dimension (and a heartbeat that names one anyway fails
+validation), and a setup wait that times out cannot leak the resource the
+journey already created.
 
 Run without a deployed cluster; ``--noconftest`` skips the session fixtures
 that reach the cluster:
@@ -151,12 +152,36 @@ def test_envelope_journey_waits_for_two_typed_heartbeats(monkeypatch: pytest.Mon
             delete_compute_instance=lambda **_kwargs: None,
         ),
         grpc=SimpleNamespace(),
-        k8s_hub_client=SimpleNamespace(),
+        # The journey's cleanup reads the CR's deletion timestamp before the
+        # patched waits remove it.
+        k8s_hub_client=SimpleNamespace(get_jsonpath=lambda **_kwargs: "2026-10-05T10:03:00Z"),
         vm_template="vm-template",
         metering_network_attachment={},
         metering=collector,
         metering_project="billing",
     )
+
+
+def test_expect_no_project_rejects_a_project_dimension(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With the mode set, a heartbeat that carries a project dimension fails
+    validation: the resource was created without a project, so the dimension
+    is misattribution, not a permission to skip the check."""
+    heartbeat = _heartbeat("with-project", START, START + timedelta(minutes=1), "60.000000")
+    collector = _serve(monkeypatch, [heartbeat])
+    collector.expect_no_project()
+
+    with pytest.raises(AssertionError, match="project"):
+        collector.verify_event(heartbeat, resource_id="vm-7")
+
+
+def test_expect_no_project_accepts_a_heartbeat_without_a_project(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With the mode set, a heartbeat that carries no project dimension passes
+    the full structure validation: absence is asserted, not tolerated."""
+    heartbeat = _heartbeat("no-project", START, START + timedelta(minutes=1), "60.000000", project=None)
+    collector = _serve(monkeypatch, [heartbeat])
+    collector.expect_no_project()
+
+    collector.verify_event(heartbeat, resource_id="vm-7")
 
 
 def test_verify_accepts_reversed_history_returned_after_its_replacement(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -223,7 +248,12 @@ def test_stop_journey_accepts_corrected_net_usage(monkeypatch: pytest.MonkeyPatc
             delete_compute_instance=lambda **_kwargs: None,
         ),
         grpc=grpc,
-        k8s_hub_client=SimpleNamespace(get_compute_instance_vm_namespace=lambda **_kwargs: "vm-ns"),
+        # The journey's cleanup reads the CR's deletion timestamp before the
+        # patched waits remove it.
+        k8s_hub_client=SimpleNamespace(
+            get_compute_instance_vm_namespace=lambda **_kwargs: "vm-ns",
+            get_jsonpath=lambda **_kwargs: "2026-10-05T10:03:00Z",
+        ),
         k8s_virt_client=SimpleNamespace(get_vm_printable_status=lambda **_kwargs: "Stopped"),
         vm_template="vm-template",
         metering_network_attachment={},

@@ -11,6 +11,7 @@ package rules_test
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -166,6 +167,50 @@ func TestParseRejectsConditionsOnComputedFields(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "computed") {
 		t.Fatalf("the rejection must say the field is computed, got %q", err.Error())
+	}
+}
+
+// TestParseErrorsWrapErrInvalid pins the classification contract: every Parse failure,
+// whatever its kind, wraps ErrInvalid. The service uses the sentinel to tell a
+// malformed revision (permanent; billing must stop) from a failed listing (transient;
+// the next check retries), so a failure mode that slips out unwrapped would be
+// retried forever while the old calculator keeps serving.
+func TestParseErrorsWrapErrInvalid(t *testing.T) {
+	effective := time.Unix(0, 0).UTC().Format(time.RFC3339)
+	twoDocuments := defaultMeters(t) + "---\n" + defaultMeters(t)
+	unknownState := strings.Replace(defaultMeters(t), "states: [RUNNING]", "states: [WARP9]", 1)
+	cases := []struct {
+		name        string
+		effectiveAt string
+		meters      string
+	}{
+		{"wrong ConfigMap name", effective, defaultMeters(t)},
+		{"non-numeric revision number", effective, defaultMeters(t)},
+		{"invalid effective_at", "not-a-time", defaultMeters(t)},
+		{"invalid meters YAML", effective, "\tresource: [ComputeInstance"},
+		{"unknown meter key", effective, strings.Replace(
+			defaultMeters(t), "states: [RUNNING]", "states: [RUNNING]\n    once: [READY]", 1,
+		)},
+		{"second YAML document", effective, twoDocuments},
+		{"meters failing validation", effective, unknownState},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			name := rules.NamePrefix + "0001"
+			if c.name == "wrong ConfigMap name" {
+				name = "wrong-name"
+			}
+			if c.name == "non-numeric revision number" {
+				name = rules.NamePrefix + "00X1"
+			}
+			_, err := rules.Parse(name, c.effectiveAt, c.meters)
+			if err == nil {
+				t.Fatal("the revision must not parse")
+			}
+			if !errors.Is(err, rules.ErrInvalid) {
+				t.Fatalf("the Parse failure must wrap ErrInvalid, got %v", err)
+			}
+		})
 	}
 }
 

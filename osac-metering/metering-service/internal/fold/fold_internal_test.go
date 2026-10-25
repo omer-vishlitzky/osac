@@ -160,6 +160,73 @@ func TestOutOfRangeOffsetLogsTheSkippedRange(t *testing.T) {
 	}
 }
 
+// TestFreshFoldLogsTheRetentionGap checks the same report for a fold that has not consumed
+// yet: a fresh or restored-empty database starts at the oldest retained record, and the
+// records retention deleted below it are gone from history the same way. Skipping the gap
+// silently would under-bill with no signal.
+func TestFreshFoldLogsTheRetentionGap(t *testing.T) {
+	const tenant = "t-fresh-gap"
+	store := testenv.Database(t)
+	if err := store.EnsureProgress(context.Background(), tenant); err != nil {
+		t.Fatalf("ensuring progress: %v", err)
+	}
+	// No progress row seeding: the fold has consumed nothing, so it starts at
+	// the oldest retained record directly, without an out-of-range error.
+
+	core, logs := captured()
+	f, err := New(store, &fakeConsumer{}, core)
+	if err != nil {
+		t.Fatalf("creating fold: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- f.RunTenant(ctx, tenant) }()
+
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		progress, err := store.GetTenantProgress(context.Background(), tenant)
+		if err != nil {
+			t.Fatalf("reading progress: %v", err)
+		}
+		if progress.EventOffset >= oldestRetained+2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("fold did not consume from the oldest retained offset, stopped at %d",
+				progress.EventOffset)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	reported := false
+	for _, entry := range logs.TakeAll() {
+		if strings.Contains(entry.Message, "retention deleted events") {
+			reported = true
+			if entry.ContextMap()["skippedFromOffset"] != int64(0) ||
+				entry.ContextMap()["oldestRetainedOffset"] != int64(3) {
+				t.Fatalf(
+					"skipped range reported as %v..%v, want 0..3",
+					entry.ContextMap()["skippedFromOffset"], entry.ContextMap()["oldestRetainedOffset"],
+				)
+			}
+		}
+	}
+	if !reported {
+		t.Fatal("a fresh fold over a retention-deleted topic must log the skipped range loudly")
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("fold run: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("fold did not stop after cancellation")
+	}
+}
+
 // captured returns a logger that records its entries for assertions.
 func captured() (logr.Logger, *observer.ObservedLogs) {
 	core, logs := observer.New(zapcore.DebugLevel)

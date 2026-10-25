@@ -183,6 +183,70 @@ func TestEnsureTopicAcceptsMatchingRetentionOnExistingTopic(t *testing.T) {
 	}
 }
 
+// TestEnsureTopicRejectsBrokenRetentionContract checks that verification covers the
+// whole contract the create path pins, not only retention.ms: a topic with the right
+// retention but a broker size limit or a compacting policy passes the old check and
+// silently shrinks the recovery window the database rebuild depends on.
+func TestEnsureTopicRejectsBrokenRetentionContract(t *testing.T) {
+	cases := []struct {
+		name    string
+		entries []sarama.ConfigEntry
+	}{
+		{
+			name: "size-limited retention",
+			entries: []sarama.ConfigEntry{
+				{Name: "retention.ms", Value: "-1"},
+				{Name: "retention.bytes", Value: "1073741824"},
+			},
+		},
+		{
+			name: "compacting policy",
+			entries: []sarama.ConfigEntry{
+				{Name: "retention.ms", Value: "-1"},
+				{Name: "cleanup.policy", Value: "compact"},
+			},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			admin := &fakeAdmin{
+				description: &sarama.TopicMetadata{
+					Err: sarama.ErrNoError, Partitions: []*sarama.PartitionMetadata{{}},
+				},
+				configEntries: c.entries,
+			}
+
+			err := ensureTopic(admin, "osac.metering.heartbeat.acme", "-1")
+
+			if err == nil || !strings.Contains(err.Error(), "fix the topic's configuration") {
+				t.Fatalf("expected the broken retention contract to be refused, got %v", err)
+			}
+		})
+	}
+}
+
+// TestEnsureTopicAcceptsTheWholeRetentionContract checks the matching case: a topic
+// carrying all three pinned values, exactly as the create path sets them, passes.
+func TestEnsureTopicAcceptsTheWholeRetentionContract(t *testing.T) {
+	admin := &fakeAdmin{
+		description: &sarama.TopicMetadata{Err: sarama.ErrNoError, Partitions: []*sarama.PartitionMetadata{{}}},
+		configEntries: []sarama.ConfigEntry{
+			{Name: "retention.ms", Value: "-1"},
+			{Name: "retention.bytes", Value: "-1"},
+			{Name: "cleanup.policy", Value: "delete"},
+		},
+	}
+
+	err := ensureTopic(admin, "osac.metering.heartbeat.acme", "-1")
+
+	if err != nil {
+		t.Fatalf("a topic matching the whole retention contract must be accepted, got %v", err)
+	}
+	if len(admin.created) != 0 {
+		t.Fatalf("an existing topic must not be recreated, created %v", admin.created)
+	}
+}
+
 // TestEnsureTopicRefusesUnverifiableRetention pins the fail-closed branch: without
 // the DescribeConfigs permission the retention check can never run, so every
 // existing topic would be accepted without verification. A denied read is a

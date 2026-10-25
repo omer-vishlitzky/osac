@@ -15,7 +15,7 @@ from __future__ import annotations
 import contextlib
 import itertools
 import subprocess
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -23,13 +23,19 @@ import pytest
 
 from tests.e2e.core.grpc_client import PRIVATE_API, PUBLIC_API, GRPCClient
 from tests.e2e.core.helpers import unique_name
-from tests.e2e.core.metering import HEARTBEAT_TYPE, MeteringCollector
+from tests.e2e.core.k8s_client import K8sClient
+from tests.e2e.core.metering import HEARTBEAT_TYPE, MeteringCollector, net_usage_past_by_dimension
 from tests.e2e.core.runner import poll_until, run
 
 pytestmark = [pytest.mark.regression, pytest.mark.metering]
 
 VOLUME_SIZE_GIB = 5
 HEARTBEAT_TIMEOUT: int = 300
+
+# The CR stamps the API server writes carry whole seconds, while heartbeat
+# intervals carry microseconds: comparisons between the two allow one second,
+# like the compute metering test's tolerance.
+CR_STAMP_TOLERANCE = timedelta(seconds=1)
 
 # The topology segment the LVMS provisioner requires: a node-local volume pins
 # its node, and the cluster under test is single-node.
@@ -63,10 +69,67 @@ def _interval_seconds(start: datetime, end: datetime) -> Decimal:
     return Decimal(micros) / Decimal(1_000_000)
 
 
+def _net_intervals(events: list[dict[str, Any]]) -> list[tuple[datetime, datetime, Decimal]]:
+    """Collapse signed heartbeats into the intervals the meter actually bills.
+
+    Each heartbeat bills its quantity over its usage interval and a negative
+    correction cancels the overlap, so a canceled tail disappears from the net
+    instead of showing up as a gap or an overlap between raw intervals.
+    Return the contiguous net-billed intervals with their net quantity.
+    """
+    rates = [
+        (start, end, quantity / _interval_seconds(start, end))
+        for start, end, quantity in (_usage_interval(event) for event in events)
+    ]
+    boundaries = sorted({moment for start, end, _ in rates for moment in (start, end)})
+    intervals: list[tuple[datetime, datetime, Decimal]] = []
+    for start, end in itertools.pairwise(boundaries):
+        rate = sum(r for r_start, r_end, r in rates if r_start <= start and r_end >= end)
+        if rate <= 0:
+            continue
+        quantity = rate * _interval_seconds(start, end)
+        if intervals and intervals[-1][1] == start:
+            previous_start, _, previous_quantity = intervals[-1]
+            intervals[-1] = (previous_start, end, previous_quantity + quantity)
+        else:
+            intervals.append((start, end, quantity))
+    return intervals
+
+
+def _typed_heartbeats(metering: MeteringCollector, volume_id: str) -> list[dict[str, Any]]:
+    """The heartbeats that carry the storage_tier dimension, in interval order."""
+    typed = [
+        event
+        for event in metering.get_all_events(HEARTBEAT_TYPE, volume_id)
+        if event.get("data", {}).get("billing_dimensions", {}).get("storage_tier")
+    ]
+    typed.sort(key=lambda event: event["data"]["usage"]["from"])
+    return typed
+
+
+def _final_heartbeat(metering: MeteringCollector, volume_id: str, deletion: datetime) -> dict[str, Any] | None:
+    """The latest typed heartbeat once its interval reaches the recorded deletion."""
+    latest_end: datetime | None = None
+    latest: dict[str, Any] | None = None
+    for event in _typed_heartbeats(metering, volume_id):
+        _, to, _ = _usage_interval(event)
+        if latest_end is None or to > latest_end:
+            latest_end, latest = to, event
+    if latest is None or latest_end is None or latest_end < deletion - CR_STAMP_TOLERANCE:
+        return None
+    return latest
+
+
 def test_volume_bills_gibibyte_seconds(
-    grpc: GRPCClient, private_grpc: GRPCClient, metering: MeteringCollector, metering_project: str, jwt_tenant: str
+    grpc: GRPCClient,
+    private_grpc: GRPCClient,
+    k8s_hub_client: K8sClient,
+    metering: MeteringCollector,
+    metering_project: str,
+    jwt_tenant: str,
 ) -> None:
-    """An AVAILABLE volume bills capacity x size per interval; deletion ends billing."""
+    """An AVAILABLE volume bills capacity x size per interval; deletion bills the
+    final partial interval up to the recorded deletion, then ends billing."""
     node = run("kubectl", "get", "nodes", "-o", "jsonpath={.items[0].metadata.name}")
     name = unique_name("e2e-volume-metering")
     response: dict[str, Any] = private_grpc.call(
@@ -86,6 +149,7 @@ def test_volume_bills_gibibyte_seconds(
         },
     )
     volume_id: str = response["object"]["id"]
+    volume_cr_name: str | None = None
 
     try:
         volume = poll_until(
@@ -97,6 +161,21 @@ def test_volume_bills_gibibyte_seconds(
         )
         # grpcurl renders proto int64 fields as strings.
         assert int(volume["object"]["spec"]["sizeGib"]) == VOLUME_SIZE_GIB
+
+        # Resolve the Volume CR before any delete can remove it: the feedback
+        # controller finds it by the volume-uuid label, and the deletion
+        # assertions below need its recorded deletion timestamp.
+        volume_cr_name = poll_until(
+            fn=lambda: k8s_hub_client.get_by_label(
+                resource="volume",
+                label=f"osac.openshift.io/volume-uuid={volume_id}",
+                jsonpath="{.items[0].metadata.name}",
+            ),
+            until=lambda name: name != "",
+            retries=30,
+            delay=2,
+            description=f"Volume CR for {volume_id}",
+        )
 
         # The first heartbeat that carries the storage_tier dimension is the first
         # one billed under the capacity meter.
@@ -113,24 +192,13 @@ def test_volume_bills_gibibyte_seconds(
         # quantity must equal size x the exact microsecond length of its interval,
         # and consecutive intervals must be contiguous with no billed gap.
         poll_until(
-            fn=lambda: len(
-                [
-                    event
-                    for event in metering.get_all_events(HEARTBEAT_TYPE, volume_id)
-                    if event.get("data", {}).get("billing_dimensions", {}).get("storage_tier")
-                ]
-            ),
+            fn=lambda: len(_typed_heartbeats(metering, volume_id)),
             until=lambda count: count >= 2,
             retries=HEARTBEAT_TIMEOUT // 10,
             delay=10,
             description=f"two typed heartbeats of volume {volume_id}",
         )
-        typed = [
-            event
-            for event in metering.get_all_events(HEARTBEAT_TYPE, volume_id)
-            if event.get("data", {}).get("billing_dimensions", {}).get("storage_tier")
-        ]
-        typed.sort(key=lambda event: event["data"]["usage"]["from"])
+        typed = _typed_heartbeats(metering, volume_id)
         for event in typed:
             start, end, quantity = _usage_interval(event)
             expected = Decimal(VOLUME_SIZE_GIB) * _interval_seconds(start, end)
@@ -145,18 +213,94 @@ def test_volume_bills_gibibyte_seconds(
                 f"billed intervals are not contiguous: {previous_end} then {following_start}"
             )
     finally:
-        with contextlib.suppress(Exception):
-            private_grpc.call(service=f"{PRIVATE_API}.Volumes/Delete", data={"id": volume_id})
-        poll_until(
-            fn=lambda: _volume_gone(private_grpc, volume_id),
-            until=lambda gone: gone is True,
-            retries=60,
-            delay=5,
-            description=f"{volume_id} volume removed",
-        )
+        deletion_recorded = _delete_volume(private_grpc, k8s_hub_client, volume_id=volume_id, cr_name=volume_cr_name)
 
-    deleted_after = datetime.now(UTC).isoformat()
-    metering.assert_no_events(HEARTBEAT_TYPE, volume_id, since=deleted_after, within=120)
+    deleted_after = datetime.now(UTC)
+    assert deletion_recorded is not None, "the volume's CR vanished before its deletion timestamp was read"
+
+    # The final heartbeat covers the partial interval up to the recorded
+    # deletion; billing runs through DELETING, so the final interval ends at
+    # that timestamp or later (at the DELETED transition). It arrives only in
+    # the round after the delete, so poll for it.
+    poll_until(
+        fn=lambda: _final_heartbeat(metering, volume_id, deletion_recorded),
+        until=lambda event: event is not None,
+        retries=HEARTBEAT_TIMEOUT // 10,
+        delay=10,
+        description=f"final partial-interval heartbeat of volume {volume_id}",
+    )
+
+    # The billed life is exact: the typed heartbeats collapse into contiguous
+    # net intervals, each billing exactly size x its length in seconds, and the
+    # last interval reaches the recorded deletion, so a dropped final partial
+    # interval or a stale-phase overrun cannot pass.
+    net = _net_intervals(_typed_heartbeats(metering, volume_id))
+    assert net, f"no typed heartbeats of {volume_id} to assert the billed life on"
+    for start, end, quantity in net:
+        assert quantity == Decimal(VOLUME_SIZE_GIB) * _interval_seconds(start, end), (
+            f"net interval {start}..{end} bills {quantity}, not {VOLUME_SIZE_GIB} GiB x its exact length in seconds"
+        )
+    for (_, previous_end, _), (start, _, _) in itertools.pairwise(net):
+        assert start == previous_end, f"billed intervals are not contiguous: {previous_end} then {start}"
+    assert net[-1][1] >= deletion_recorded - CR_STAMP_TOLERANCE, (
+        f"the final interval ends at {net[-1][1]}, before the recorded deletion "
+        f"at {deletion_recorded}: the partial final interval was dropped"
+    )
+
+    # Nothing bills past the removal. A volume legitimately bills past the
+    # deletion request through DELETING until the physical volume is gone, so
+    # the zero anchor is the post-removal moment, not the deletion timestamp.
+    poll_until(
+        fn=lambda: net_usage_past_by_dimension(metering.get_all_events(HEARTBEAT_TYPE, volume_id), past=deleted_after),
+        until=lambda nets: all(abs(net) <= 1 for net in nets.values()),
+        retries=HEARTBEAT_TIMEOUT // 10,
+        delay=10,
+        description=f"net billing of {volume_id} to end at the removal at {deleted_after}",
+    )
+
+    # Past the final interval nothing more arrives: the meter stopped.
+    metering.assert_no_events(HEARTBEAT_TYPE, volume_id, since=deleted_after.isoformat(), within=120)
+
+
+def _delete_volume(grpc: GRPCClient, k8s: K8sClient, *, volume_id: str, cr_name: str | None) -> datetime | None:
+    """Delete the volume and return the deletion time the API server recorded.
+
+    The CR lingers on its finalizers after the delete, so its deletion
+    timestamp is readable before it disappears. None when the volume never had
+    a CR to read: the cleanup path after a failed setup.
+    """
+    with contextlib.suppress(Exception):
+        grpc.call(service=f"{PRIVATE_API}.Volumes/Delete", data={"id": volume_id})
+    deletion_recorded: datetime | None = None
+    if cr_name is not None:
+        with contextlib.suppress(Exception):
+            deletion_recorded = _parse_time(
+                poll_until(
+                    fn=lambda: k8s.get_jsonpath(
+                        resource="volume", name=cr_name, jsonpath="{.metadata.deletionTimestamp}"
+                    ),
+                    until=lambda stamp: bool(stamp),
+                    retries=30,
+                    delay=2,
+                    description=f"deletion timestamp of Volume CR {cr_name}",
+                )
+            )
+        with contextlib.suppress(Exception):
+            poll_until(
+                fn=lambda: not k8s.is_present(resource="volume", name=cr_name),
+                until=lambda gone: gone is True,
+                retries=60,
+                delay=5,
+                description=f"{cr_name} Volume CR deletion",
+            )
+    poll_until(
+        fn=lambda: _volume_gone(grpc, volume_id),
+        until=lambda gone: gone is True,
+        retries=60,
+        delay=5,
+        description=f"{volume_id} volume removed",
+    )
+    return deletion_recorded
 
 
 def _volume_gone(grpc: GRPCClient, volume_id: str) -> bool:

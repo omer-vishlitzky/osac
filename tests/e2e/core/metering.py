@@ -28,8 +28,10 @@ HEARTBEAT_RESOURCE_TYPES = (
     "volume",
 )
 
-# Every meter sends these dimensions; a meter's own dimensions ride along. Project is an
-# identity field every resource carries.
+# Every meter sends these dimensions; a meter's own dimensions ride along.
+# Project is an identity field a resource carries only when it was created
+# inside one: expect_no_project() asserts that absence for a project-less
+# resource instead of skipping the check.
 COMMON_DIMENSIONS = ("deployment", "tenant", "meter_type")
 
 # Dimensions that legitimately land after RUNNING: the operator reports the running
@@ -196,7 +198,7 @@ class MeteringCollector:
         self._expectations: list[ExpectedEvent] = []
         self._matched: set[str] = set()
         self._verified: dict[tuple[str, str], dict[str, Any]] = {}
-        self._require_project = True
+        self._expect_no_project = False
         self._expected_tenant: str | None = None
 
     def start(self) -> None:
@@ -205,10 +207,15 @@ class MeteringCollector:
     def stop(self) -> None:
         """No-op -- no background resources to clean up."""
 
-    def without_project(self) -> MeteringCollector:
-        """Stop requiring the project dimension: resources created without a project
-        send none, because the engine emits only the facts a resource carries."""
-        self._require_project = False
+    def expect_no_project(self) -> MeteringCollector:
+        """Require the project dimension to be absent.
+
+        A resource created without a project sends none, because the engine
+        emits only the facts a resource carries: a heartbeat that names one
+        anyway is misattributed, so validation fails instead of skipping the
+        project check.
+        """
+        self._expect_no_project = True
         return self
 
     def with_tenant(self, tenant: str) -> MeteringCollector:
@@ -270,7 +277,7 @@ class MeteringCollector:
                 event,
                 expected,
                 late_required=late_required,
-                require_project=self._require_project,
+                expect_no_project=self._expect_no_project,
                 expected_tenant=self._expected_tenant,
             )
 
@@ -291,7 +298,7 @@ class MeteringCollector:
             event,
             expected,
             late_required=set(late),
-            require_project=self._require_project,
+            expect_no_project=self._expect_no_project,
             expected_tenant=self._expected_tenant,
         )
         if event_id := event.get("id", ""):
@@ -426,7 +433,7 @@ class MeteringCollector:
         expected: ExpectedEvent,
         *,
         late_required: set[str] | None = None,
-        require_project: bool = True,
+        expect_no_project: bool = False,
         expected_tenant: str | None = None,
     ) -> None:
         late_required = late_required or set()
@@ -476,7 +483,9 @@ class MeteringCollector:
         bd = data.get("billing_dimensions", {})
         for dimension in COMMON_DIMENSIONS:
             assert bd.get(dimension), f"Missing {dimension} in billing_dimensions"
-        if require_project:
+        if expect_no_project:
+            assert not bd.get("project"), f"Unexpected project in billing_dimensions: {bd.get('project')!r}"
+        else:
             assert bd.get("project"), "Missing project in billing_dimensions"
         for dimension in LATE_DIMENSIONS.get(event["osacresourcetype"], ()):
             if dimension in late_required:

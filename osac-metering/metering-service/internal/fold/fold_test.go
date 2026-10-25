@@ -241,21 +241,34 @@ func foldAll(
 	}
 
 	if !restarts {
-		runCtx, cancel := context.WithCancel(ctx)
-		defer cancel()
-		done := make(chan error, 1)
-		go func() { done <- f.RunTenant(runCtx, tenant) }()
-		if !waitForTotal() {
-			t.Fatalf("fold did not reach offset %d", total)
+		// A transient database blip ends one fold run; the service restarts the
+		// loop, so the test restarts the fold a few attempts before the error
+		// is real.
+		const attempts = 3
+		for attempt := 1; ; attempt++ {
+			runCtx, cancel := context.WithCancel(ctx)
+			done := make(chan error, 1)
+			go func() { done <- f.RunTenant(runCtx, tenant) }()
+
+			reached := waitForTotal()
+			cancel()
+			var err error
+			select {
+			case err = <-done:
+			case <-time.After(10 * time.Second):
+				t.Fatal("fold did not stop after cancellation")
+			}
+
+			if reached && (err == nil || errors.Is(err, context.Canceled)) {
+				return
+			}
+			if attempt >= attempts {
+				if !reached {
+					t.Fatalf("fold did not reach offset %d", total)
+				}
+				t.Fatalf("fold run failed: %v", err)
+			}
 		}
-		cancel()
-		select {
-		case err := <-done:
-			check(err)
-		case <-time.After(10 * time.Second):
-			t.Fatal("fold did not stop after cancellation")
-		}
-		return
 	}
 	// Each restart is a new process: its own consumer and its own fold.
 	reached := func() bool {
@@ -373,6 +386,149 @@ func skippedEvents(t *testing.T, tenant, reason string) float64 {
 		t, "osac_metering_events_skipped_total",
 		map[string]string{"tenant": tenant, "reason": reason},
 	)
+}
+
+// TestFoldSkipsEventsWithoutAPayload checks that an event whose payload this build cannot
+// read is skipped, not silently advanced past: a payload variant a newer publisher knows,
+// or a record with no payload at all, would otherwise be unbilled forever with the offset
+// moving on. A payload variant this build does not know survives decoding only as unknown
+// fields, so after unmarshaling it reads exactly like a missing payload.
+func TestFoldSkipsEventsWithoutAPayload(t *testing.T) {
+	tenant := "t-no-payload"
+	bare := &privatev1.Event{
+		Id:        "b1",
+		Type:      privatev1.EventType_EVENT_TYPE_OBJECT_UPDATED,
+		Timestamp: timestamppb.New(base),
+	}
+	healthy := testenv.VMEventOf("vm-mine", "h1",
+		privatev1.EventType_EVENT_TYPE_OBJECT_CREATED, base, base, "web",
+		"RUNNING", base, "small", base)
+
+	total := produce(t, tenant, []*privatev1.Event{bare, healthy})
+	store := testenv.Database(t)
+	skipsBefore := skippedEvents(t, tenant, "unknown_payload")
+	foldAll(t, store, tenant, total, false)
+
+	history := stringsJoin(dumpHistory(t, store, tenant))
+	if !strings.Contains(history, "vm-mine") {
+		t.Fatalf("healthy event was not folded:\n%s", history)
+	}
+	for _, line := range dumpHistory(t, store, tenant) {
+		if !strings.Contains(line, "vm-mine") {
+			t.Fatalf("the payload-less event must contribute no facts:\n%s", history)
+		}
+	}
+	if skipsAfter := skippedEvents(t, tenant, "unknown_payload"); skipsAfter != skipsBefore+1 {
+		t.Fatalf(
+			"unknown-payload skip counter is %v after the fold, want %v: the skip must be visible to alerting",
+			skipsAfter, skipsBefore+1,
+		)
+	}
+}
+
+// TestFoldSkipsTrackedPayloadsWithoutAResourceID checks that a tracked payload without a
+// resource id is skipped loudly: its facts could never be keyed into history.
+func TestFoldSkipsTrackedPayloadsWithoutAResourceID(t *testing.T) {
+	tenant := "t-no-id"
+	anonymous := testenv.VMEventOf("", "a1",
+		privatev1.EventType_EVENT_TYPE_OBJECT_UPDATED, base, base, "web",
+		"RUNNING", base, "small", base)
+	healthy := testenv.VMEventOf("vm-mine", "h1",
+		privatev1.EventType_EVENT_TYPE_OBJECT_CREATED, base, base, "web",
+		"RUNNING", base, "small", base)
+
+	total := produce(t, tenant, []*privatev1.Event{anonymous, healthy})
+	store := testenv.Database(t)
+	skipsBefore := skippedEvents(t, tenant, "missing_resource_id")
+	foldAll(t, store, tenant, total, false)
+
+	history := stringsJoin(dumpHistory(t, store, tenant))
+	if !strings.Contains(history, "vm-mine") {
+		t.Fatalf("healthy event was not folded:\n%s", history)
+	}
+	if skipsAfter := skippedEvents(t, tenant, "missing_resource_id"); skipsAfter != skipsBefore+1 {
+		t.Fatalf(
+			"missing-resource-id skip counter is %v after the fold, want %v",
+			skipsAfter, skipsBefore+1,
+		)
+	}
+}
+
+// TestFoldSkipsTrackedPayloadsWithoutACreationTime checks that a tracked payload whose
+// creation timestamp is missing, or present but all zero, is skipped loudly. Folding it
+// would silently drop every creation-keyed fact: created, project, template, and the
+// creation fallback of varying fields. Inventing a time instead would bill the wrong
+// minutes. A payload with a real creation timestamp keeps folding normally.
+func TestFoldSkipsTrackedPayloadsWithoutACreationTime(t *testing.T) {
+	tenant := "t-no-creation"
+	undated := testenv.VMEventOf("vm-undated", "u1",
+		privatev1.EventType_EVENT_TYPE_OBJECT_CREATED, base, base, "web",
+		"RUNNING", base, "small", base)
+	undated.GetComputeInstance().Metadata.CreationTimestamp = nil
+	zeroDated := testenv.VMEventOf("vm-zero", "z1",
+		privatev1.EventType_EVENT_TYPE_OBJECT_UPDATED, base.Add(time.Minute), base, "web",
+		"RUNNING", base, "small", base)
+	zeroDated.GetComputeInstance().Metadata.CreationTimestamp = timestamppb.New(time.Unix(0, 0))
+	healthy := testenv.VMEventOf("vm-mine", "h1",
+		privatev1.EventType_EVENT_TYPE_OBJECT_CREATED, base, base, "web",
+		"RUNNING", base, "small", base)
+
+	total := produce(t, tenant, []*privatev1.Event{undated, zeroDated, healthy})
+	store := testenv.Database(t)
+	skipsBefore := skippedEvents(t, tenant, "missing_creation_time")
+	foldAll(t, store, tenant, total, false)
+
+	history := stringsJoin(dumpHistory(t, store, tenant))
+	if !strings.Contains(history, "vm-mine") {
+		t.Fatalf("an event with a real creation timestamp was not folded:\n%s", history)
+	}
+	if strings.Contains(history, "vm-undated") || strings.Contains(history, "vm-zero") {
+		t.Fatalf("an event without a creation time was folded:\n%s", history)
+	}
+	if skipsAfter := skippedEvents(t, tenant, "missing_creation_time"); skipsAfter != skipsBefore+2 {
+		t.Fatalf(
+			"missing-creation-time skip counter is %v after the fold, want %v",
+			skipsAfter, skipsBefore+2,
+		)
+	}
+}
+
+// TestFoldSkipsUndatedDeletionEvents checks that a deletion event without an envelope
+// timestamp, or with an all-zero one, is skipped loudly. Folding it silently would leave
+// the resource billed forever; dating the deletion at 1970 would bill decades too much.
+// A dated deletion still records the deleted fact.
+func TestFoldSkipsUndatedDeletionEvents(t *testing.T) {
+	tenant := "t-no-deletion"
+	undated := testenv.VMEventOf("vm-undated", "u1",
+		privatev1.EventType_EVENT_TYPE_OBJECT_DELETED, base.Add(time.Hour), base, "web",
+		"STOPPED", base.Add(time.Hour), "large", base)
+	undated.Timestamp = nil
+	zeroDated := testenv.VMEventOf("vm-zero", "z1",
+		privatev1.EventType_EVENT_TYPE_OBJECT_DELETED, base.Add(time.Hour), base, "web",
+		"STOPPED", base.Add(time.Hour), "large", base)
+	zeroDated.Timestamp = timestamppb.New(time.Unix(0, 0))
+	dated := testenv.VMEventOf("vm-dated", "d1",
+		privatev1.EventType_EVENT_TYPE_OBJECT_DELETED, base.Add(time.Hour), base, "web",
+		"STOPPED", base.Add(time.Hour), "large", base)
+
+	total := produce(t, tenant, []*privatev1.Event{undated, zeroDated, dated})
+	store := testenv.Database(t)
+	skipsBefore := skippedEvents(t, tenant, "missing_deletion_time")
+	foldAll(t, store, tenant, total, false)
+
+	history := stringsJoin(dumpHistory(t, store, tenant))
+	if !strings.Contains(history, "vm-dated deleted") {
+		t.Fatalf("a dated deletion event did not record the deleted fact:\n%s", history)
+	}
+	if strings.Contains(history, "vm-undated deleted") || strings.Contains(history, "vm-zero deleted") {
+		t.Fatalf("an undated deletion event recorded a deleted fact:\n%s", history)
+	}
+	if skipsAfter := skippedEvents(t, tenant, "missing_deletion_time"); skipsAfter != skipsBefore+2 {
+		t.Fatalf(
+			"missing-deletion-time skip counter is %v after the fold, want %v",
+			skipsAfter, skipsBefore+2,
+		)
+	}
 }
 
 func TestFoldIsDeterministic(t *testing.T) {

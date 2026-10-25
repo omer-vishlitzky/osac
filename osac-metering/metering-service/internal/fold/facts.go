@@ -31,6 +31,24 @@ import (
 // fold skips the record and reports the mismatch.
 var ErrForeignTenant = errors.New("event of another tenant")
 
+// Skip-worthy extraction failures. Each names a record that can never be billed correctly:
+// folding it would silently under- or over-bill, and inventing the missing data would bill
+// the wrong minutes. The fold skips such records and reports them.
+var (
+	// ErrUnknownPayload marks an event whose payload this build cannot read: a payload of
+	// a kind this build does not know, or no payload at all.
+	ErrUnknownPayload = errors.New("event with no readable payload")
+
+	// ErrMissingResourceID marks a tracked payload without a resource id.
+	ErrMissingResourceID = errors.New("tracked payload without a resource id")
+
+	// ErrMissingCreationTime marks a tracked payload without a creation timestamp.
+	ErrMissingCreationTime = errors.New("tracked payload without a creation timestamp")
+
+	// ErrMissingDeletionTime marks a deletion event without an envelope timestamp.
+	ErrMissingDeletionTime = errors.New("deletion event without a timestamp")
+)
+
 // FactExtractor pulls the billable facts out of events: for each event it walks the
 // payload message against the shared registry of tracked fields, so fulfillment's
 // triggers and this fold cannot drift apart.
@@ -52,15 +70,22 @@ func NewFactExtractor() (*FactExtractor, error) {
 }
 
 // Facts returns the facts the event carries for the tenant. Events whose payload is not a
-// billable resource carry none. Each fact is derived from the event alone, so the same set of
-// events always produces the same facts, whatever their order or how often each is applied.
+// billable resource carry none. An event that names a billable resource but cannot be
+// folded correctly — misrouted, unreadable, or undatable — returns an error the caller
+// must skip loudly, never fold with invented data. Each fact is derived from the event
+// alone, so the same set of events always produces the same facts, whatever their order or
+// how often each is applied.
 func (e *FactExtractor) Facts(tenant string, event *privatev1.Event) ([]database.Fact, error) {
 	if tenant == "" {
 		return nil, fmt.Errorf("event %s has no tenant", event.GetId())
 	}
 	payload, resourceType := payloadOf(event)
 	if payload == nil || !payload.IsValid() {
-		return nil, nil
+		// A payload this build cannot read is version skew or a broken record: folding it
+		// would silently under-bill, because the offset advances either way.
+		return nil, fmt.Errorf(
+			"%w: event %s carries no payload this build recognizes", ErrUnknownPayload, event.GetId(),
+		)
 	}
 	// The topic decides the billing tenant. An event whose payload names a different tenant
 	// is misrouted data: folding it would bill this tenant for another tenant's resource.
@@ -77,15 +102,26 @@ func (e *FactExtractor) Facts(tenant string, event *privatev1.Event) ([]database
 	}
 	resourceID := resourceIDOf(payload)
 	if resourceID == "" {
-		return nil, nil
+		// A tracked resource without an id cannot be keyed into history.
+		return nil, fmt.Errorf(
+			"%w: event %s carries a %s payload without a resource id",
+			ErrMissingResourceID, event.GetId(), metering.ShortName(string(resourceType)),
+		)
 	}
 	typeName := metering.ShortName(string(resourceType))
 
+	creation := timestampAt(payload, "metadata.creation_timestamp")
+	if creation.IsZero() {
+		// Without a creation time, every creation-keyed fact — created, project, catalog
+		// item, template, and the creation fallback of varying fields — would be lost, and
+		// inventing a time would bill the wrong minutes.
+		return nil, fmt.Errorf(
+			"%w: event %s of %s %s carries no creation timestamp",
+			ErrMissingCreationTime, event.GetId(), typeName, resourceID,
+		)
+	}
 	var facts []database.Fact
 	add := func(field string, since time.Time, value string) {
-		if since.IsZero() {
-			return
-		}
 		facts = append(facts, database.Fact{
 			ResourceType: typeName,
 			ResourceID:   resourceID,
@@ -95,7 +131,6 @@ func (e *FactExtractor) Facts(tenant string, event *privatev1.Event) ([]database
 		})
 	}
 
-	creation := timestampAt(payload, "metadata.creation_timestamp")
 	add("created", creation, "true")
 
 	// Identity dimensions every meter sends. They never change, so they are facts of the
@@ -147,8 +182,18 @@ func (e *FactExtractor) Facts(tenant string, event *privatev1.Event) ([]database
 		}
 	}
 
-	if event.GetType() == privatev1.EventType_EVENT_TYPE_OBJECT_DELETED && event.GetTimestamp() != nil {
-		add("deleted", event.GetTimestamp().AsTime(), "true")
+	if event.GetType() == privatev1.EventType_EVENT_TYPE_OBJECT_DELETED {
+		// The envelope timestamp is the authoritative deletion boundary: without it the
+		// resource would never stop billing. An absent and an all-zero timestamp behave
+		// the same, per timestampAt.
+		deleted := timestampAt(event.ProtoReflect(), "timestamp")
+		if deleted.IsZero() {
+			return nil, fmt.Errorf(
+				"%w: deletion event %s of %s %s carries no timestamp",
+				ErrMissingDeletionTime, event.GetId(), typeName, resourceID,
+			)
+		}
+		add("deleted", deleted, "true")
 	}
 	return facts, nil
 }

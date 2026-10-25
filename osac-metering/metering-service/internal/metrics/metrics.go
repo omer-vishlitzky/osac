@@ -34,6 +34,15 @@ const (
 	SkipUndecodable = "undecodable"
 	// SkipForeignTenant marks an event whose payload names a tenant other than its topic.
 	SkipForeignTenant = "foreign_tenant"
+	// SkipUnknownPayload marks an event whose payload this build cannot read: a payload
+	// kind it does not know, or no payload at all.
+	SkipUnknownPayload = "unknown_payload"
+	// SkipMissingResourceID marks a tracked payload without a resource id.
+	SkipMissingResourceID = "missing_resource_id"
+	// SkipMissingCreationTime marks a tracked payload without a creation timestamp.
+	SkipMissingCreationTime = "missing_creation_time"
+	// SkipMissingDeletionTime marks a deletion event without an envelope timestamp.
+	SkipMissingDeletionTime = "missing_deletion_time"
 	// SkipRetention marks the range a topic lost below the stored fold offset.
 	SkipRetention = "retention"
 )

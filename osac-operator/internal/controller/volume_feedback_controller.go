@@ -138,36 +138,36 @@ func syncVolumeUpdate(_ context.Context, obj *v1alpha1.Volume, remote *privatev1
 // status still carries, including the empty phase of a volume deleted before any
 // controller status write. Erroring on those phases would wedge the delete on data the
 // window cannot have.
+//
+// The state and its time come from the same place. A phase the CR records (Failed,
+// Deleted) dates its own transition, an event the controller observed. The DELETING
+// reported for every other phase is forced: the phase predates the deletion, so its
+// time is not the deletion's — the deletion started at the deletion timestamp, and
+// dating the report at the old phase's time would erase the billed span up to the
+// deletion. A volume deleted before any controller status write has no phase time
+// either, and the deletion timestamp covers it.
 func syncVolumeDelete(_ context.Context, obj *v1alpha1.Volume, remote *privatev1.Volume) error {
-	if err := syncVolumeDeletionTransitionTime(obj, remote); err != nil {
-		return err
-	}
+	var at *timestamppb.Timestamp
 	switch obj.Status.Phase {
 	case v1alpha1.VolumePhaseFailed:
 		remote.GetStatus().SetState(privatev1.VolumeState_VOLUME_STATE_FAILED)
+		at = stateTransitionTimeOf(obj.Status.StateTransitionTime, obj.DeletionTimestamp)
 	case v1alpha1.VolumePhaseDeleted:
 		remote.GetStatus().SetState(privatev1.VolumeState_VOLUME_STATE_DELETED)
+		at = stateTransitionTimeOf(obj.Status.StateTransitionTime, obj.DeletionTimestamp)
 	default:
 		remote.GetStatus().SetState(privatev1.VolumeState_VOLUME_STATE_DELETING)
+		at = stateTransitionTimeOf(obj.DeletionTimestamp, obj.Status.StateTransitionTime)
 	}
-	syncVolumeStatusMessage(obj, remote)
-	return nil
-}
-
-// syncVolumeDeletionTransitionTime dates the deletion state change. The CR's recorded
-// transition time wins; a volume deleted before any controller status write carries none,
-// and its deletion timestamp is then the time the change started, the same fallback the
-// networking resources use. Fulfillment keeps its stored time when neither the CR nor its
-// deletion carries one, and only that case with no stored time either is an error.
-func syncVolumeDeletionTransitionTime(obj *v1alpha1.Volume, remote *privatev1.Volume) error {
-	at := stateTransitionTimeOf(obj.Status.StateTransitionTime, obj.DeletionTimestamp)
 	if at == nil {
 		if remote.GetStatus().GetStateTransitionTime() != nil {
+			syncVolumeStatusMessage(obj, remote)
 			return nil
 		}
 		return fmt.Errorf("volume %s has no state transition time", remote.GetId())
 	}
 	remote.GetStatus().SetStateTransitionTime(at)
+	syncVolumeStatusMessage(obj, remote)
 	return nil
 }
 

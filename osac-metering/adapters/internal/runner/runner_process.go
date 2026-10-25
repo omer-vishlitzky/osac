@@ -44,6 +44,21 @@ func (r *Runner) processMessage(
 
 	eventID := ce.ID()
 
+	// The CloudEvent ID is the dedup key: an event without one can never be
+	// deduplicated correctly. Refuse it instead of letting the first empty-ID
+	// event poison the dedup cache and silently suppress every later one.
+	if eventID == "" {
+		r.metrics.eventsFailed.WithLabelValues(provider, "non_retryable").Inc()
+		r.logger.Error(nil, "event has an empty CloudEvent ID, dead-lettering",
+			"topic", msg.Topic, "partition", msg.Partition, "offset", msg.Offset,
+		)
+		if err := r.sendToDLQ(msg, "empty event id", 1, provider); err != nil {
+			return false
+		}
+		r.trackOffset(msg)
+		return true
+	}
+
 	if r.dedup.contains(eventID) {
 		r.metrics.duplicatesSuppressed.WithLabelValues(provider).Inc()
 		r.trackOffset(msg)

@@ -93,6 +93,62 @@ func TestCatchUpRefusesWhenRetentionDeletedTheStoredOffset(t *testing.T) {
 	}
 }
 
+// TestCatchUpRefusesWhenHeartbeatTopicWasRecreated checks the recreation case: a stored
+// heartbeat offset past the topic's end means the topic was deleted and recreated (its
+// offsets restart at zero) or truncated. Treating the position as caught up would replay
+// nothing, and the comparison would re-emit the spans the lost heartbeats billed under
+// new heartbeat ids. The customer would pay twice, so the round refuses, while a stored
+// offset exactly at the topic's end stays caught up.
+func TestCatchUpRefusesWhenHeartbeatTopicWasRecreated(t *testing.T) {
+	p := pipelinetest.NewPipeline(t, "recreated")
+	p.StartRelay(t)
+
+	total := testenv.ProduceEvents(t, p.Tenant, []*privatev1.Event{
+		testenv.VMEvent("e1", privatev1.EventType_EVENT_TYPE_OBJECT_CREATED,
+			base, base, "web", "RUNNING", base, "small", base),
+	})
+	p.FoldAll(t, total)
+	p.RoundAt(t, base.Add(time.Minute))
+	p.RoundAt(t, base.Add(2*time.Minute))
+	p.WaitOutboxEmpty(t)
+
+	// The stored offset sits exactly at the topic's end: the round stays caught up
+	// and bills the next minute.
+	p.RoundAt(t, base.Add(3*time.Minute))
+	if outboxCount(t, p.Store, p.Tenant) == 0 {
+		t.Fatal("a round whose stored offset equals the topic end must stay caught up and bill")
+	}
+	p.WaitOutboxEmpty(t)
+
+	// The topic was deleted and recreated after the third round: its offsets restarted
+	// at zero, so the stored offset now sits past the new topic's end.
+	if _, err := p.Store.Pool().Exec(
+		context.Background(),
+		`UPDATE progress SET heartbeat_offset = 99 WHERE tenant = $1`, p.Tenant,
+	); err != nil {
+		t.Fatalf("pushing the stored offset past the topic end: %v", err)
+	}
+
+	// The round must refuse, naming the stored offset and the topic's end.
+	err := p.Round.Once(context.Background(), p.Tenant, time.Now())
+	if err == nil ||
+		!strings.Contains(err.Error(), "stored heartbeat offset 99") ||
+		!strings.Contains(err.Error(), "is past the end 3 of its heartbeat topic") {
+		t.Fatalf("expected the round to refuse on the recreated topic, got %v", err)
+	}
+
+	// Billing holds: nothing new was sent after the three rounds that succeeded.
+	got := pipelinetest.BeatLines(pipelinetest.SentHeartbeats(t, p.Tenant))
+	want := []string{
+		"compute 2026-10-05T10:00:00Z..2026-10-05T10:01:00Z 60.000000",
+		"compute 2026-10-05T10:01:00Z..2026-10-05T10:02:00Z 60.000000",
+		"compute 2026-10-05T10:02:00Z..2026-10-05T10:03:00Z 60.000000",
+	}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("heartbeats mismatch:\ngot:\n%s\nwant:\n%s", pipelinetest.Join(got), pipelinetest.Join(want))
+	}
+}
+
 // TestRoundWithSteadyEventStream checks round liveness on a tenant whose events keep
 // arriving: the round compares the fold against the watermark it captured when it started
 // waiting, so a steady stream still gets rounds instead of chasing a watermark that always

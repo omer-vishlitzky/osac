@@ -420,9 +420,9 @@ def assert_cluster_available(
 
     wait_for_cluster_order_condition(k8s=k8s, name=co_name, condition_type="ClusterAvailable")
 
-    # The cluster was created without a project, so its heartbeats carry no
-    # project dimension: the engine emits only the facts a resource carries.
-    metering.without_project()
+    # The cluster was created without a project, so its heartbeats must carry
+    # no project dimension: the engine emits only the facts a resource carries.
+    metering.expect_no_project()
     # The control-plane meter has once: [READY] semantics: a cluster bills its
     # installation time only when it reaches READY, so the heartbeat expectation can
     # start only after the cluster is available.
@@ -880,9 +880,9 @@ def assert_cluster_with_two_node_sets_available(
         instance_types=instance_types,
     )
 
-    # The cluster was created without a project, so its heartbeats carry no
-    # project dimension: the engine emits only the facts a resource carries.
-    metering.without_project()
+    # The cluster was created without a project, so its heartbeats must carry
+    # no project dimension: the engine emits only the facts a resource carries.
+    metering.expect_no_project()
     # The control-plane meter has once: [READY] semantics: a cluster bills its
     # installation time only when it reaches READY, so the heartbeat expectation can
     # start only after the worker and agent readiness checks above.

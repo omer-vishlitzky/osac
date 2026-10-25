@@ -58,9 +58,10 @@ const DeletionPasses = 3
 // recorded revisions, or the billing position. It is transient; the next check retries.
 var errRulesListing = errors.New("reading rule revisions failed")
 
-// errRulesDisagree marks a validation failure: the rule revisions and the billing position
-// contradict each other, so billing under the loaded rules would be wrong. It is fatal;
-// the service exits and the startup check refuses the restart until the rules are fixed.
+// errRulesDisagree marks a failure billing must not continue through: the rule revisions
+// and the billing position contradict each other, or a revision is malformed and cannot
+// load. It is fatal; the service exits and the startup check refuses the restart until
+// the rules are fixed.
 var errRulesDisagree = errors.New("rule revisions disagree with the billing position")
 
 // Config configures the service.
@@ -188,6 +189,12 @@ func approveRules(
 ) ([]rules.Revision, *usage.Calculator, error) {
 	present, err := source.List(ctx)
 	if err != nil {
+		// A malformed revision is fatal, not transient: no retry fixes a YAML typo or a
+		// bad effective_at, and the operator intended new pricing at that time. Billing
+		// under the rules loaded before the malformed revision appeared would be wrong.
+		if errors.Is(err, rules.ErrInvalid) {
+			return nil, nil, fmt.Errorf("%w: a revision failed to parse: %v", errRulesDisagree, err)
+		}
 		return nil, nil, fmt.Errorf("%w: reading the ConfigMaps: %v", errRulesListing, err)
 	}
 	used, err := store.ListRuleRevisions(ctx)

@@ -167,8 +167,24 @@ func (r *Round) readHeartbeats(
 	if err != nil {
 		return nil, false, fmt.Errorf("reading the heartbeat topic end: %w", err)
 	}
-	if offset >= high {
+	if offset == high {
 		return nil, true, nil
+	}
+	if offset > high {
+		// The topic was deleted and recreated, so its offsets restarted at zero, or it
+		// was truncated: a stored offset can never legitimately exceed the end of the
+		// topic it was written to. Reporting the tenant caught up would replay nothing,
+		// and the comparison would then re-emit the spans the lost heartbeats billed
+		// under new heartbeat ids: the customer pays twice. Refuse instead, loudly, and
+		// leave recovery to the operator.
+		return nil, false, fmt.Errorf(
+			"stored heartbeat offset %d of %s is past the end %d of its heartbeat topic: "+
+				"the topic was recreated or truncated and the billed history is gone; "+
+				"replaying what the topic now holds would bill the same spans twice; "+
+				"restore the topic's history or rebuild the tenant's progress from a "+
+				"backup that matches the topic",
+			offset, tenant, high,
+		)
 	}
 	partition, err := r.consumer.ConsumePartition(topic, 0, offset)
 	if err != nil {

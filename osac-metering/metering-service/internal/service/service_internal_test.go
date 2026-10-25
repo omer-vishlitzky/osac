@@ -922,6 +922,59 @@ func TestCheckRulesStopsWhenRulesDisagree(t *testing.T) {
 	}
 }
 
+// TestCheckRulesStopsWhenRevisionMalformed checks the fatal case for a malformed
+// revision: a ConfigMap the operator created with a typo cannot load, no retry fixes
+// it, and the operator intended new pricing at its effective time. The check must
+// classify the parse failure as a disagreement, which stops the service, instead of
+// retrying it forever as a listing failure while the old calculator keeps serving.
+func TestCheckRulesStopsWhenRevisionMalformed(t *testing.T) {
+	ctx := context.Background()
+	store := testenv.Database(t)
+
+	dir := t.TempDir()
+	writeRevisionManifest(t, dir, "0001", "1970-01-01T00:00:00Z", testenv.DefaultMetersYAML(t))
+
+	svc, err := New(ctx, Config{
+		Store:  store,
+		Rules:  rules.NewDirectorySource(dir),
+		Kafka:  kafka.ConnectionConfig{Brokers: testenv.Broker(t)},
+		Logger: logr.Discard(),
+	})
+	if err != nil {
+		t.Fatalf("startup: %v", err)
+	}
+	t.Cleanup(svc.stopAll)
+
+	for name, malformed := range map[string]struct {
+		effectiveAt string
+		meters      string
+	}{
+		"invalid effective_at": {"not-a-time", testenv.DefaultMetersYAML(t)},
+		"unknown meter key": {
+			time.Now().UTC().Add(time.Hour).Format(time.RFC3339),
+			strings.Replace(
+				testenv.DefaultMetersYAML(t), "states: [RUNNING]",
+				"states: [RUNNING]\n    once: [READY]", 1,
+			),
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			writeRevisionManifest(t, dir, "0002", malformed.effectiveAt, malformed.meters)
+
+			err := svc.checkRules(ctx)
+			if !errors.Is(err, errRulesDisagree) {
+				t.Fatalf("a malformed revision must be fatal, got %v", err)
+			}
+			if errors.Is(err, errRulesListing) {
+				t.Fatalf("a malformed revision must not be transient, got %v", err)
+			}
+			if got := len(svc.ruleset.Revisions()); got != 1 {
+				t.Fatalf("a malformed revision must not be swapped in, calculator serves %d", got)
+			}
+		})
+	}
+}
+
 // failingSource is a rules source whose listing always fails, like a ConfigMap read
 // during an API-server hiccup.
 type failingSource struct{}

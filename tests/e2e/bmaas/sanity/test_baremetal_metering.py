@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import contextlib
 import itertools
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -25,13 +25,18 @@ from tests.e2e.core.helpers import (
     wait_for_bmi_running,
 )
 from tests.e2e.core.k8s_client import K8sClient
-from tests.e2e.core.metering import HEARTBEAT_TYPE, MeteringCollector
+from tests.e2e.core.metering import HEARTBEAT_TYPE, MeteringCollector, net_usage_past_by_dimension
 from tests.e2e.core.osac_cli import OsacCLI
 from tests.e2e.core.runner import poll_until
 
 pytestmark = [pytest.mark.sanity, pytest.mark.metering]
 
 HEARTBEAT_TIMEOUT: int = 600
+
+# The CR stamps the API server writes carry whole seconds, while heartbeat
+# intervals carry microseconds: comparisons between the two allow one second,
+# like the compute metering test's tolerance.
+CR_STAMP_TOLERANCE = timedelta(seconds=1)
 
 
 def _parse_time(value: str) -> datetime:
@@ -49,6 +54,48 @@ def _interval_seconds(start: datetime, end: datetime) -> Decimal:
     delta = end - start
     micros = (delta.days * 86400 + delta.seconds) * 1_000_000 + delta.microseconds
     return Decimal(micros) / Decimal(1_000_000)
+
+
+def _net_intervals(events: list[dict[str, Any]]) -> list[tuple[datetime, datetime, Decimal]]:
+    """Collapse signed heartbeats into the intervals the meter actually bills.
+
+    Each heartbeat bills its quantity over its usage interval and a negative
+    correction cancels the overlap, so a canceled tail disappears from the net
+    instead of showing up as a gap or an overlap between raw intervals.
+    Return the contiguous net-billed intervals with their net quantity.
+    """
+    rates = [
+        (start, end, quantity / _interval_seconds(start, end))
+        for start, end, quantity in (_usage_interval(event) for event in events)
+    ]
+    boundaries = sorted({moment for start, end, _ in rates for moment in (start, end)})
+    intervals: list[tuple[datetime, datetime, Decimal]] = []
+    for start, end in itertools.pairwise(boundaries):
+        rate = sum(r for r_start, r_end, r in rates if r_start <= start and r_end >= end)
+        if rate <= 0:
+            continue
+        quantity = rate * _interval_seconds(start, end)
+        if intervals and intervals[-1][1] == start:
+            previous_start, _, previous_quantity = intervals[-1]
+            intervals[-1] = (previous_start, end, previous_quantity + quantity)
+        else:
+            intervals.append((start, end, quantity))
+    return intervals
+
+
+def _final_heartbeat(
+    metering: MeteringCollector, bmi_id: str, deletion: datetime, *, meter: str
+) -> dict[str, Any] | None:
+    """The latest typed heartbeat of one meter once its interval reaches the deletion."""
+    latest_end: datetime | None = None
+    latest: dict[str, Any] | None = None
+    for event in _typed_heartbeats(metering, bmi_id, meter):
+        _, to, _ = _usage_interval(event)
+        if latest_end is None or to > latest_end:
+            latest_end, latest = to, event
+    if latest is None or latest_end is None or latest_end < deletion - CR_STAMP_TOLERANCE:
+        return None
+    return latest
 
 
 def _typed_heartbeats(metering: MeteringCollector, bmi_id: str, meter: str) -> list[dict[str, Any]]:
@@ -101,20 +148,23 @@ def test_baremetal_instance_bills_allocation_and_consumption(
     ssh_public_key: str,
     test_run_id: str,
 ) -> None:
-    """Both meters bill a running instance and stop after its deletion."""
+    """Both meters bill a running instance and stop after its deletion, each
+    ending at the recorded deletion with its final partial interval billed."""
     name = f"e2e-bmi-metering-{test_run_id}"
     bmi_id, _ = jwt_cli_user.create_baremetal_instance(
         name=name, catalog_item=catalog_item, ssh_key=ssh_public_key, disk_image=bmi_disk_image
     )
+    bmi_cr_name: str | None = None
 
     try:
         bmi_cr_name = wait_for_bmi_cr(k8s=k8s_hub_client, uuid=bmi_id)
         wait_for_bmi_running(grpc=jwt_grpc_tenant1, bmi_id=bmi_id)
 
         allocation = _wait_for_meter(metering, bmi_id, "allocation", bmi_instance_type)
-        # The instance is created without a project, so its heartbeats carry no
-        # project dimension: the engine emits only the facts a resource carries.
-        metering.without_project()
+        # The instance is created without a project, so its heartbeats must
+        # carry no project dimension: the engine emits only the facts a
+        # resource carries, and one that names a project is misattributed.
+        metering.expect_no_project()
         metering.verify_event(allocation, resource_id=bmi_id)
         consumption = _wait_for_meter(metering, bmi_id, "consumption", bmi_instance_type)
         metering.verify_event(consumption, resource_id=bmi_id)
@@ -148,12 +198,76 @@ def test_baremetal_instance_bills_allocation_and_consumption(
             f"starts at {consumption_start}: the host reservation must bill first"
         )
     finally:
-        with contextlib.suppress(Exception):
-            jwt_cli_user.delete_baremetal_instance(uuid=bmi_id)
-        with contextlib.suppress(Exception):
-            wait_for_bmi_deletion(k8s=k8s_hub_client, name=bmi_cr_name)
-        with contextlib.suppress(Exception):
-            wait_for_bmi_grpc_removal(grpc=jwt_grpc_tenant1, uuid=bmi_id)
+        deletion_recorded = _delete_bmi(
+            jwt_cli_user, jwt_grpc_tenant1, k8s_hub_client, uuid=bmi_id, cr_name=bmi_cr_name
+        )
 
-    deleted_after = datetime.now(UTC).isoformat()
-    metering.assert_no_events(HEARTBEAT_TYPE, bmi_id, since=deleted_after, within=180)
+    deleted_after = datetime.now(UTC)
+    assert deletion_recorded is not None, "the instance's CR vanished before its deletion timestamp was read"
+
+    # Each meter ends at the recorded deletion: its final partial interval is
+    # billed, not dropped, and its typed heartbeats collapse into contiguous
+    # net intervals billing exactly their length.
+    for meter in ("allocation", "consumption"):
+        poll_until(
+            fn=lambda meter=meter: _final_heartbeat(metering, bmi_id, deletion_recorded, meter=meter),
+            until=lambda event: event is not None,
+            retries=HEARTBEAT_TIMEOUT // 10,
+            delay=10,
+            description=f"final partial-interval {meter} heartbeat of {bmi_id}",
+        )
+
+        net = _net_intervals(_typed_heartbeats(metering, bmi_id, meter))
+        assert net, f"no typed {meter} heartbeats of {bmi_id} to assert the billed life on"
+        for start, end, quantity in net:
+            assert quantity == _interval_seconds(start, end), (
+                f"{meter} net interval {start}..{end} bills {quantity}, not its exact length in seconds"
+            )
+        for (_, previous_end, _), (start, _, _) in itertools.pairwise(net):
+            assert start == previous_end, f"{meter} billed intervals are not contiguous: {previous_end} then {start}"
+        assert net[-1][1] >= deletion_recorded - CR_STAMP_TOLERANCE, (
+            f"the final {meter} interval ends at {net[-1][1]}, before the recorded "
+            f"deletion at {deletion_recorded}: the partial final interval was dropped"
+        )
+
+    # Nothing bills past the removal, on either meter.
+    poll_until(
+        fn=lambda: net_usage_past_by_dimension(metering.get_all_events(HEARTBEAT_TYPE, bmi_id), past=deleted_after),
+        until=lambda nets: all(abs(net) <= 1 for net in nets.values()),
+        retries=HEARTBEAT_TIMEOUT // 10,
+        delay=10,
+        description=f"net billing of {bmi_id} to end at the removal at {deleted_after}",
+    )
+
+    # Past the final interval nothing more arrives: both meters stopped.
+    metering.assert_no_events(HEARTBEAT_TYPE, bmi_id, since=deleted_after.isoformat(), within=180)
+
+
+def _delete_bmi(cli: OsacCLI, grpc: GRPCClient, k8s: K8sClient, *, uuid: str, cr_name: str | None) -> datetime | None:
+    """Delete the instance and return the deletion time the API server recorded.
+
+    The CR lingers on its finalizers after the delete, so its deletion
+    timestamp is readable before it disappears. None when the instance never
+    had a CR to read: the cleanup path after a failed setup.
+    """
+    with contextlib.suppress(Exception):
+        cli.delete_baremetal_instance(uuid=uuid)
+    deletion_recorded: datetime | None = None
+    if cr_name is not None:
+        with contextlib.suppress(Exception):
+            deletion_recorded = _parse_time(
+                poll_until(
+                    fn=lambda: k8s.get_jsonpath(
+                        resource="baremetalinstance", name=cr_name, jsonpath="{.metadata.deletionTimestamp}"
+                    ),
+                    until=lambda stamp: bool(stamp),
+                    retries=30,
+                    delay=2,
+                    description=f"deletion timestamp of {cr_name}",
+                )
+            )
+        with contextlib.suppress(Exception):
+            wait_for_bmi_deletion(k8s=k8s, name=cr_name)
+    with contextlib.suppress(Exception):
+        wait_for_bmi_grpc_removal(grpc=grpc, uuid=uuid)
+    return deletion_recorded

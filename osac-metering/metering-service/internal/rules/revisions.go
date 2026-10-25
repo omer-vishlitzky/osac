@@ -114,7 +114,7 @@ func (s *DirectorySource) List(ctx context.Context) ([]Revision, error) {
 		}
 		var manifest configMapManifest
 		if err := yaml.Unmarshal(content, &manifest); err != nil {
-			return nil, fmt.Errorf("parsing %s: %w", entry.Name(), err)
+			return nil, fmt.Errorf("%w: parsing %s: %v", ErrInvalid, entry.Name(), err)
 		}
 		revision, err := Parse(
 			manifest.Metadata.Name, manifest.Data["effective_at"], manifest.Data["meters.yaml"],

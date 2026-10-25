@@ -719,6 +719,39 @@ var _ = Describe("Runner DLQ integration", func() {
 		})
 	})
 
+	Describe("empty CloudEvent id", func() {
+		It("dead-letters the event with a reason and keeps consuming", func() {
+			feedMessages(claim,
+				newTestMessage("", "res-1", 0), // empty CloudEvent ID
+				newTestMessage("evt-2", "res-2", 1),
+			)
+
+			err := runner.ConsumeClaim(session, claim)
+			Expect(err).NotTo(HaveOccurred())
+
+			dlqSender.mu.Lock()
+			defer dlqSender.mu.Unlock()
+			Expect(dlqSender.sends).To(HaveLen(1))
+			Expect(dlqSender.sends[0].reason).To(ContainSubstring("empty event id"))
+			Expect(dlqSender.sends[0].attempts).To(Equal(1))
+
+			// The well-formed event after the empty-ID one is submitted, not
+			// suppressed as a duplicate of it.
+			adapter.mu.Lock()
+			defer adapter.mu.Unlock()
+			Expect(adapter.submitCalls).To(HaveLen(1))
+			Expect(adapter.submitCalls[0].CloudEvent.ID()).To(Equal("evt-2"))
+
+			runner.mu.Lock()
+			defer runner.mu.Unlock()
+			tp := topicPartition{Topic: testTopic, Partition: 0}
+			Expect(runner.offsets[tp]).To(Equal(int64(1)), "the dead-lettered offset must be tracked")
+
+			val := testutil.ToFloat64(runner.metrics.eventsFailed.WithLabelValues("test-provider", "non_retryable"))
+			Expect(val).To(Equal(float64(1)))
+		})
+	})
+
 	Describe("exhausted retries", func() {
 		It("routes to DLQ after all retries exhausted", func() {
 			adapter.submitErr = errors.New("always fails")

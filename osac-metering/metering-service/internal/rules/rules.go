@@ -32,6 +32,12 @@ import (
 // NamePrefix is the prefix of every rule revision ConfigMap.
 const NamePrefix = "osac-metering-rules-"
 
+// ErrInvalid marks a revision that cannot be parsed: a YAML typo, a bad effective_at,
+// an unknown key, a second document, or meters that fail validation. Such a failure is
+// permanent, not an outage: no retry fixes it, and the operator intended new pricing at
+// the revision's effective time, so callers must stop billing instead of retrying.
+var ErrInvalid = errors.New("invalid rule revision")
+
 // Meter says, for one resource type, when the resource is billable and how its usage is
 // dimensioned.
 type Meter struct {
@@ -91,18 +97,23 @@ type Revision struct {
 }
 
 // Parse parses a revision from its ConfigMap name and data. It fails when the meters are not
-// valid: rules are data, so a bad revision must stop metering rather than bill wrong.
+// valid: rules are data, so a bad revision must stop metering rather than bill wrong. Every
+// failure wraps ErrInvalid, so callers can tell a malformed revision from a failed read.
 func Parse(name, effectiveAtText, metersYAML string) (Revision, error) {
 	number := strings.TrimPrefix(name, NamePrefix)
 	if number == name || len(number) != 4 {
-		return Revision{}, fmt.Errorf("revision ConfigMap %q is not named %s<NNNN>", name, NamePrefix)
+		return Revision{}, fmt.Errorf(
+			"%w: revision ConfigMap %q is not named %s<NNNN>", ErrInvalid, name, NamePrefix,
+		)
 	}
 	if _, err := strconv.Atoi(number); err != nil {
-		return Revision{}, fmt.Errorf("revision number %q of %s is not a number", number, name)
+		return Revision{}, fmt.Errorf("%w: revision number %q of %s is not a number", ErrInvalid, number, name)
 	}
 	effectiveAt, err := time.Parse(time.RFC3339, effectiveAtText)
 	if err != nil {
-		return Revision{}, fmt.Errorf("revision %s has an invalid effective_at %q", number, effectiveAtText)
+		return Revision{}, fmt.Errorf(
+			"%w: revision %s has an invalid effective_at %q", ErrInvalid, number, effectiveAtText,
+		)
 	}
 
 	var meters []Meter
@@ -112,14 +123,15 @@ func Parse(name, effectiveAtText, metersYAML string) (Revision, error) {
 	decoder := yaml.NewDecoder(strings.NewReader(metersYAML))
 	decoder.KnownFields(true)
 	if err := decoder.Decode(&meters); err != nil {
-		return Revision{}, fmt.Errorf("revision %s has invalid meters: %w", number, err)
+		return Revision{}, fmt.Errorf("%w: revision %s has invalid meters: %w", ErrInvalid, number, err)
 	}
 	// A second document would load as the first alone and silently drop its meters, so
 	// a revision must hold exactly one document.
 	var trailing any
 	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
 		return Revision{}, fmt.Errorf(
-			"revision %s has a second YAML document; only one meters document is allowed", number,
+			"%w: revision %s has a second YAML document; only one meters document is allowed",
+			ErrInvalid, number,
 		)
 	}
 	revision := Revision{
@@ -127,7 +139,7 @@ func Parse(name, effectiveAtText, metersYAML string) (Revision, error) {
 		Meters: meters, MetersYAML: metersYAML,
 	}
 	if err := revision.validate(); err != nil {
-		return Revision{}, err
+		return Revision{}, fmt.Errorf("%w: %w", ErrInvalid, err)
 	}
 	return revision, nil
 }

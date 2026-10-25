@@ -3,7 +3,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import subprocess
-import time
+from datetime import UTC, datetime
 
 import pytest
 
@@ -52,6 +52,10 @@ def test_cluster_delete_reports_deleting_state_without_provisioning(
     )
     node_sets = {"workers": {"size": 1, "baremetal_instance_type": {"name": "ci-worker-bm"}}}
     name = unique_name("e2e-cluster")
+    # Nothing may bill at all, so the silence window is anchored at the test
+    # start: any heartbeat for the cluster or a worker, whenever it arrives,
+    # violates the gate.
+    started_at = datetime.now(UTC).isoformat()
     uuid = cli.create_cluster(
         name=name,
         template=cluster_template,
@@ -87,18 +91,15 @@ def test_cluster_delete_reports_deleting_state_without_provisioning(
         wait_for_cluster_deletion(k8s=k8s_hub_client, name=co_name)
         wait_for_cluster_grpc_removal(grpc=grpc, uuid=uuid)
 
-        # One round of margin: a gate that opened when it must not have bills on
-        # the next round after the delete, so an empty history after it is the
-        # proof both meters stayed shut.
-        time.sleep(70)
-        assert not metering.get_all_events(HEARTBEAT_TYPE, uuid), (
-            f"cluster {uuid} billed control plane time although it never reached READY"
-        )
+        # The gate stayed shut: no control plane time and no worker hardware
+        # bills, although the workers' own meters would bill a standalone host
+        # from STARTING. That is the no-double-billing guarantee for owned
+        # hardware, verified end to end. The window is polled, not slept
+        # through, so a heartbeat delivered after a single fetch cannot slip
+        # through.
+        metering.assert_no_events(HEARTBEAT_TYPE, resource_id=uuid, since=started_at, within=120)
         for bmi_id in worker_bmi_ids:
-            assert not metering.get_all_events(HEARTBEAT_TYPE, bmi_id), (
-                f"worker {bmi_id} billed hardware time although its cluster never reached READY: "
-                "owned hardware must bill under the cluster's gate, never standalone"
-            )
+            metering.assert_no_events(HEARTBEAT_TYPE, resource_id=bmi_id, since=started_at, within=120)
     finally:
         with contextlib.suppress(subprocess.CalledProcessError):
             cli.delete_cluster(uuid=uuid)

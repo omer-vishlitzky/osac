@@ -22,6 +22,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
+	"google.golang.org/protobuf/types/known/timestamppb"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	clnt "sigs.k8s.io/controller-runtime/pkg/client"
@@ -122,13 +123,35 @@ func syncExternalIPUpdate(ctx context.Context, obj *v1alpha1.ExternalIP, remote 
 	return nil
 }
 
+// syncExternalIPDelete maps ExternalIP CR status during deletion. Failed addresses report
+// FAILED, and everything else reports DELETING: an address whose deletion timestamp is set
+// is going away whatever state its status still carries, including the empty state of an
+// address deleted before any controller status write.
+//
+// The state and its time come from the same place. The Failed state the CR records dates
+// its own transition, an event the controller observed. The DELETING reported for every
+// other state is forced: the state predates the deletion, so its time is not the
+// deletion's — the deletion started at the deletion timestamp, and dating the report at
+// the old state's time would erase the billed span up to the deletion. An address deleted
+// before any controller status write has no state time either, and the deletion timestamp
+// covers it.
 func syncExternalIPDelete(_ context.Context, obj *v1alpha1.ExternalIP, remote *privatev1.ExternalIP) error {
-	syncExternalIPStateTransitionTime(obj, remote)
-	if obj.Status.State == v1alpha1.ExternalIPStateFailed {
+	var at *timestamppb.Timestamp
+	switch obj.Status.State {
+	case v1alpha1.ExternalIPStateFailed:
 		remote.GetStatus().SetState(privatev1.ExternalIPState_EXTERNAL_IP_STATE_FAILED)
-		return nil
+		at = stateTransitionTimeOf(obj.Status.StateTransitionTime, obj.DeletionTimestamp)
+	default:
+		remote.GetStatus().SetState(privatev1.ExternalIPState_EXTERNAL_IP_STATE_DELETING)
+		at = stateTransitionTimeOf(obj.DeletionTimestamp, obj.Status.StateTransitionTime)
 	}
-	remote.GetStatus().SetState(privatev1.ExternalIPState_EXTERNAL_IP_STATE_DELETING)
+	if at == nil {
+		if remote.GetStatus().GetStateTransitionTime() != nil {
+			return nil
+		}
+		return fmt.Errorf("external IP %s has no state transition time", remote.GetId())
+	}
+	remote.GetStatus().SetStateTransitionTime(at)
 	return nil
 }
 

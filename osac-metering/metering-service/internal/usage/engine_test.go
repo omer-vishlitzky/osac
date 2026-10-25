@@ -1208,6 +1208,53 @@ func TestMissingRootHistoryHoldsWorkerBilling(t *testing.T) {
 		at(40*time.Minute), nil)
 }
 
+// TestFactsWithoutCreationRefuse checks the fail-shut rule: facts that carry no creation
+// fact are corrupt, because the fold writes one with every resource's first fact.
+// Guessing the start from the earliest surviving fact would under-bill, so both compute
+// paths refuse instead.
+func TestFactsWithoutCreationRefuse(t *testing.T) {
+	calculator := defaultCalculator(t)
+	facts := []database.Fact{
+		state("BareMetalInstance", "bm-1", base, "STARTING"),
+		fact("BareMetalInstance", "bm-1", "spec.instance_type", base, "m7a"),
+	}
+	_, err := calculator.Expected(
+		"acme", "BareMetalInstance", "bm-1", facts, nil, at(30*time.Minute),
+	)
+	if err == nil || !strings.Contains(err.Error(), "BareMetalInstance bm-1 has no creation fact") {
+		t.Fatalf("expected Expected to refuse facts without a creation fact, got %v", err)
+	}
+	_, err = calculator.Since(
+		"acme", "BareMetalInstance", "bm-1", facts, nil, base, at(30*time.Minute), nil,
+	)
+	if err == nil || !strings.Contains(err.Error(), "BareMetalInstance bm-1 has no creation fact") {
+		t.Fatalf("expected Since to refuse facts without a creation fact, got %v", err)
+	}
+}
+
+// TestEmptyFactsBillNothing pins the hold: completely empty facts produce no pieces and no
+// error, because the missing-ownership-root gate depends on empty facts shutting billing
+// instead of failing the round.
+func TestEmptyFactsBillNothing(t *testing.T) {
+	calculator := defaultCalculator(t)
+	pieces, err := calculator.Expected("acme", "BareMetalInstance", "bm-1", nil, nil, at(30*time.Minute))
+	if err != nil {
+		t.Fatalf("computing empty facts: %v", err)
+	}
+	if len(pieces) != 0 {
+		t.Fatalf("empty facts must produce no pieces, got %s", summarize(pieces))
+	}
+	pieces, err = calculator.Since(
+		"acme", "BareMetalInstance", "bm-1", nil, nil, base, at(30*time.Minute), nil,
+	)
+	if err != nil {
+		t.Fatalf("computing empty facts since: %v", err)
+	}
+	if len(pieces) != 0 {
+		t.Fatalf("empty facts must produce no pieces since, got %s", summarize(pieces))
+	}
+}
+
 // TestStandaloneWorkerBillsOnItsOwnGate checks that a worker without an owner fact reads
 // nothing but its own gate: the BMI meters' own confirming states apply.
 func TestStandaloneWorkerBillsOnItsOwnGate(t *testing.T) {

@@ -569,27 +569,47 @@ var _ = Describe("syncVolumeStateTransitionTime", func() {
 	})
 })
 
-var _ = Describe("syncVolumeDeletionTransitionTime", func() {
-	It("prefers the CR's recorded transition time over the deletion timestamp", func() {
-		remote := newRemoteVolume("vol-del-recorded", privatev1.VolumeState_VOLUME_STATE_AVAILABLE)
+var _ = Describe("syncVolumeDelete", func() {
+	It("dates a failed volume's report at the CR's recorded transition time", func() {
+		remote := newRemoteVolume("vol-del-failed", privatev1.VolumeState_VOLUME_STATE_AVAILABLE)
 		recorded := metav1.NewTime(time.Unix(1000, 0))
 		deletedAt := metav1.NewTime(time.Unix(2000, 0))
 		cr := &v1alpha1.Volume{
 			ObjectMeta: metav1.ObjectMeta{DeletionTimestamp: &deletedAt},
-			Status:     v1alpha1.VolumeStatus{StateTransitionTime: &recorded},
+			Status:     v1alpha1.VolumeStatus{Phase: v1alpha1.VolumePhaseFailed, StateTransitionTime: &recorded},
 		}
 
-		Expect(syncVolumeDeletionTransitionTime(cr, remote)).To(Succeed())
+		Expect(syncVolumeDelete(context.Background(), cr, remote)).To(Succeed())
 
 		Expect(remote.GetStatus().GetStateTransitionTime().AsTime().Equal(recorded.Time)).To(BeTrue())
+	})
+
+	It("dates the forced DELETING of a pre-deletion phase at the deletion timestamp", func() {
+		// The recorded time dates the Ready phase, not the deletion: reporting
+		// DELETING at it would end billing at the Ready time and erase the span
+		// up to the deletion.
+		remote := newRemoteVolume("vol-del-ready", privatev1.VolumeState_VOLUME_STATE_AVAILABLE)
+		recorded := metav1.NewTime(time.Unix(1000, 0))
+		deletedAt := metav1.NewTime(time.Unix(2000, 0))
+		cr := &v1alpha1.Volume{
+			ObjectMeta: metav1.ObjectMeta{DeletionTimestamp: &deletedAt},
+			Status:     v1alpha1.VolumeStatus{Phase: v1alpha1.VolumePhaseReady, StateTransitionTime: &recorded},
+		}
+
+		Expect(syncVolumeDelete(context.Background(), cr, remote)).To(Succeed())
+
+		Expect(remote.GetStatus().GetStateTransitionTime().AsTime().Equal(deletedAt.Time)).To(BeTrue())
 	})
 
 	It("dates the change at the deletion timestamp when the CR status carries no time", func() {
 		remote := newRemoteVolume("vol-del-fallback", privatev1.VolumeState_VOLUME_STATE_AVAILABLE)
 		deletedAt := metav1.NewTime(time.Unix(2000, 0))
-		cr := &v1alpha1.Volume{ObjectMeta: metav1.ObjectMeta{DeletionTimestamp: &deletedAt}}
+		cr := &v1alpha1.Volume{
+			ObjectMeta: metav1.ObjectMeta{DeletionTimestamp: &deletedAt},
+			Status:     v1alpha1.VolumeStatus{Phase: v1alpha1.VolumePhaseReady},
+		}
 
-		Expect(syncVolumeDeletionTransitionTime(cr, remote)).To(Succeed())
+		Expect(syncVolumeDelete(context.Background(), cr, remote)).To(Succeed())
 
 		Expect(remote.GetStatus().GetStateTransitionTime().AsTime().Equal(deletedAt.Time)).To(BeTrue())
 	})
@@ -599,7 +619,7 @@ var _ = Describe("syncVolumeDeletionTransitionTime", func() {
 		original := timestamppb.Now()
 		remote.GetStatus().SetStateTransitionTime(original)
 
-		Expect(syncVolumeDeletionTransitionTime(&v1alpha1.Volume{}, remote)).To(Succeed())
+		Expect(syncVolumeDelete(context.Background(), &v1alpha1.Volume{}, remote)).To(Succeed())
 
 		Expect(proto.Equal(remote.GetStatus().GetStateTransitionTime(), original)).To(BeTrue())
 	})
@@ -608,7 +628,9 @@ var _ = Describe("syncVolumeDeletionTransitionTime", func() {
 		remote := newRemoteVolume("vol-del-none", privatev1.VolumeState_VOLUME_STATE_AVAILABLE)
 		remote.GetStatus().StateTransitionTime = nil
 
-		Expect(syncVolumeDeletionTransitionTime(&v1alpha1.Volume{}, remote)).To(MatchError(ContainSubstring("no state transition time")))
+		Expect(syncVolumeDelete(context.Background(), &v1alpha1.Volume{}, remote)).To(
+			MatchError(ContainSubstring("no state transition time")),
+		)
 	})
 })
 
