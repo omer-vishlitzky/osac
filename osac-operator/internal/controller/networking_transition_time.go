@@ -47,6 +47,21 @@ func stateTransitionTimeOf(at, deleted *metav1.Time) *timestamppb.Timestamp {
 	return timestamppb.New(at.Time)
 }
 
+// laterTransitionTimeOf returns the later of the two times: the deletion
+// started at the deletion timestamp, but a reconciler status write can land
+// after it, and fulfillment rejects a change whose time is not later than the
+// stored one. Reporting the later of the two satisfies both: a stale
+// pre-deletion phase time never dates the report (the deletion timestamp
+// wins), and a post-delete status write never gets rejected (the status time
+// wins).
+func laterTransitionTimeOf(a, b *metav1.Time) *timestamppb.Timestamp {
+	at := stateTransitionTimeOf(a, b)
+	if a != nil && b != nil && b.Time.After(a.Time) {
+		at = timestamppb.New(b.Time)
+	}
+	return at
+}
+
 func setExternalIPDeleting(status *v1alpha1.ExternalIPStatus) bool {
 	if status.Phase == v1alpha1.ExternalIPPhaseDeleting {
 		return false

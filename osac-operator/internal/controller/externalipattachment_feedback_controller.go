@@ -163,7 +163,7 @@ func syncExternalIPAttachmentDelete(_ context.Context, obj *v1alpha1.ExternalIPA
 		at = stateTransitionTimeOf(obj.Status.StateTransitionTime, obj.DeletionTimestamp)
 	default:
 		remote.GetStatus().SetState(privatev1.ExternalIPAttachmentState_EXTERNAL_IP_ATTACHMENT_STATE_DELETING)
-		at = stateTransitionTimeOf(obj.DeletionTimestamp, obj.Status.StateTransitionTime)
+		at = laterTransitionTimeOf(obj.Status.StateTransitionTime, obj.DeletionTimestamp)
 	}
 	if at == nil {
 		if remote.GetStatus().GetStateTransitionTime() != nil {

@@ -143,7 +143,7 @@ func syncExternalIPDelete(_ context.Context, obj *v1alpha1.ExternalIP, remote *p
 		at = stateTransitionTimeOf(obj.Status.StateTransitionTime, obj.DeletionTimestamp)
 	default:
 		remote.GetStatus().SetState(privatev1.ExternalIPState_EXTERNAL_IP_STATE_DELETING)
-		at = stateTransitionTimeOf(obj.DeletionTimestamp, obj.Status.StateTransitionTime)
+		at = laterTransitionTimeOf(obj.Status.StateTransitionTime, obj.DeletionTimestamp)
 	}
 	if at == nil {
 		if remote.GetStatus().GetStateTransitionTime() != nil {

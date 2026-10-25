@@ -579,6 +579,25 @@ var _ = Describe("syncNATGatewayDelete", func() {
 		Expect(remote.GetStatus().GetStateTransitionTime().AsTime().Equal(deletedAt.Time)).To(BeTrue())
 	})
 
+	It("dates the forced DELETING at the later of the status time and the deletion timestamp", func() {
+		// A reconciler status write can land after the delete request, putting
+		// the CR's transition time past the deletion timestamp. Fulfillment
+		// rejects a change whose time is not later than the stored one, so the
+		// report must carry the later time — the status time — not the
+		// deletion timestamp.
+		remote := &privatev1.NATGateway{Id: "natgateway-del-late", Status: &privatev1.NATGatewayStatus{}}
+		deletedAt := metav1.NewTime(time.Unix(2000, 0))
+		statusAt := metav1.NewTime(time.Unix(3000, 0))
+		cr := &v1alpha1.NATGateway{
+			ObjectMeta: metav1.ObjectMeta{DeletionTimestamp: &deletedAt},
+			Status:     v1alpha1.NATGatewayStatus{Phase: v1alpha1.NATGatewayPhaseDeleting, StateTransitionTime: &statusAt},
+		}
+
+		Expect(syncNATGatewayDelete(context.Background(), cr, remote)).To(Succeed())
+
+		Expect(remote.GetStatus().GetStateTransitionTime().AsTime().Equal(statusAt.Time)).To(BeTrue())
+	})
+
 	It("dates the change at the deletion timestamp when the CR status carries no time", func() {
 		remote := &privatev1.NATGateway{Id: "natgateway-del-fallback", Status: &privatev1.NATGatewayStatus{}}
 		deletedAt := metav1.NewTime(time.Unix(2000, 0))
