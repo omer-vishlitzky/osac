@@ -213,10 +213,17 @@ def test_volume_bills_gibibyte_seconds(
                 f"billed intervals are not contiguous: {previous_end} then {following_start}"
             )
     finally:
+        delete_requested = datetime.now(UTC)
         deletion_recorded = _delete_volume(private_grpc, k8s_hub_client, volume_id=volume_id, cr_name=volume_cr_name)
 
     deleted_after = datetime.now(UTC)
-    assert deletion_recorded is not None, "the volume's CR vanished before its deletion timestamp was read"
+    if deletion_recorded is None:
+        # The CR vanished before its deletionTimestamp was readable — every
+        # finalizer was already gone. The moment just before the delete call
+        # is a lower bound on the recorded deletion: billing past it is an
+        # over-bill, and a final interval dropped to a stale pre-deletion
+        # time fails against this bound too.
+        deletion_recorded = delete_requested
 
     # The final heartbeat covers the partial interval up to the recorded
     # deletion; billing runs through DELETING, so the final interval ends at
