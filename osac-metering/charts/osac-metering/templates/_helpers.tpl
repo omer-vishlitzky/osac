@@ -78,11 +78,12 @@ Args: list of [context, saslSecretName]
     - name: tmp
       mountPath: /tmp
   securityContext:
-    # The CLI image defaults to root; the pod requires non-root, so pin the
-    # same nonroot UID the workload images use. Plain Kubernetes (kind)
-    # refuses a runAsNonRoot pod whose image would run as UID 0.
-    runAsUser: 65532
-    runAsNonRoot: true
+    # The CLI image defaults to root, which kind refuses under the main
+    # container's runAsNonRoot. OpenShift's restricted SCC assigns its own UID
+    # range and rejects a pinned one, so the init container opts out of the
+    # non-root requirement instead: it only reads a Secret and writes to
+    # emptyDirs.
+    runAsNonRoot: false
     allowPrivilegeEscalation: false
     readOnlyRootFilesystem: true
     capabilities:

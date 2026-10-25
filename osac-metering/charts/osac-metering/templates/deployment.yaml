@@ -20,7 +20,6 @@ spec:
     spec:
       serviceAccountName: {{ include "osac-metering.fullname" . }}
       securityContext:
-        runAsNonRoot: true
         seccompProfile:
           type: RuntimeDefault
       volumes:
@@ -109,6 +108,7 @@ spec:
             initialDelaySeconds: 5
             periodSeconds: 10
           securityContext:
+            runAsNonRoot: true
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
             capabilities:
