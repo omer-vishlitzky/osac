@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import contextlib
 import itertools
-from datetime import datetime, timedelta
+from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
@@ -25,77 +25,20 @@ from tests.e2e.core.helpers import (
     wait_for_bmi_running,
 )
 from tests.e2e.core.k8s_client import K8sClient
-from tests.e2e.core.metering import HEARTBEAT_TYPE, MeteringCollector, net_usage_past_by_dimension
+from tests.e2e.core.metering import (
+    HEARTBEAT_TYPE,
+    MeteringCollector,
+    assert_exact_contiguous_life,
+    interval_seconds,
+    parse_time,
+    usage_interval,
+)
 from tests.e2e.core.osac_cli import OsacCLI
 from tests.e2e.core.runner import poll_until
 
 pytestmark = [pytest.mark.sanity, pytest.mark.metering]
 
 HEARTBEAT_TIMEOUT: int = 600
-
-# The recorded deletion stamp and the heartbeat interval end come from
-# different pods, each truncating to whole seconds: comparisons between the
-# two allow one second, like the compute metering test's tolerance.
-CR_STAMP_TOLERANCE = timedelta(seconds=1)
-
-
-def _parse_time(value: str) -> datetime:
-    if value.endswith("Z"):
-        value = value[:-1] + "+00:00"
-    return datetime.fromisoformat(value)
-
-
-def _usage_interval(event: dict[str, Any]) -> tuple[datetime, datetime, Decimal]:
-    usage = event["data"]["usage"]
-    return _parse_time(usage["from"]), _parse_time(usage["to"]), Decimal(usage["quantity"])
-
-
-def _interval_seconds(start: datetime, end: datetime) -> Decimal:
-    delta = end - start
-    micros = (delta.days * 86400 + delta.seconds) * 1_000_000 + delta.microseconds
-    return Decimal(micros) / Decimal(1_000_000)
-
-
-def _net_intervals(events: list[dict[str, Any]]) -> list[tuple[datetime, datetime, Decimal]]:
-    """Collapse signed heartbeats into the intervals the meter actually bills.
-
-    Each heartbeat bills its quantity over its usage interval and a negative
-    correction cancels the overlap, so a canceled tail disappears from the net
-    instead of showing up as a gap or an overlap between raw intervals.
-    Return the contiguous net-billed intervals with their net quantity.
-    """
-    rates = [
-        (start, end, quantity / _interval_seconds(start, end))
-        for start, end, quantity in (_usage_interval(event) for event in events)
-    ]
-    boundaries = sorted({moment for start, end, _ in rates for moment in (start, end)})
-    intervals: list[tuple[datetime, datetime, Decimal]] = []
-    for start, end in itertools.pairwise(boundaries):
-        rate = sum(r for r_start, r_end, r in rates if r_start <= start and r_end >= end)
-        if rate <= 0:
-            continue
-        quantity = rate * _interval_seconds(start, end)
-        if intervals and intervals[-1][1] == start:
-            previous_start, _, previous_quantity = intervals[-1]
-            intervals[-1] = (previous_start, end, previous_quantity + quantity)
-        else:
-            intervals.append((start, end, quantity))
-    return intervals
-
-
-def _final_heartbeat(
-    metering: MeteringCollector, bmi_id: str, deletion: datetime, *, meter: str
-) -> dict[str, Any] | None:
-    """The latest typed heartbeat of one meter once its interval reaches the deletion."""
-    latest_end: datetime | None = None
-    latest: dict[str, Any] | None = None
-    for event in _typed_heartbeats(metering, bmi_id, meter):
-        _, to, _ = _usage_interval(event)
-        if latest_end is None or to > latest_end:
-            latest_end, latest = to, event
-    if latest is None or latest_end is None or latest_end < deletion - CR_STAMP_TOLERANCE:
-        return None
-    return latest
 
 
 def _typed_heartbeats(metering: MeteringCollector, bmi_id: str, meter: str) -> list[dict[str, Any]]:
@@ -125,13 +68,13 @@ def _assert_contiguous_exact_seconds(events: list[dict[str, Any]], meter: str) -
     """Every heartbeat bills exactly its interval; consecutive intervals touch."""
     assert events, f"no typed {meter} heartbeats to assert arithmetic on"
     for event in events:
-        start, end, quantity = _usage_interval(event)
-        assert quantity == _interval_seconds(start, end), (
+        start, end, quantity = usage_interval(event)
+        assert quantity == interval_seconds(start, end), (
             f"{meter} quantity {quantity} is not the exact length of its interval ({start}..{end})"
         )
     for previous, following in itertools.pairwise(events):
-        previous_end = _parse_time(previous["data"]["usage"]["to"])
-        following_start = _parse_time(following["data"]["usage"]["from"])
+        previous_end = parse_time(previous["data"]["usage"]["to"])
+        following_start = parse_time(following["data"]["usage"]["from"])
         assert following_start == previous_end, (
             f"{meter} billed intervals are not contiguous: {previous_end} then {following_start}"
         )
@@ -191,8 +134,8 @@ def test_baremetal_instance_bills_allocation_and_consumption(
         # Allocation bills from the moment the host was confirmed, which is at or
         # before the moment the instance started running: the allocation meter's
         # first interval cannot start after the consumption meter's.
-        allocation_start = _parse_time(allocation["data"]["usage"]["from"])
-        consumption_start = _parse_time(consumption["data"]["usage"]["from"])
+        allocation_start = parse_time(allocation["data"]["usage"]["from"])
+        consumption_start = parse_time(consumption["data"]["usage"]["from"])
         assert allocation_start <= consumption_start, (
             f"allocation starts billing at {allocation_start}, after consumption "
             f"starts at {consumption_start}: the host reservation must bill first"
@@ -204,51 +147,26 @@ def test_baremetal_instance_bills_allocation_and_consumption(
 
     assert deletion_recorded is not None, "the instance's CR was never deleted, so no deletion timestamp was recorded"
 
-    # Each meter ends at the recorded deletion: its final partial interval is
-    # billed, not dropped, and its typed heartbeats collapse into contiguous
-    # net intervals billing exactly its length. The billing end is the latest
-    # final heartbeat's own interval end: a cluster-recorded time from the
-    # metering pipeline, because the runner's wall clock skews against the
-    # pods and cannot anchor it.
-    billing_end: datetime | None = None
+    # The billing end is the meter's own last interval end across both meters,
+    # read once the heartbeat stream has gone quiet for a full round: the final
+    # partial pieces land in the first round after the fold consumes the
+    # deletion, and reading the end earlier anchors on an intermediate round,
+    # making the final piece read as billing past the anchor.
+    billing_end = metering.wait_for_billing_end(bmi_id)
+
+    # Each meter ends at or after the recorded deletion: its final partial
+    # interval is billed, not dropped, and its typed heartbeats collapse into
+    # contiguous net intervals billing exactly one second per second.
     for meter in ("allocation", "consumption"):
-        final = poll_until(
-            fn=lambda meter=meter: _final_heartbeat(metering, bmi_id, deletion_recorded, meter=meter),
-            until=lambda event: event is not None,
-            retries=HEARTBEAT_TIMEOUT // 10,
-            delay=10,
-            description=f"final partial-interval {meter} heartbeat of {bmi_id}",
-        )
-        _, final_to, _ = _usage_interval(final)
-        if billing_end is None or final_to > billing_end:
-            billing_end = final_to
-
-        net = _net_intervals(_typed_heartbeats(metering, bmi_id, meter))
-        assert net, f"no typed {meter} heartbeats of {bmi_id} to assert the billed life on"
-        for start, end, quantity in net:
-            assert quantity == _interval_seconds(start, end), (
-                f"{meter} net interval {start}..{end} bills {quantity}, not its exact length in seconds"
-            )
-        for (_, previous_end, _), (start, _, _) in itertools.pairwise(net):
-            assert start == previous_end, f"{meter} billed intervals are not contiguous: {previous_end} then {start}"
-        assert net[-1][1] >= deletion_recorded - CR_STAMP_TOLERANCE, (
-            f"the final {meter} interval ends at {net[-1][1]}, before the recorded "
-            f"deletion at {deletion_recorded}: the partial final interval was dropped"
+        assert_exact_contiguous_life(
+            _typed_heartbeats(metering, bmi_id, meter),
+            multiplier=Decimal(1),
+            deletion=deletion_recorded,
+            label=f"typed {meter} heartbeats of {bmi_id}",
         )
 
-    # Nothing bills past the billing end, on either meter: a round that keeps
-    # billing past it lands past this anchor, and a correction that follows
-    # cancels it, so the poll passes only once both meters stop or take their
-    # over-bill back.
-    poll_until(
-        fn=lambda: net_usage_past_by_dimension(metering.get_all_events(HEARTBEAT_TYPE, bmi_id), past=billing_end),
-        until=lambda nets: all(abs(net) <= 1 for net in nets.values()),
-        retries=HEARTBEAT_TIMEOUT // 10,
-        delay=10,
-        description=f"net billing of {bmi_id} to end at {billing_end}",
-    )
-
-    # Past the final interval nothing more arrives: both meters stopped.
+    # Nothing bills past the end, and past the final interval nothing more
+    # arrives: both meters stopped.
     metering.assert_no_events(HEARTBEAT_TYPE, bmi_id, since=billing_end.isoformat(), within=180)
 
 
@@ -271,7 +189,7 @@ def _delete_bmi(cli: OsacCLI, grpc: GRPCClient, k8s: K8sClient, *, uuid: str, cr
                 with contextlib.suppress(Exception):
                     cli.delete_baremetal_instance(uuid=uuid)
                 with contextlib.suppress(Exception):
-                    deletion_recorded = _parse_time(
+                    deletion_recorded = parse_time(
                         poll_until(
                             fn=deletion_stamp,
                             until=lambda stamp: bool(stamp),

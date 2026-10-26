@@ -6,7 +6,7 @@ from typing import Any
 
 import pytest
 
-from tests.e2e.core.metering import HEARTBEAT_TYPE, MeteringCollector
+from tests.e2e.core.metering import HEARTBEAT_TYPE, MeteringCollector, parse_time
 
 
 def _heartbeat(
@@ -122,3 +122,42 @@ def test_verify_rejects_a_heartbeat_that_loses_the_dimension_after_it_landed(
     collector.expect(HEARTBEAT_TYPE, "vm-7")
     with pytest.raises(AssertionError, match="instance_type"):
         collector.verify()
+
+
+def test_wait_for_billing_end_returns_the_latest_end_once_quiet(
+    collector: MeteringCollector, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The billing end is the latest interval end, read only once no new heartbeat
+    arrives for the quiet window: a late final piece moves the end instead of
+    reading as billing past an intermediate round's end."""
+    rounds = [
+        [_heartbeat(minute=minute) for minute in range(5)],
+        [_heartbeat(minute=minute) for minute in range(5)],
+        [_heartbeat(minute=minute) for minute in range(7)],
+        [_heartbeat(minute=minute) for minute in range(7)],
+    ]
+    calls = list(rounds)
+
+    def fetch(event_type: str, resource_id: str) -> list[dict[str, Any]]:
+        return calls.pop(0) if calls else rounds[-1]
+
+    clock = _AdvancingClock(step_seconds=30)
+    monkeypatch.setattr(collector, "_fetch_events", fetch)
+    monkeypatch.setattr("time.sleep", lambda seconds: None)
+    monkeypatch.setattr("time.monotonic", clock)
+
+    end = collector.wait_for_billing_end("vm-7", quiet=90, timeout=300)
+    assert end == parse_time("2026-10-05T10:07:00Z")
+
+
+class _AdvancingClock:
+    """A monotonic clock that advances a fixed step per call, so quiet windows pass
+    without the test sleeping through them."""
+
+    def __init__(self, *, step_seconds: int) -> None:
+        self._step = step_seconds
+        self._now = 1000.0
+
+    def __call__(self) -> float:
+        self._now += self._step
+        return self._now

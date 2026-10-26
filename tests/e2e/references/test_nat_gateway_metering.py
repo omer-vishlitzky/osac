@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import itertools
-from datetime import datetime, timedelta
+from datetime import datetime
 from decimal import Decimal
 from typing import Any
 from uuid import uuid4
@@ -24,77 +24,21 @@ from tests.e2e.core.helpers import (
     wait_for_nat_gateway_deletion,
 )
 from tests.e2e.core.k8s_client import K8sClient
-from tests.e2e.core.metering import HEARTBEAT_TYPE, MeteringCollector, net_usage_past_by_dimension
+from tests.e2e.core.metering import (
+    HEARTBEAT_TYPE,
+    MeteringCollector,
+    assert_exact_contiguous_life,
+    interval_seconds,
+    parse_time,
+    usage_interval,
+)
 from tests.e2e.core.runner import poll_until
 
 pytestmark = pytest.mark.metering
 
 HEARTBEAT_TIMEOUT: int = 300
 
-# The recorded deletion stamp and the heartbeat interval end come from
-# different pods, each truncating to whole seconds: comparisons between the
-# two allow one second, like the compute metering test's tolerance.
-CR_STAMP_TOLERANCE = timedelta(seconds=1)
 
-
-def _parse_time(value: str) -> datetime:
-    if value.endswith("Z"):
-        value = value[:-1] + "+00:00"
-    return datetime.fromisoformat(value)
-
-
-def _usage_interval(event: dict[str, Any]) -> tuple[datetime, datetime, Decimal]:
-    usage = event["data"]["usage"]
-    return _parse_time(usage["from"]), _parse_time(usage["to"]), Decimal(usage["quantity"])
-
-
-def _interval_seconds(start: datetime, end: datetime) -> Decimal:
-    delta = end - start
-    micros = (delta.days * 86400 + delta.seconds) * 1_000_000 + delta.microseconds
-    return Decimal(micros) / Decimal(1_000_000)
-
-
-def _net_intervals(events: list[dict[str, Any]]) -> list[tuple[datetime, datetime, Decimal]]:
-    """Collapse signed heartbeats into the intervals the meter actually bills.
-
-    Each heartbeat bills its quantity over its usage interval and a negative
-    correction cancels the overlap, so a canceled tail disappears from the net
-    instead of showing up as a gap or an overlap between raw intervals.
-    Return the contiguous net-billed intervals with their net quantity.
-    """
-    rates = [
-        (start, end, quantity / _interval_seconds(start, end))
-        for start, end, quantity in (_usage_interval(event) for event in events)
-    ]
-    boundaries = sorted({moment for start, end, _ in rates for moment in (start, end)})
-    intervals: list[tuple[datetime, datetime, Decimal]] = []
-    for start, end in itertools.pairwise(boundaries):
-        rate = sum(r for r_start, r_end, r in rates if r_start <= start and r_end >= end)
-        if rate <= 0:
-            continue
-        quantity = rate * _interval_seconds(start, end)
-        if intervals and intervals[-1][1] == start:
-            previous_start, _, previous_quantity = intervals[-1]
-            intervals[-1] = (previous_start, end, previous_quantity + quantity)
-        else:
-            intervals.append((start, end, quantity))
-    return intervals
-
-
-def _final_heartbeat(metering: MeteringCollector, nat_id: str, deletion: datetime) -> dict[str, Any] | None:
-    """The latest heartbeat once its interval reaches the recorded deletion."""
-    latest_end: datetime | None = None
-    latest: dict[str, Any] | None = None
-    for event in metering.get_all_events(HEARTBEAT_TYPE, nat_id):
-        _, to, _ = _usage_interval(event)
-        if latest_end is None or to > latest_end:
-            latest_end, latest = to, event
-    if latest is None or latest_end is None or latest_end < deletion - CR_STAMP_TOLERANCE:
-        return None
-    return latest
-
-
-@pytest.mark.requires_bmaas
 def test_nat_gateway_bills_allocation(
     grpc: GRPCClient,
     k8s_hub_client: K8sClient,
@@ -171,13 +115,13 @@ def test_nat_gateway_bills_allocation(
             metering.get_all_events(HEARTBEAT_TYPE, nat_id), key=lambda event: event["data"]["usage"]["from"]
         )
         for event in events:
-            start, end, quantity = _usage_interval(event)
-            assert quantity == _interval_seconds(start, end), (
+            start, end, quantity = usage_interval(event)
+            assert quantity == interval_seconds(start, end), (
                 f"quantity {quantity} is not the exact length of its interval ({start}..{end})"
             )
         for previous, following in itertools.pairwise(events):
-            previous_end = _parse_time(previous["data"]["usage"]["to"])
-            following_start = _parse_time(following["data"]["usage"]["from"])
+            previous_end = parse_time(previous["data"]["usage"]["to"])
+            following_start = parse_time(following["data"]["usage"]["from"])
             assert following_start == previous_end, (
                 f"billed intervals are not contiguous: {previous_end} then {following_start}"
             )
@@ -196,52 +140,25 @@ def test_nat_gateway_bills_allocation(
             "the NATGateway CR was never deleted, so no deletion timestamp was recorded"
         )
 
-        # The final heartbeat covers the partial interval up to the recorded
-        # deletion, so its interval ends at that timestamp: it arrives only in
-        # the round after the delete, so poll for it.
-        final = poll_until(
-            fn=lambda: _final_heartbeat(metering, nat_id, deletion_recorded),
-            until=lambda event: event is not None,
-            retries=HEARTBEAT_TIMEOUT // 10,
-            delay=10,
-            description=f"final partial-interval heartbeat of NATGateway {nat_id}",
-        )
-
-        # The billing end is the final heartbeat's own interval end: a
-        # cluster-recorded time from the metering pipeline. The runner's wall
-        # clock cannot anchor it, because the runner and the pods skew.
-        _, billing_end, _ = _usage_interval(final)
+        # The billing end is the meter's own last interval end, read once the
+        # heartbeat stream has gone quiet for a full round: the final partial
+        # piece lands in the first round after the fold consumes the deletion,
+        # and reading the end earlier anchors on an intermediate round, making
+        # the final piece read as billing past the anchor.
+        billing_end = metering.wait_for_billing_end(nat_id)
 
         # The billed life is exact: the heartbeats collapse into contiguous net
-        # intervals, each billing exactly its length in seconds, and the last
-        # interval reaches the recorded deletion, so a dropped final partial
-        # interval or a stale-phase overrun cannot pass.
-        net = _net_intervals(metering.get_all_events(HEARTBEAT_TYPE, nat_id))
-        assert net, f"no heartbeats of {nat_id} to assert the billed life on"
-        for start, end, quantity in net:
-            assert quantity == _interval_seconds(start, end), (
-                f"net interval {start}..{end} bills {quantity}, not its exact length in seconds"
-            )
-        for (_, previous_end, _), (start, _, _) in itertools.pairwise(net):
-            assert start == previous_end, f"billed intervals are not contiguous: {previous_end} then {start}"
-        assert net[-1][1] >= deletion_recorded - CR_STAMP_TOLERANCE, (
-            f"the final interval ends at {net[-1][1]}, before the recorded deletion "
-            f"at {deletion_recorded}: the partial final interval was dropped"
+        # intervals, each billing exactly one second per second, and the last
+        # interval reaches the recorded deletion.
+        assert_exact_contiguous_life(
+            metering.get_all_events(HEARTBEAT_TYPE, nat_id),
+            multiplier=Decimal(1),
+            deletion=deletion_recorded,
+            label=f"heartbeats of NATGateway {nat_id}",
         )
 
-        # Nothing bills past the billing end: a round that keeps billing past
-        # it lands past this anchor, and a correction that follows cancels it,
-        # so the poll passes only once the meter stops or takes its over-bill
-        # back.
-        poll_until(
-            fn=lambda: net_usage_past_by_dimension(metering.get_all_events(HEARTBEAT_TYPE, nat_id), past=billing_end),
-            until=lambda nets: all(abs(net) <= 1 for net in nets.values()),
-            retries=HEARTBEAT_TIMEOUT // 10,
-            delay=10,
-            description=f"net billing of {nat_id} to end at {billing_end}",
-        )
-
-        # Past the final interval nothing more arrives: the meter stopped.
+        # Nothing bills past the end, and past the final interval nothing more
+        # arrives: the meter stopped.
         metering.assert_no_events(HEARTBEAT_TYPE, nat_id, since=billing_end.isoformat(), within=120)
 
 
@@ -264,7 +181,7 @@ def _delete_nat_gateway(grpc: GRPCClient, k8s: K8sClient, *, nat_id: str, cr_nam
                 with contextlib.suppress(Exception):
                     grpc.delete_nat_gateway(nat_gateway_id=nat_id)
                 with contextlib.suppress(Exception):
-                    deletion_recorded = _parse_time(
+                    deletion_recorded = parse_time(
                         poll_until(
                             fn=deletion_stamp,
                             until=lambda stamp: bool(stamp),

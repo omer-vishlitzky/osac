@@ -34,7 +34,15 @@ from tests.e2e.core.helpers import (
     wait_for_virtual_network_ready,
 )
 from tests.e2e.core.k8s_client import K8sClient
-from tests.e2e.core.metering import HEARTBEAT_TYPE, MeteringCollector, net_usage_past_by_dimension, parse_time
+from tests.e2e.core.metering import (
+    HEARTBEAT_TYPE,
+    MeteringCollector,
+    interval_seconds,
+    net_intervals,
+    net_usage_past_by_dimension,
+    parse_time,
+    usage_interval,
+)
 from tests.e2e.core.osac_cli import OsacCLI
 from tests.e2e.core.runner import poll_until
 
@@ -190,51 +198,6 @@ def _delete_vm(cli: OsacCLI, grpc: GRPCClient, k8s: K8sClient, *, uuid: str, ci_
     return deletion_recorded
 
 
-def _usage_interval(event: dict[str, Any]) -> tuple[datetime, datetime, Decimal]:
-    """Return one heartbeat's usage interval and quantity."""
-    usage = event["data"]["usage"]
-    return parse_time(usage["from"]), parse_time(usage["to"]), Decimal(usage["quantity"])
-
-
-def _interval_seconds(start: datetime, end: datetime) -> Decimal:
-    """Return the exact interval length in seconds.
-
-    Heartbeat boundaries are whole seconds, but quantities still carry six
-    decimals; building the value through ``total_seconds()`` goes via a binary
-    float and can differ from the exact decimal, failing correct billing.
-    """
-    delta = end - start
-    micros = (delta.days * 86400 + delta.seconds) * 1_000_000 + delta.microseconds
-    return Decimal(micros) / Decimal(1_000_000)
-
-
-def _net_intervals(events: list[dict[str, Any]]) -> list[tuple[datetime, datetime, Decimal]]:
-    """Collapse signed heartbeats into the intervals the meter actually bills.
-
-    Each heartbeat bills its quantity over its usage interval and a negative
-    correction cancels the overlap, so a canceled tail disappears from the net
-    instead of showing up as a gap or an overlap between raw intervals.
-    Return the contiguous net-billed intervals with their net quantity.
-    """
-    rates = [
-        (start, end, quantity / _interval_seconds(start, end))
-        for start, end, quantity in (_usage_interval(event) for event in events)
-    ]
-    boundaries = sorted({moment for start, end, _ in rates for moment in (start, end)})
-    intervals: list[tuple[datetime, datetime, Decimal]] = []
-    for start, end in itertools.pairwise(boundaries):
-        rate = sum(r for r_start, r_end, r in rates if r_start <= start and r_end >= end)
-        if rate <= 0:
-            continue
-        quantity = rate * _interval_seconds(start, end)
-        if intervals and intervals[-1][1] == start:
-            previous_start, _, previous_quantity = intervals[-1]
-            intervals[-1] = (previous_start, end, previous_quantity + quantity)
-        else:
-            intervals.append((start, end, quantity))
-    return intervals
-
-
 @pytest.mark.metering
 def test_metering_heartbeat_envelope(
     cli: OsacCLI,
@@ -279,7 +242,7 @@ def test_metering_heartbeat_envelope(
         assert data["billing_dimensions"]["project"] == metering_project, (
             f"project dimension is {data['billing_dimensions'].get('project')!r}, want {metering_project!r}"
         )
-        _, _, quantity = _usage_interval(heartbeat)
+        _, _, quantity = usage_interval(heartbeat)
         assert quantity > 0, f"quantity is not positive: {quantity}"
 
         # Billing continues while the VM runs: a second typed heartbeat arrives.
@@ -369,7 +332,7 @@ def test_metering_stop_ends_billing(
             delay=10,
             description=f"final partial-interval heartbeat of {uuid}",
         )
-        _, final_to, _ = _usage_interval(final)
+        _, final_to, _ = usage_interval(final)
 
         # The net billing ends at the recorded stop, not at the round that
         # observed it: a round that ran before the stop was folded sends a full
@@ -394,7 +357,7 @@ def _final_heartbeat(metering: MeteringCollector, resource_id: str, halt: dateti
     latest_end: datetime | None = None
     latest: dict[str, Any] | None = None
     for event in metering.get_all_events(HEARTBEAT_TYPE, resource_id):
-        _, to, _ = _usage_interval(event)
+        _, to, _ = usage_interval(event)
         if latest_end is None or to > latest_end:
             latest_end, latest = to, event
     if latest is None or latest_end is None or latest_end < halt - CR_STAMP_TOLERANCE:
@@ -473,7 +436,7 @@ def test_metering_resize_splits_dimensions(
             events = metering.get_all_events(HEARTBEAT_TYPE, uuid)
             old = [e for e in events if e["data"]["billing_dimensions"].get("instance_type") == old_type]
             new = [e for e in events if e["data"]["billing_dimensions"].get("instance_type") == new_type]
-            return _net_intervals(old), _net_intervals(new)
+            return net_intervals(old), net_intervals(new)
 
         # The old meter's tail correction is a separate event from the new
         # meter's first heartbeat and can arrive a round later: poll until the
@@ -533,7 +496,7 @@ def test_metering_resize_splits_dimensions(
         # dimension heartbeats arrive within a full round past the split.
         time.sleep(90)
         events = metering.get_all_events(HEARTBEAT_TYPE, uuid)
-        old_after = _net_intervals(
+        old_after = net_intervals(
             [event for event in events if event["data"]["billing_dimensions"].get("instance_type") == old_type]
         )
         assert all(to <= new_start for _, to, _ in old_after), (
@@ -591,7 +554,7 @@ def test_metering_delete_ends_billing(
             uuid, {"instance_type": cli.default_instance_type}, timeout=HEARTBEAT_TIMEOUT
         )
         metering.verify_event(heartbeat, resource_id=uuid)
-        running_since, _, _ = _usage_interval(heartbeat)
+        running_since, _, _ = usage_interval(heartbeat)
 
         deletion_recorded = _delete_vm(cli, grpc, k8s_hub_client, uuid=uuid, ci_name=ci_name)
         assert deletion_recorded is not None, "the running VM's CR vanished before its deletion timestamp was read"
@@ -609,7 +572,7 @@ def test_metering_delete_ends_billing(
             delay=10,
             description=f"final partial-interval heartbeat of {uuid}",
         )
-        _, final_to, _ = _usage_interval(final)
+        _, final_to, _ = usage_interval(final)
 
         # The billed life is exact: the typed heartbeats collapse into contiguous
         # net intervals, each billing exactly its length in seconds, so the total
@@ -619,17 +582,17 @@ def test_metering_delete_ends_billing(
             for event in metering.get_all_events(HEARTBEAT_TYPE, uuid)
             if event["data"]["billing_dimensions"].get("instance_type")
         ]
-        net = _net_intervals(typed)
+        net = net_intervals(typed)
         assert net, f"no typed heartbeats of {uuid} to assert the billed life on"
         for start, end, quantity in net:
-            assert quantity == _interval_seconds(start, end), (
+            assert quantity == interval_seconds(start, end), (
                 f"net interval {start}..{end} bills {quantity}, not its exact length"
             )
         for (_, previous_end, _), (start, _, _) in itertools.pairwise(net):
             assert start == previous_end, f"billed intervals are not contiguous: {previous_end} then {start}"
         billed_total = sum((quantity for _, _, quantity in net), Decimal(0))
-        assert billed_total == _interval_seconds(net[0][0], net[-1][1]), (
-            f"the billed total {billed_total} does not equal the billed span {_interval_seconds(net[0][0], net[-1][1])}"
+        assert billed_total == interval_seconds(net[0][0], net[-1][1]), (
+            f"the billed total {billed_total} does not equal the billed span {interval_seconds(net[0][0], net[-1][1])}"
         )
         assert net[-1][1] >= deletion_recorded - CR_STAMP_TOLERANCE, (
             f"the final interval ends at {net[-1][1]}, before the recorded deletion "

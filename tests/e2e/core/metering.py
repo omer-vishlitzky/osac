@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import itertools
 import json
 import logging
 import re
 import time
 import urllib.error
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 from urllib.parse import urlencode
@@ -55,6 +56,81 @@ def parse_time(s: str) -> datetime:
     return datetime.fromisoformat(s)
 
 
+# The CR stamps the API server writes and the meter's interval boundaries both
+# carry whole seconds, but they come from different clocks: comparisons between
+# the two allow one second of cross-clock truncation.
+CR_STAMP_TOLERANCE = timedelta(seconds=1)
+
+
+def usage_interval(event: dict[str, Any]) -> tuple[datetime, datetime, Decimal]:
+    """A heartbeat's usage interval and its quantity."""
+    usage = event["data"]["usage"]
+    return parse_time(usage["from"]), parse_time(usage["to"]), Decimal(usage["quantity"])
+
+
+def interval_seconds(start: datetime, end: datetime) -> Decimal:
+    """The exact interval length in seconds, without a float round-trip.
+
+    Partial intervals carry quantities like ``37.000000``; ``total_seconds()``
+    goes via a binary float and can differ from the exact decimal.
+    """
+    delta = end - start
+    micros = (delta.days * 86400 + delta.seconds) * 1_000_000 + delta.microseconds
+    return Decimal(micros) / Decimal(1_000_000)
+
+
+def net_intervals(events: list[dict[str, Any]]) -> list[tuple[datetime, datetime, Decimal]]:
+    """Collapse signed heartbeats into the intervals the meter actually bills.
+
+    Each heartbeat bills its quantity over its usage interval and a negative
+    correction cancels the overlap, so a canceled tail disappears from the net
+    instead of showing up as a gap or an overlap between raw intervals.
+    Return the contiguous net-billed intervals with their net quantity.
+    """
+    rates = [
+        (start, end, quantity / interval_seconds(start, end))
+        for start, end, quantity in (usage_interval(event) for event in events)
+    ]
+    boundaries = sorted({moment for start, end, _ in rates for moment in (start, end)})
+    intervals: list[tuple[datetime, datetime, Decimal]] = []
+    for start, end in itertools.pairwise(boundaries):
+        rate = sum(r for r_start, r_end, r in rates if r_start <= start and r_end >= end)
+        if rate <= 0:
+            continue
+        quantity = rate * interval_seconds(start, end)
+        if intervals and intervals[-1][1] == start:
+            previous_start, _, previous_quantity = intervals[-1]
+            intervals[-1] = (previous_start, end, previous_quantity + quantity)
+        else:
+            intervals.append((start, end, quantity))
+    return intervals
+
+
+def assert_exact_contiguous_life(
+    events: list[dict[str, Any]], *, multiplier: Decimal, deletion: datetime, label: str
+) -> None:
+    """One resource's billed life is exact, contiguous, and reaches the deletion.
+
+    Every net interval bills exactly ``multiplier`` per second of its length
+    (for a volume the multiplier is its size in GiB, for allocation and
+    consumption meters it is one), consecutive intervals touch with no billed
+    gap, and the last interval reaches the recorded deletion, so a dropped
+    final partial interval or a stale-phase overrun cannot pass.
+    """
+    net = net_intervals(events)
+    assert net, f"no {label} to assert the billed life on"
+    for start, end, quantity in net:
+        assert quantity == multiplier * interval_seconds(start, end), (
+            f"net interval {start}..{end} of {label} bills {quantity}, not {multiplier} per second of its exact length"
+        )
+    for (_, previous_end, _), (start, _, _) in itertools.pairwise(net):
+        assert start == previous_end, f"billed intervals of {label} are not contiguous: {previous_end} then {start}"
+    assert net[-1][1] >= deletion - CR_STAMP_TOLERANCE, (
+        f"the final interval of {label} ends at {net[-1][1]}, before the recorded "
+        f"deletion at {deletion}: the partial final interval was dropped"
+    )
+
+
 def _matches(event: dict[str, Any], expected: ExpectedEvent) -> bool:
     return event.get("type") == expected.event_type and (
         event.get("resource_id") == expected.resource_id
@@ -74,18 +150,6 @@ def _interval_start(event: dict[str, Any]) -> datetime:
         return parse_time(text)
     except ValueError:
         return datetime.max.replace(tzinfo=UTC)
-
-
-def _exact_seconds(start: datetime, end: datetime) -> Decimal:
-    """The exact interval length in seconds, without a float round-trip.
-
-    Heartbeat boundaries are whole seconds, but proportional overlaps divide
-    interval lengths; keeping the value in decimal avoids the binary float
-    ``total_seconds()`` goes through, which can differ from the exact value.
-    """
-    delta = end - start
-    micros = (delta.days * 86400 + delta.seconds) * 1_000_000 + delta.microseconds
-    return Decimal(micros) / Decimal(1_000_000)
 
 
 def _dimension_key(event: dict[str, Any]) -> tuple[tuple[str, str], ...]:
@@ -158,8 +222,8 @@ def net_usage_past_by_dimension(
             continue
         # The quantity accrues over the interval, so the part past the moment
         # counts in the interval's proportion.
-        overlap = _exact_seconds(max(start, past), end)
-        length = _exact_seconds(start, end)
+        overlap = interval_seconds(max(start, past), end)
+        length = interval_seconds(start, end)
         key = _dimension_key(event)
         nets[key] = nets.get(key, Decimal(0)) + quantity * overlap / length
     return nets
@@ -344,6 +408,38 @@ class MeteringCollector:
     def get_all_events(self, event_type: str, resource_id: str) -> list[dict[str, Any]]:
         """Return all events matching type and resource_id (for N+1 count assertions)."""
         return self._fetch_events(event_type, resource_id)
+
+    def wait_for_billing_end(self, resource_id: str, *, quiet: int = 90, timeout: int = 300) -> datetime:
+        """The end of the resource's billed life: its latest interval end, read only
+        once the heartbeat stream has gone quiet for longer than one round.
+
+        The final partial piece lands in the first round after the fold consumes the
+        deletion, and the deletion boundary (the archive time) can sit a whole
+        deprovisioning past the CR deletion stamp the earlier rounds already reached.
+        Reading the end before the stream goes quiet anchors on an intermediate
+        round, and the final piece then reads as billing past the anchor. A round
+        emits nothing for a resource whose run ended, so a quiet window longer than
+        the round interval means the meter stopped and the latest end is final.
+        """
+        deadline = time.monotonic() + timeout
+        latest_end: datetime | None = None
+        unchanged_since: float | None = None
+        while True:
+            end: datetime | None = None
+            for event in self.get_all_events(HEARTBEAT_TYPE, resource_id):
+                to = parse_time(event["data"]["usage"]["to"])
+                if end is None or to > end:
+                    end = to
+            now = time.monotonic()
+            if end != latest_end:
+                latest_end, unchanged_since = end, now
+            if latest_end is not None and unchanged_since is not None and now - unchanged_since >= quiet:
+                return latest_end
+            if now >= deadline:
+                raise TimeoutError(
+                    f"billing of {resource_id} did not go quiet within {timeout}s: last interval end {latest_end}"
+                )
+            time.sleep(10)
 
     def heartbeat_with_dimensions(
         self,
