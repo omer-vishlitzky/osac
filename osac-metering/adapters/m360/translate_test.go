@@ -50,7 +50,7 @@ func buildHeartbeat(
 			"to":        "2026-10-05T10:01:00Z",
 			"quantity":  quantity,
 			"unit":      unit,
-			"precision": "microsecond",
+			"precision": "second",
 		},
 	}
 	if dimensions != nil {
@@ -84,7 +84,7 @@ var _ = Describe("translateEvent", func() {
 			HaveKeyWithValue("interval_to", "2026-10-05T10:01:00Z"),
 			HaveKeyWithValue("usage_quantity", "60.000000"),
 			HaveKeyWithValue("usage_unit", "second"),
-			HaveKeyWithValue("usage_precision", "microsecond"),
+			HaveKeyWithValue("usage_precision", "second"),
 			HaveKeyWithValue("instance_type", "small"),
 			HaveKeyWithValue("project", "web"),
 		))

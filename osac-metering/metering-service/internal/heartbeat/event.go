@@ -92,7 +92,7 @@ func New(
 			To:        formatTime(to),
 			Quantity:  FormatMicro(quantityMicro),
 			Unit:      unit,
-			Precision: schema.UsagePrecisionMicrosecond,
+			Precision: schema.UsagePrecisionSecond,
 		},
 		HeartbeatTime:     formatTime(heartbeatTime),
 		LastAppliedOffset: lastAppliedOffset,
@@ -166,7 +166,9 @@ func HeartbeatTime(data schema.HeartbeatData) (time.Time, error) {
 }
 
 func formatTime(moment time.Time) string {
-	return moment.UTC().Format("2006-01-02T15:04:05.999999Z07:00")
+	// Whole seconds: the coarsest source clock in the pipeline is the Kubernetes CR
+	// timestamp, and no boundary is known more finely than that.
+	return moment.UTC().Truncate(time.Second).Format("2006-01-02T15:04:05Z07:00")
 }
 
 // decodeDimensions reads the key's dimension text. Corrupted text fails the heartbeat: the

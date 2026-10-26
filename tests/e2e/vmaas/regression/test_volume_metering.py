@@ -32,9 +32,9 @@ pytestmark = [pytest.mark.regression, pytest.mark.metering]
 VOLUME_SIZE_GIB = 5
 HEARTBEAT_TIMEOUT: int = 300
 
-# The CR stamps the API server writes carry whole seconds, while heartbeat
-# intervals carry microseconds: comparisons between the two allow one second,
-# like the compute metering test's tolerance.
+# The recorded deletion stamp and the heartbeat interval end come from
+# different pods, each truncating to whole seconds: comparisons between the
+# two allow one second, like the compute metering test's tolerance.
 CR_STAMP_TOLERANCE = timedelta(seconds=1)
 
 # The topology segment the LVMS provisioner requires: a node-local volume pins
@@ -189,7 +189,7 @@ def test_volume_bills_gibibyte_seconds(
         assert data["billing_dimensions"]["project"] == metering_project
 
         # The multiplier: wait for a second heartbeat, then every typed heartbeat's
-        # quantity must equal size x the exact microsecond length of its interval,
+        # quantity must equal size x the exact length of its interval in seconds,
         # and consecutive intervals must be contiguous with no billed gap.
         poll_until(
             fn=lambda: len(_typed_heartbeats(metering, volume_id)),

@@ -43,8 +43,8 @@ LATE_DIMENSIONS: dict[str, tuple[str, ...]] = {"compute_instance": ("instance_ty
 
 _QUANTITY_RE = re.compile(r"^-?\d+\.\d{6}$")
 
-# Net usage may differ from zero by one microsecond, the heartbeat precision,
-# without being real billing.
+# Net usage past a moment is a proportional overlap, and the division can
+# leave a rounding tail smaller than this without being real billing.
 _NET_USAGE_TOLERANCE = Decimal("0.000001")
 
 
@@ -79,9 +79,9 @@ def _interval_start(event: dict[str, Any]) -> datetime:
 def _exact_seconds(start: datetime, end: datetime) -> Decimal:
     """The exact interval length in seconds, without a float round-trip.
 
-    Heartbeat precision is microsecond and partial intervals carry quantities
-    like ``37.123456``; ``total_seconds()`` goes via a binary float and can
-    differ from the exact decimal.
+    Heartbeat boundaries are whole seconds, but proportional overlaps divide
+    interval lengths; keeping the value in decimal avoids the binary float
+    ``total_seconds()`` goes through, which can differ from the exact value.
     """
     delta = end - start
     micros = (delta.days * 86400 + delta.seconds) * 1_000_000 + delta.microseconds
@@ -470,7 +470,7 @@ class MeteringCollector:
         usage = data.get("usage", {})
         assert usage.get("semantics") == "interval", f"Wrong usage semantics: {usage.get('semantics')}"
         assert usage.get("unit"), "Missing usage unit"
-        assert usage.get("precision") == "microsecond", f"Wrong usage precision: {usage.get('precision')}"
+        assert usage.get("precision") == "second", f"Wrong usage precision: {usage.get('precision')}"
         assert usage.get("from") and usage.get("to"), "Missing usage interval"
         from_dt = parse_time(usage["from"])
         to_dt = parse_time(usage["to"])

@@ -246,9 +246,10 @@ func (s *Store) GetTenantProgress(ctx context.Context, tenant string) (Progress,
 }
 
 // InsertFacts writes facts that the tenant's event carries, and moves the tenant's event offset
-// to the given next offset, in the same transaction. The offset only moves forward. Facts that
-// exist already change nothing, so applying an event twice or in any order writes the same
-// history.
+// to the given next offset, in the same transaction. The offset only moves forward. Facts are
+// consumed in log order, so a fact that exists already is updated to the arriving value: two
+// changes of one field within the same second collapse to the value the log carries last, and
+// replaying an event writes the value it already wrote.
 func InsertFacts(
 	ctx context.Context, q Querier, tenant string, facts []Fact, nextOffset int64,
 ) error {
@@ -258,7 +259,8 @@ func InsertFacts(
 			`INSERT INTO history
 			     (tenant, resource_type, resource_id, field, since, value, event_offset)
 			 VALUES ($1, $2, $3, $4, $5, $6, $7)
-			 ON CONFLICT (tenant, resource_type, resource_id, field, since) DO NOTHING`,
+			 ON CONFLICT (tenant, resource_type, resource_id, field, since)
+			 DO UPDATE SET value = EXCLUDED.value, event_offset = EXCLUDED.event_offset`,
 			tenant, fact.ResourceType, fact.ResourceID, fact.Field, fact.Since, fact.Value,
 			nextOffset,
 		)

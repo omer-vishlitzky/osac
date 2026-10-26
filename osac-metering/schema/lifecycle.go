@@ -13,15 +13,16 @@ package schema
 const SchemaVersion = "v1"
 
 const (
-	UsageSemanticsInterval    = "interval"
-	UsageSemanticsCumulative  = "cumulative"
-	UsageUnitGiByteSecond     = "gibibyte_second"
-	UsagePrecisionMicrosecond = "microsecond"
+	UsageSemanticsInterval   = "interval"
+	UsageSemanticsCumulative = "cumulative"
+	UsageUnitGiByteSecond    = "gibibyte_second"
+	UsagePrecisionSecond     = "second"
 )
 
-// Usage is the canonical usage record of a heartbeat. Timestamps are UTC and normalized to
-// microsecond precision. Quantity is fixed-point text so JSON decoding cannot turn billing
-// values into binary floating-point numbers.
+// Usage is the canonical usage record of a heartbeat. Timestamps are UTC and carry whole
+// seconds: no source clock in the pipeline is finer (Kubernetes CR timestamps truncate to
+// seconds), so finer digits would be false precision. Quantity is fixed-point text so JSON
+// decoding cannot turn billing values into binary floating-point numbers.
 type Usage struct {
 	Semantics string `json:"semantics"`
 	From      string `json:"from"`

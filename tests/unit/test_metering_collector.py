@@ -44,7 +44,7 @@ def _heartbeat(
             "usage": {
                 "semantics": "interval",
                 "unit": "second",
-                "precision": "microsecond",
+                "precision": "second",
                 "from": start,
                 "to": end,
                 "quantity": "60.000000",

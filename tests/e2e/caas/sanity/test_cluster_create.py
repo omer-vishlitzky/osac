@@ -534,7 +534,7 @@ def _heartbeat_interval(event: dict[str, Any]) -> tuple[datetime, datetime, Deci
 
 def _interval_seconds(start: datetime, end: datetime) -> Decimal:
     """The exact interval length in seconds, kept in decimal: heartbeat
-    quantities carry microseconds and a float total loses the tail."""
+    quantities carry six decimals and a float total loses the tail."""
     delta = end - start
     micros = (delta.days * 86400 + delta.seconds) * 1_000_000 + delta.microseconds
     return Decimal(micros) / Decimal(1_000_000)

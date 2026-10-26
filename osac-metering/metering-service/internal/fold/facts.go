@@ -126,8 +126,11 @@ func (e *FactExtractor) Facts(tenant string, event *privatev1.Event) ([]database
 			ResourceType: typeName,
 			ResourceID:   resourceID,
 			Field:        field,
-			Since:        since.UTC(),
-			Value:        value,
+			// Whole seconds: the payload's CR-sourced times truncate to seconds at
+			// the source, and the database-clock stamps (creation, deletion envelope)
+			// are normalized here so every fact boundary carries the same precision.
+			Since: since.UTC().Truncate(time.Second),
+			Value: value,
 		})
 	}
 

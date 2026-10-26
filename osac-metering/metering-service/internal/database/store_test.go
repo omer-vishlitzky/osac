@@ -11,6 +11,7 @@ package database_test
 
 import (
 	"context"
+
 	"testing"
 	"time"
 
@@ -73,6 +74,68 @@ func TestStoreFactsAndProgressAreIdempotent(t *testing.T) {
 	}
 	if progress.EventOffset != 5 {
 		t.Errorf("expected event offset 5, got %d", progress.EventOffset)
+	}
+}
+
+// TestInsertFactsLastValueWithinOneSecondWins pins the whole-second collapse: two
+// changes of one field whose times truncate to the same second are one history row,
+// carrying the value the log applied last.
+func TestInsertFactsLastValueWithinOneSecondWins(t *testing.T) {
+	ctx := context.Background()
+	_, pool := startDatabase(t)
+
+	store := database.NewStore(pool)
+
+	if err := store.EnsureProgress(ctx, "acme"); err != nil {
+		t.Fatalf("ensure progress: %v", err)
+	}
+
+	base := time.Date(2026, 10, 5, 10, 0, 0, 0, time.UTC)
+	first := []database.Fact{
+		{ResourceType: "ComputeInstance", ResourceID: "vm-7", Field: "created",
+			Since: base, Value: "true"},
+		{ResourceType: "ComputeInstance", ResourceID: "vm-7", Field: "status.state",
+			Since: base, Value: "STARTING"},
+	}
+	second := []database.Fact{
+		{ResourceType: "ComputeInstance", ResourceID: "vm-7", Field: "status.state",
+			Since: base, Value: "RUNNING"},
+	}
+
+	for i, facts := range [][]database.Fact{first, second} {
+		tx, err := store.Begin(ctx)
+		if err != nil {
+			t.Fatalf("begin: %v", err)
+		}
+		if err := database.InsertFacts(ctx, tx, "acme", facts, int64(i+1)); err != nil {
+			t.Fatalf("insert facts %d: %v", i+1, err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			t.Fatalf("commit: %v", err)
+		}
+	}
+
+	got, err := database.ResourceFacts(ctx, pool, "acme", "ComputeInstance", "vm-7")
+	if err != nil {
+		t.Fatalf("read facts: %v", err)
+	}
+	// The fold truncates fact times to whole seconds, so two changes of one
+	// field within a second arrive with the same since: the row carries the
+	// value the log applied last.
+	want := []database.Fact{
+		{ResourceType: "ComputeInstance", ResourceID: "vm-7", Field: "created",
+			Since: base, Value: "true"},
+		{ResourceType: "ComputeInstance", ResourceID: "vm-7", Field: "status.state",
+			Since: base, Value: "RUNNING"},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("expected %d facts, got %+v", len(want), got)
+	}
+	for i := range want {
+		if got[i].Field != want[i].Field || got[i].Value != want[i].Value ||
+			!got[i].Since.Equal(want[i].Since) {
+			t.Fatalf("fact %d: expected %+v, got %+v", i, want[i], got[i])
+		}
 	}
 }
 

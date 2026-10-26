@@ -71,7 +71,7 @@ def _heartbeat(
             "usage": {
                 "semantics": "interval",
                 "unit": "second",
-                "precision": "microsecond",
+                "precision": "second",
                 "from": start.isoformat(),
                 "to": end.isoformat(),
                 "quantity": quantity,

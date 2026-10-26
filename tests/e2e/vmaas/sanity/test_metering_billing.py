@@ -43,9 +43,9 @@ pytestmark = pytest.mark.sanity
 # A round ticks every 60s; heartbeats may need a few rounds to surface.
 HEARTBEAT_TIMEOUT: int = 180
 
-# The CR stamps the API server writes carry whole seconds, while heartbeat
-# intervals carry microseconds: comparisons between the two allow one second,
-# like the stop test's net-usage tolerance.
+# The recorded stamp and the heartbeat interval end come from different
+# pods, each truncating to whole seconds: comparisons between the two allow
+# one second, like the stop test's net-usage tolerance.
 CR_STAMP_TOLERANCE = timedelta(seconds=1)
 
 RESIZE_IT_VCPUS: int = 4
@@ -199,8 +199,8 @@ def _usage_interval(event: dict[str, Any]) -> tuple[datetime, datetime, Decimal]
 def _interval_seconds(start: datetime, end: datetime) -> Decimal:
     """Return the exact interval length in seconds.
 
-    Heartbeat precision is microsecond and partial intervals carry quantities like
-    ``37.123456``; building the value through ``total_seconds()`` goes via a binary
+    Heartbeat boundaries are whole seconds, but quantities still carry six
+    decimals; building the value through ``total_seconds()`` goes via a binary
     float and can differ from the exact decimal, failing correct billing.
     """
     delta = end - start

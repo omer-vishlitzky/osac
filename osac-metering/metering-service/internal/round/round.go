@@ -144,12 +144,15 @@ func (r *Round) RunTenant(ctx context.Context, tenant string, interval time.Dura
 		case <-ticker.C:
 			// The round time comes from PostgreSQL's clock, so all pods agree on it.
 			// A pod whose clock is too far from the database's skips its round rather
-			// than compute at a time the database cannot confirm.
+			// than compute at a time the database cannot confirm. Truncated to whole
+			// seconds: every fact boundary is second-granular, and finer round times
+			// would only put fractional digits on interval ends.
 			roundTime, err := r.store.Clock(ctx)
 			if err != nil {
 				r.logger.Error(err, "reading the round clock", "tenant", tenant)
 				continue
 			}
+			roundTime = roundTime.Truncate(time.Second)
 			if clockSkewTooLarge(time.Now(), roundTime) {
 				r.logger.Error(
 					nil, "pod clock is too far from the database clock; skipping round",

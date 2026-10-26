@@ -1630,16 +1630,17 @@ func TestRebuildRecoversAPartiallyDeliveredRound(t *testing.T) {
 	}
 }
 
-// TestRebuildKeepsAPendingOpenRun checks that a rebuild recreates the open-run marker of
-// a VM whose run was too short to emit a heartbeat: the marker lived only in the lost
-// database, and without it a running VM with no new facts bills nothing ever again.
-func TestRebuildKeepsAPendingOpenRun(t *testing.T) {
+// TestRebuildBillsARunWithoutAHeartbeat checks that a rebuild bills a VM whose run opened
+// at the round's own second: the first round had no elapsed run to bill, so no heartbeat
+// of the VM's own reached the topic, and the run's whole bill lives only in the history
+// the restored database keeps.
+func TestRebuildBillsARunWithoutAHeartbeat(t *testing.T) {
 	tenant := "pending-run"
 	p := pipelinetest.NewPipeline(t, tenant)
 
-	// vm-mature has run two minutes; vm-young started half a second before the round,
-	// too short to emit a heartbeat of its own.
-	young := base.Add(2*time.Minute - 500*time.Millisecond)
+	// vm-mature has run two minutes; vm-young started at the round's own second, so
+	// the round has no elapsed run of its own to bill yet.
+	young := base.Add(2 * time.Minute)
 	total := testenv.ProduceEvents(t, tenant, []*privatev1.Event{
 		testenv.VMEventOf("vm-mature", "m1", privatev1.EventType_EVENT_TYPE_OBJECT_CREATED,
 			base, base, "web", "RUNNING", base, "small", base),
@@ -1649,12 +1650,13 @@ func TestRebuildKeepsAPendingOpenRun(t *testing.T) {
 	p.FoldAll(t, total)
 	backup := snapshot(t, p.Store, tenant)
 
-	// The round bills vm-mature and leaves vm-young pending. The round is fully
-	// delivered, then the database is lost.
+	// The round bills vm-mature only: vm-young's run opens at the round's own second,
+	// so it emits no heartbeat. The round is fully delivered, then the database is lost.
 	p.RoundAt(t, base.Add(2*time.Minute))
 	rows := pendingHeartbeats(t, p.Store, tenant)
 	if len(rows) != 1 {
-		t.Fatalf("a 500 ms run must emit no heartbeat, got %d", len(rows))
+		t.Fatalf("a run that opens at the round's own second must emit no heartbeat, "+
+			"got %d", len(rows))
 	}
 	deliver(t, tenant, rows...)
 
@@ -1667,9 +1669,9 @@ func TestRebuildKeepsAPendingOpenRun(t *testing.T) {
 	if got := billedMicro(t, tenant, "vm-mature"); got != 240_000_000 {
 		t.Fatalf("vm-mature billed %d micro, want 240000000", got)
 	}
-	if got := billedMicro(t, tenant, "vm-young"); got != 120_500_000 {
-		t.Fatalf("a pending open run the rebuild must recreate: vm-young billed "+
-			"%d micro, want 120500000", got)
+	if got := billedMicro(t, tenant, "vm-young"); got != 120_000_000 {
+		t.Fatalf("a run without a heartbeat of its own the rebuild must still bill: "+
+			"vm-young billed %d micro, want 120000000", got)
 	}
 }
 

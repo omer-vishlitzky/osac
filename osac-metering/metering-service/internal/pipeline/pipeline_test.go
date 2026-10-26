@@ -98,7 +98,7 @@ func checkEnvelope(
 	if data.Usage.Unit != unit {
 		t.Fatalf("usage unit is %q, want %q", data.Usage.Unit, unit)
 	}
-	if data.Usage.Precision != schema.UsagePrecisionMicrosecond {
+	if data.Usage.Precision != schema.UsagePrecisionSecond {
 		t.Fatalf("usage precision is %q", data.Usage.Precision)
 	}
 	if data.BillingDimensions["deployment"] != deploymentID {

@@ -33,9 +33,9 @@ pytestmark = [pytest.mark.sanity, pytest.mark.metering]
 
 HEARTBEAT_TIMEOUT: int = 600
 
-# The CR stamps the API server writes carry whole seconds, while heartbeat
-# intervals carry microseconds: comparisons between the two allow one second,
-# like the compute metering test's tolerance.
+# The recorded deletion stamp and the heartbeat interval end come from
+# different pods, each truncating to whole seconds: comparisons between the
+# two allow one second, like the compute metering test's tolerance.
 CR_STAMP_TOLERANCE = timedelta(seconds=1)
 
 

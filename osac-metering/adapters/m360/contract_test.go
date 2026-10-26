@@ -122,7 +122,7 @@ func TestBillingProviderContract(t *testing.T) {
 				To:        to.Format(time.RFC3339Nano),
 				Quantity:  quantity,
 				Unit:      "second",
-				Precision: schema.UsagePrecisionMicrosecond,
+				Precision: schema.UsagePrecisionSecond,
 			},
 		}
 		if err := ce.SetData(cloudevents.ApplicationJSON, data); err != nil {
@@ -177,7 +177,7 @@ func TestBillingProviderContract(t *testing.T) {
 			"tenant_id": tenant, "resource_type": schema.ResourceTypeComputeInstance,
 			"resource_id": "contract-test-vm", "meter": "compute", "component": "compute",
 			"usage": schema.Usage{Semantics: "interval", From: "not-a-time", To: "not-a-time",
-				Quantity: "1.000000", Unit: "second", Precision: "microsecond"},
+				Quantity: "1.000000", Unit: "second", Precision: "second"},
 		}); err != nil {
 			t.Fatalf("building invalid heartbeat: %v", err)
 		}
