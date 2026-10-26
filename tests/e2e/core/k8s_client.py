@@ -151,9 +151,12 @@ class K8sClient:
                     # The name always renders, so the first line proves the
                     # watch is established; the timestamp after the colon is
                     # empty until the delete stamps it. Object names cannot
-                    # contain colons, so splitting on the first is safe.
+                    # contain colons, so splitting on the first is safe. The
+                    # jsonpath printer emits no newline of its own, so the
+                    # template carries one: without it every watched object
+                    # concatenates into a single unterminated line.
                     "-o",
-                    "jsonpath={.metadata.name}:{.metadata.deletionTimestamp}",
+                    'jsonpath={.metadata.name}:{.metadata.deletionTimestamp}{"\\n"}',
                     "--watch",
                 ]
                 proc = subprocess.Popen(command, stdout=out, stderr=err)

@@ -284,19 +284,26 @@ def _delete_volume(grpc: GRPCClient, k8s: K8sClient, *, volume_id: str, cr_name:
         with contextlib.suppress(Exception):
             grpc.call(service=f"{PRIVATE_API}.Volumes/Delete", data={"id": volume_id})
     else:
-        with k8s.watch_deletion_timestamp(resource="volume", name=cr_name) as deletion_stamp:
+        try:
+            with k8s.watch_deletion_timestamp(resource="volume", name=cr_name) as deletion_stamp:
+                with contextlib.suppress(Exception):
+                    grpc.call(service=f"{PRIVATE_API}.Volumes/Delete", data={"id": volume_id})
+                with contextlib.suppress(Exception):
+                    deletion_recorded = _parse_time(
+                        poll_until(
+                            fn=deletion_stamp,
+                            until=lambda stamp: bool(stamp),
+                            retries=30,
+                            delay=2,
+                            description=f"deletion timestamp of Volume CR {cr_name}",
+                        )
+                    )
+        except Exception:
+            # A watch that never started must not leak the volume: the
+            # delete above never ran, so issue it now, then fail loudly.
             with contextlib.suppress(Exception):
                 grpc.call(service=f"{PRIVATE_API}.Volumes/Delete", data={"id": volume_id})
-            with contextlib.suppress(Exception):
-                deletion_recorded = _parse_time(
-                    poll_until(
-                        fn=deletion_stamp,
-                        until=lambda stamp: bool(stamp),
-                        retries=30,
-                        delay=2,
-                        description=f"deletion timestamp of Volume CR {cr_name}",
-                    )
-                )
+            raise
         with contextlib.suppress(Exception):
             poll_until(
                 fn=lambda: not k8s.is_present(resource="volume", name=cr_name),

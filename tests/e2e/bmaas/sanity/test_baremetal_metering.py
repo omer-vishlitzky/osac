@@ -266,19 +266,26 @@ def _delete_bmi(cli: OsacCLI, grpc: GRPCClient, k8s: K8sClient, *, uuid: str, cr
         with contextlib.suppress(Exception):
             cli.delete_baremetal_instance(uuid=uuid)
     else:
-        with k8s.watch_deletion_timestamp(resource="baremetalinstance", name=cr_name) as deletion_stamp:
+        try:
+            with k8s.watch_deletion_timestamp(resource="baremetalinstance", name=cr_name) as deletion_stamp:
+                with contextlib.suppress(Exception):
+                    cli.delete_baremetal_instance(uuid=uuid)
+                with contextlib.suppress(Exception):
+                    deletion_recorded = _parse_time(
+                        poll_until(
+                            fn=deletion_stamp,
+                            until=lambda stamp: bool(stamp),
+                            retries=30,
+                            delay=2,
+                            description=f"deletion timestamp of {cr_name}",
+                        )
+                    )
+        except Exception:
+            # A watch that never started must not leak the instance: the
+            # delete above never ran, so issue it now, then fail loudly.
             with contextlib.suppress(Exception):
                 cli.delete_baremetal_instance(uuid=uuid)
-            with contextlib.suppress(Exception):
-                deletion_recorded = _parse_time(
-                    poll_until(
-                        fn=deletion_stamp,
-                        until=lambda stamp: bool(stamp),
-                        retries=30,
-                        delay=2,
-                        description=f"deletion timestamp of {cr_name}",
-                    )
-                )
+            raise
         with contextlib.suppress(Exception):
             wait_for_bmi_deletion(k8s=k8s, name=cr_name)
     with contextlib.suppress(Exception):

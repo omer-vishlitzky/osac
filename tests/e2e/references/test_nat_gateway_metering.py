@@ -259,19 +259,26 @@ def _delete_nat_gateway(grpc: GRPCClient, k8s: K8sClient, *, nat_id: str, cr_nam
         with contextlib.suppress(Exception):
             grpc.delete_nat_gateway(nat_gateway_id=nat_id)
     else:
-        with k8s.watch_deletion_timestamp(resource="natgateway", name=cr_name) as deletion_stamp:
+        try:
+            with k8s.watch_deletion_timestamp(resource="natgateway", name=cr_name) as deletion_stamp:
+                with contextlib.suppress(Exception):
+                    grpc.delete_nat_gateway(nat_gateway_id=nat_id)
+                with contextlib.suppress(Exception):
+                    deletion_recorded = _parse_time(
+                        poll_until(
+                            fn=deletion_stamp,
+                            until=lambda stamp: bool(stamp),
+                            retries=30,
+                            delay=2,
+                            description=f"deletion timestamp of {cr_name}",
+                        )
+                    )
+        except Exception:
+            # A watch that never started must not leak the gateway: the
+            # delete above never ran, so issue it now, then fail loudly.
             with contextlib.suppress(Exception):
                 grpc.delete_nat_gateway(nat_gateway_id=nat_id)
-            with contextlib.suppress(Exception):
-                deletion_recorded = _parse_time(
-                    poll_until(
-                        fn=deletion_stamp,
-                        until=lambda stamp: bool(stamp),
-                        retries=30,
-                        delay=2,
-                        description=f"deletion timestamp of {cr_name}",
-                    )
-                )
+            raise
         with contextlib.suppress(Exception):
             wait_for_nat_gateway_deletion(k8s=k8s, name=cr_name)
     with contextlib.suppress(Exception):
