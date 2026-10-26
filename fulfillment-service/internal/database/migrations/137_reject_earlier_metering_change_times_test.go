@@ -165,6 +165,52 @@ var _ = DescribeMigration("Reject earlier metering change times", func() {
 		)
 	})
 
+	// The whole-second truncation tolerance: Kubernetes CR timestamps carry no fractional
+	// part, so a change observed in the same second as a stored microsecond time arrives
+	// truncated down past it. Rejecting that as backdated wedged every resource whose
+	// feedback controller reports CR times against a stored microsecond time: the writer
+	// retried the same fixed CR time forever and the resource never finished deleting.
+	It("clamps a CR-truncated time earlier within the stored second", func(ctx context.Context) {
+		insert(ctx, "vm-1", `{
+			"status": {
+				"state": "COMPUTE_INSTANCE_STATE_RUNNING",
+				"state_transition_time": "2026-01-01T10:00:00.500000Z",
+				"instance_type": {"id": "type-small"},
+				"instance_type_transition_time": "2026-01-01T10:00:00Z"
+			}
+		}`)
+		Expect(update(ctx, "vm-1", `{
+			"status": {
+				"state": "COMPUTE_INSTANCE_STATE_STOPPED",
+				"state_transition_time": "2026-01-01T10:00:00Z",
+				"instance_type": {"id": "type-small"},
+				"instance_type_transition_time": "2026-01-01T10:00:00Z"
+			}
+		}`)).To(Succeed())
+		Expect(storedPath(ctx, "vm-1", "status.state_transition_time")).To(
+			HaveValue(Equal("2026-01-01T10:00:00.500001Z")),
+		)
+	})
+
+	It("still rejects a time from before the stored second", func(ctx context.Context) {
+		insert(ctx, "vm-1", `{
+			"status": {
+				"state": "COMPUTE_INSTANCE_STATE_RUNNING",
+				"state_transition_time": "2026-01-01T10:00:00.500000Z",
+				"instance_type": {"id": "type-small"},
+				"instance_type_transition_time": "2026-01-01T10:00:00Z"
+			}
+		}`)
+		expectRejection(ctx, "vm-1", "status.state_transition_time", `{
+			"status": {
+				"state": "COMPUTE_INSTANCE_STATE_STOPPED",
+				"state_transition_time": "2026-01-01T09:59:59Z",
+				"instance_type": {"id": "type-small"},
+				"instance_type_transition_time": "2026-01-01T10:00:00Z"
+			}
+		}`, proto.String("2026-01-01T10:00:00.500000Z"))
+	})
+
 	It("keeps a supplied time that is later than the stored one", func(ctx context.Context) {
 		insert(ctx, "vm-1", runningVM)
 		Expect(update(ctx, "vm-1", `{

@@ -18,12 +18,16 @@
 -- changed value can only come from a writer that backdates the new value, so the write
 -- now rolls back with SQLSTATE 'Z0006' instead of being silently adjusted.
 --
--- A time exactly equal to the stored one keeps the clamp of migration 133: Kubernetes CR
--- timestamps truncate to whole seconds, so two changes observed in the same second
--- legitimately carry the same time through feedback, and rejecting them would block the
--- write forever. Equal clamps to the stored time plus one microsecond. A missing time
--- still rejects, and the first-time clamp against the creation fallback of migration 131
--- is unchanged.
+-- "Earlier" means a full second or more before the stored time, because no truncation
+-- can reach that far and only a backdating writer supplies it. A supplied time within
+-- the stored second is whole-second granularity, not backdating: Kubernetes CR
+-- timestamps truncate to whole seconds (metav1.Time carries no fractional part), so a
+-- change observed in the same second as the stored one arrives truncated down past the
+-- stored microseconds, and rejecting it would block the write forever -- the writer
+-- retries with the same fixed CR time and the resource can never finish deleting. Equal
+-- or truncated-earlier within the second clamps to the stored time plus one microsecond.
+-- A missing time still rejects, and the first-time clamp against the creation fallback
+-- of migration 131 is unchanged.
 
 create or replace function enforce_metering_fields() returns trigger as $$
 declare
@@ -89,19 +93,25 @@ begin
 
     if field->>'transition_time' = any(changed_times) then
       -- A value changed, so the write carries the time of the change. A missing time means
-      -- the writer does not know when the change happened, and a time earlier than the
-      -- stored one means the writer is backdating the new value: both are bugs, and the
-      -- write rolls back. A time equal to the stored one is a whole-second granularity
-      -- collision from a CR timestamp, not a bug: the write is accepted and the stored time
-      -- clamped to the old stored time plus one microsecond.
-      if new_time is null or (old_time is not null and new_time::timestamptz < old_time::timestamptz) then
+      -- the writer does not know when the change happened: a bug, and the write rolls back.
+      -- A supplied time a full second or more before the stored one can only come from a
+      -- writer backdating the new value: also a bug, and the write rolls back. Anything
+      -- within the stored second is whole-second granularity, not backdating: Kubernetes
+      -- CR timestamps truncate to whole seconds, so a change observed in the same second
+      -- as the stored one carries a time truncated down past the stored microseconds, and
+      -- rejecting it would block the write forever. Equal or truncated-earlier within the
+      -- second clamps to the stored time plus one microsecond.
+      if new_time is null or (
+        old_time is not null
+        and date_trunc('second', new_time::timestamptz) < date_trunc('second', old_time::timestamptz)
+      ) then
         raise exception using
           errcode = 'Z0006',
           message = format(
             'a change of %s ''%s'' needs a later %s',
             TG_TABLE_NAME, new.id, field->>'transition_time'
           );
-      elsif old_time is not null and new_time::timestamptz = old_time::timestamptz then
+      elsif old_time is not null and new_time::timestamptz <= old_time::timestamptz then
         clamped_time := to_char(
           (old_time::timestamptz + interval '1 microsecond') at time zone 'utc',
           'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'
