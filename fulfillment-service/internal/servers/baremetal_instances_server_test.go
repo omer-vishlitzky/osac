@@ -282,7 +282,7 @@ var _ = Describe("Bare metal instances server", func() {
 
 			// Store a state with its transition time, as the operator feedback would. The time
 			// must be after creation: the source contract clamps a first time on or before it.
-			storedTime := timestamppb.New(time.Now())
+			storedTime := timestamppb.New(time.Now().Truncate(time.Second))
 			bmiDao, err := dao.NewGenericDAO[*privatev1.BareMetalInstance]().
 				SetLogger(logger).
 				SetTenancyLogic(tenancy).
