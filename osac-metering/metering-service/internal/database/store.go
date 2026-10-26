@@ -360,6 +360,10 @@ func ResourceFacts(
 		if err := rows.Scan(&fact.Field, &fact.Since, &fact.Value); err != nil {
 			return nil, fmt.Errorf("scanning fact of %s %s: %w", resourceType, resourceID, err)
 		}
+		// pgx scans timestamptz in time.Local, while the round's computed
+		// boundaries carry UTC: a time.Time map key compares the location
+		// pointer, so the same instant from the two sources must not mix.
+		fact.Since = fact.Since.UTC()
 		facts = append(facts, fact)
 	}
 	if err := rows.Err(); err != nil {
@@ -467,6 +471,11 @@ func LedgerPiecesWhere(
 		); err != nil {
 			return nil, fmt.Errorf("scanning ledger piece of tenant %s: %w", tenant, err)
 		}
+		// pgx scans timestamptz in time.Local, while the round's computed
+		// boundaries carry UTC: a time.Time map key compares the location
+		// pointer, so the same instant from the two sources must not mix.
+		piece.StartTime = piece.StartTime.UTC()
+		piece.EndTime = piece.EndTime.UTC()
 		pieces = append(pieces, piece)
 	}
 	return pieces, rows.Err()

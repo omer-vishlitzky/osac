@@ -63,7 +63,10 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer cancel()
 
-	if err := run(ctx, logger, cfg); err != nil {
+	// A cancelled context is the ordinary SIGTERM path: the service unwound
+	// cleanly, and recording it as a failure turns every rollout and node
+	// drain into pod Error status and false error logs.
+	if err := run(ctx, logger, cfg); err != nil && !errors.Is(err, context.Canceled) {
 		logger.Error(err, "metering service exited with error")
 		os.Exit(1)
 	}

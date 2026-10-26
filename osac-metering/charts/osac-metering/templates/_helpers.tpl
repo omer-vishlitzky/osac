@@ -43,10 +43,6 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- .Values.kafka.brokers | default "osac-kafka-kafka-bootstrap.osac-kafka.svc.cluster.local:9093" }}
 {{- end -}}
 
-{{- define "osac-metering.kafkaTopic" -}}
-osac.metering.lifecycle
-{{- end -}}
-
 {{- define "osac-metering.kafkaSaslUsername" -}}
 osac-metering
 {{- end -}}

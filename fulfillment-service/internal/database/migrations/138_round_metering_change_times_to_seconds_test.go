@@ -109,6 +109,24 @@ var _ = DescribeMigration("Round metering change times to seconds", func() {
 		)
 	})
 
+	It("normalizes a microsecond time supplied at insert", func(ctx context.Context) {
+		Expect(tool.Migrate(ctx, 138)).To(Succeed())
+		insert(ctx, "vm-1", `{
+			"status": {
+				"state": "COMPUTE_INSTANCE_STATE_RUNNING",
+				"state_transition_time": "2026-01-01T10:00:00.959617599Z",
+				"instance_type": {"id": "type-small"},
+				"instance_type_transition_time": "2026-01-01T10:00:00.500000Z"
+			}
+		}`)
+		Expect(storedPath(ctx, "vm-1", "status.state_transition_time")).To(
+			HaveValue(Equal("2026-01-01T10:00:00Z")),
+		)
+		Expect(storedPath(ctx, "vm-1", "status.instance_type_transition_time")).To(
+			HaveValue(Equal("2026-01-01T10:00:00Z")),
+		)
+	})
+
 	It("normalizes a supplied microsecond time to whole seconds", func(ctx context.Context) {
 		Expect(tool.Migrate(ctx, 138)).To(Succeed())
 		insert(ctx, "vm-1", runningVM)

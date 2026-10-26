@@ -99,11 +99,28 @@ declare
   changed_times text[] := '{}';
   seen_times text[] := '{}';
 begin
-  if TG_OP != 'UPDATE' then
+  tracked := coalesce(metering_tracked_fields(TG_TABLE_NAME), '[]'::jsonb);
+
+  if TG_OP = 'INSERT' then
+    -- Normalize the supplied times to whole seconds on insert as well: a first
+    -- time has no earlier stored time to compare against, but a microsecond
+    -- first time stored verbatim would wedge the resource the same way this
+    -- migration removes for updates -- the first whole-second change after it
+    -- is earlier than the stored microseconds and rolls back forever.
+    for field in select * from jsonb_array_elements(tracked) loop
+      if field->>'kind' != 'varies' then
+        continue;
+      end if;
+      time_path := string_to_array(field->>'transition_time', '.');
+      if new.data #>> time_path is not null then
+        new.data := jsonb_set(new.data, time_path, to_jsonb(to_char(
+          date_trunc('second', (new.data #>> time_path)::timestamptz) at time zone 'utc',
+          'YYYY-MM-DD"T"HH24:MI:SS"Z"'
+        )));
+      end if;
+    end loop;
     return new;
   end if;
-
-  tracked := coalesce(metering_tracked_fields(TG_TABLE_NAME), '[]'::jsonb);
 
   -- Collect the change times whose value changed:
   for field in select * from jsonb_array_elements(tracked) loop
@@ -192,3 +209,42 @@ begin
   return new;
 end;
 $$ language plpgsql;
+
+-- The trigger migration 128 installed fires only on UPDATE, so the insert
+-- normalization above never ran: recreate it to fire on INSERT and UPDATE.
+do $$
+declare
+  tbl text;
+begin
+  for tbl in
+    select pg_catalog.pg_class.relname
+    from pg_catalog.pg_class
+    join pg_catalog.pg_namespace
+      on pg_catalog.pg_namespace.oid = pg_catalog.pg_class.relnamespace
+    where
+      pg_catalog.pg_namespace.nspname = 'public' and
+      pg_catalog.pg_class.relkind = 'r' and
+      pg_catalog.pg_class.relname not like 'active_%' and
+      pg_catalog.pg_class.relname not like 'archived_%' and
+      pg_catalog.pg_class.relname not in (
+        'changes',
+        'notifications',
+        'project_membership_subjects',
+        'schema_migrations',
+        'storage_tier_backends',
+        'tenant_domains'
+      )
+  loop
+    if metering_tracked_fields(tbl) is null then
+      continue;
+    end if;
+    execute format('drop trigger if exists enforce_metering_fields on %I', tbl);
+    execute format(
+      'create trigger enforce_metering_fields
+         before insert or update on %I
+         for each row
+         execute function enforce_metering_fields()',
+      tbl);
+  end loop;
+end;
+$$;

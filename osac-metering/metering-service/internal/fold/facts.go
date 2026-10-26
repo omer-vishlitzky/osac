@@ -327,9 +327,12 @@ func nonZero(value protoreflect.Value, descriptor protoreflect.FieldDescriptor) 
 		return value.String() != ""
 	case protoreflect.BoolKind:
 		return true
-	case protoreflect.Int32Kind, protoreflect.Int64Kind, protoreflect.Uint32Kind,
-		protoreflect.Uint64Kind:
+	case protoreflect.Int32Kind, protoreflect.Int64Kind:
 		return value.Int() != 0
+	case protoreflect.Uint32Kind, protoreflect.Uint64Kind:
+		// protoreflect.Value.Int panics on a uint-typed value, and the registry
+		// accepts uint fields, so this arm reads the uint accessor.
+		return value.Uint() != 0
 	case protoreflect.EnumKind:
 		return value.Enum() != 0
 	case protoreflect.MessageKind:
@@ -346,9 +349,12 @@ func formatValue(value protoreflect.Value, descriptor protoreflect.FieldDescript
 		return value.String()
 	case protoreflect.BoolKind:
 		return strconv.FormatBool(value.Bool())
-	case protoreflect.Int32Kind, protoreflect.Int64Kind, protoreflect.Uint32Kind,
-		protoreflect.Uint64Kind:
+	case protoreflect.Int32Kind, protoreflect.Int64Kind:
 		return strconv.FormatInt(value.Int(), 10)
+	case protoreflect.Uint32Kind, protoreflect.Uint64Kind:
+		// protoreflect.Value.Int panics on a uint-typed value, and the registry
+		// accepts uint fields, so this arm reads the uint accessor.
+		return strconv.FormatUint(value.Uint(), 10)
 	case protoreflect.EnumKind:
 		return enumShortName(value.Enum(), descriptor.Enum())
 	case protoreflect.MessageKind:
