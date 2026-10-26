@@ -51,7 +51,8 @@ func (a *retentionAdmin) DescribeConfig(resource sarama.ConfigResource) ([]saram
 func TestPrepareTopicRejectsWrongRetentionOnExistingTopic(t *testing.T) {
 	admin := &retentionAdmin{exists: true, retention: "604800000"}
 
-	err := prepareTopic(context.Background(), admin, "osac.events.acme", "-1", slog.Default())
+	publisher := &EventPublisher{logger: slog.Default(), kafkaTopicRetention: DefaultTopicRetention}
+	err := publisher.prepareTopic(context.Background(), admin, "osac.events.acme")
 
 	if err == nil || !strings.Contains(err.Error(), "fix the topic's configuration") {
 		t.Fatalf("expected the wrong retention to be refused, got %v", err)
@@ -64,7 +65,8 @@ func TestPrepareTopicRejectsWrongRetentionOnExistingTopic(t *testing.T) {
 func TestPrepareTopicAcceptsMatchingRetentionOnExistingTopic(t *testing.T) {
 	admin := &retentionAdmin{exists: true, retention: "-1"}
 
-	err := prepareTopic(context.Background(), admin, "osac.events.acme", "-1", slog.Default())
+	publisher := &EventPublisher{logger: slog.Default(), kafkaTopicRetention: DefaultTopicRetention}
+	err := publisher.prepareTopic(context.Background(), admin, "osac.events.acme")
 
 	if err != nil {
 		t.Fatalf("matching retention must be accepted, got %v", err)
@@ -77,7 +79,8 @@ func TestPrepareTopicAcceptsMatchingRetentionOnExistingTopic(t *testing.T) {
 func TestPrepareTopicSetsFullRetentionContractOnCreation(t *testing.T) {
 	admin := &retentionAdmin{}
 
-	err := prepareTopic(context.Background(), admin, "osac.events.acme", "-1", slog.Default())
+	publisher := &EventPublisher{logger: slog.Default(), kafkaTopicRetention: DefaultTopicRetention}
+	err := publisher.prepareTopic(context.Background(), admin, "osac.events.acme")
 
 	if err != nil {
 		t.Fatalf("prepareTopic: %v", err)
@@ -113,7 +116,8 @@ func TestPrepareTopicRefusesUnverifiableRetention(t *testing.T) {
 		},
 	}
 
-	err := prepareTopic(context.Background(), admin, "osac.events.acme", "-1", slog.Default())
+	publisher := &EventPublisher{logger: slog.Default(), kafkaTopicRetention: DefaultTopicRetention}
+	err := publisher.prepareTopic(context.Background(), admin, "osac.events.acme")
 
 	if err == nil || !strings.Contains(err.Error(), "DescribeConfigs") {
 		t.Fatalf("expected the denied config read to be refused, got %v", err)
@@ -129,7 +133,8 @@ func TestPrepareTopicRefusesUnverifiableRetention(t *testing.T) {
 func TestPrepareTopicContinuesWhenRetentionConfigUnreadable(t *testing.T) {
 	admin := &retentionAdmin{exists: true, configErr: sarama.ErrOutOfBrokers}
 
-	err := prepareTopic(context.Background(), admin, "osac.events.acme", "-1", slog.Default())
+	publisher := &EventPublisher{logger: slog.Default(), kafkaTopicRetention: DefaultTopicRetention}
+	err := publisher.prepareTopic(context.Background(), admin, "osac.events.acme")
 
 	if err != nil {
 		t.Fatalf("an unreadable config must be an outage, not a topic problem, got %v", err)
@@ -142,7 +147,8 @@ func TestPrepareTopicContinuesWhenRetentionConfigUnreadable(t *testing.T) {
 func TestPrepareTopicRefusesAMultiPartitionTopic(t *testing.T) {
 	admin := &multiPartitionAdmin{topic: "osac.events.acme"}
 
-	err := prepareTopic(context.Background(), admin, "osac.events.acme", "-1", slog.Default())
+	publisher := &EventPublisher{logger: slog.Default(), kafkaTopicRetention: DefaultTopicRetention}
+	err := publisher.prepareTopic(context.Background(), admin, "osac.events.acme")
 
 	if err == nil || !strings.Contains(err.Error(), "2 partitions, want 1") {
 		t.Fatalf("a multi-partition topic must be refused, got %v", err)

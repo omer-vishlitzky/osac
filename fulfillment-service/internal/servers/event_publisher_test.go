@@ -289,33 +289,22 @@ var _ = Describe("Event publisher", Ordered, func() {
 			Expect(publisher).To(BeNil())
 		})
 
-		It("Can't be created with a retention the broker cannot parse", func() {
-			// A quoted value reaches this check when a chart template quotes a
-			// command-line argument: container args carry the quote characters.
-			publisher, err := NewEventPublisher().
-				SetLogger(logger).
-				SetDatabasePool(&pgxpool.Pool{}).
-				SetKafkaTopicPrefix("osac.events.").
-				SetTopicRetentionMS(`"-1"`).
-				Build()
-			Expect(err).To(HaveOccurred())
-			Expect(err.Error()).To(ContainSubstring("topic retention should be a whole number"))
-			Expect(publisher).To(BeNil())
-		})
-
-		It("Can't be created with a retention that destroys or wedges the topic", func() {
-			// Zero is the one value the broker accepts that deletes the event log as
-			// it is written; -2 is rejected per record, forever.
-			for _, retention := range []string{"0", "-2"} {
+		It("Creates with any retention: negative and zero both mean indefinite", func() {
+			// A negative duration is the spelled-out indefinite form, matching
+			// the broker's own retention.ms = -1; the zero duration means it too.
+			for _, retention := range []time.Duration{-time.Second, 0} {
 				publisher, err := NewEventPublisher().
 					SetLogger(logger).
 					SetDatabasePool(&pgxpool.Pool{}).
+					SetKafkaConfig(kafkaConfig).
+					SetKafkaBrokers(kafkaBroker.Brokers()).
 					SetKafkaTopicPrefix("osac.events.").
-					SetTopicRetentionMS(retention).
+					SetKafkaTopicRetention(retention).
 					Build()
-				Expect(err).To(HaveOccurred())
-				Expect(err.Error()).To(ContainSubstring("topic retention should be -1"))
-				Expect(publisher).To(BeNil())
+				Expect(err).ToNot(HaveOccurred())
+				Expect(publisher).ToNot(BeNil())
+				Expect(publisher.retentionMS()).To(Equal("-1"))
+				Expect(publisher.Close()).To(Succeed())
 			}
 		})
 

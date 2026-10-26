@@ -868,11 +868,11 @@
               "description": "Deploy the Kafka-backed event publisher (disable for API-only environments)",
               "default": true
             },
-            "topicRetentionMs": {
+            "topicRetention": {
               "type": "string",
-              "description": "How long a tenant's event topic keeps records, in milliseconds; -1 keeps them indefinitely. Only applies to topics the publisher creates",
-              "pattern": "^(-1|[1-9][0-9]*)$",
-              "default": "-1"
+              "description": "How long a tenant's event topic keeps records: a negative duration like '-1s' keeps them indefinitely, or a positive one like '168h'. Only applies to topics the publisher creates",
+              "pattern": "^-?(0|([0-9]+(\\.[0-9]+)?(ns|us|µs|ms|s|m|h)))+$",
+              "default": "-1s"
             }
           }
         },
