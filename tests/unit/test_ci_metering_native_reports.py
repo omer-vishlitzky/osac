@@ -1,4 +1,4 @@
-"""Keep native reports from restored metering suites without changing exits.
+"""Keep native reports from the metering suites without changing exits.
 
 Reports stay private. Assertions check the suite catalog and outcomes without
 printing native report content.
@@ -31,22 +31,14 @@ from test_ci_native_reports import stable_dir as stable_dir
 requires_ginkgo = pytest.mark.skipif(GINKGO_BIN is None, reason="ginkgo CLI not available")
 
 METERING_SERVICE = REPO_ROOT / "osac-metering" / "metering-service"
-# The six Ginkgo suites under metering-service/internal. The plain Go test
-# in internal/database is not a Ginkgo suite and publishes no final.
-SIX_SUITE_CATALOG = [
-    "Events Suite",
-    "Heartbeat Suite",
-    "Kafka Suite",
-    "Projection Suite",
-    "Reconciliation Suite",
-    "Watch Suite",
-]
+# Only Kafka uses Ginkgo; the other internal packages use plain Go tests.
+SUITE_CATALOG = ["Kafka Suite"]
 
 
 @requires_ginkgo
-def test_all_six_metering_service_suites_publish_valid_native_finals(*, stable_dir: Path) -> None:
+def test_metering_service_suites_publish_valid_native_finals(*, stable_dir: Path) -> None:
     manifest = stable_dir / "expected-suites.txt"
-    manifest.write_text("\n".join(SIX_SUITE_CATALOG) + "\n", encoding="utf-8")
+    manifest.write_text("\n".join(SUITE_CATALOG) + "\n", encoding="utf-8")
     output_dir = stable_dir / "reports"
 
     process = run_helper(
@@ -61,9 +53,9 @@ def test_all_six_metering_service_suites_publish_valid_native_finals(*, stable_d
     assert process.returncode == 0, process.stderr
     attempt = _single_attempt_dir(output_dir)
     finals = _ginkgo_finals(attempt)
-    assert len(finals) == len(SIX_SUITE_CATALOG)
+    assert len(finals) == len(SUITE_CATALOG)
     merged = _read_ginkgo_merged(attempt)
-    assert sorted(suite["SuiteDescription"] for suite in merged) == sorted(SIX_SUITE_CATALOG)
+    assert sorted(suite["SuiteDescription"] for suite in merged) == sorted(SUITE_CATALOG)
     assert all(suite["SuiteSucceeded"] is True for suite in merged)
     status = _read_status(attempt)
     assert status["state"] == "finished"
@@ -72,8 +64,8 @@ def test_all_six_metering_service_suites_publish_valid_native_finals(*, stable_d
 
 
 @requires_ginkgo
-def test_restored_events_suite_stays_green_when_collection_is_denied(*, stable_dir: Path) -> None:
-    """Use a fast pure suite so output-denial checks need no database."""
+def test_kafka_suite_stays_green_when_collection_is_denied(*, stable_dir: Path) -> None:
+    """Use the fast pure kafka suite so output-denial checks need no database."""
     fake_bin = stable_dir / "fake-bin"
     fake_bin.mkdir()
     sabotage = 'chmod 500 "$OSAC_CI_GINKGO_REPORT_DIR"'
@@ -83,7 +75,7 @@ def test_restored_events_suite_stays_green_when_collection_is_denied(*, stable_d
     process = run_helper(
         "ginkgo",
         output_dir,
-        ["ginkgo", "run", "./internal/events"],
+        ["ginkgo", "run", "./internal/kafka"],
         cwd=METERING_SERVICE,
         env=_env_with_fake_runners(fake_bin),
         timeout=600,
