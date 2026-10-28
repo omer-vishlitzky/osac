@@ -409,27 +409,39 @@ class MeteringCollector:
         """Return all events matching type and resource_id (for N+1 count assertions)."""
         return self._fetch_events(event_type, resource_id)
 
-    def wait_for_billing_end(self, resource_id: str, *, quiet: int = 90, timeout: int = 300) -> datetime:
-        """The end of the resource's billed life: its latest interval end, read only
-        once the heartbeat stream has gone quiet for longer than one round.
+    def wait_for_billing_end(
+        self, resource_id: str, *, deletion: datetime | None = None, quiet: int = 90, timeout: int = 300
+    ) -> datetime:
+        """The end of the resource's billed life: its latest interval end.
 
-        The final partial piece lands in the first round after the fold consumes the
-        deletion, and the deletion boundary (the archive time) can sit a whole
-        deprovisioning past the CR deletion stamp the earlier rounds already reached.
-        Reading the end before the stream goes quiet anchors on an intermediate
-        round, and the final piece then reads as billing past the anchor. A round
-        emits nothing for a resource whose run ended, so a quiet window longer than
-        the round interval means the meter stopped and the latest end is final.
+        With a recorded deletion, wait for the final partial piece itself: the
+        latest interval end must reach the deletion. A round skips its tick
+        while the fold lags the event topic, so the piece can land two or more
+        round intervals after the deletion; a quiet window alone reads the end
+        before the piece lands, and the piece then reads as billing past the
+        anchor.
+
+        Without a deletion, the end is read only once the heartbeat stream has
+        gone quiet for longer than one round: a round emits nothing for a
+        resource whose run ended, so a quiet window longer than the round
+        interval means the meter stopped and the latest end is final.
         """
         deadline = time.monotonic() + timeout
+        if deletion is not None:
+            while True:
+                end = self._latest_interval_end(resource_id)
+                if end is not None and end >= deletion - CR_STAMP_TOLERANCE:
+                    return end
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"final interval of {resource_id} did not reach the deletion at {deletion} "
+                        f"within {timeout}s: last interval end {end}"
+                    )
+                time.sleep(10)
         latest_end: datetime | None = None
         unchanged_since: float | None = None
         while True:
-            end: datetime | None = None
-            for event in self.get_all_events(HEARTBEAT_TYPE, resource_id):
-                to = parse_time(event["data"]["usage"]["to"])
-                if end is None or to > end:
-                    end = to
+            end = self._latest_interval_end(resource_id)
             now = time.monotonic()
             if end != latest_end:
                 latest_end, unchanged_since = end, now
@@ -440,6 +452,15 @@ class MeteringCollector:
                     f"billing of {resource_id} did not go quiet within {timeout}s: last interval end {latest_end}"
                 )
             time.sleep(10)
+
+    def _latest_interval_end(self, resource_id: str) -> datetime | None:
+        """The latest ``usage.to`` across the resource's heartbeats."""
+        end: datetime | None = None
+        for event in self.get_all_events(HEARTBEAT_TYPE, resource_id):
+            to = parse_time(event["data"]["usage"]["to"])
+            if end is None or to > end:
+                end = to
+        return end
 
     def heartbeat_with_dimensions(
         self,

@@ -65,7 +65,6 @@ def _typed_heartbeats(metering: MeteringCollector, volume_id: str) -> list[dict[
     return typed
 
 
-@pytest.mark.skip(reason="OSAC-6974: billing-end quiet window can expire before the final heartbeat arrives")
 def test_volume_bills_gibibyte_seconds(
     grpc: GRPCClient,
     private_grpc: GRPCClient,
@@ -163,12 +162,12 @@ def test_volume_bills_gibibyte_seconds(
 
     assert deletion_recorded is not None, "the Volume CR was never deleted, so no deletion timestamp was recorded"
 
-    # The billing end is the meter's own last interval end, read once the
-    # heartbeat stream has gone quiet for a full round: the final partial piece
-    # lands in the first round after the fold consumes the deletion, and reading
-    # the end earlier anchors on an intermediate round, making the final piece
-    # read as billing past the anchor.
-    billing_end = metering.wait_for_billing_end(volume_id)
+    # The billing end is the meter's own last interval end, anchored on the
+    # recorded deletion: a round skips its tick while the fold lags the event
+    # topic, so the final partial piece can land several round intervals after
+    # the deletion, and reading the end before the piece lands anchors on an
+    # intermediate round, making the piece read as billing past the anchor.
+    billing_end = metering.wait_for_billing_end(volume_id, deletion=deletion_recorded)
 
     # The billed life is exact: the typed heartbeats collapse into contiguous
     # net intervals, each billing exactly its size in GiB per second, and the

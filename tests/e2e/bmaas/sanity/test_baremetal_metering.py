@@ -148,11 +148,12 @@ def test_baremetal_instance_bills_allocation_and_consumption(
     assert deletion_recorded is not None, "the instance's CR was never deleted, so no deletion timestamp was recorded"
 
     # The billing end is the meter's own last interval end across both meters,
-    # read once the heartbeat stream has gone quiet for a full round: the final
-    # partial pieces land in the first round after the fold consumes the
-    # deletion, and reading the end earlier anchors on an intermediate round,
-    # making the final piece read as billing past the anchor.
-    billing_end = metering.wait_for_billing_end(bmi_id)
+    # anchored on the recorded deletion: a round skips its tick while the fold
+    # lags the event topic, so the final partial pieces can land several round
+    # intervals after the deletion, and reading the end before they land
+    # anchors on an intermediate round, making the pieces read as billing past
+    # the anchor.
+    billing_end = metering.wait_for_billing_end(bmi_id, deletion=deletion_recorded)
 
     # Each meter ends at or after the recorded deletion: its final partial
     # interval is billed, not dropped, and its typed heartbeats collapse into

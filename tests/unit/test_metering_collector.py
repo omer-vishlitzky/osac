@@ -150,6 +150,52 @@ def test_wait_for_billing_end_returns_the_latest_end_once_quiet(
     assert end == parse_time("2026-10-05T10:07:00Z")
 
 
+def test_wait_for_billing_end_anchored_on_the_deletion_waits_for_the_final_piece(
+    collector: MeteringCollector, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With a recorded deletion the end is the final partial piece's own end:
+    the wait returns only once the latest interval reaches the deletion, so a
+    piece that lands rounds after the deletion cannot be missed."""
+    final_piece = _heartbeat(event_id="beat-final", minute=7)
+    final_piece["data"]["usage"]["to"] = "2026-10-05T10:07:42Z"
+    final_piece["data"]["usage"]["quantity"] = "42.000000"
+    rounds = [
+        [_heartbeat(minute=minute) for minute in range(5)],
+        [_heartbeat(minute=minute) for minute in range(5)],
+        # An intermediate round whose end is still short of the deletion.
+        [_heartbeat(minute=minute) for minute in range(7)],
+        [_heartbeat(minute=minute) for minute in range(7)] + [final_piece],
+    ]
+    calls = list(rounds)
+
+    def fetch(event_type: str, resource_id: str) -> list[dict[str, Any]]:
+        return calls.pop(0) if calls else rounds[-1]
+
+    clock = _AdvancingClock(step_seconds=30)
+    monkeypatch.setattr(collector, "_fetch_events", fetch)
+    monkeypatch.setattr("time.sleep", lambda seconds: None)
+    monkeypatch.setattr("time.monotonic", clock)
+
+    end = collector.wait_for_billing_end("vm-7", deletion=parse_time("2026-10-05T10:07:41Z"), timeout=300)
+    assert end == parse_time("2026-10-05T10:07:42Z")
+
+
+def test_wait_for_billing_end_anchored_on_the_deletion_times_out_when_the_piece_never_lands(
+    collector: MeteringCollector, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A final piece that never reaches the deletion fails the wait with the
+    last seen end, instead of returning a stale quiet-window end."""
+    events = [_heartbeat(minute=minute) for minute in range(5)]
+
+    clock = _AdvancingClock(step_seconds=30)
+    monkeypatch.setattr(collector, "_fetch_events", lambda event_type, resource_id: events)
+    monkeypatch.setattr("time.sleep", lambda seconds: None)
+    monkeypatch.setattr("time.monotonic", clock)
+
+    with pytest.raises(TimeoutError, match="did not reach the deletion"):
+        collector.wait_for_billing_end("vm-7", deletion=parse_time("2026-10-05T10:07:41Z"), timeout=300)
+
+
 class _AdvancingClock:
     """A monotonic clock that advances a fixed step per call, so quiet windows pass
     without the test sleeping through them."""
