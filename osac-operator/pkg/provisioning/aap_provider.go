@@ -7,9 +7,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
-	"time"
 
-	"github.com/google/uuid"
 	"github.com/stoewer/go-strcase"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	ctrllog "sigs.k8s.io/controller-runtime/pkg/log"
@@ -124,12 +122,12 @@ func (p *AAPProvider) launchProvisionJob(ctx context.Context, resource client.Ob
 	if err != nil {
 		return "", err
 	}
-	return p.launchTemplate(ctx, "create", templateName, resource, extraVars)
+	return p.launchTemplate(ctx, templateName, resource, extraVars)
 }
 
 // GetProvisionStatus checks provisioning job status via AAP API.
 func (p *AAPProvider) GetProvisionStatus(ctx context.Context, resource client.Object, jobID string) (ProvisionStatus, error) {
-	return p.getJobStatus(ctx, resource, "create", jobID)
+	return p.getJobStatus(ctx, jobID)
 }
 
 // CancelJob cancels a running provisioning job during resource deletion.
@@ -167,7 +165,7 @@ func (p *AAPProvider) FindJobByLaunchID(
 	if err != nil || !found {
 		return ProvisionStatus{}, found, err
 	}
-	status, err := p.getJobStatus(ctx, resource, action, jobID)
+	status, err := p.getJobStatus(ctx, jobID)
 	if err != nil {
 		return ProvisionStatus{}, false, err
 	}
@@ -177,16 +175,12 @@ func (p *AAPProvider) FindJobByLaunchID(
 // GetProvisionStatusWithExtraVars checks provisioning job status and returns its submitted inputs
 // and output artifacts from the same AAP job response.
 func (p *AAPProvider) GetProvisionStatusWithExtraVars(ctx context.Context, resource client.Object, jobID string) (ProvisionStatusWithExtraVars, error) {
-	return p.getJobStatusWithExtraVars(ctx, resource, "create", jobID)
-}
-
-func (p *AAPProvider) getJobStatusWithExtraVars(ctx context.Context, resource client.Object, action, jobID string) (ProvisionStatusWithExtraVars, error) {
 	job, err := p.client.GetJob(ctx, jobID)
 	if err != nil {
 		return ProvisionStatusWithExtraVars{}, fmt.Errorf("failed to get job: %w", err)
 	}
 
-	status := ProvisionStatusWithExtraVars{ProvisionStatus: provisionStatusFromAAPJob(ctx, resource, action, jobID, job)}
+	status := ProvisionStatusWithExtraVars{ProvisionStatus: provisionStatusFromAAPJob(ctx, jobID, job)}
 	if status.State != v1alpha1.JobStateSucceeded {
 		return status, nil
 	}
@@ -329,12 +323,11 @@ func (p *AAPProvider) launchDeprovisionJob(ctx context.Context, resource client.
 	if err != nil {
 		return "", err
 	}
-	return p.launchTemplate(ctx, "delete", templateName, resource, nil)
+	return p.launchTemplate(ctx, templateName, resource, nil)
 }
 
 // launchTemplate launches the named template (job or workflow) and returns the job ID.
-func (p *AAPProvider) launchTemplate(ctx context.Context, action, templateName string, resource client.Object, inheritedExtraVars map[string]any) (string, error) {
-	log := ctrllog.FromContext(ctx)
+func (p *AAPProvider) launchTemplate(ctx context.Context, templateName string, resource client.Object, inheritedExtraVars map[string]any) (string, error) {
 	template, err := p.client.GetTemplate(ctx, templateName)
 	if err != nil {
 		return "", fmt.Errorf("failed to get template: %w", err)
@@ -345,11 +338,6 @@ func (p *AAPProvider) launchTemplate(ctx context.Context, action, templateName s
 			return "", err
 		}
 		if found {
-			log.Info("AAP job launch reused existing job",
-				append(aapResourceIdentity(resource),
-					"action", action,
-					"templateType", string(template.Type),
-					"jobID", jobID)...)
 			return jobID, nil
 		}
 	}
@@ -361,28 +349,7 @@ func (p *AAPProvider) launchTemplate(ctx context.Context, action, templateName s
 	extraVars = mergeExtraVars(extraVars, inheritedExtraVars)
 	sensitive := adminKubeconfigInExtraVars(extraVars)
 
-	requestStarted := time.Now()
-	jobID, launchErr := p.launchTemplateRequest(ctx, template, templateName, extraVars, sensitive)
-	launchDurationMs := time.Since(requestStarted).Milliseconds()
-	if launchErr != nil {
-		log.Info("AAP job launch failed",
-			append(aapResourceIdentity(resource),
-				"action", action,
-				"templateType", string(template.Type),
-				"launchDurationMs", launchDurationMs,
-				"result", aapErrorClass(launchErr))...)
-		return "", launchErr
-	}
-	log.Info("AAP job launched",
-		append(aapResourceIdentity(resource),
-			"action", action,
-			"templateType", string(template.Type),
-			"launchDurationMs", launchDurationMs,
-			"jobID", strconv.Itoa(jobID))...)
-	return strconv.Itoa(jobID), nil
-}
-
-func (p *AAPProvider) launchTemplateRequest(ctx context.Context, template *aap.Template, templateName string, extraVars map[string]any, sensitive bool) (int, error) {
+	var jobID int
 	switch template.Type {
 	case aap.TemplateTypeJob:
 		resp, err := p.client.LaunchJobTemplate(ctx, aap.LaunchJobTemplateRequest{
@@ -392,9 +359,9 @@ func (p *AAPProvider) launchTemplateRequest(ctx context.Context, template *aap.T
 			Sensitive:    sensitive,
 		})
 		if err != nil {
-			return 0, fmt.Errorf("failed to launch job template: %w", err)
+			return "", fmt.Errorf("failed to launch job template: %w", err)
 		}
-		return resp.JobID, nil
+		jobID = resp.JobID
 	case aap.TemplateTypeWorkflow:
 		resp, err := p.client.LaunchWorkflowTemplate(ctx, aap.LaunchWorkflowTemplateRequest{
 			TemplateID:   template.ID,
@@ -403,12 +370,14 @@ func (p *AAPProvider) launchTemplateRequest(ctx context.Context, template *aap.T
 			Sensitive:    sensitive,
 		})
 		if err != nil {
-			return 0, fmt.Errorf("failed to launch workflow template: %w", err)
+			return "", fmt.Errorf("failed to launch workflow template: %w", err)
 		}
-		return resp.JobID, nil
+		jobID = resp.JobID
 	default:
-		return 0, fmt.Errorf("unknown template type: %s", template.Type)
+		return "", fmt.Errorf("unknown template type: %s", template.Type)
 	}
+
+	return strconv.Itoa(jobID), nil
 }
 
 func (p *AAPProvider) findJobByLaunchID(ctx context.Context, templateID int, launchID string) (string, bool, error) {
@@ -485,12 +454,12 @@ func (p *AAPProvider) GetDeprovisionStatusWithExtraVars(
 	resource client.Object,
 	jobID string,
 ) (ProvisionStatusWithExtraVars, error) {
-	return p.getJobStatusWithExtraVars(ctx, resource, "delete", jobID)
+	return p.GetProvisionStatusWithExtraVars(ctx, resource, jobID)
 }
 
 // GetDeprovisionStatus checks deprovisioning job status via AAP API.
 func (p *AAPProvider) GetDeprovisionStatus(ctx context.Context, resource client.Object, jobID string) (ProvisionStatus, error) {
-	return p.getJobStatus(ctx, resource, "delete", jobID)
+	return p.getJobStatus(ctx, jobID)
 }
 
 // Name returns the provider name for logging.
@@ -499,32 +468,16 @@ func (p *AAPProvider) Name() string {
 }
 
 // getJobStatus retrieves job status from AAP and converts it to ProvisionStatus.
-func (p *AAPProvider) getJobStatus(ctx context.Context, resource client.Object, action, jobID string) (ProvisionStatus, error) {
+func (p *AAPProvider) getJobStatus(ctx context.Context, jobID string) (ProvisionStatus, error) {
 	job, err := p.client.GetJob(ctx, jobID)
 	if err != nil {
 		return ProvisionStatus{}, fmt.Errorf("failed to get job: %w", err)
 	}
 
-	return provisionStatusFromAAPJob(ctx, resource, action, jobID, job), nil
+	return provisionStatusFromAAPJob(ctx, jobID, job), nil
 }
 
-// Per-poll details use V(2) because the default Development logger enables V(1).
-func provisionStatusFromAAPJob(ctx context.Context, resource client.Object, action, jobID string, job *aap.Job) ProvisionStatus {
-	log := ctrllog.FromContext(ctx)
-	statusEvent := append(aapResourceIdentity(resource),
-		"action", action,
-		"jobID", jobID)
-	if job.Status != "" {
-		statusEvent = append(statusEvent, "state", job.Status)
-	}
-	if !job.Started.IsZero() {
-		statusEvent = append(statusEvent, "started", job.Started.UTC())
-	}
-	if !job.Finished.IsZero() {
-		statusEvent = append(statusEvent, "finished", job.Finished.UTC())
-	}
-	log.V(2).Info("AAP job status returned", statusEvent...)
-
+func provisionStatusFromAAPJob(ctx context.Context, jobID string, job *aap.Job) ProvisionStatus {
 	status := ProvisionStatus{
 		JobID:     jobID,
 		State:     mapAAPStatusToJobState(job.Status),
@@ -534,7 +487,7 @@ func provisionStatusFromAAPJob(ctx context.Context, resource client.Object, acti
 	}
 	if len(job.Artifacts) > 0 {
 		if err := json.Unmarshal(job.Artifacts, &status.Outputs); err != nil {
-			log.Error(err, "AAP job returned non-object artifacts", "jobID", jobID)
+			ctrllog.FromContext(ctx).Error(err, "AAP job returned non-object artifacts", "jobID", jobID)
 		}
 	}
 
@@ -697,47 +650,4 @@ func serializeResource(resource client.Object) (map[string]any, error) {
 	}
 
 	return resourceMap, nil
-}
-
-const apiResourceUUIDLabelPrefix = "osac.openshift.io/"
-
-// Labels can contain arbitrary text; log only canonical resource UUIDs.
-func aapResourceIdentity(resource client.Object) []any {
-	fields := make([]any, 0, 10)
-	if kind := resource.GetObjectKind().GroupVersionKind().Kind; kind != "" {
-		fields = append(fields, "kind", kind)
-		if labelValue := resource.GetLabels()[apiResourceUUIDLabelPrefix+strings.ToLower(kind)+"-uuid"]; labelValue != "" {
-			if parsed, err := uuid.Parse(labelValue); err == nil && parsed.String() == labelValue {
-				fields = append(fields, "apiResourceUUID", labelValue)
-			}
-		}
-	}
-	if namespace := resource.GetNamespace(); namespace != "" {
-		fields = append(fields, "namespace", namespace)
-	}
-	if name := resource.GetName(); name != "" {
-		fields = append(fields, "name", name)
-	}
-	if uid := resource.GetUID(); uid != "" {
-		fields = append(fields, "uid", string(uid))
-	}
-	return fields
-}
-
-// AAP error text can echo credentials, so events carry only a failure class.
-func aapErrorClass(err error) string {
-	var notFoundErr *aap.NotFoundError
-	var methodNotAllowedErr *aap.MethodNotAllowedError
-	switch {
-	case errors.Is(err, context.Canceled):
-		return "cancelled"
-	case errors.Is(err, context.DeadlineExceeded):
-		return "timeout"
-	case errors.As(err, &notFoundErr):
-		return "not_found"
-	case errors.As(err, &methodNotAllowedErr):
-		return "method_not_allowed"
-	default:
-		return "error"
-	}
 }
