@@ -27,14 +27,14 @@ supported.
 
 ## What is preserved
 
-The helper adds only the framework's reporting flag and changes nothing else:
+The helper adds the framework's reporting flag and keeps the resulting command's exit code:
 
 - `go-test`: inserts `-json` right after `go test`. The raw test2json event
   stream goes to `go-test.json` in the attempt directory. The console keeps a
   readable stream, reconstructed live from the event `Output` fields, so it
   shows the same verbose text a `-v` run prints. Stderr, including build
-  errors, passes through untouched and is not captured to a file. A caller
-  effective flag that disables `-json` is rejected before the child starts.
+  errors, passes through untouched and is not captured to a file. An effective
+  caller flag that disables `-json` is rejected before the child starts.
   Repeated flags use the last value. Values of selection flags and arguments
   after `-args` or `--` stay with the test binary.
 - `ginkgo`: inserts `--json-report=ginkgo-report.json` and
@@ -47,8 +47,8 @@ The helper adds only the framework's reporting flag and changes nothing else:
 
 Test selection, parallelism, timeouts, environment, and working directory are
 passed through verbatim. There are no retests, no timeout changes, and no
-output truncation: every byte of the child's stdout reaches the report file,
-and every `Output` field reaches the console.
+output truncation. For Go, every stdout byte reaches the report file and
+every `Output` field reaches the console. Ginkgo writes its own JSON report.
 
 ## Private output directory
 
@@ -73,9 +73,9 @@ process.
 
 ## Exit codes, interrupts, and collection errors
 
-- Normal runs exit with the child's exact exit code. A collection problem
-  (report or status IO failure, unexpected symlink) never changes it: the
-  error is printed to stderr as `native_reports: collection error: <label>`
+- Normal runs exit with the child's exact exit code. An error in the helper's
+  own report or status writes never changes that code. The error is printed
+  to stderr as `native_reports: collection error: <label>`
   and recorded in `status.json` when that file is still writable.
 - If the helper receives SIGINT or SIGTERM, it forwards the signal to the
   child's whole process group (the child runs in its own session) and exits
@@ -106,6 +106,13 @@ the CI observability data contract; that contract is owned elsewhere.
 
 ## Limitations
 
+- Ginkgo writes reports inside its own CLI and suite hooks. A report write
+  can fail an otherwise passing run. With no surviving report evidence, the
+  helper records a collection error and leaves test outcomes unknown.
+  It preserves the nonzero exit code and never guesses a pass from console
+  text. W03 needs non-failing report hooks before this path enters default CI.
+- The final file inventory is a snapshot. Descendants that survive a normal
+  exit can change files afterwards. A trusted collector validates them again.
 - Vitest is not supported. The plan's own coverage table notes the built-in
   Vitest JSON reporter lacks lifecycle and worker fields and needs a small
   reporter owned by the UI component, which is outside this helper's scope.

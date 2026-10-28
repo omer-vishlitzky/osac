@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Keep private native Go/Ginkgo reports without changing test commands' results.
+"""Keep private native Go/Ginkgo reports and each reporting command's exit code.
 
 Reports stay local and require redaction before upload. Bookkeeping failures
 are collection errors, separate from the child's result.
@@ -24,6 +24,7 @@ from typing import BinaryIO
 FRAMEWORKS = ("go-test", "ginkgo")
 GO_TEST_REPORT_NAME = "go-test.json"
 GINKGO_REPORT_NAME = "ginkgo-report.json"
+GINKGO_REPORT_EVIDENCE_ERROR = "ginkgo left no report evidence; test outcome is unknown"
 STATUS_NAME = "status.json"
 REDACTION_MARKER_NAME = "REDACTION_REQUIRED"
 
@@ -137,7 +138,21 @@ def validate_command(*, framework: str, command: list[str]) -> None:
         raise NativeReportError("ginkgo framework expects a command that starts with: ginkgo ...")
     if len(command) > 1 and command[1] in UNSUPPORTED_GINKGO_SUBCOMMANDS:
         raise NativeReportError(f"ginkgo {command[1]} does not run specs; only the ginkgo run form is supported")
-    for argument in command[1:]:
+    index = 1
+    while index < len(command):
+        argument = command[index]
+        if argument == "--":
+            break
+        if argument.startswith("-") and argument.lstrip("-") in (
+            "focus",
+            "skip",
+            "label-filter",
+            "focus-file",
+            "skip-file",
+            "sem-ver-filter",
+        ):
+            index += 2
+            continue
         if _is_flag_argument(argument=argument, name="json-report") or _is_flag_argument(
             argument=argument, name="output-dir"
         ):
@@ -145,6 +160,7 @@ def validate_command(*, framework: str, command: list[str]) -> None:
                 "command already sets --json-report or --output-dir; "
                 "remove them so the helper can place the report in its private output dir"
             )
+        index += 1
 
 
 def build_go_test_argv(*, command: list[str]) -> list[str]:
@@ -434,6 +450,7 @@ def _finalize_attempt(*, attempt_dir: Path, record: _RunRecord) -> None:
     except OSError:
         record.errors.append("attempt directory listing failed")
         return
+    has_ginkgo_report = False
     for entry in entries:
         if entry.name in (STATUS_NAME, f"{STATUS_NAME}.tmp", REDACTION_MARKER_NAME):
             continue
@@ -445,6 +462,13 @@ def _finalize_attempt(*, attempt_dir: Path, record: _RunRecord) -> None:
         except OSError:
             record.errors.append("artifact size unavailable")
             size = None
+        if (
+            (entry.name == GINKGO_REPORT_NAME or entry.name.endswith(f"_{GINKGO_REPORT_NAME}"))
+            and entry.is_file()
+            and size is not None
+            and size > 0
+        ):
+            has_ginkgo_report = True
         try:
             os.chmod(entry, 0o700 if entry.is_dir() else 0o600)
         except OSError:
@@ -454,6 +478,14 @@ def _finalize_attempt(*, attempt_dir: Path, record: _RunRecord) -> None:
             artifact["json_event_lines"] = record.json_event_lines
             artifact["non_json_lines"] = record.non_json_lines
         record.artifacts.append(artifact)
+    if (
+        record.framework == "ginkgo"
+        and record.child_returncode is not None
+        and not record.interrupted
+        and not has_ginkgo_report
+    ):
+        # Ginkgo can fail its own reporting hook after every spec passes.
+        record.errors.append(GINKGO_REPORT_EVIDENCE_ERROR)
 
 
 def _is_flag_argument(*, argument: str, name: str) -> bool:
@@ -518,7 +550,8 @@ def build_parser() -> argparse.ArgumentParser:
         prog="native_reports.py",
         description=(
             "Run one trusted CI test command with its native report kept in a private "
-            "output directory. Selection, parallelism, timeouts, and exit codes are preserved."
+            "output directory. The reporting command's exit code is returned unchanged. "
+            "Ginkgo's own report errors can make passing specs exit nonzero."
         ),
     )
     parser.add_argument("--framework", required=True, choices=FRAMEWORKS, help="test framework of the command")

@@ -14,6 +14,7 @@ import contextlib
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import stat
@@ -27,6 +28,7 @@ from pathlib import Path
 import pytest
 
 from tools.ci_observability.native_reports import (
+    GINKGO_REPORT_EVIDENCE_ERROR,
     GINKGO_REPORT_NAME,
     GO_TEST_REPORT_NAME,
     MISSING_COMMAND_EXIT,
@@ -489,6 +491,21 @@ def test_repeated_attempts_into_one_output_dir_never_collide(stable_dir: Path) -
         reports.append(report.read_bytes())
         assert b"attempt output from pid" in reports[-1]
     assert reports[0] != reports[1]
+
+
+def test_ginkgo_without_evidence_marks_collection_incomplete_even_on_zero_exit(stable_dir: Path) -> None:
+    fake_bin = stable_dir / "fake-bin"
+    fake_bin.mkdir()
+    _write_fake_runner(fake_bin, "ginkgo", "exit 0")
+    output_dir = stable_dir / "reports"
+
+    proc = run_helper("ginkgo", output_dir, ["ginkgo", "run", "."], env=_env_with_fake_runners(fake_bin))
+
+    assert proc.returncode == 0
+    status = _read_status(_single_attempt_dir(output_dir))
+    assert status["child_returncode"] == 0
+    assert status["errors"] == [GINKGO_REPORT_EVIDENCE_ERROR]
+    assert GINKGO_REPORT_EVIDENCE_ERROR.encode() in proc.stderr
 
 
 def test_output_dir_with_dotdot_writes_into_one_resolved_root(stable_dir: Path) -> None:
@@ -982,6 +999,64 @@ def test_ginkgo_run_subcommand_failure_preserves_exit_code(stable_dir: Path) -> 
     assert report[0]["SuiteSucceeded"] is False
     status = _read_status(attempt)
     assert status["exit_code"] == 1
+
+
+@requires_ginkgo
+@pytest.mark.parametrize("keep_separate", [False, True])
+def test_ginkgo_report_write_failure_keeps_nonzero_exit_and_unknown_test_outcome(
+    stable_dir: Path, keep_separate: bool
+) -> None:
+    assert GINKGO_BIN is not None
+    suite_dir = _copy_fixture("ginkgotiny", stable_dir)
+    control = subprocess.run(
+        [GINKGO_BIN, "run", "--focus=passes on purpose", "."],
+        cwd=suite_dir,
+        capture_output=True,
+        timeout=180,
+        check=False,
+    )
+    assert control.returncode == 0
+    fake_bin = stable_dir / "fake-bin"
+    fake_bin.mkdir()
+    report_name = "ginkgotiny_ginkgo-report.json" if keep_separate else GINKGO_REPORT_NAME
+    body = (
+        'for argument in "$@"; do\n'
+        '  case "$argument" in --output-dir=*) output_dir="${argument#--output-dir=}" ;; esac\n'
+        "done\n"
+    )
+    if keep_separate:
+        body += f': > "$output_dir/{report_name}"\n'
+    body += f'chmod 000 "$output_dir/{report_name}"\nexec {shlex.quote(GINKGO_BIN)} "$@"'
+    _write_fake_runner(fake_bin, "ginkgo", body)
+    command = ["ginkgo", "run", "--focus=passes on purpose"]
+    if keep_separate:
+        command.append("--keep-separate-reports")
+    command.append(".")
+    output_dir = stable_dir / "reports"
+
+    proc = run_helper("ginkgo", output_dir, command, cwd=suite_dir, env=_env_with_fake_runners(fake_bin), timeout=180)
+
+    assert proc.returncode == 1
+    assert b"1 Passed" in proc.stdout
+    status = _read_status(_single_attempt_dir(output_dir))
+    assert status["child_returncode"] == 1
+    assert status["errors"] == [GINKGO_REPORT_EVIDENCE_ERROR]
+    assert GINKGO_REPORT_EVIDENCE_ERROR.encode() in proc.stderr
+    assert all(artifact["bytes"] == 0 for artifact in status["artifacts"])
+
+
+@requires_ginkgo
+def test_ginkgo_report_flag_like_selection_value_keeps_native_behavior(stable_dir: Path) -> None:
+    suite_dir = _copy_fixture("ginkgotiny", stable_dir)
+    output_dir = stable_dir / "reports"
+
+    proc = run_helper("ginkgo", output_dir, [GINKGO_BIN, "run", "--focus", "--json-report", "."], cwd=suite_dir)
+
+    assert proc.returncode == 0
+    attempt = _single_attempt_dir(output_dir)
+    report = json.loads((attempt / GINKGO_REPORT_NAME).read_text())
+    assert all(spec["State"] == "skipped" for suite in report for spec in suite["SpecReports"])
+    assert _read_status(attempt)["errors"] == []
 
 
 @requires_ginkgo
