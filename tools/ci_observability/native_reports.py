@@ -253,14 +253,12 @@ def run_with_native_report(
     _finalize_attempt(attempt_dir=attempt_dir, record=record)
     if framework == "ginkgo" and len(record.errors) != errors_before_inventory:
         record.coverage = {"state": "unknown"}
-    try:
-        _write_status(attempt_dir=attempt_dir, record=record)
-    except OSError:
-        record.errors.append("status write failed")
+    _persist_status(attempt_dir=attempt_dir, record=record)
+    if not _write_collection_errors(errors=record.errors):
+        record.errors.append("collection diagnostic write failed")
         if framework == "ginkgo":
             record.coverage = {"state": "unknown"}
-    for error in record.errors:
-        print(f"{COLLECTION_ERROR_PREFIX} {error}", file=sys.stderr)
+        _persist_status(attempt_dir=attempt_dir, record=record)
     return NativeReportResult(
         framework=framework,
         attempt_dir=attempt_dir,
@@ -337,7 +335,7 @@ def _run_go_test(*, attempt_dir: Path, command: list[str], record: _RunRecord) -
         raise
     record.child_pid = child.pid
     with _ChildSignalWatch(child=child) as watch:
-        _persist_child_pid(attempt_dir=attempt_dir, record=record)
+        _persist_status(attempt_dir=attempt_dir, record=record)
         assert child.stdout is not None
         report_file = os.fdopen(report_fd, "wb")
         tee = _StreamTee(report_file=report_file, console=sys.stdout.buffer)
@@ -369,7 +367,7 @@ def _run_ginkgo(*, attempt_dir: Path, command: list[str], record: _RunRecord, ex
     child = _popen_child(argv=list(command), pipe_stdout=False, env=child_env)
     record.child_pid = child.pid
     with _ChildSignalWatch(child=child) as watch:
-        _persist_child_pid(attempt_dir=attempt_dir, record=record)
+        _persist_status(attempt_dir=attempt_dir, record=record)
         returncode = child.wait()
     record.child_returncode = returncode
     record.interrupted = watch.signum is not None
@@ -603,11 +601,22 @@ def _popen_child(*, argv: list[str], pipe_stdout: bool, env: dict[str, str] | No
     return subprocess.Popen(argv, stdout=stdout, env=env, start_new_session=True, umask=0o077)
 
 
-def _persist_child_pid(*, attempt_dir: Path, record: _RunRecord) -> None:
+def _persist_status(*, attempt_dir: Path, record: _RunRecord) -> None:
     try:
         _write_status(attempt_dir=attempt_dir, record=record)
     except OSError:
         record.errors.append("status write failed")
+        if record.framework == "ginkgo":
+            record.coverage = {"state": "unknown"}
+
+
+def _write_collection_errors(*, errors: list[str]) -> bool:
+    try:
+        for error in errors:
+            print(f"{COLLECTION_ERROR_PREFIX} {error}", file=sys.stderr)
+    except OSError:
+        return False
+    return True
 
 
 class _StreamTee:
@@ -868,17 +877,18 @@ def main(*, argv: list[str] | None = None) -> int:
         return USAGE_ERROR_EXIT
     except KeyboardInterrupt:
         return 128 + signal.SIGINT
-    _defuse_broken_stdout()
+    _defuse_broken_streams()
     return result.exit_code
 
 
-def _defuse_broken_stdout() -> None:
+def _defuse_broken_streams() -> None:
     # Python's shutdown flush must not replace the child's exit code with 120.
-    try:
-        sys.stdout.flush()
-    except BrokenPipeError:
-        with open(os.devnull, "wb") as sink:
-            os.dup2(sink.fileno(), sys.stdout.fileno())
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.flush()
+        except OSError:
+            with open(os.devnull, "wb") as sink:
+                os.dup2(sink.fileno(), stream.fileno())
 
 
 if __name__ == "__main__":

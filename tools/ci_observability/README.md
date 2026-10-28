@@ -153,6 +153,8 @@ process.
 - If the helper's console or report stream breaks mid-run, it keeps draining
   the child, reaps it, and preserves its exit code; the broken sink is
   reported as a collection error.
+- A closed or full diagnostic sink also preserves the child's exit code.
+  The helper records the diagnostic failure in private status when writable.
 - 127 means the command executable was not found; 2 means a usage error.
 
 Interrupted runs keep their partial evidence: the go-test report file is

@@ -1886,3 +1886,74 @@ def test_merge_preserves_the_exact_validated_native_json_bytes(stable_dir: Path)
     assert record.errors == []
     assert record.coverage == {"state": "complete", "expected": 1, "published": 1}
     assert (stable_dir / GINKGO_REPORT_NAME).read_bytes() == b"[" + payload + b"]\n"
+
+
+def test_closed_diagnostic_pipe_never_replaces_the_child_exit(stable_dir: Path) -> None:
+    fake_bin = stable_dir / "fake-bin"
+    fake_bin.mkdir()
+    _write_fake_ginkgo_publisher(fake_bin, 'printf "{" > "$report_dir/ginkgo-report-bad.json"', exit_code=7)
+    output_dir = stable_dir / "reports"
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            str(HELPER),
+            "--framework",
+            "ginkgo",
+            "--output-dir",
+            str(output_dir),
+            "--",
+            "ginkgo",
+            "run",
+            ".",
+        ],
+        env=_env_with_fake_runners(fake_bin),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        assert process.stderr is not None
+        process.stderr.close()
+        process.wait(timeout=30)
+        assert process.returncode == 7
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+    status = _read_status(_single_attempt_dir(output_dir))
+    assert status["state"] == "finished"
+    assert status["child_returncode"] == 7
+    assert status["exit_code"] == 7
+    assert GINKGO_FINAL_JSON_ERROR in status["errors"]
+    assert "collection diagnostic write failed" in status["errors"]
+
+
+def test_full_diagnostic_sink_never_replaces_the_child_exit(stable_dir: Path) -> None:
+    fake_bin = stable_dir / "fake-bin"
+    fake_bin.mkdir()
+    _write_fake_ginkgo_publisher(fake_bin, 'printf "{" > "$report_dir/ginkgo-report-bad.json"', exit_code=7)
+    output_dir = stable_dir / "reports"
+    with open("/dev/full", "wb") as failed_sink:
+        process = subprocess.run(
+            [
+                sys.executable,
+                str(HELPER),
+                "--framework",
+                "ginkgo",
+                "--output-dir",
+                str(output_dir),
+                "--",
+                "ginkgo",
+                "run",
+                ".",
+            ],
+            env=_env_with_fake_runners(fake_bin),
+            stdout=subprocess.DEVNULL,
+            stderr=failed_sink,
+            timeout=30,
+            check=False,
+        )
+    assert process.returncode == 7
+    status = _read_status(_single_attempt_dir(output_dir))
+    assert status["state"] == "finished"
+    assert status["exit_code"] == 7
+    assert "collection diagnostic write failed" in status["errors"]
