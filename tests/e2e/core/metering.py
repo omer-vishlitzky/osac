@@ -409,36 +409,62 @@ class MeteringCollector:
         """Return all events matching type and resource_id (for N+1 count assertions)."""
         return self._fetch_events(event_type, resource_id)
 
-    def wait_for_billing_end(self, resource_id: str, *, deletion: datetime, timeout: int = 300) -> datetime:
-        """The end of the resource's billed life: its latest interval end,
-        waited for until it reaches the recorded deletion.
+    def wait_for_billing_end(
+        self, resource_id: str, *, deletion: datetime, quiet: int = 150, timeout: int = 600
+    ) -> datetime:
+        """The end of the resource's billed life: the latest net interval end
+        across its meters, read only once every meter reaches the recorded
+        deletion and the heartbeat stream has gone quiet for longer than one
+        round.
 
-        A round skips its tick while the fold lags the event topic, so the
-        final partial piece can land two or more round intervals after the
-        deletion; reading the end on a quiet window alone anchors on an
-        intermediate round before the piece lands, and the piece then reads
-        as billing past the anchor.
+        The end must reach the deletion because a round skips its tick while
+        the fold lags the event topic, so the final partial piece can land
+        two or more round intervals after the deletion. The quiet window is
+        still needed because a round that ticks before the fold consumes the
+        deletion sends a full interval past it and the negative correction
+        that follows lands in a later round: an end read before the
+        correction lands reads as billing past the anchor. Each meter is
+        tracked separately, so one meter's final piece landing does not end
+        the wait for another meter's.
         """
         deadline = time.monotonic() + timeout
+        latest_ends: dict[str, datetime] = {}
+        unchanged_since: float | None = None
         while True:
-            end = self._latest_interval_end(resource_id)
-            if end is not None and end >= deletion - CR_STAMP_TOLERANCE:
-                return end
-            if time.monotonic() >= deadline:
+            ends = self._latest_net_interval_ends(resource_id)
+            now = time.monotonic()
+            if ends != latest_ends:
+                latest_ends, unchanged_since = ends, now
+            if (
+                latest_ends
+                and unchanged_since is not None
+                and now - unchanged_since >= quiet
+                and all(end >= deletion - CR_STAMP_TOLERANCE for end in latest_ends.values())
+            ):
+                return max(latest_ends.values())
+            if now >= deadline:
                 raise TimeoutError(
-                    f"final interval of {resource_id} did not reach the deletion at {deletion} "
-                    f"within {timeout}s: last interval end {end}"
+                    f"billing of {resource_id} did not reach the deletion at {deletion} and go "
+                    f"quiet within {timeout}s: last interval ends {latest_ends}"
                 )
             time.sleep(10)
 
-    def _latest_interval_end(self, resource_id: str) -> datetime | None:
-        """The latest ``usage.to`` across the resource's heartbeats."""
-        end: datetime | None = None
+    def _latest_net_interval_ends(self, resource_id: str) -> dict[str, datetime]:
+        """Each meter's latest net interval end, keyed by meter name.
+
+        The net end, not the raw latest ``usage.to``, is what the billed-life
+        assertions check, and per-meter keys keep one meter's convergence
+        from hiding another meter's pending final piece.
+        """
+        meters: dict[str, list[dict[str, Any]]] = {}
         for event in self.get_all_events(HEARTBEAT_TYPE, resource_id):
-            to = parse_time(event["data"]["usage"]["to"])
-            if end is None or to > end:
-                end = to
-        return end
+            meters.setdefault(event.get("data", {}).get("meter", ""), []).append(event)
+        ends: dict[str, datetime] = {}
+        for meter, events in meters.items():
+            net = net_intervals(events)
+            if net:
+                ends[meter] = net[-1][1]
+        return ends
 
     def heartbeat_with_dimensions(
         self,

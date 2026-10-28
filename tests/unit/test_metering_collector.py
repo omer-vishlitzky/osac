@@ -10,7 +10,11 @@ from tests.e2e.core.metering import HEARTBEAT_TYPE, MeteringCollector, parse_tim
 
 
 def _heartbeat(
-    *, instance_type: str | None = "m-small", event_id: str = "01JM8Z9X4KQW7N2R3T5V8B6C0D", minute: int = 0
+    *,
+    instance_type: str | None = "m-small",
+    event_id: str = "01JM8Z9X4KQW7N2R3T5V8B6C0D",
+    minute: int = 0,
+    meter: str = "compute",
 ) -> dict[str, Any]:
     dimensions: dict[str, Any] = {
         "deployment": "us-east-1",
@@ -37,7 +41,7 @@ def _heartbeat(
             "resource_id": "vm-7",
             "resource_type": "compute_instance",
             "tenant_id": "tenant1",
-            "meter": "compute",
+            "meter": meter,
             "component": "compute",
             "heartbeat_time": end,
             "rules_revision": "0001",
@@ -140,6 +144,7 @@ def test_wait_for_billing_end_anchored_on_the_deletion_waits_for_the_final_piece
         [_heartbeat(minute=minute) for minute in range(7)],
         [_heartbeat(minute=minute) for minute in range(7)] + [final_piece],
     ]
+
     calls = list(rounds)
 
     def fetch(event_type: str, resource_id: str) -> list[dict[str, Any]]:
@@ -150,8 +155,84 @@ def test_wait_for_billing_end_anchored_on_the_deletion_waits_for_the_final_piece
     monkeypatch.setattr("time.sleep", lambda seconds: None)
     monkeypatch.setattr("time.monotonic", clock)
 
-    end = collector.wait_for_billing_end("vm-7", deletion=parse_time("2026-10-05T10:07:41Z"), timeout=300)
+    end = collector.wait_for_billing_end("vm-7", deletion=parse_time("2026-10-05T10:07:41Z"), quiet=60, timeout=300)
     assert end == parse_time("2026-10-05T10:07:42Z")
+
+
+def test_wait_for_billing_end_waits_for_the_correction_of_a_stale_overrun(
+    collector: MeteringCollector, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A round that ticks before the fold consumes the deletion sends a full
+    interval past it; the wait must not return on that stale end, only once
+    the negative correction and the final partial piece have landed."""
+    stale = _heartbeat(event_id="beat-stale", minute=5)
+    stale["data"]["usage"]["to"] = "2026-10-05T10:07:50Z"
+    stale["data"]["usage"]["quantity"] = "170.000000"
+    # The stale round billed [10:05, 10:07:50]; the deletion at 10:07:41
+    # over-billed the last 9 seconds, which the next round reverses.
+    correction = _heartbeat(event_id="beat-correction", minute=7)
+    correction["data"]["usage"]["from"] = "2026-10-05T10:07:41Z"
+    correction["data"]["usage"]["to"] = "2026-10-05T10:07:50Z"
+    correction["data"]["usage"]["quantity"] = "-9.000000"
+    rounds = [
+        [_heartbeat(minute=minute) for minute in range(5)],
+        [_heartbeat(minute=minute) for minute in range(5)] + [stale],
+        [_heartbeat(minute=minute) for minute in range(5)] + [stale, correction],
+    ]
+
+    calls = list(rounds)
+
+    def fetch(event_type: str, resource_id: str) -> list[dict[str, Any]]:
+        return calls.pop(0) if calls else rounds[-1]
+
+    clock = _AdvancingClock(step_seconds=30)
+    monkeypatch.setattr(collector, "_fetch_events", fetch)
+    monkeypatch.setattr("time.sleep", lambda seconds: None)
+    monkeypatch.setattr("time.monotonic", clock)
+
+    # The stale round's end (10:07:50) already reaches past the deletion, but
+    # the wait must hold out for the corrected net end (10:07:41).
+    end = collector.wait_for_billing_end("vm-7", deletion=parse_time("2026-10-05T10:07:41Z"), quiet=60, timeout=300)
+    assert end == parse_time("2026-10-05T10:07:41Z")
+
+
+def test_wait_for_billing_end_waits_for_every_meter(
+    collector: MeteringCollector, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A bare-metal instance bills under two meters; one meter's final piece
+    landing must not end the wait while the other meter's is still pending."""
+    allocation_final = _heartbeat(event_id="beat-alloc", minute=7, meter="allocation")
+    allocation_final["data"]["usage"]["to"] = "2026-10-05T10:07:42Z"
+    allocation_final["data"]["usage"]["quantity"] = "42.000000"
+    consumption_final = _heartbeat(event_id="beat-cons", minute=7, meter="consumption")
+    consumption_final["data"]["usage"]["to"] = "2026-10-05T10:07:45Z"
+    consumption_final["data"]["usage"]["quantity"] = "45.000000"
+    rounds = [
+        [_heartbeat(minute=minute, meter="allocation") for minute in range(5)]
+        + [_heartbeat(minute=minute, meter="consumption") for minute in range(5)],
+        # The allocation meter converges; consumption still falls short.
+        [_heartbeat(minute=minute, meter="allocation") for minute in range(7)]
+        + [allocation_final]
+        + [_heartbeat(minute=minute, meter="consumption") for minute in range(5)],
+        # Consumption converges, to a later end than allocation's.
+        [_heartbeat(minute=minute, meter="allocation") for minute in range(7)]
+        + [allocation_final]
+        + [_heartbeat(minute=minute, meter="consumption") for minute in range(7)]
+        + [consumption_final],
+    ]
+
+    calls = list(rounds)
+
+    def fetch(event_type: str, resource_id: str) -> list[dict[str, Any]]:
+        return calls.pop(0) if calls else rounds[-1]
+
+    clock = _AdvancingClock(step_seconds=30)
+    monkeypatch.setattr(collector, "_fetch_events", fetch)
+    monkeypatch.setattr("time.sleep", lambda seconds: None)
+    monkeypatch.setattr("time.monotonic", clock)
+
+    end = collector.wait_for_billing_end("vm-7", deletion=parse_time("2026-10-05T10:07:41Z"), quiet=60, timeout=300)
+    assert end == parse_time("2026-10-05T10:07:45Z")
 
 
 def test_wait_for_billing_end_anchored_on_the_deletion_times_out_when_the_piece_never_lands(
@@ -167,7 +248,7 @@ def test_wait_for_billing_end_anchored_on_the_deletion_times_out_when_the_piece_
     monkeypatch.setattr("time.monotonic", clock)
 
     with pytest.raises(TimeoutError, match="did not reach the deletion"):
-        collector.wait_for_billing_end("vm-7", deletion=parse_time("2026-10-05T10:07:41Z"), timeout=300)
+        collector.wait_for_billing_end("vm-7", deletion=parse_time("2026-10-05T10:07:41Z"), quiet=60, timeout=300)
 
 
 class _AdvancingClock:
