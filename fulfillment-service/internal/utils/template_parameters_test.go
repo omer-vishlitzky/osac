@@ -25,10 +25,13 @@ import (
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
+
+	. "github.com/osac-project/osac/fulfillment-service/internal/testing"
 )
 
 func TestTemplateParameters(t *testing.T) {
 	RegisterFailHandler(Fail)
+	RegisterNativeReportCollector()
 	RunSpecs(t, "Template parameters")
 }
 

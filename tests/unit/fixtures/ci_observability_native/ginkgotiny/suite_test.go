@@ -10,6 +10,7 @@ import (
 
 func TestGinkgotiny(t *testing.T) {
 	gomega.RegisterFailHandler(ginkgo.Fail)
+	registerNativeReportCollector()
 	ginkgo.RunSpecs(t, "Ginkgotiny Suite")
 }
 

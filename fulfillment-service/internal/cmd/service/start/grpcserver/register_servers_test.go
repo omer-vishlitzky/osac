@@ -59,6 +59,7 @@ import (
 
 func TestRegisterServers(t *testing.T) {
 	RegisterFailHandler(Fail)
+	itesting.RegisterNativeReportCollector()
 	RunSpecs(t, "gRPC server registration package")
 }
 

@@ -21,10 +21,13 @@ import (
 	. "github.com/onsi/gomega"
 
 	"github.com/osac-project/osac/fulfillment-service/internal/logging"
+
+	. "github.com/osac-project/osac/fulfillment-service/internal/testing"
 )
 
 func TestConfig(t *testing.T) {
 	RegisterFailHandler(Fail)
+	RegisterNativeReportCollector()
 	RunSpecs(t, "Config package")
 }
 

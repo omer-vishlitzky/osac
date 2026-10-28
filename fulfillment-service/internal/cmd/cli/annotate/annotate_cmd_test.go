@@ -24,10 +24,13 @@ import (
 
 	"github.com/osac-project/osac/fulfillment-service/internal/cmd/cli/updatable"
 	"github.com/osac-project/osac/fulfillment-service/internal/reflection"
+
+	. "github.com/osac-project/osac/fulfillment-service/internal/testing"
 )
 
 func TestAnnotate(t *testing.T) {
 	RegisterFailHandler(Fail)
+	RegisterNativeReportCollector()
 	RunSpecs(t, "Annotate command")
 }
 

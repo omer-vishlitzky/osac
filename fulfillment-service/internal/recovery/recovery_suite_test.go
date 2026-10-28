@@ -21,10 +21,13 @@ import (
 	. "github.com/onsi/gomega"
 
 	"github.com/osac-project/osac/fulfillment-service/internal/logging"
+
+	. "github.com/osac-project/osac/fulfillment-service/internal/testing"
 )
 
 func TestRecovery(t *testing.T) {
 	RegisterFailHandler(Fail)
+	RegisterNativeReportCollector()
 	RunSpecs(t, "Recovery package")
 }
 

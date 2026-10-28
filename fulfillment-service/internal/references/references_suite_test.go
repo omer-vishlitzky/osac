@@ -20,12 +20,15 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+
+	. "github.com/osac-project/osac/fulfillment-service/internal/testing"
 )
 
 var logger *slog.Logger
 
 func TestReferences(t *testing.T) {
 	RegisterFailHandler(Fail)
+	RegisterNativeReportCollector()
 	RunSpecs(t, "References Suite")
 }
 

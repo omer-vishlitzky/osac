@@ -21,12 +21,15 @@ import (
 	. "github.com/onsi/gomega"
 
 	"github.com/osac-project/osac/fulfillment-service/internal/logging"
+
+	. "github.com/osac-project/osac/fulfillment-service/internal/testing"
 )
 
 var logger *slog.Logger
 
 func TestTenant(t *testing.T) {
 	RegisterFailHandler(Fail)
+	RegisterNativeReportCollector()
 	RunSpecs(t, "Onboarding Controller Suite")
 }
 

@@ -262,6 +262,29 @@ concurrent archival using callback doubles. Catalog cleanup observes every
 seconds; it waits for archival before removing dependencies. The complete
 installer command in the tier table remains the component-integration check.
 
+### Non-failing native unit reports
+
+Fulfillment's internal Ginkgo suites and the three metering modules register
+an opt-in report collector. `OSAC_CI_GINKGO_REPORT_DIR` activates it; an unset
+variable leaves the suite unchanged. This collector does not change the
+existing Fulfillment IT reporting flags above.
+
+From the repository root, `uv run pytest -n 0 tests/unit/test_ci_native_reports.py`
+executes the helper against real Go and Ginkgo processes and private files.
+These component-integration tests belong to the observability implementation.
+They cover serial, parallel, recursive and retried runs, interruption,
+unwritable output, unsafe files, merge failure and incomplete collection.
+The real Fulfillment logging and metering schema suites prove component
+registration and report-write failure isolation. No deployed OSAC service,
+cluster, AAP server or provider runs in this test file.
+
+Reports stay private and unredacted. A trusted expected-suite catalog supplies
+the denominator for collection coverage; missing reports never imply a pass.
+Plain Go `Test` functions need Go test events, including those beside Ginkgo
+suites. Canonical native adapters, those plain-test events and canonical
+imports of the four real IT reports remain unresolved W03 and W04 work. No follow-up
+Jira issue is assigned. See the [native report helper](../tools/ci_observability/README.md).
+
 ### Coverage notes
 
 - **Tenant storage onboarding projection ([OSAC-6575](https://redhat.atlassian.net/browse/OSAC-6575), DEV):** `internal/controllers/tenant/tenant_storage_onboarding_test.go` covers exact operator condition projection, missing/unknown evidence, source isolation, timestamps, and unchanged observations through the reconciler with mocked hub and Kubernetes clients. `it/it_tenant_storage_onboarding_test.go` exercises operator Tenant CR status to explicit private Tenant `Signal` to persisted private API status using real Kubernetes, the deployed Fulfillment controller/API, and PostgreSQL. [OSAC-6684](https://redhat.atlassian.net/browse/OSAC-6684) adds repeated reads and signals with unchanged storage evidence; a changed compute-readiness reason in the same response confirms the later hub observation occurred. Run the Fulfillment installer target above, or `ginkgo run --timeout 20m --focus 'Tenant storage onboarding feedback' it` against a compatible deployed environment. The fixture supplies the operator condition; it does not prove automatic feedback-watch delivery, storage readiness calculation ([OSAC-6447](https://redhat.atlassian.net/browse/OSAC-6447)), AAP execution, remote cluster access, real storage-provider behavior, or VM consumption ([OSAC-6596](https://redhat.atlassian.net/browse/OSAC-6596)).

@@ -11,26 +11,50 @@ import argparse
 import contextlib
 import dataclasses
 import datetime
+import fnmatch
 import json
+import math
 import os
 import signal
+import stat
 import subprocess
 import sys
 import time
 import types
+from collections import Counter
 from pathlib import Path
 from typing import BinaryIO
 
 FRAMEWORKS = ("go-test", "ginkgo")
 GO_TEST_REPORT_NAME = "go-test.json"
 GINKGO_REPORT_NAME = "ginkgo-report.json"
+# Suite-side collectors published by the components' test-support hooks read
+# this variable and write one "ginkgo-report-<random>.json" final per suite
+# run; the random suffix comes from the collector's exclusive temporary name.
+GINKGO_REPORT_ENV = "OSAC_CI_GINKGO_REPORT_DIR"
+GINKGO_FINAL_REPORT_GLOB = "ginkgo-report-*.json"
+GINKGO_PARTIAL_REPORT_GLOB = ".ginkgo-report-*.json.partial"
 GINKGO_REPORT_EVIDENCE_ERROR = "ginkgo left no report evidence; test outcome is unknown"
+GINKGO_MERGE_ERROR = "ginkgo report merge failed"
+GINKGO_FINAL_NOT_REGULAR_ERROR = "ginkgo report final is not a regular file"
+GINKGO_FINAL_SIZE_ERROR = "ginkgo report final exceeds the collection size limit"
+GINKGO_FINAL_JSON_ERROR = "ginkgo report final is not valid JSON"
+GINKGO_PARTIAL_LEFT_ERROR = "ginkgo report collection left unpublished partial evidence"
+GINKGO_EXPECTED_MISSING_PREFIX = "ginkgo expected suite report missing:"
+# Collection caps. A native report is contracted to stay below 32 MiB; the
+# totals keep a pathological attempt from exhausting memory or disk.
+GINKGO_FINAL_MAX_BYTES = 32 * 1024 * 1024
+GINKGO_TOTAL_MAX_BYTES = 256 * 1024 * 1024
+GINKGO_FINAL_MAX_COUNT = 1000
+ATTEMPT_MAX_ENTRIES = 4096
+GINKGO_EXPECTED_MAX_BYTES = 128 * 1024
+GINKGO_JSON_MAX_DEPTH = 64
+ATTEMPT_ENTRY_LIMIT_ERROR = "attempt directory exceeds the collection entry limit"
 STATUS_NAME = "status.json"
 REDACTION_MARKER_NAME = "REDACTION_REQUIRED"
 
 ESCALATION_GRACE_SECONDS = 10
 
-GINKGO_RUN_SUBCOMMAND = "run"
 UNSUPPORTED_GINKGO_SUBCOMMANDS = ("build", "bootstrap", "convert", "generate", "labels", "unfocus", "version", "watch")
 
 # Boolean spellings go test's flag parser accepts, matching strconv.ParseBool.
@@ -111,7 +135,7 @@ class NativeReportError(Exception):
     """A configuration or reporting problem that stopped the helper."""
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, kw_only=True)
 class NativeReportResult:
     """Child result and independent collection errors."""
 
@@ -158,7 +182,7 @@ def validate_command(*, framework: str, command: list[str]) -> None:
         ):
             raise NativeReportError(
                 "command already sets --json-report or --output-dir; "
-                "remove them so the helper can place the report in its private output dir"
+                "remove them so the helper's non-failing collector is the only report writer"
             )
         index += 1
 
@@ -167,14 +191,6 @@ def build_go_test_argv(*, command: list[str]) -> list[str]:
     if _caller_json_setting(command=command) in GO_FLAG_TRUE:
         return list(command)
     return [command[0], command[1], "-json", *command[2:]]
-
-
-def build_ginkgo_argv(*, command: list[str], attempt_dir: Path) -> list[str]:
-    # Ginkgo rejects reporting flags before an explicit run subcommand.
-    report_flags = [f"--json-report={GINKGO_REPORT_NAME}", f"--output-dir={attempt_dir}"]
-    if len(command) > 1 and command[1] == GINKGO_RUN_SUBCOMMAND:
-        return [command[0], command[1], *report_flags, *command[2:]]
-    return [command[0], *report_flags, *command[1:]]
 
 
 def create_attempt_dir(*, output_dir: Path) -> Path:
@@ -206,9 +222,15 @@ def write_redaction_marker(*, attempt_dir: Path) -> None:
         marker_file.write(REDACTION_MARKER_TEXT)
 
 
-def run_with_native_report(*, framework: str, output_dir: Path, command: list[str]) -> NativeReportResult:
+def run_with_native_report(
+    *, framework: str, output_dir: Path, command: list[str], ginkgo_expected_suites: list[str] | None = None
+) -> NativeReportResult:
     """Run one test command and keep its native report in a private attempt dir."""
     validate_command(framework=framework, command=command)
+    if ginkgo_expected_suites is not None and framework != "ginkgo":
+        raise NativeReportError("--ginkgo-expected-suites requires --framework ginkgo")
+    if ginkgo_expected_suites is not None:
+        _validate_expected_suites(suites=ginkgo_expected_suites)
     attempt_dir = create_attempt_dir(output_dir=output_dir)
     write_redaction_marker(attempt_dir=attempt_dir)
     report_name = GO_TEST_REPORT_NAME if framework == "go-test" else GINKGO_REPORT_NAME
@@ -218,18 +240,25 @@ def run_with_native_report(*, framework: str, output_dir: Path, command: list[st
         if framework == "go-test":
             exit_code = _run_go_test(attempt_dir=attempt_dir, command=command, record=record)
         else:
-            exit_code = _run_ginkgo(attempt_dir=attempt_dir, command=command, record=record)
+            exit_code = _run_ginkgo(
+                attempt_dir=attempt_dir, command=command, record=record, expected_suites=ginkgo_expected_suites
+            )
     except FileNotFoundError:
         record.errors.append(f"test command executable not found: {os.path.basename(command[0])}")
         exit_code = MISSING_COMMAND_EXIT
     record.state = "finished"
     record.end_utc = _utc_now()
     record.exit_code = exit_code
+    errors_before_inventory = len(record.errors)
     _finalize_attempt(attempt_dir=attempt_dir, record=record)
+    if framework == "ginkgo" and len(record.errors) != errors_before_inventory:
+        record.coverage = {"state": "unknown"}
     try:
         _write_status(attempt_dir=attempt_dir, record=record)
     except OSError:
         record.errors.append("status write failed")
+        if framework == "ginkgo":
+            record.coverage = {"state": "unknown"}
     for error in record.errors:
         print(f"{COLLECTION_ERROR_PREFIX} {error}", file=sys.stderr)
     return NativeReportResult(
@@ -244,7 +273,7 @@ def run_with_native_report(*, framework: str, output_dir: Path, command: list[st
     )
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(kw_only=True)
 class _RunRecord:
     """Mutable local bookkeeping for one attempt; serialized to status.json."""
 
@@ -264,6 +293,7 @@ class _RunRecord:
     non_json_lines: int | None = None
     artifacts: list[dict[str, object]] = dataclasses.field(default_factory=list)
     errors: list[str] = dataclasses.field(default_factory=list)
+    coverage: dict[str, object] | None = None
 
 
 def _validate_go_test_command(*, command: list[str]) -> None:
@@ -330,10 +360,13 @@ def _run_go_test(*, attempt_dir: Path, command: list[str], record: _RunRecord) -
     return _final_exit_code(returncode=returncode, signum=watch.signum)
 
 
-def _run_ginkgo(*, attempt_dir: Path, command: list[str], record: _RunRecord) -> int:
-    argv = build_ginkgo_argv(command=command, attempt_dir=attempt_dir)
-    os.close(_create_private_file(path=attempt_dir / GINKGO_REPORT_NAME))
-    child = _popen_child(argv=argv, pipe_stdout=False)
+def _run_ginkgo(*, attempt_dir: Path, command: list[str], record: _RunRecord, expected_suites: list[str] | None) -> int:
+    # The collector lives in the suites, not in the CLI: reporting flags stay
+    # untouched and the private attempt directory is named by an environment
+    # variable, so a report IO failure can never change the CLI's exit code.
+    child_env = dict(os.environ)
+    child_env[GINKGO_REPORT_ENV] = str(attempt_dir)
+    child = _popen_child(argv=list(command), pipe_stdout=False, env=child_env)
     record.child_pid = child.pid
     with _ChildSignalWatch(child=child) as watch:
         _persist_child_pid(attempt_dir=attempt_dir, record=record)
@@ -342,12 +375,232 @@ def _run_ginkgo(*, attempt_dir: Path, command: list[str], record: _RunRecord) ->
     record.interrupted = watch.signum is not None
     record.signal = watch.signum
     record.forced_kill = watch.forced_kill
+    _collect_ginkgo_reports(attempt_dir=attempt_dir, record=record, expected_suites=expected_suites)
     return _final_exit_code(returncode=returncode, signum=watch.signum)
 
 
-def _popen_child(*, argv: list[str], pipe_stdout: bool) -> subprocess.Popen[bytes]:
+class _GinkgoFinalError(Exception):
+    """A rejected collector final, carrying a constant collection-error label."""
+
+    def __init__(self, label: str) -> None:
+        super().__init__(label)
+        self.label = label
+
+
+def _collect_ginkgo_reports(*, attempt_dir: Path, record: _RunRecord, expected_suites: list[str] | None) -> None:
+    """File presence cannot establish coverage without a caller catalog."""
+    record.coverage = {"state": "unknown"}
+    try:
+        entries = _attempt_entries(attempt_dir=attempt_dir)
+    except _GinkgoFinalError as error:
+        record.errors.append(error.label)
+        return
+    finals: list[os.DirEntry[str]] = []
+    try:
+        for entry in entries:
+            if fnmatch.fnmatch(entry.name, GINKGO_PARTIAL_REPORT_GLOB):
+                record.errors.append(GINKGO_PARTIAL_LEFT_ERROR)
+                continue
+            if not fnmatch.fnmatch(entry.name, GINKGO_FINAL_REPORT_GLOB):
+                continue
+            if entry.is_symlink() or not entry.is_file(follow_symlinks=False):
+                record.errors.append(GINKGO_FINAL_NOT_REGULAR_ERROR)
+                continue
+            finals.append(entry)
+            if len(finals) > GINKGO_FINAL_MAX_COUNT:
+                record.errors.append(GINKGO_FINAL_SIZE_ERROR)
+                return
+    except OSError:
+        record.errors.append(GINKGO_MERGE_ERROR)
+        return
+    if record.interrupted or record.errors:
+        return
+    merged: list[bytes] = []
+    descriptions: Counter[str] = Counter()
+    total_bytes = 0
+    for entry in finals:
+        remaining_bytes = GINKGO_TOTAL_MAX_BYTES - total_bytes
+        if remaining_bytes <= 0:
+            record.errors.append(GINKGO_FINAL_SIZE_ERROR)
+            return
+        try:
+            description, payload, size = _read_ginkgo_final(
+                path=Path(entry.path), byte_limit=min(GINKGO_FINAL_MAX_BYTES, remaining_bytes)
+            )
+        except _GinkgoFinalError as failure:
+            record.errors.append(failure.label)
+            return
+        total_bytes += size
+        if total_bytes > GINKGO_TOTAL_MAX_BYTES:
+            record.errors.append(GINKGO_FINAL_SIZE_ERROR)
+            return
+        merged.append(payload)
+        descriptions[description] += 1
+    if merged and not _write_ginkgo_merged(attempt_dir=attempt_dir, merged=merged):
+        record.errors.append(GINKGO_MERGE_ERROR)
+        return
+    if expected_suites is None:
+        return
+    expected = Counter(expected_suites)
+    missing = sorted((expected - descriptions).elements())
+    record.coverage = {
+        "state": "incomplete" if missing else "complete",
+        "expected": len(expected_suites),
+        "published": sum(descriptions.values()),
+    }
+    if missing:
+        record.coverage["missing"] = missing
+        # A missing expected suite is a source gap; the exit code stays the
+        # child's own and no test outcome is invented.
+        record.errors.append(f"{GINKGO_EXPECTED_MISSING_PREFIX} {len(missing)}")
+
+
+def _attempt_entries(*, attempt_dir: Path) -> list[os.DirEntry[str]]:
+    entries: list[os.DirEntry[str]] = []
+    try:
+        with os.scandir(attempt_dir) as directory:
+            for entry in directory:
+                if len(entries) >= ATTEMPT_MAX_ENTRIES:
+                    raise _GinkgoFinalError(ATTEMPT_ENTRY_LIMIT_ERROR)
+                entries.append(entry)
+    except OSError:
+        raise _GinkgoFinalError(GINKGO_MERGE_ERROR) from None
+    return sorted(entries, key=lambda entry: entry.name)
+
+
+def _read_capped_regular_file(*, path: Path, byte_limit: int) -> bytes:
+    try:
+        directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory_fd)
+            try:
+                info = os.fstat(fd)
+                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                    raise _GinkgoFinalError(GINKGO_FINAL_NOT_REGULAR_ERROR)
+                if info.st_size > byte_limit:
+                    raise _GinkgoFinalError(GINKGO_FINAL_SIZE_ERROR)
+                chunks: list[bytes] = []
+                remaining = byte_limit + 1
+                while remaining > 0:
+                    chunk = os.read(fd, min(remaining, 1 << 20))
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    remaining -= len(chunk)
+            finally:
+                os.close(fd)
+        finally:
+            os.close(directory_fd)
+    except OSError:
+        raise _GinkgoFinalError(GINKGO_MERGE_ERROR) from None
+    data = b"".join(chunks)
+    if len(data) > byte_limit:
+        raise _GinkgoFinalError(GINKGO_FINAL_SIZE_ERROR)
+    return data
+
+
+def _reject_json_constant(value: str) -> object:
+    raise ValueError("non-finite-json-number")
+
+
+def _report_float(value: str) -> float:
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError("non-finite-json-number")
+    return number
+
+
+def _report_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    values: dict[str, object] = {}
+    for key, value in pairs:
+        if key in values:
+            raise ValueError("duplicate-json-key")
+        values[key] = value
+    return values
+
+
+def _check_report_depth(*, value: object, depth: int = 0) -> None:
+    if depth > GINKGO_JSON_MAX_DEPTH:
+        raise ValueError("json-depth-limit")
+    if isinstance(value, dict):
+        for item in value.values():
+            _check_report_depth(value=item, depth=depth + 1)
+    elif isinstance(value, list):
+        for item in value:
+            _check_report_depth(value=item, depth=depth + 1)
+
+
+def _read_ginkgo_final(*, path: Path, byte_limit: int = GINKGO_FINAL_MAX_BYTES) -> tuple[str, bytes, int]:
+    data = _read_capped_regular_file(path=path, byte_limit=byte_limit)
+    try:
+        document = json.loads(
+            data.decode("utf-8"),
+            parse_constant=_reject_json_constant,
+            parse_float=_report_float,
+            object_pairs_hook=_report_pairs,
+        )
+        _check_report_depth(value=document)
+    except (ValueError, RecursionError):
+        raise _GinkgoFinalError(GINKGO_FINAL_JSON_ERROR) from None
+    if not isinstance(document, list) or len(document) != 1 or not isinstance(document[0], dict):
+        raise _GinkgoFinalError(GINKGO_FINAL_JSON_ERROR)
+    description = document[0].get("SuiteDescription")
+    if not isinstance(description, str) or not description:
+        raise _GinkgoFinalError(GINKGO_FINAL_JSON_ERROR)
+    # Merge these exact validated bytes, not a second read of mutable files.
+    return description, data.strip()[1:-1], len(data)
+
+
+def _write_ginkgo_merged(*, attempt_dir: Path, merged: list[bytes]) -> bool:
+    tmp_path = attempt_dir / f"{GINKGO_REPORT_NAME}.merge.tmp"
+    try:
+        with os.fdopen(_create_private_file(path=tmp_path), "wb") as merged_file:
+            merged_file.write(b"[")
+            for index, report in enumerate(merged):
+                if index:
+                    merged_file.write(b",\n")
+                merged_file.write(report)
+            merged_file.write(b"]\n")
+        os.replace(tmp_path, attempt_dir / GINKGO_REPORT_NAME)
+    except (OSError, ValueError, RecursionError):
+        # The finals stay in place as evidence when the merge cannot run.
+        return False
+    return True
+
+
+def load_ginkgo_expected_suites(*, path: Path) -> list[str]:
+    """Read the trusted manifest of suite descriptions expected to publish."""
+    try:
+        text = _read_capped_regular_file(path=path, byte_limit=GINKGO_EXPECTED_MAX_BYTES).decode("utf-8")
+    except (_GinkgoFinalError, UnicodeError):
+        raise NativeReportError("cannot read ginkgo expected suites manifest") from None
+    suites: list[str] = []
+    for line in text.splitlines():
+        entry = line.strip()
+        if entry and not entry.startswith("#"):
+            suites.append(entry)
+    _validate_expected_suites(suites=suites)
+    return sorted(suites)
+
+
+def _validate_expected_suites(*, suites: list[str]) -> None:
+    if not suites:
+        raise NativeReportError("ginkgo expected suites manifest is empty")
+    if len(suites) > GINKGO_FINAL_MAX_COUNT:
+        raise NativeReportError("ginkgo expected suites manifest exceeds the entry limit")
+    for suite in suites:
+        if (
+            not isinstance(suite, str)
+            or not suite.strip()
+            or len(suite) > 512
+            or any(ord(character) < 32 or ord(character) == 127 for character in suite)
+        ):
+            raise NativeReportError("invalid ginkgo expected suite identity")
+
+
+def _popen_child(*, argv: list[str], pipe_stdout: bool, env: dict[str, str] | None = None) -> subprocess.Popen[bytes]:
     stdout = subprocess.PIPE if pipe_stdout else None
-    return subprocess.Popen(argv, stdout=stdout, start_new_session=True, umask=0o077)
+    return subprocess.Popen(argv, stdout=stdout, env=env, start_new_session=True, umask=0o077)
 
 
 def _persist_child_pid(*, attempt_dir: Path, record: _RunRecord) -> None:
@@ -429,7 +682,11 @@ def _final_exit_code(*, returncode: int, signum: int | None) -> int:
 
 def _create_private_file(*, path: Path) -> int:
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    os.fchmod(fd, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+    except OSError:
+        os.close(fd)
+        raise
     return fd
 
 
@@ -446,33 +703,43 @@ def _write_status(*, attempt_dir: Path, record: _RunRecord) -> None:
 
 def _finalize_attempt(*, attempt_dir: Path, record: _RunRecord) -> None:
     try:
-        entries = sorted(attempt_dir.iterdir())
-    except OSError:
-        record.errors.append("attempt directory listing failed")
+        entries = _attempt_entries(attempt_dir=attempt_dir)
+    except _GinkgoFinalError as error:
+        record.errors.append(error.label)
         return
     has_ginkgo_report = False
-    for entry in entries:
+    for directory_entry in entries:
+        entry = Path(directory_entry.path)
         if entry.name in (STATUS_NAME, f"{STATUS_NAME}.tmp", REDACTION_MARKER_NAME):
             continue
-        if entry.is_symlink():
-            record.errors.append("unexpected symlink in attempt directory")
-            continue
         try:
-            size = entry.stat().st_size
+            metadata = directory_entry.stat(follow_symlinks=False)
         except OSError:
             record.errors.append("artifact size unavailable")
-            size = None
-        if (
-            (entry.name == GINKGO_REPORT_NAME or entry.name.endswith(f"_{GINKGO_REPORT_NAME}"))
-            and entry.is_file()
-            and size is not None
-            and size > 0
-        ):
+            continue
+        if stat.S_ISLNK(metadata.st_mode):
+            record.errors.append("unexpected symlink in attempt directory")
+            continue
+        is_file = stat.S_ISREG(metadata.st_mode)
+        is_directory = stat.S_ISDIR(metadata.st_mode)
+        size = metadata.st_size
+        if fnmatch.fnmatch(entry.name, GINKGO_FINAL_REPORT_GLOB) and is_file and size > 0:
             has_ginkgo_report = True
-        try:
-            os.chmod(entry, 0o700 if entry.is_dir() else 0o600)
-        except OSError:
-            record.errors.append("permission sweep failed")
+        if (is_file and metadata.st_nlink == 1) or is_directory:
+            try:
+                descriptor = os.open(entry, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                try:
+                    current = os.fstat(descriptor)
+                    if (stat.S_ISREG(current.st_mode) and current.st_nlink == 1) or stat.S_ISDIR(current.st_mode):
+                        os.fchmod(descriptor, 0o700 if stat.S_ISDIR(current.st_mode) else 0o600)
+                    else:
+                        record.errors.append("artifact type changed during collection")
+                finally:
+                    os.close(descriptor)
+            except OSError:
+                record.errors.append("permission sweep failed")
+        elif is_file:
+            record.errors.append("unexpected hardlink in attempt directory")
         artifact: dict[str, object] = {"name": entry.name, "bytes": size}
         if entry.name == record.report_name and record.json_event_lines is not None:
             artifact["json_event_lines"] = record.json_event_lines
@@ -551,11 +818,20 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "Run one trusted CI test command with its native report kept in a private "
             "output directory. The reporting command's exit code is returned unchanged. "
-            "Ginkgo's own report errors can make passing specs exit nonzero."
+            "Ginkgo report collection is non-failing; missing evidence is a collection error."
         ),
     )
     parser.add_argument("--framework", required=True, choices=FRAMEWORKS, help="test framework of the command")
     parser.add_argument("--output-dir", required=True, help="private directory that receives the report files")
+    parser.add_argument(
+        "--ginkgo-expected-suites",
+        metavar="PATH",
+        default=None,
+        help=(
+            "trusted manifest with one expected suite description per line; "
+            "ginkgo collection coverage is unknown without it"
+        ),
+    )
     parser.add_argument(
         "command",
         nargs=argparse.REMAINDER,
@@ -570,8 +846,23 @@ def main(*, argv: list[str] | None = None) -> int:
     command = list(args.command)
     if command and command[0] == "--":
         command = command[1:]
+    expected_suites: list[str] | None = None
+    if args.ginkgo_expected_suites is not None:
+        if args.framework != "ginkgo":
+            print("native_reports: --ginkgo-expected-suites requires --framework ginkgo", file=sys.stderr)
+            return USAGE_ERROR_EXIT
+        try:
+            expected_suites = load_ginkgo_expected_suites(path=Path(args.ginkgo_expected_suites))
+        except NativeReportError as error:
+            print(f"native_reports: {error}", file=sys.stderr)
+            return USAGE_ERROR_EXIT
     try:
-        result = run_with_native_report(framework=args.framework, output_dir=Path(args.output_dir), command=command)
+        result = run_with_native_report(
+            framework=args.framework,
+            output_dir=Path(args.output_dir),
+            command=command,
+            ginkgo_expected_suites=expected_suites,
+        )
     except NativeReportError as error:
         print(f"native_reports: {error}", file=sys.stderr)
         return USAGE_ERROR_EXIT

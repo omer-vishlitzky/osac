@@ -18,9 +18,12 @@ import (
 
 	. "github.com/onsi/ginkgo/v2/dsl/core"
 	. "github.com/onsi/gomega"
+
+	. "github.com/osac-project/osac/fulfillment-service/internal/testing"
 )
 
 func TestDescribe(t *testing.T) {
 	RegisterFailHandler(Fail)
+	RegisterNativeReportCollector()
 	RunSpecs(t, "Describe command")
 }

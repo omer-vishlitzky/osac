@@ -29,10 +29,13 @@ import (
 
 	"github.com/osac-project/osac/fulfillment-service/internal/terminal"
 	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
+
+	. "github.com/osac-project/osac/fulfillment-service/internal/testing"
 )
 
 func TestConnect(t *testing.T) {
 	RegisterFailHandler(Fail)
+	RegisterNativeReportCollector()
 	RunSpecs(t, "Console connect")
 }
 

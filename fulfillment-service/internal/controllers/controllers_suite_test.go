@@ -20,10 +20,13 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"github.com/osac-project/osac/fulfillment-service/internal/logging"
+
+	. "github.com/osac-project/osac/fulfillment-service/internal/testing"
 )
 
 func TestControllers(t *testing.T) {
 	RegisterFailHandler(Fail)
+	RegisterNativeReportCollector()
 	RunSpecs(t, "Controllers package")
 }
 

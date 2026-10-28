@@ -18,9 +18,12 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+
+	. "github.com/osac-project/osac/fulfillment-service/internal/testing"
 )
 
 func TestCreateClusterversion(t *testing.T) {
 	RegisterFailHandler(Fail)
+	RegisterNativeReportCollector()
 	RunSpecs(t, "Create clusterversion command")
 }

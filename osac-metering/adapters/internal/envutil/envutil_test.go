@@ -18,10 +18,13 @@ import (
 	. "github.com/onsi/gomega"
 
 	"github.com/osac-project/osac-metering/adapters/internal/envutil"
+
+	"github.com/osac-project/osac-metering/adapters/internal/cireports"
 )
 
 func TestEnvutil(t *testing.T) {
 	RegisterFailHandler(Fail)
+	cireports.RegisterNativeReportCollector()
 	RunSpecs(t, "Envutil Suite")
 }
 

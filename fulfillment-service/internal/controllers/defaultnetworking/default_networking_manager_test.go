@@ -26,10 +26,13 @@ import (
 	"google.golang.org/grpc/status"
 
 	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
+
+	. "github.com/osac-project/osac/fulfillment-service/internal/testing"
 )
 
 func TestDefaultNetworkingManager(t *testing.T) {
 	RegisterFailHandler(Fail)
+	RegisterNativeReportCollector()
 	RunSpecs(t, "Default networking manager")
 }
 

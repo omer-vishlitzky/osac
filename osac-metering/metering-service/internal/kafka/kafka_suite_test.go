@@ -14,9 +14,12 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+
+	"github.com/osac-project/osac-metering/internal/cireports"
 )
 
 func TestKafka(t *testing.T) {
 	RegisterFailHandler(Fail)
+	cireports.RegisterNativeReportCollector()
 	RunSpecs(t, "Kafka Suite")
 }
