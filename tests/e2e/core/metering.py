@@ -409,6 +409,23 @@ class MeteringCollector:
         """Return all events matching type and resource_id (for N+1 count assertions)."""
         return self._fetch_events(event_type, resource_id)
 
+    def typed_heartbeats(self, resource_id: str, *, dimension: str, meter: str | None = None) -> list[dict[str, Any]]:
+        """The heartbeats that carry a billing dimension, in interval order.
+
+        A resource's first heartbeats can legitimately lack a dimension that
+        lands later (the running instance type, the storage tier), so exact
+        billing assertions read only the heartbeats that carry it. A meter
+        name narrows a multi-meter resource such as a bare-metal instance.
+        """
+        typed = [
+            event
+            for event in self.get_all_events(HEARTBEAT_TYPE, resource_id)
+            if event.get("data", {}).get("billing_dimensions", {}).get(dimension)
+            and (meter is None or event.get("data", {}).get("meter") == meter)
+        ]
+        typed.sort(key=_interval_start)
+        return typed
+
     def wait_for_billing_end(
         self, resource_id: str, *, deletion: datetime, quiet: int = 150, timeout: int = 600
     ) -> datetime:
@@ -423,48 +440,53 @@ class MeteringCollector:
         still needed because a round that ticks before the fold consumes the
         deletion sends a full interval past it and the negative correction
         that follows lands in a later round: an end read before the
-        correction lands reads as billing past the anchor. Each meter is
-        tracked separately, so one meter's final piece landing does not end
-        the wait for another meter's.
+        correction lands reads as billing past the anchor. The whole net
+        interval state, not just the latest end, must be unchanged for the
+        quiet window, because a correction can change billed usage inside
+        the life without moving the end. Each meter is tracked separately,
+        so one meter's final piece landing does not end the wait for another
+        meter's.
         """
         deadline = time.monotonic() + timeout
-        latest_ends: dict[str, datetime] = {}
+        latest: dict[str, list[tuple[datetime, datetime, Decimal]]] = {}
         unchanged_since: float | None = None
         while True:
-            ends = self._latest_net_interval_ends(resource_id)
+            intervals = self._latest_net_intervals(resource_id)
             now = time.monotonic()
-            if ends != latest_ends:
-                latest_ends, unchanged_since = ends, now
+            if intervals != latest:
+                latest, unchanged_since = intervals, now
             if (
-                latest_ends
+                latest
                 and unchanged_since is not None
                 and now - unchanged_since >= quiet
-                and all(end >= deletion - CR_STAMP_TOLERANCE for end in latest_ends.values())
+                and all(net[-1][1] >= deletion - CR_STAMP_TOLERANCE for net in latest.values())
             ):
-                return max(latest_ends.values())
+                return max(net[-1][1] for net in latest.values())
             if now >= deadline:
+                ends = {meter: net[-1][1] for meter, net in latest.items()}
                 raise TimeoutError(
                     f"billing of {resource_id} did not reach the deletion at {deletion} and go "
-                    f"quiet within {timeout}s: last interval ends {latest_ends}"
+                    f"quiet within {timeout}s: last interval ends {ends}"
                 )
             time.sleep(10)
 
-    def _latest_net_interval_ends(self, resource_id: str) -> dict[str, datetime]:
-        """Each meter's latest net interval end, keyed by meter name.
+    def _latest_net_intervals(self, resource_id: str) -> dict[str, list[tuple[datetime, datetime, Decimal]]]:
+        """Each meter's net billed intervals, keyed by meter name.
 
-        The net end, not the raw latest ``usage.to``, is what the billed-life
-        assertions check, and per-meter keys keep one meter's convergence
-        from hiding another meter's pending final piece.
+        The net intervals, not the raw heartbeats or just their latest end,
+        are what the billed-life assertions check: a negative correction can
+        change billed usage inside the life without moving the latest end,
+        and per-meter keys keep one meter's convergence from hiding another
+        meter's pending final piece.
         """
         meters: dict[str, list[dict[str, Any]]] = {}
         for event in self.get_all_events(HEARTBEAT_TYPE, resource_id):
             meters.setdefault(event.get("data", {}).get("meter", ""), []).append(event)
-        ends: dict[str, datetime] = {}
+        intervals: dict[str, list[tuple[datetime, datetime, Decimal]]] = {}
         for meter, events in meters.items():
-            net = net_intervals(events)
-            if net:
-                ends[meter] = net[-1][1]
-        return ends
+            if net := net_intervals(events):
+                intervals[meter] = net
+        return intervals
 
     def heartbeat_with_dimensions(
         self,

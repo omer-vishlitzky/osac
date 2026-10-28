@@ -54,17 +54,6 @@ def metering_project(grpc: GRPCClient):
         grpc.delete_project(project_id=project_id)
 
 
-def _typed_heartbeats(metering: MeteringCollector, volume_id: str) -> list[dict[str, Any]]:
-    """The heartbeats that carry the storage_tier dimension, in interval order."""
-    typed = [
-        event
-        for event in metering.get_all_events(HEARTBEAT_TYPE, volume_id)
-        if event.get("data", {}).get("billing_dimensions", {}).get("storage_tier")
-    ]
-    typed.sort(key=lambda event: event["data"]["usage"]["from"])
-    return typed
-
-
 def test_volume_bills_gibibyte_seconds(
     grpc: GRPCClient,
     private_grpc: GRPCClient,
@@ -137,13 +126,13 @@ def test_volume_bills_gibibyte_seconds(
         # quantity must equal size x the exact length of its interval in seconds,
         # and consecutive intervals must be contiguous with no billed gap.
         poll_until(
-            fn=lambda: len(_typed_heartbeats(metering, volume_id)),
+            fn=lambda: len(metering.typed_heartbeats(volume_id, dimension="storage_tier")),
             until=lambda count: count >= 2,
             retries=HEARTBEAT_TIMEOUT // 10,
             delay=10,
             description=f"two typed heartbeats of volume {volume_id}",
         )
-        typed = _typed_heartbeats(metering, volume_id)
+        typed = metering.typed_heartbeats(volume_id, dimension="storage_tier")
         for event in typed:
             start, end, quantity = usage_interval(event)
             expected = Decimal(VOLUME_SIZE_GIB) * interval_seconds(start, end)
@@ -173,7 +162,7 @@ def test_volume_bills_gibibyte_seconds(
     # net intervals, each billing exactly its size in GiB per second, and the
     # last interval reaches the recorded deletion.
     assert_exact_contiguous_life(
-        _typed_heartbeats(metering, volume_id),
+        metering.typed_heartbeats(volume_id, dimension="storage_tier"),
         multiplier=Decimal(VOLUME_SIZE_GIB),
         deletion=deletion_recorded,
         label=f"typed heartbeats of volume {volume_id}",
