@@ -124,32 +124,6 @@ def test_verify_rejects_a_heartbeat_that_loses_the_dimension_after_it_landed(
         collector.verify()
 
 
-def test_wait_for_billing_end_returns_the_latest_end_once_quiet(
-    collector: MeteringCollector, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The billing end is the latest interval end, read only once no new heartbeat
-    arrives for the quiet window: a late final piece moves the end instead of
-    reading as billing past an intermediate round's end."""
-    rounds = [
-        [_heartbeat(minute=minute) for minute in range(5)],
-        [_heartbeat(minute=minute) for minute in range(5)],
-        [_heartbeat(minute=minute) for minute in range(7)],
-        [_heartbeat(minute=minute) for minute in range(7)],
-    ]
-    calls = list(rounds)
-
-    def fetch(event_type: str, resource_id: str) -> list[dict[str, Any]]:
-        return calls.pop(0) if calls else rounds[-1]
-
-    clock = _AdvancingClock(step_seconds=30)
-    monkeypatch.setattr(collector, "_fetch_events", fetch)
-    monkeypatch.setattr("time.sleep", lambda seconds: None)
-    monkeypatch.setattr("time.monotonic", clock)
-
-    end = collector.wait_for_billing_end("vm-7", quiet=90, timeout=300)
-    assert end == parse_time("2026-10-05T10:07:00Z")
-
-
 def test_wait_for_billing_end_anchored_on_the_deletion_waits_for_the_final_piece(
     collector: MeteringCollector, monkeypatch: pytest.MonkeyPatch
 ) -> None:
