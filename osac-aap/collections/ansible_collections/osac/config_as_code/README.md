@@ -15,8 +15,8 @@ AAP itself, and one used for cluster fulfillment operations.
 ### Config-as-code environment variables
 
 In order to reconcile the configuration of AAP, the following environment
-variables are used (injected from the `config-as-code-ig` secret or the pod
-where applicable):
+variables are used (injected from the configured config-as-code Secret, named
+`config-as-code-ig` by default, or the pod where applicable):
 
 | Variable | Description | Default |
 |----|----|----|
@@ -33,13 +33,33 @@ where applicable):
 | `AAP_PROJECT_GIT_BRANCH` | Git branch to use for the project | `main` |
 | `AAP_PROJECT_ARCHIVE_URI` | Optional archive URL instead of git (e.g. tarball) | — |
 | `AAP_EE_IMAGE` | Registry URL of the execution environment image | `ghcr.io/osac/osac-aap:latest` |
+| `AAP_OSAC_SERVICE_ACCOUNT` | Kubernetes ServiceAccount for the cluster-fulfillment, compute-instance-operations, networking-operations, storage-operations, and bare-metal-fulfillment job pods. The config-as-code, publish-templates, and fulfillment-trust-sync pods use their own accounts. | `osac-sa` |
 | `LICENSE_MANIFEST_PATH` | Path to the license manifest file to register the AAP instance ([Red Hat account](https://access.redhat.com/management/subscription_allocations)) | `/var/secrets/config-as-code-manifest/license.zip` |
-| `REMOTE_CLUSTER_KUBECONFIG_SECRET_NAME` | Name of the secret holding the kubeconfig for the remote cluster (cluster fulfillment only) | — |
+| `REMOTE_CLUSTER_KUBECONFIG_SECRET_NAME` | Name of the secret holding the kubeconfig for the remote cluster (compute instance and storage operations; not supported with provider networking enabled) | — |
 | `REMOTE_CLUSTER_KUBECONFIG_SECRET_KEY` | Key within that secret for the kubeconfig file | `kubeconfig` |
-| `OSAC_PUBLISH_TEMPLATES_ENABLED` | Whether the periodic **publish-templates** schedule is enabled in Controller (`true`/`false`) | `true` |
+| `OSAC_PUBLISH_TEMPLATES_ENABLED` | Whether the periodic **publish-templates** schedule is enabled in Controller (`true`/`false`) | Helm sets this from `instanceGroups.publishTemplates.enabled`; if unset for a manually managed deployment, `true` |
+| `NETRIS_CONTROLLER_URL` | Netris controller URL of the CaaS Netris steps, set on the cluster-fulfillment container group | — |
+| `NETRIS_VALIDATE_CERTS` | Whether Netris TLS certificates are validated by CaaS Netris jobs | `true` |
+| `NETRIS_CA_CONFIGMAP` | Optional customer-created ConfigMap name containing `bundle.pem` in the AAP namespace | — |
 
-These variables must be defined in a secret named `config-as-code-ig` in the
-namespace where AAP is deployed.
+These variables must be defined in the configured config-as-code Secret
+(`configAsCode.secret`, default `config-as-code-ig`) in the namespace where AAP
+is deployed.
+
+The three `NETRIS_*` variables are the installation-owned connection settings
+of the CaaS Netris steps (`NETWORK_CLASS=netris`). Config-as-code sets them as
+fixed environment variables of the cluster-fulfillment container group, with
+the `netris.controller.protected_linear` strategy that rejects launch-time
+overrides. When `NETRIS_CA_CONFIGMAP` is configured, it adds a required,
+read-only `bundle.pem` mount at `/etc/netris/ca/bundle.pem` and sets
+`NETRIS_CA_PATH`. The CA ConfigMap applies only to cluster-fulfillment (CaaS)
+jobs; the networking-operations container group neither mounts nor reads it.
+The installer reads these values from the Netris settings in
+`aap.instanceGroups.networkFulfillment.config` and fails the render unless the
+URL is `https://` and the validation flag is `true` or `false`; customers
+create the ConfigMap and the installer does not copy certificate contents into the
+execution-environment image. Networking jobs do not use these variables: they
+read the network managers' settings from `network-fulfillment-ig`.
 
 The content of license manifest file must be set in a secret named
 `config-as-code-manifest-ig` as `license.zip` in the namespace where AAP is
@@ -65,24 +85,44 @@ These variables must be defined in a secret named: `cluster-fulfillment-ig` in
 the namespace where AAP is deployed.
 
 The cluster fulfillment needs to access the Kube API of the cluster it runs on,
-so we expect a service account `osac-sa` to exists with enough rights.
+so the configured AAP service account (`AAP_OSAC_SERVICE_ACCOUNT`, default
+`osac-sa`) must exist with enough rights.
+
+### Networking environment variables
+
+Networking jobs read the settings and credentials of the network managers from
+the ConfigMap and Secret named `network-fulfillment-ig` in the AAP namespace.
+Keys are prefixed with the registration name in upper case. Consult the
+selected manager's owner documentation for its settings.
 
 ### Compute instance operations environment variables
 
 Compute instance (VMaaS) job templates run in the
 `compute-instance-operations-ig` instance group. The default KubeVirt path
-(`ocp_virt_vm`) uses the in-cluster `osac-sa` service account and does not
-require credentials in a dedicated secret.
+(`ocp_virt_vm`) uses the configured AAP service account
+(`AAP_OSAC_SERVICE_ACCOUNT`, default `osac-sa`) and does not require credentials
+in a dedicated secret.
 
 The pod spec optionally mounts a secret named
 `compute-instance-operations-ig`. Create it only when a deployment-specific
 compute template needs extra environment variables. OpenStack credentials are
 not required for VMaaS; Neutron networking uses `network-fulfillment-ig`, and
-cluster/ESI floating-IP workflows use `cluster-fulfillment-ig`.
+cluster/ESI floating-IP workflows use `cluster-fulfillment-ig`. Jobs use the
+configured AAP service account (`AAP_OSAC_SERVICE_ACCOUNT`, default `osac-sa`).
 
 The compute instance instance group also optionally mounts `storage-operations-ig`
 for JIT tenant storage during VM provisioning, and may mount a remote cluster
 kubeconfig when `REMOTE_CLUSTER_KUBECONFIG_SECRET_NAME` is configured.
+
+### Storage operations environment variables
+
+Storage jobs use the isolated `storage-operations-ig` secret and config map. The
+worker optionally mounts the same remote-cluster kubeconfig secret configured by
+`REMOTE_CLUSTER_KUBECONFIG_SECRET_NAME` and exports its path as
+`OSAC_REMOTE_CLUSTER_KUBECONFIG`. Tenant StorageClass provisioning and teardown
+use this kubeconfig when it is configured; without it, they use the worker's
+default cluster context. ClusterOrder storage continues to use the per-job
+`admin_kubeconfig`.
 
 ## Deploy a local AAP installation using CRC
 
@@ -228,66 +268,25 @@ as AWS and OpenStack credentials:
 
     oc create secret generic cluster-fulfillment-ig --from-env-file=fufillment_creds -n fulfillment-aap
 
-#### Template publisher configuration
+#### Template publisher authentication
 
-Create the service account, role, and role bindings required by the template
-publisher to authenticate against the
-[fulfillment-service](https://github.com/osac-project/fulfillment-service/):
+The `publish-templates` execution group uses the Keycloak client-credentials
+flow to authenticate its Fulfillment REST calls. In the AAP namespace, provide
+the `fulfillment-controller-credentials` Secret with `client-id` and
+`client-secret` keys, and the `aap-fulfillment-auth-config` ConfigMap with the
+`OSAC_FULFILLMENT_ISSUER_URL` key. The installer provisions the Secret from
+Keycloak's managed client credentials and renders the ConfigMap from
+`service.auth.issuerUrl` when template publishing is enabled.
 
-    cat << EOF > template-publisher
-    apiVersion: v1
-    kind: ServiceAccount
-    metadata:
-      name: template-publisher
-      namespace: fulfillment-aap
-    ---
-    apiVersion: rbac.authorization.k8s.io/v1
-    kind: Role
-    metadata:
-      name: create-controller-token
-      namespace: osac
-    rules:
-      - apiGroups: [""]
-        resources: ["serviceaccounts/token"]
+For a separately managed AAP deployment, provision those resources through the
+deployment's secret-management process and configure the `publish-templates`
+instance group to expose them to its execution pods. Do not place the client
+secret in a ConfigMap, playbook variable, or checked-in values file.
 
-        # here is the name of the service account to authenticate against the
-        # fulfillment-service
-        resourceNames: ["controller"]
-        verbs: ["create"]
-    ---
-    apiVersion: rbac.authorization.k8s.io/v1
-    kind: RoleBinding
-    metadata:
-      name: aap-fulfillment-template-publisher-binding
-      namespace: osac
-    roleRef:-
-      apiGroup: rbac.authorization.k8s.io
-      kind: Role
-      name: create-controller-token
-    subjects:
-      - kind: ServiceAccount
-        name: template-publisher
-        namespace: fulfillment-aap
-    ---
-    apiVersion: v1
-    kind: ConfigMap
-    metadata:
-      name: my-prefix-publish-templates-ig
-      namespace: fulfillment-aap
-    data:
-      OSAC_FULFILLMENT_SERVICE_URI: https://fulfillment-service.example.uri
-      OSAC_TEMPLATE_COLLECTIONS: osac.templates,example.templates
-
-      # this is the service account used to login against fulfillment service (see
-      # RBAC above)
-      OSAC_PUBLISH_TEMPLATES_SERVICE_ACCOUNT: controller
-
-      # this is the namespace where the service account used to login against
-      # fulfillment service lives ("controller" in this example)
-      OSAC_PUBLISH_TEMPLATES_NAMESPACE: osac
-    EOF
-
-    oc apply -f template-publisher
+The `template-publisher` ServiceAccount remains the execution pod's Kubernetes
+API identity. Its projected Kubernetes token is separate from the Keycloak
+client-credentials token used for Fulfillment requests; it no longer needs
+permission to create service-account tokens.
 
 #### Bootstrap AAP configuration
 

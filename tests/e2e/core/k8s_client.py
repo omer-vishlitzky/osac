@@ -1,23 +1,65 @@
 from __future__ import annotations
 
+import contextlib
 import json
+import re
 import subprocess
+import tempfile
+import time
+from collections.abc import Callable, Iterator
+from pathlib import Path
 from typing import Any
 
 from tests.e2e.core.runner import run, run_unchecked
 
+_CLUSTER_ORDER_NOT_FOUND_RE = re.compile(
+    r'Error from server \(NotFound\): clusterorders(?:\.osac\.openshift\.io)? "(?P<name>[^"]+)" not found',
+    re.IGNORECASE,
+)
+_RESOURCE_NOT_FOUND_RE = re.compile(
+    r'Error from server \(NotFound\): (?P<resource>[a-z0-9.-]+) "(?P<name>[^"]+)" not found', re.IGNORECASE
+)
+# kubectl reports canonical plural resource names, not necessarily the requested alias.
+_RESOURCE_NOT_FOUND_ALIASES = {
+    "clusterorder": {"clusterorders", "clusterorders.osac.openshift.io"},
+    "infraenv.agent-install.openshift.io": {"infraenvs.agent-install.openshift.io"},
+    "namespace": {"namespaces"},
+    "tenant": {"tenants", "tenants.osac.openshift.io"},
+}
+
+
+def _watch_lines(path: Path) -> list[str]:
+    """The complete non-empty lines of a growing watch output file.
+
+    kubectl prints one line per watched object; the last line may be a
+    partial write in progress, so only newline-terminated lines count.
+    """
+    text = path.read_text()
+    if not text:
+        return []
+    lines = text.split("\n")
+    if not text.endswith("\n"):
+        lines.pop()
+    return [line for line in lines if line]
+
 
 class K8sClient:
-    def __init__(self, *, namespace: str, kubeconfig: str | None = None) -> None:
+    def __init__(self, *, namespace: str, kubeconfig: str | None = None, as_system_admin: bool = True) -> None:
         self.namespace: str = namespace
         self.kubeconfig: str | None = kubeconfig
+        self.as_system_admin: bool = as_system_admin
 
     def _base(self) -> list[str]:
         args: list[str] = ["kubectl"]
         if self.kubeconfig is not None:
             args.extend(["--kubeconfig", self.kubeconfig])
-        args.extend(["--as", "system:admin"])
+        if self.as_system_admin:
+            args.extend(["--as", "system:admin"])
         return args
+
+    def base_args(self) -> list[str]:
+        """The kubectl prefix (binary, kubeconfig, impersonation) for callers that run their own commands."""
+        return self._base()
 
     def _get(self, *args: str, checked: bool = True) -> tuple[str, int]:
         if checked:
@@ -26,11 +68,131 @@ class K8sClient:
 
     # Generic kubectl operations
 
-    def get_json(self, *, resource: str, name: str) -> dict[str, Any]:
-        return json.loads(run(*self._base(), "get", resource, name, "-n", self.namespace, "-o", "json"))
+    def get_json(self, *, resource: str, name: str, namespace: str | None = None) -> dict[str, Any]:
+        target_namespace = self.namespace if namespace is None else namespace
+        return json.loads(run(*self._base(), "get", resource, name, "-n", target_namespace, "-o", "json"))
+
+    def list_json(self, *, resource: str, namespace: str | None = None) -> dict[str, Any]:
+        args = [*self._base(), "get", resource]
+        if namespace is not None:
+            args.extend(["-n", namespace])
+        args.extend(["-o", "json"])
+        return json.loads(run(*args))
+
+    def get_operator_metrics(self) -> str:
+        services = self.list_json(resource="services", namespace=self.namespace).get("items", [])
+        metrics_service = next(
+            (
+                service
+                for service in services
+                if service.get("metadata", {}).get("labels", {}).get("app.kubernetes.io/name") == "operator"
+                and any(
+                    port.get("name") == "https" and port.get("port") == 8443
+                    for port in service.get("spec", {}).get("ports", [])
+                )
+            ),
+            None,
+        )
+        if metrics_service is None:
+            raise RuntimeError(f"No operator metrics service on HTTPS port 8443 in namespace {self.namespace}")
+
+        service_name = metrics_service.get("metadata", {}).get("name", "")
+        if not service_name:
+            raise RuntimeError("Operator metrics service has no metadata.name")
+        pod_name = run(
+            *self._base(),
+            "get",
+            "pods",
+            "-n",
+            self.namespace,
+            "-l",
+            "app.kubernetes.io/name=operator,control-plane=controller-manager",
+            "-o",
+            "jsonpath={.items[0].metadata.name}",
+        )
+        token = run(*self._base(), "create", "token", "osac-operator", "-n", self.namespace, "--duration=10m")
+        return run(
+            *self._base(),
+            "exec",
+            pod_name,
+            "-n",
+            self.namespace,
+            "--",
+            "curl",
+            "-sk",
+            "-H",
+            f"Authorization: Bearer {token}",
+            "https://127.0.0.1:8443/metrics",
+        )
 
     def get_jsonpath(self, *, resource: str, name: str, jsonpath: str) -> str:
         return run(*self._base(), "get", resource, name, "-n", self.namespace, "-o", f"jsonpath={jsonpath}")
+
+    @contextlib.contextmanager
+    def watch_deletion_timestamp(self, *, resource: str, name: str) -> Iterator[Callable[[], str]]:
+        """Yield a callable returning the object's deletionTimestamp once set.
+
+        A plain get loses the race against a fast teardown: controllers can
+        release every finalizer within a second of the delete request, and
+        the object is gone before the next get runs. A watch established
+        before the delete request cannot miss it: Kubernetes delivers the
+        modification that stamps metadata.deletionTimestamp to every watcher
+        already open, whatever happens to the object afterwards.
+
+        The watch is confirmed established (the current object arrived)
+        before the context body runs, so a delete issued inside the body is
+        always after the watch.
+        """
+        with tempfile.TemporaryDirectory() as run_dir:
+            out_path = Path(run_dir) / "watch.out"
+            err_path = Path(run_dir) / "watch.err"
+            with out_path.open("w") as out, err_path.open("w") as err:
+                command = [
+                    *self._base(),
+                    "get",
+                    resource,
+                    name,
+                    "-n",
+                    self.namespace,
+                    # The name always renders, so the first line proves the
+                    # watch is established; the timestamp after the colon is
+                    # empty until the delete stamps it. Object names cannot
+                    # contain colons, so splitting on the first is safe. The
+                    # jsonpath printer emits no newline of its own, so the
+                    # template carries one: without it every watched object
+                    # concatenates into a single unterminated line.
+                    "-o",
+                    'jsonpath={.metadata.name}:{.metadata.deletionTimestamp}{"\\n"}',
+                    "--watch",
+                ]
+                proc = subprocess.Popen(command, stdout=out, stderr=err)
+            try:
+                deadline = time.monotonic() + 30
+                while not _watch_lines(out_path):
+                    if proc.poll() is not None:
+                        raise RuntimeError(f"kubectl watch exited early: {err_path.read_text().strip()}")
+                    if time.monotonic() > deadline:
+                        raise RuntimeError(f"kubectl watch for {resource} {name} produced no output within 30s")
+                    time.sleep(0.2)
+
+                def deletion_stamp() -> str:
+                    if proc.poll() is not None:
+                        raise RuntimeError(f"kubectl watch exited early: {err_path.read_text().strip()}")
+                    for line in _watch_lines(out_path):
+                        stamp = line.split(":", 1)[1]
+                        if stamp:
+                            return stamp
+                    return ""
+
+                yield deletion_stamp
+            finally:
+                if proc.poll() is None:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait(timeout=5)
 
     def get_by_label(self, *, resource: str, label: str, jsonpath: str) -> str:
         return run(*self._base(), "get", resource, "-n", self.namespace, "-l", label, "-o", f"jsonpath={jsonpath}")
@@ -51,6 +213,21 @@ class K8sClient:
     def is_present(self, *, resource: str, name: str) -> bool:
         _, rc = run_unchecked(*self._base(), "get", resource, name, "-n", self.namespace)
         return rc == 0
+
+    def is_absent(self, *, resource: str, name: str) -> bool:
+        args = ("get", resource, name, "-n", self.namespace)
+        output, rc = run_unchecked(*self._base(), *args)
+        if rc == 0:
+            return False
+        not_found = _RESOURCE_NOT_FOUND_RE.fullmatch(output.strip())
+        expected_resources = _RESOURCE_NOT_FOUND_ALIASES.get(resource, {resource})
+        if (
+            not_found is not None
+            and not_found.group("resource").lower() in expected_resources
+            and not_found.group("name") == name
+        ):
+            return True
+        raise subprocess.CalledProcessError(rc, [*self._base(), *args], output=output, stderr=output)
 
     def count_by_label_all_namespaces(self, *, resource: str, label: str) -> int:
         output: str = run(*self._base(), "get", resource, "-A", "-l", label, "--no-headers")
@@ -83,27 +260,27 @@ class K8sClient:
     def get_compute_instance_last_restarted_at(self, *, name: str) -> str:
         return self.get_jsonpath(resource="computeinstance", name=name, jsonpath="{.status.lastRestartedAt}")
 
-    def get_compute_instance_latest_job_id(self, *, name: str, job_type: str, checked: bool = True) -> str:
+    def _get_latest_compute_instance_job(self, *, name: str, job_type: str, checked: bool) -> dict[str, Any] | None:
         output, rc = self._get("get", "computeinstance", name, "-n", self.namespace, "-o", "json", checked=checked)
         if rc != 0:
-            return ""
-        jobs: list[dict[str, Any]] = [
-            j for j in json.loads(output).get("status", {}).get("jobs", []) if j["type"] == job_type
+            return None
+        jobs = [
+            job
+            for job in json.loads(output).get("status", {}).get("jobs", [])
+            if job.get("task") == job_type and job.get("manager") == "none"
         ]
         if not jobs:
-            return ""
-        return sorted(jobs, key=lambda j: j["timestamp"], reverse=True)[0]["jobID"]
+            return None
+        return max(jobs, key=lambda job: job.get("attempt", 0))
+
+    def get_compute_instance_latest_job_id(self, *, name: str, job_type: str, checked: bool = True) -> str:
+        job = self._get_latest_compute_instance_job(name=name, job_type=job_type, checked=checked)
+        return job.get("jobID", "") if job else ""
 
     def get_compute_instance_latest_job_state(self, *, name: str, job_type: str, checked: bool = True) -> str:
-        output, rc = self._get("get", "computeinstance", name, "-n", self.namespace, "-o", "json", checked=checked)
-        if rc != 0:
-            return ""
-        jobs: list[dict[str, Any]] = [
-            j for j in json.loads(output).get("status", {}).get("jobs", []) if j["type"] == job_type
-        ]
-        if not jobs:
-            return ""
-        return sorted(jobs, key=lambda j: j["timestamp"], reverse=True)[0].get("state", "")
+        job = self._get_latest_compute_instance_job(name=name, job_type=job_type, checked=checked)
+        state = job.get("state", "") if job else ""
+        return "Canceled" if state == "Cancelled" else state
 
     def get_compute_instance_condition_status(self, *, name: str, condition_type: str, checked: bool = True) -> str:
         output, rc = self._get("get", "computeinstance", name, "-n", self.namespace, "-o", "json", checked=checked)
@@ -122,6 +299,23 @@ class K8sClient:
 
     # VirtualNetwork queries
 
+    def get_ready_condition(self, *, resource: str, name: str, checked: bool = True) -> str:
+        """Status of the Ready condition ("True", "False", "Unknown"), or "" when absent.
+
+        Networking CRs report readiness only through this condition.
+        """
+        output, rc = self._get(
+            "get",
+            resource,
+            name,
+            "-n",
+            self.namespace,
+            "-o",
+            'jsonpath={.status.conditions[?(@.type=="Ready")].status}',
+            checked=checked,
+        )
+        return output if rc == 0 else ""
+
     def get_virtual_network_name(self, *, uuid: str, checked: bool = True) -> str:
         output, rc = self._get(
             "get",
@@ -133,12 +327,6 @@ class K8sClient:
             "-o",
             "jsonpath={.items[0].metadata.name}",
             checked=checked,
-        )
-        return output if rc == 0 else ""
-
-    def get_virtual_network_phase(self, *, name: str, checked: bool = True) -> str:
-        output, rc = self._get(
-            "get", "virtualnetwork", name, "-n", self.namespace, "-o", "jsonpath={.status.phase}", checked=checked
         )
         return output if rc == 0 else ""
 
@@ -158,12 +346,6 @@ class K8sClient:
         )
         return output if rc == 0 else ""
 
-    def get_subnet_phase(self, *, name: str, checked: bool = True) -> str:
-        output, rc = self._get(
-            "get", "subnet", name, "-n", self.namespace, "-o", "jsonpath={.status.phase}", checked=checked
-        )
-        return output if rc == 0 else ""
-
     # VirtualMachine/VMI queries (explicit namespace — may be on a different cluster)
 
     def get_vmi_creation_timestamp(self, *, vmi_namespace: str, compute_instance_name: str) -> str:
@@ -178,6 +360,37 @@ class K8sClient:
             "-o",
             "jsonpath={.items[0].metadata.creationTimestamp}",
         )
+
+    def get_vmi_json(self, *, vmi_namespace: str, compute_instance_name: str, checked: bool = True) -> dict[str, Any]:
+        output, rc = self._get(
+            "get",
+            "virtualmachineinstance",
+            "-n",
+            vmi_namespace,
+            "-l",
+            f"osac.openshift.io/computeinstance={compute_instance_name}",
+            "-o",
+            "json",
+            checked=checked,
+        )
+        if rc != 0:
+            return {}
+        items = json.loads(output).get("items", [])
+        return items[0] if items else {}
+
+    def get_vmi_ip(self, *, vmi_namespace: str, compute_instance_name: str, checked: bool = True) -> str:
+        output, rc = self._get(
+            "get",
+            "virtualmachineinstance",
+            "-n",
+            vmi_namespace,
+            "-l",
+            f"osac.openshift.io/computeinstance={compute_instance_name}",
+            "-o",
+            "jsonpath={.items[0].status.interfaces[0].ipAddress}",
+            checked=checked,
+        )
+        return output if rc == 0 else ""
 
     def get_vm_printable_status(self, *, name: str, vm_namespace: str, checked: bool = True) -> str:
         output, rc = self._get(
@@ -197,23 +410,53 @@ class K8sClient:
             *self._base(), "get", "virtualmachine", name, "-n", vm_namespace, "-o", "jsonpath={.spec.runStrategy}"
         )
 
+    def get_vm_host_devices(self, *, name: str, vm_namespace: str) -> str:
+        output, rc = self._get(
+            "get",
+            "virtualmachine",
+            name,
+            "-n",
+            vm_namespace,
+            "-o",
+            "jsonpath={.spec.template.spec.domain.devices.hostDevices}",
+            checked=False,
+        )
+        return output if rc == 0 else ""
+
     # Storage tier resolution
 
-    def get_storage_class_for_tier(self, *, tier_name: str) -> str:
-        """Resolve StorageClass name from tier name via Tenant.status.storageClasses."""
-        tenant = self.get_json(resource="tenant", name=self.namespace)
+    def get_storage_class_for_tier(
+        self,
+        *,
+        tier_name: str,
+        tenant_name: str | None = None,
+        storage_class_client: K8sClient | None = None,
+    ) -> str:
+        """Resolve StorageClass name from tier name via Tenant.status.storageClasses or labeled StorageClasses."""
+        normalized_tier = tier_name.strip().lower()
+        target_tenant = (tenant_name or self.namespace).strip()
+        tenant = self.get_json(resource="tenant", name=target_tenant)
         storage_classes = tenant.get("status", {}).get("storageClasses", [])
 
         for sc in storage_classes:
-            if sc.get("tier", "").lower() == tier_name.lower():
-                return sc.get("name", "")
+            name = sc.get("name", "").strip()
+            if sc.get("tier", "").strip().lower() == normalized_tier and name:
+                return name
 
-        raise ValueError(f"No StorageClass found for tier '{tier_name}' in Tenant {self.namespace}")
+        items = (storage_class_client or self).list_json(resource="storageclass").get("items", [])
+        for item in items:
+            labels = item.get("metadata", {}).get("labels", {})
+            sc_tier = labels.get("osac.openshift.io/storage-tier", "").strip().lower()
+            sc_tenant = labels.get("osac.openshift.io/tenant", "").strip()
+            if sc_tier == normalized_tier and sc_tenant == target_tenant:
+                return item["metadata"]["name"].strip()
 
-    def get_datavolume_storage_class(self, *, name: str) -> str:
+        raise ValueError(f"No StorageClass found for tier '{tier_name}' in Tenant {target_tenant}")
+
+    def get_datavolume_storage_class(self, *, name: str, namespace: str | None = None) -> str:
         """Get the StorageClass name from a DataVolume's PVC spec."""
-        dv = self.get_json(resource="datavolume", name=name)
-        return dv.get("spec", {}).get("pvc", {}).get("storageClassName", "")
+        dv = self.get_json(resource="datavolume", name=name, namespace=namespace)
+        return dv.get("spec", {}).get("pvc", {}).get("storageClassName", "").strip()
 
     # ExternalIPPool queries
 
@@ -228,12 +471,6 @@ class K8sClient:
             "-o",
             "jsonpath={.items[0].metadata.name}",
             checked=checked,
-        )
-        return output if rc == 0 else ""
-
-    def get_external_ip_pool_phase(self, *, name: str, checked: bool = True) -> str:
-        output, rc = self._get(
-            "get", "externalippool", name, "-n", self.namespace, "-o", "jsonpath={.status.phase}", checked=checked
         )
         return output if rc == 0 else ""
 
@@ -253,12 +490,6 @@ class K8sClient:
         )
         return output if rc == 0 else ""
 
-    def get_external_ip_state(self, *, name: str, checked: bool = True) -> str:
-        output, rc = self._get(
-            "get", "externalip", name, "-n", self.namespace, "-o", "jsonpath={.status.state}", checked=checked
-        )
-        return output if rc == 0 else ""
-
     # ExternalIPAttachment queries
 
     def get_external_ip_attachment_name(self, *, uuid: str, checked: bool = True) -> str:
@@ -275,9 +506,17 @@ class K8sClient:
         )
         return output if rc == 0 else ""
 
-    def get_external_ip_attachment_phase(self, *, name: str, checked: bool = True) -> str:
+    def get_nat_gateway_name(self, *, uuid: str, checked: bool = True) -> str:
         output, rc = self._get(
-            "get", "externalipattachment", name, "-n", self.namespace, "-o", "jsonpath={.status.phase}", checked=checked
+            "get",
+            "natgateway",
+            "-n",
+            self.namespace,
+            "-l",
+            f"osac.openshift.io/natgateway-uuid={uuid}",
+            "-o",
+            "jsonpath={.items[0].metadata.name}",
+            checked=checked,
         )
         return output if rc == 0 else ""
 
@@ -297,11 +536,30 @@ class K8sClient:
         )
         return output if rc == 0 else ""
 
-    def get_cluster_order_phase(self, *, name: str, checked: bool = True) -> str:
+    def get_cluster_order_infra_env_name(self, *, name: str, checked: bool = True) -> str:
         output, rc = self._get(
-            "get", "clusterorder", name, "-n", self.namespace, "-o", "jsonpath={.status.phase}", checked=checked
+            "get", "infraenv.agent-install.openshift.io", "-n", self.namespace, "-o", "json", checked=checked
         )
-        return output if rc == 0 else ""
+        if rc != 0:
+            return ""
+        for item in json.loads(output).get("items", []):
+            owner_references = item.get("metadata", {}).get("ownerReferences", [])
+            if any(owner.get("kind") == "ClusterOrder" and owner.get("name") == name for owner in owner_references):
+                return item.get("metadata", {}).get("name", "")
+        return ""
+
+    def get_cluster_order_phase(self, *, name: str, checked: bool = True) -> str | None:
+        # In unchecked mode, None means that this ClusterOrder is gone. Keep a
+        # successful lookup with no status phase as "" so pollers do not treat
+        # an unrelated kubectl failure as deletion.
+        args = ("get", "clusterorder", name, "-n", self.namespace, "-o", "jsonpath={.status.phase}")
+        output, rc = self._get(*args, checked=checked)
+        if rc == 0:
+            return output
+        not_found = _CLUSTER_ORDER_NOT_FOUND_RE.fullmatch(output.strip())
+        if not_found is not None and not_found.group("name") == name:
+            return None
+        raise subprocess.CalledProcessError(rc, [*self._base(), *args], output=output, stderr=output)
 
     def get_cluster_order_latest_job_id(self, *, name: str, job_type: str, checked: bool = True) -> str:
         output, rc = self._get("get", "clusterorder", name, "-n", self.namespace, "-o", "json", checked=checked)
@@ -337,6 +595,10 @@ class K8sClient:
         output = self.get_jsonpath(resource="clusterorder", name=name, jsonpath="{.spec}")
         return json.loads(output) if output else {}
 
+    def get_cluster_order_status(self, *, name: str) -> dict[str, Any]:
+        output = self.get_jsonpath(resource="clusterorder", name=name, jsonpath="{.status}")
+        return json.loads(output) if output else {}
+
     def get_cluster_order_condition_status(self, *, name: str, condition_type: str, checked: bool = True) -> str:
         output, rc = self._get("get", "clusterorder", name, "-n", self.namespace, "-o", "json", checked=checked)
         if rc != 0:
@@ -346,6 +608,22 @@ class K8sClient:
             if cond.get("type") == condition_type:
                 return cond.get("status", "")
         return ""
+
+    def get_cluster_order_events(self, *, name: str, checked: bool = True) -> list[dict[str, Any]]:
+        output, rc = self._get(
+            "get",
+            "events",
+            "-n",
+            self.namespace,
+            "--field-selector",
+            f"involvedObject.kind=ClusterOrder,involvedObject.name={name}",
+            "-o",
+            "json",
+            checked=checked,
+        )
+        if rc != 0:
+            return []
+        return json.loads(output).get("items", [])
 
     def get_cluster_order_finalizers(self, *, name: str, checked: bool = True) -> list[str]:
         output, rc = self._get("get", "clusterorder", name, "-n", self.namespace, "-o", "json", checked=checked)
@@ -452,12 +730,6 @@ class K8sClient:
         )
         return output if rc == 0 else ""
 
-    def get_security_group_phase(self, *, name: str, checked: bool = True) -> str:
-        output, rc = self._get(
-            "get", "securitygroup", name, "-n", self.namespace, "-o", "jsonpath={.status.phase}", checked=checked
-        )
-        return output if rc == 0 else ""
-
     # BareMetalInstance queries
 
     def get_baremetal_instance_name(self, *, uuid: str, checked: bool = True) -> str:
@@ -476,6 +748,16 @@ class K8sClient:
 
     def get_baremetal_instance_external_host_id(self, *, name: str) -> str:
         return self.get_jsonpath(resource="baremetalinstance", name=name, jsonpath="{.spec.externalHostID}")
+
+    def get_baremetal_instance_ssh_public_key(self, *, name: str) -> str:
+        """Return the sshPublicKey value materialized into the BMFO CR template parameters.
+
+        The CR stores template parameters as a JSON-encoded string, so the value
+        is extracted in Python instead of through the jsonpath expression.
+        """
+        raw = self.get_jsonpath(resource="baremetalinstance", name=name, jsonpath="{.spec.templateParameters}")
+        parameters: dict[str, Any] = json.loads(raw) if raw else {}
+        return str(parameters.get("sshPublicKey", ""))
 
     def get_bmi_hardware_nics(self, *, name: str) -> list[str]:
         """Return lowercased MAC addresses from BareMetalInstance CR status.hardware.nics."""

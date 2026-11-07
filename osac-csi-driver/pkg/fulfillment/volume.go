@@ -15,10 +15,16 @@ const (
 
 // VolumeInfo describes a volume managed by the fulfillment service.
 type VolumeInfo struct {
-	ID             string
-	Name           string
-	State          VolumeState
-	Backend        string
+	ID    string
+	Name  string
+	State VolumeState
+	// Provider is the provider selected by server-side StorageTier resolution.
+	// Backend is the provider alias used by the osac.backend CSI routing key.
+	Provider string
+	Backend  string
+	// Message contains the detailed fulfillment/operator failure reason, when
+	// the volume is in the error state.
+	Message        string
 	VendorVolumeID string
 	Protocol       string
 	CapacityBytes  int64
@@ -30,20 +36,31 @@ type VolumeInfo struct {
 	VendorContext map[string]string
 }
 
+// VolumeTopology carries CSI-style placement segments for a volume request.
+type VolumeTopology struct {
+	Segments map[string]string
+}
+
 // CreateVolumeParams are the parameters for creating a volume through the
 // fulfillment service.
 type CreateVolumeParams struct {
 	Tenant     string
+	Project    string
 	Tier       string
 	SizeBytes  int64
 	AccessMode string
 	ClusterID  string
 	PVCRef     string
+	Topology   *VolumeTopology
 }
 
-// ListVolumesParams are the filter parameters for listing volumes.
+// ListVolumesParams are the filter parameters for listing volumes. Non-nil
+// tenant and project filters select their scopes explicitly, including the
+// tenant default project represented by an empty project string.
 type ListVolumesParams struct {
-	NameFilter string
+	NameFilter    string
+	TenantFilter  *string
+	ProjectFilter *string
 }
 
 // VolumeClient is the interface for managing volumes through the OSAC

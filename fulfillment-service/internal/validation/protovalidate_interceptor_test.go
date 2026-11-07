@@ -17,6 +17,7 @@ import (
 	"context"
 	"strings"
 
+	validate "buf.build/gen/go/bufbuild/protovalidate/protocolbuffers/go/buf/validate"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"google.golang.org/grpc"
@@ -25,15 +26,55 @@ import (
 	grpcstatus "google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
-	publicv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/public/v1"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
 
 // testPassword is a fixture credential; the test* prefix marks it as non-production.
 const testPassword = "secret"
 
+func newValidStorageBackendCreateRequest(provider string) *privatev1.StorageBackendsCreateRequest {
+	return privatev1.StorageBackendsCreateRequest_builder{
+		Object: privatev1.StorageBackend_builder{
+			Metadata: privatev1.Metadata_builder{Name: "my-backend"}.Build(),
+			Spec: privatev1.StorageBackendSpec_builder{
+				Provider:   provider,
+				CspManaged: provider == "netapp",
+				Endpoint:   "https://storage.example.com",
+				Credentials: privatev1.StorageBackendCredentials_builder{
+					Username: "admin",
+					Password: testPassword,
+				}.Build(),
+			}.Build(),
+		}.Build(),
+	}.Build()
+}
+
 var _ = Describe("Protovalidate interceptor", func() {
 	var interceptor *ProtovalidateInterceptor
+
+	It("keeps provider choices included in the provider validation allowlist", func() {
+		providerField := (&privatev1.StorageBackendSpec{}).ProtoReflect().Descriptor().Fields().ByName("provider")
+		Expect(providerField).ToNot(BeNil())
+
+		fieldOptions := providerField.Options()
+		validationRules := proto.GetExtension(fieldOptions, validate.E_Field).(*validate.FieldRules)
+		allowedProviders := validationRules.GetString().GetIn()
+		providerOptions := proto.GetExtension(
+			fieldOptions,
+			privatev1.E_StorageBackendProviderOptions,
+		).(*privatev1.StorageBackendProviderOptions)
+
+		seen := make(map[string]struct{}, len(providerOptions.GetChoices()))
+		for _, choice := range providerOptions.GetChoices() {
+			Expect(choice.GetKey()).ToNot(BeEmpty())
+			Expect(choice.GetDisplayName()).ToNot(BeEmpty())
+			Expect(allowedProviders).To(ContainElement(choice.GetKey()))
+			_, duplicate := seen[choice.GetKey()]
+			Expect(duplicate).To(BeFalse(), "provider key %q is duplicated", choice.GetKey())
+			seen[choice.GetKey()] = struct{}{}
+		}
+	})
 
 	Describe("Creation", func() {
 		It("Can be built if logger is set", func() {
@@ -343,85 +384,45 @@ var _ = Describe("Protovalidate interceptor", func() {
 			Expect(response).To(Equal("response"))
 		})
 
-		DescribeTable("Accepts display_name and description within length limits",
-			func(msg proto.Message) {
-				handlerCalled := false
-				mockHandler := func(ctx context.Context, req any) (any, error) {
-					handlerCalled = true
-					return "response", nil
-				}
+		It("reports an invalid ExternalIPAttachment target at the target field", func() {
+			request := publicv1.ExternalIPAttachmentsCreateRequest_builder{
+				Object: publicv1.ExternalIPAttachment_builder{
+					Metadata: publicv1.Metadata_builder{
+						Name: "ref-att-bad",
+					}.Build(),
+					Spec: publicv1.ExternalIPAttachmentSpec_builder{
+						ExternalIp: publicv1.ExternalIPLocalReference_builder{
+							Id: "fake-eip-id",
+						}.Build(),
+						ComputeInstance: publicv1.ComputeInstanceLocalReference_builder{
+							Name: "nonexistent-ci",
+						}.Build(),
+					}.Build(),
+				}.Build(),
+			}.Build()
 
-				response, err := interceptor.UnaryServer(
-					context.Background(),
-					msg,
-					&grpc.UnaryServerInfo{FullMethod: "/test.Service/Method"},
-					mockHandler,
-				)
+			handler := func(ctx context.Context, req any) (any, error) {
+				Fail("handler should not be called for an invalid request")
+				return nil, nil
+			}
 
-				Expect(err).ToNot(HaveOccurred())
-				Expect(handlerCalled).To(BeTrue())
-				Expect(response).To(Equal("response"))
-			},
-			Entry("public max lengths", &publicv1.Metadata{
-				Name:        "valid-name",
-				DisplayName: strings.Repeat("a", 63),
-				Description: strings.Repeat("b", 256),
-			}),
-			Entry("public empty values", &publicv1.Metadata{
-				Name:        "valid-name",
-				DisplayName: "",
-				Description: "",
-			}),
-			Entry("private max lengths", &privatev1.Metadata{
-				Name:        "valid-name",
-				DisplayName: strings.Repeat("a", 63),
-				Description: strings.Repeat("b", 256),
-			}),
-			Entry("private empty values", &privatev1.Metadata{
-				Name:        "valid-name",
-				DisplayName: "",
-				Description: "",
-			}),
-		)
+			_, err := interceptor.UnaryServer(
+				context.Background(),
+				request,
+				&grpc.UnaryServerInfo{
+					FullMethod: "/osac.public.v1.ExternalIPAttachments/Create",
+				},
+				handler,
+			)
 
-		DescribeTable("Rejects over-long display_name and description",
-			func(msg proto.Message) {
-				mockHandler := func(ctx context.Context, req any) (any, error) {
-					Fail("Handler should not be called for invalid request")
-					return nil, nil
-				}
+			Expect(err).To(HaveOccurred())
 
-				response, err := interceptor.UnaryServer(
-					context.Background(),
-					msg,
-					&grpc.UnaryServerInfo{FullMethod: "/test.Service/Method"},
-					mockHandler,
-				)
+			status, ok := grpcstatus.FromError(err)
+			Expect(ok).To(BeTrue())
+			Expect(status.Code()).To(Equal(grpccodes.InvalidArgument))
+			Expect(status.Message()).To(ContainSubstring("object.spec.compute_instance"))
+		})
 
-				Expect(err).To(HaveOccurred())
-				Expect(response).To(BeNil())
-				status, ok := grpcstatus.FromError(err)
-				Expect(ok).To(BeTrue())
-				Expect(status.Code()).To(Equal(grpccodes.InvalidArgument))
-				Expect(status.Message()).To(ContainSubstring("validation failed"))
-			},
-			Entry("public display_name too long", &publicv1.Metadata{
-				Name:        "valid-name",
-				DisplayName: strings.Repeat("a", 64),
-			}),
-			Entry("public description too long", &publicv1.Metadata{
-				Name:        "valid-name",
-				Description: strings.Repeat("b", 257),
-			}),
-			Entry("private display_name too long", &privatev1.Metadata{
-				Name:        "valid-name",
-				DisplayName: strings.Repeat("a", 64),
-			}),
-			Entry("private description too long", &privatev1.Metadata{
-				Name:        "valid-name",
-				Description: strings.Repeat("b", 257),
-			}),
-		)
 	})
 
 	Describe("Project name validation", func() {
@@ -584,6 +585,46 @@ var _ = Describe("Protovalidate interceptor", func() {
 			Expect(status.Message()).To(ContainSubstring("validation failed"))
 		})
 
+		It("accepts supported provider keys and internal LVMS", func() {
+			for _, provider := range []string{
+				"vast",
+				"netapp",
+				"pure",
+				"lvms",
+			} {
+				response, err := interceptor.UnaryServer(
+					context.Background(),
+					newValidStorageBackendCreateRequest(provider),
+					&grpc.UnaryServerInfo{FullMethod: "/osac.private.v1.StorageBackendsService/Create"},
+					func(context.Context, any) (any, error) { return "response", nil },
+				)
+
+				Expect(err).NotTo(HaveOccurred(), provider)
+				Expect(response).To(Equal("response"), provider)
+			}
+		})
+
+		It("Rejects unlisted provider keys", func() {
+			handlerCalled := false
+			response, err := interceptor.UnaryServer(
+				context.Background(),
+				newValidStorageBackendCreateRequest("ceph"),
+				&grpc.UnaryServerInfo{FullMethod: "/osac.private.v1.StorageBackendsService/Create"},
+				func(context.Context, any) (any, error) {
+					handlerCalled = true
+					return "response", nil
+				},
+			)
+
+			Expect(err).To(HaveOccurred())
+			Expect(response).To(BeNil())
+			Expect(handlerCalled).To(BeFalse())
+			status, ok := grpcstatus.FromError(err)
+			Expect(ok).To(BeTrue())
+			Expect(status.Code()).To(Equal(grpccodes.InvalidArgument))
+			Expect(status.Message()).To(ContainSubstring("validation failed"))
+		})
+
 		It("Rejects create request with empty endpoint", func() {
 			request := privatev1.StorageBackendsCreateRequest_builder{
 				Object: privatev1.StorageBackend_builder{
@@ -591,7 +632,7 @@ var _ = Describe("Protovalidate interceptor", func() {
 						Name: "my-backend",
 					}.Build(),
 					Spec: privatev1.StorageBackendSpec_builder{
-						Provider: "ceph",
+						Provider: "vast",
 						Endpoint: "",
 						Credentials: privatev1.StorageBackendCredentials_builder{
 							Username: "admin",
@@ -628,7 +669,7 @@ var _ = Describe("Protovalidate interceptor", func() {
 						Name: "my-backend",
 					}.Build(),
 					Spec: privatev1.StorageBackendSpec_builder{
-						Provider: "ceph",
+						Provider: "vast",
 						Endpoint: "https://storage.example.com",
 					}.Build(),
 				}.Build(),
@@ -661,7 +702,7 @@ var _ = Describe("Protovalidate interceptor", func() {
 						Name: "my-backend",
 					}.Build(),
 					Spec: privatev1.StorageBackendSpec_builder{
-						Provider: "ceph",
+						Provider: "vast",
 						Endpoint: "https://storage.example.com",
 						Credentials: privatev1.StorageBackendCredentials_builder{
 							Username: "",
@@ -698,7 +739,7 @@ var _ = Describe("Protovalidate interceptor", func() {
 						Name: "my-backend",
 					}.Build(),
 					Spec: privatev1.StorageBackendSpec_builder{
-						Provider: "ceph",
+						Provider: "vast",
 						Endpoint: "https://storage.example.com",
 						Credentials: privatev1.StorageBackendCredentials_builder{
 							Username: "admin",
@@ -735,7 +776,7 @@ var _ = Describe("Protovalidate interceptor", func() {
 						Name: "my-backend",
 					}.Build(),
 					Spec: privatev1.StorageBackendSpec_builder{
-						Provider: "ceph",
+						Provider: "vast",
 						Endpoint: "https://storage.example.com",
 						Credentials: privatev1.StorageBackendCredentials_builder{
 							Username: "admin",
@@ -772,7 +813,7 @@ var _ = Describe("Protovalidate interceptor", func() {
 						Name: "my-backend",
 					}.Build(),
 					Spec: privatev1.StorageBackendSpec_builder{
-						Provider: "ceph",
+						Provider: "vast",
 						Endpoint: "https://storage.example.com",
 						Credentials: privatev1.StorageBackendCredentials_builder{
 							Username: "admin",
@@ -812,7 +853,7 @@ var _ = Describe("Protovalidate interceptor", func() {
 						Name: "my-backend",
 					}.Build(),
 					Spec: privatev1.StorageBackendSpec_builder{
-						Provider: "ceph",
+						Provider: "vast",
 						Endpoint: "https://storage.example.com",
 						Credentials: privatev1.StorageBackendCredentials_builder{
 							Username: "admin",
@@ -850,14 +891,14 @@ var _ = Describe("Protovalidate interceptor", func() {
 			Expect(err).ToNot(HaveOccurred())
 		})
 
-		It("Rejects create request with zero cores", func() {
+		It("Rejects create request with zero vCPUs", func() {
 			request := privatev1.InstanceTypesCreateRequest_builder{
 				Object: privatev1.InstanceType_builder{
 					Metadata: privatev1.Metadata_builder{
 						Name: "my-type",
 					}.Build(),
 					Spec: privatev1.InstanceTypeSpec_builder{
-						Cores:     0,
+						Vcpus:     0,
 						MemoryGib: 16,
 					}.Build(),
 				}.Build(),
@@ -890,7 +931,7 @@ var _ = Describe("Protovalidate interceptor", func() {
 						Name: "my-type",
 					}.Build(),
 					Spec: privatev1.InstanceTypeSpec_builder{
-						Cores:     4,
+						Vcpus:     4,
 						MemoryGib: 0,
 					}.Build(),
 				}.Build(),
@@ -923,7 +964,7 @@ var _ = Describe("Protovalidate interceptor", func() {
 						Name: "my-type",
 					}.Build(),
 					Spec: privatev1.InstanceTypeSpec_builder{
-						Cores:     4,
+						Vcpus:     4,
 						MemoryGib: 16,
 					}.Build(),
 				}.Build(),
@@ -956,6 +997,68 @@ var _ = Describe("Protovalidate interceptor", func() {
 				Build()
 			Expect(err).ToNot(HaveOccurred())
 		})
+
+		DescribeTable("Validates event subscription group names", func(group *string, valid bool) {
+			request := privatev1.EventsWatchRequest_builder{Group: group}.Build()
+			mockStream := &mockServerStream{
+				recvFunc: func(message any) error {
+					proto.Merge(message.(proto.Message), request)
+					return nil
+				},
+			}
+			processed := false
+			err := interceptor.StreamServer(
+				nil, mockStream,
+				&grpc.StreamServerInfo{FullMethod: privatev1.Events_Watch_FullMethodName, IsServerStream: true},
+				func(_ any, stream grpc.ServerStream) error {
+					message := &privatev1.EventsWatchRequest{}
+					if err := stream.RecvMsg(message); err != nil {
+						return err
+					}
+					processed = true
+					Expect(proto.Equal(message, request)).To(BeTrue())
+					return nil
+				},
+			)
+			Expect(processed).To(Equal(valid))
+			if valid {
+				Expect(err).ToNot(HaveOccurred())
+			} else {
+				Expect(grpcstatus.Code(err)).To(Equal(grpccodes.InvalidArgument))
+				Expect(grpcstatus.Convert(err).Message()).To(ContainSubstring("group"))
+			}
+		},
+			Entry("Omitted", nil, true),
+			Entry("Empty", new(""), true),
+			Entry("Single letter", new("a"), true),
+			Entry("Single digit", new("0"), true),
+			Entry("Starts with digit", new("1-controller"), true),
+			Entry("Letters digits and hyphens", new("osac-controller-1"), true),
+			Entry("Consecutive hyphens", new("a--b"), true),
+			Entry("Maximum length (63 characters)", new(strings.Repeat("a", 63)), true),
+			Entry("Over maximum length (64 characters)", new(strings.Repeat("a", 64)), false),
+			Entry("Uppercase", new("Controller"), false),
+			Entry("Underscore", new("compute_instance"), false),
+			Entry("Controller group", new("compute-instance-reconciler"), true),
+			Entry("Dot-separated labels", new("controller.example"), false),
+			Entry("Dotted controller group", new("osac.controllers.compute-instance"), false),
+			Entry("Single-character labels", new("a.0.b"), false),
+			Entry("Dotted maximum length (63 characters)", new("osac.controllers."+strings.Repeat("a", 46)), false),
+			Entry("Dotted over maximum length (64 characters)", new("osac.controllers."+strings.Repeat("a", 47)), false),
+			Entry("Leading dot", new(".controller"), false),
+			Entry("Trailing dot", new("controller."), false),
+			Entry("Consecutive dots", new("osac..controller"), false),
+			Entry("Label with leading hyphen", new("osac.-controller"), false),
+			Entry("Label with trailing hyphen", new("osac-.controller"), false),
+			Entry("Leading hyphen", new("-controller"), false),
+			Entry("Trailing hyphen", new("controller-"), false),
+			Entry("Only hyphen", new("-"), false),
+			Entry("Space", new("controller group"), false),
+			Entry("Leading space", new(" controller"), false),
+			Entry("Trailing space", new("controller "), false),
+			Entry("Newline", new("controller\n"), false),
+			Entry("Non-ASCII", new("contrôleur"), false),
+		)
 
 		It("Validates messages received from stream", func() {
 			// Create a mock stream:

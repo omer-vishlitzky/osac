@@ -13,12 +13,13 @@ API. Do not use "resource" for this purpose.
 
 ## Public and private APIs
 
-The API has two variants:
+The proto contract lives in the **top-level `proto/` module**, not
+under `fulfillment-service/`. The API has two variants:
 
 - `proto/private/osac/private/v1/` contains the **private API** (editable source of truth), reserved for system administrators and controllers. This is the full API with all implementation details.
 - `proto/public/osac/public/v1/` contains the **public API** (generated, never edit manually), intended for regular users. This is automatically generated from the private API.
 
-**IMPORTANT**: Only edit files in `proto/private/`. The `proto/public/` directory is fully generated and will be overwritten.
+**IMPORTANT**: Only edit files in `proto/private/`. `proto/public/` and `proto/gen/` are fully generated and will be overwritten (`make -C proto generate`).
 
 ### How Public is Generated from Private
 
@@ -157,13 +158,40 @@ The `Metadata` message is shared by all object types and contains the following 
 | `creator`              | `string`                     | Identity that created the object.                |
 | `name`                 | `string`                     | Required, immutable identifier (RFC 1123 DNS label format). Unique within its scope and immutable after creation. |
 | `tenant`               | `string`                     | Tenant that owns the object.                     |
-| `labels`               | `map<string, string>`        | Indexed key-value pairs for organizing objects.  |
-| `annotations`          | `map<string, string>`        | Arbitrary user-controlled metadata.              |
+| `labels`               | `map<string, string>`        | Indexed key-value pairs for organizing objects. Public API responses omit administrator-only reserved keys; see [Administrator-only metadata](#administrator-only-metadata). |
+| `annotations`          | `map<string, string>`        | Arbitrary user-controlled metadata, plus administrator-only reserved keys on the private API. Public API responses omit reserved keys; see [Administrator-only metadata](#administrator-only-metadata). |
 | `version`              | `int32`                      | Auto-incremented on every change.                |
-| `display_name`         | `string`                     | Optional friendly label (max 63, not unique, not DNS-constrained). |
-| `description`          | `string`                     | Optional description (max 256, not unique).      |
 
 The private API adds a `finalizers` field (`repeated string`) that is not exposed in the public API.
+
+### Administrator-only metadata
+
+Labels and annotations whose key domain is exactly `admin.osac.openshift.io` or a dot-delimited
+subdomain of it are reserved for system use. Matching is case-sensitive and applies to the domain
+before the slash. For example, `admin.osac.openshift.io/managed` and
+`controller.admin.osac.openshift.io/source` are reserved. Similar-looking keys such as
+`fakeadmin.osac.openshift.io/managed`, `admin.osac.openshift.io.example/managed`, and the
+slashless key `admin.osac.openshift.io` do not match this reserved namespace. The operational keys
+`osac.openshift.io/tenant` and `osac.openshift.io/owner-reference` are also outside this reserved
+namespace; their existing ownership and validation rules still apply.
+
+The private API returns and accepts reserved metadata under the caller's existing authorization.
+The public API omits reserved entries from object metadata and event payloads for every caller,
+regardless of tenant role. A public Create or Update request that supplies any reserved label or
+annotation is rejected atomically with `InvalidArgument` and the message
+`Label or annotation is reserved for use by the system.` The error does not include the submitted
+key or value. See [Filter expressions — reserved metadata](FILTER.md#reserved-metadata) for the
+corresponding List and Watch filter rules, and the
+[metadata administrator guide](../../docs/guides/admin/metadata.md) for permissions and CLI examples.
+
+On Update, an explicitly selected `metadata.labels` or `metadata.annotations` field is a whole-map
+replacement. On the private API, keys omitted from that selected map are removed; an empty map
+or an omitted selected map clears it, and an empty string is still a value. On the public API, the
+replacement applies to ordinary entries only: stored reserved entries are retained even when
+omitted or when the selected map is empty or omitted. An unselected map is unchanged. Behavior for
+updates without a mask remains resource-specific; public updates preserve stored reserved entries
+on those paths as well. Use an explicit map path when the resource supports it and the request must
+clearly replace or clear a map.
 
 ### Resource names
 
@@ -200,8 +228,16 @@ A name remains reserved while the object exists, including while deletion is pen
 
 #### Immutability
 
-Once an object is created, its `metadata.name` cannot be changed. Updates that include
-`metadata.name` in the field mask are accepted only if the value is identical to the existing name.
+Once an object is created, its `metadata.name` cannot be changed. For services that expose `Update`,
+requests that include `metadata.name` in the field mask are accepted only if the value is identical
+to the existing name. The public networking services `VirtualNetworks`, `Subnets`, `ExternalIPs`,
+`ExternalIPAttachments`, and `NATGateways` remain create/read/delete-only. `SecurityGroups` has a
+temporary OSAC-5679 exception: its public `Update` operation replaces the complete ingress and egress
+rule lists, while preserving the ID, name, parent VirtualNetwork, metadata, and status. The public
+server fixes the field mask to those two rule lists; callers cannot use this operation to update
+other networking fields. This is a scoped extension to the immutable target contract in the
+OSAC-1433 unified networking design. Private APIs retain their separate update operations for
+controller status and feedback.
 
 #### Error responses
 
@@ -210,7 +246,9 @@ Once an object is created, its `metadata.name` cannot be changed. Updates that i
 | Name missing or empty on create | `InvalidArgument` | Validation error on `metadata.name` (protovalidate) |
 | Name fails RFC 1123 format | `InvalidArgument` | Validation error on `metadata.name` (protovalidate) |
 | Name already taken in scope | `AlreadyExists` | `virtual network 'prod-net' already exists` |
-| Update attempts to change name | `InvalidArgument` | `field 'metadata.name' is immutable` |
+| User or identity provider created with a non-empty `metadata.project` | `InvalidArgument` | `field 'metadata.project' must be empty` |
+| Update attempts to change name on an update-capable service | `InvalidArgument` | `field 'metadata.name' is immutable` |
+| Update attempt on a public networking service without update support | `Unimplemented` | The public service has no `Update` method |
 | Singleton or single-default invariant (for example a second non-deleted `NetworkClass`) | `FailedPrecondition` | `only one NetworkClass per deployment is allowed (existing NetworkClass id '...')` |
 
 Not every unique-index violation is `AlreadyExists`. Ordinary per-object name uniqueness stays
@@ -232,6 +270,39 @@ The `spec` and `status` fields have strict ownership rules:
   the system. Users do not have permission to modify `status`. The system updates `status` to
   reflect the current state of the object, which may differ from what the user requested in `spec`
   while changes are being applied.
+
+### ComputeInstance public update semantics
+
+The public `ComputeInstances` update enforces the following rules on its request
+object and field mask. They are scoped to this service; other resource servers
+do not necessarily follow them.
+
+- **Public status is read-only.** The whole `status` and every `status.*` mask
+  path are rejected with `InvalidArgument`, including whitespace and double-dot
+  normalized spellings. Status values carried incidentally in the request
+  object are ignored. Controller-reported state, transition times, conditions,
+  and feedback such as network-attachment status are written only through the
+  private API.
+- **Omitted mask infers supplied fields.** With no `update_mask`, paths are
+  inferred from the populated direct children of `spec` and the permitted
+  metadata fields. Omitted fields stay unchanged; clearing a scalar or an empty
+  map requires an explicit mask path.
+- **Explicit mask selects writable fields only.** Permitted metadata paths are
+  `labels` and `annotations`; spec paths are
+  accepted and validated by the field-path compiler. Any other root — including
+  `name`, `tenant`, and `project`, which are server-assigned and immutable once
+  the object is created, and private metadata such as `version`, timestamps,
+  and finalizers — is rejected. The tenant is determined from the authenticated
+  caller and cannot be moved by an update.
+- **Targeted maps are atomic.** A mask selecting `metadata.labels` or
+  `metadata.annotations` replaces that map's ordinary entries, and an explicit
+  empty map clears them; reserved system-owned entries are retained. An
+  untargeted map stays unchanged.
+- **Explicit empty mask is a no-op.** It still runs the version and validation
+  checks but persists no changes.
+
+System-owned metadata and status feedback remain writable only through the
+private `ComputeInstances` API, which controllers and system components use.
 
 ### Annotations vs spec/status fields
 
@@ -263,7 +334,7 @@ invalid requests with `InvalidArgument` errors that include field-level violatio
 ### Validation flow
 
 - **Create requests**: Validated by protovalidate interceptor before reaching server handlers
-- **Update requests**: Server validates the merged object after applying `update_mask`
+- **Update requests on update-capable services**: Server validates the merged object after applying `update_mask`
   - Interceptor skips validation to avoid false errors on partial objects
   - Server merges request fields (per mask) with database object
   - Server validates the complete merged result with protovalidate
@@ -407,17 +478,17 @@ for `BareMetalInstance` is `BareMetalInstances`.
 
 ### Standard methods
 
-Services of the public API must always declare the following five methods, even if some of them are
-not yet implemented in the backend (in which case the documentation should explain this). The
-reason is that the CLI currently depends on all these methods being declared. This restriction may
-be lifted in the future.
+Most services of the public API declare the following five methods. Immutable networking services
+are the intentional exception: they expose the four CRUD methods that do not mutate an existing
+object (`Create`, `List`, `Get`, and `Delete`) and omit `Update` entirely. The private versions of
+those services still expose `Update` for controller status and feedback.
 
 | Method   | Purpose                            |
 |----------|------------------------------------|
 | `Create` | Creates a new object.              |
 | `List`   | Returns a filtered list of objects. |
 | `Get`    | Returns a single object by `id`.   |
-| `Update` | Partially updates an object.       |
+| `Update` | Partially updates an object when the service supports mutation. |
 | `Delete` | Deletes an object by `id`.         |
 
 Services of the private API must additionally declare a `Signal` method. This method must never
@@ -429,6 +500,14 @@ appear in the public API.
 
 In general, services should not have any additional ad-hoc methods beyond those listed above. There
 are some existing exceptions, and the project will work to remove them over time.
+
+### Events
+
+The `Events.Watch` stream delivers an `Event` for each generated object change. The `timestamp`
+field records when the event was generated. For `EVENT_TYPE_OBJECT_DELETED`, it is the authoritative
+deletion boundary: the object had no remaining finalizers when the event was generated. This is
+distinct from `Metadata.deletion_timestamp`, which records when deletion was requested. Clients
+must preserve the event timestamp when forwarding or storing events.
 
 ## Request and response messages
 
@@ -503,7 +582,7 @@ message ThingsGetResponse {
 }
 ```
 
-### Update
+### Update (when supported)
 
 The request contains `object`, `update_mask`, and `lock`. The response contains the updated
 `object`.
@@ -524,7 +603,14 @@ message ThingsUpdateResponse {
   populates this from the fields present in the JSON request body.
 - `lock` enables optimistic locking. When set to `true`, the server rejects the update if the
   current `metadata.version` of the stored object does not match the version in the submitted
-  object.
+  object. A stale locked update returns `Aborted`; read the object again, reapply the intended
+  change, and retry. Locking is optional and does not change when `false` or omitted.
+
+For the `metadata.labels` and `metadata.annotations` map rules, including reserved-entry handling,
+see [Administrator-only metadata](#administrator-only-metadata). The REST gateway normally builds
+the update mask from fields present in the JSON body. Unmasked-update behavior otherwise remains
+resource-specific; an explicit metadata map path makes the intended replacement or clear explicit
+where that resource supports the path.
 
 ### Delete
 
@@ -550,6 +636,119 @@ message ThingsSignalRequest {
 
 message ThingsSignalResponse {}
 ```
+
+### Service accounts
+
+`ServiceAccounts` manages machine identities in the caller's tenant. The account ID and status are
+server-controlled. The name is unique within the tenant and remains
+reserved while deletion is pending. Updates may change labels. Display names and descriptions are
+not supported for service accounts. Projects are not supported.
+
+`Create` returns the account in `PENDING` before its Keycloak client is provisioned. The controller
+provisions the client asynchronously and creates a tenant-scoped Secret containing both `client_id`
+and `client_secret`. `status.client_secret` references that Secret, and `status.state` becomes
+`READY` only after the Secret is available. Tenant administrators can read the Secret with
+`Secrets/Get`; ordinary client users receive `PERMISSION_DENIED`. Secret data is omitted from list
+and mutation responses. Dry-run creation creates no account, client, or Secret.
+`status.message` explains a `FAILED` provisioning state and reports rotation errors while automatic
+retry is in progress. A rotation failure leaves the account `READY` while its existing credential
+remains usable. If the Keycloak update may have applied but the replacement credential could not be
+published, or Keycloak reports that the client is missing, the controller marks the account
+`FAILED` until it is usable again. If a Keycloak client exists without recoverable registration
+credentials, remove that client from Keycloak; the controller then retries provisioning or completes
+deletion.
+
+Role assignments are managed through tenant-scoped RoleBindings; service accounts do not accept
+role references. A binding can include service-account IDs in `spec.service_accounts`. Fulfillment
+checks the current active bindings for each managed-token request, so removing a binding revokes
+that grant on the next request. Roles embedded in a managed account's JWT do not grant API access.
+The shared Role catalog includes `tenant-admin`, `tenant-automation`, and `tenant-idp-manager`.
+`osac-csi-driver` is stored in the system tenant and is visible to cloud administrators only.
+Migration 139 seeds `tenant-idp-manager`; migration 145 seeds `tenant-automation` and
+`osac-csi-driver`. Migration 141 creates the ServiceAccount tables.
+
+Tenant admins can request secret rotation with `RegenerateSecret`. The action records a pending
+rotation and returns an empty response. Callers can watch the referenced Secret or poll `Secrets/Get`
+until its `client_secret` changes. Before updating Keycloak,
+the controller stores a generated replacement client secret and the current registration token in the
+system-scoped registration Secret. It uses that token to authorize the Keycloak client-secret update,
+persists any returned registration token, and then publishes the replacement through the tenant-scoped
+credential Secret. The controller records rotation progress privately and marks rotation complete
+only after publication. The installer configures a Keycloak Client Policy to disable
+registration-token rotation for these updates, so retries can reuse the stored token and staged
+secret. Repeated requests while a rotation is pending or retrying return that rotation instead of
+starting another one. Rotation has no grace period: the old secret stops working when the Keycloak
+update applies, while already-issued tokens retain their normal expiry.
+
+`RegenerateSecret` is available to tenant admins for accounts in their tenant. Its REST route is
+`POST /api/fulfillment/v1/service_accounts/{id}/regenerate_secret`; the private route is
+`POST /api/private/v1/service_accounts/{id}/regenerate_secret`.
+
+### CLI
+
+Service-account create, get, list, edit, and delete use the generic `osac` commands. Edit opens the
+resource in the configured editor. Secret rotation uses `osac regenerate`:
+
+```shell
+osac create -f service-account.json
+osac get serviceaccounts batch-worker -o json
+osac get serviceaccounts --filter "this.metadata.labels['team'] == 'data'" -o json
+osac edit serviceaccounts batch-worker
+osac delete serviceaccounts batch-worker
+osac regenerate serviceaccount batch-worker
+```
+
+For administrator and workload procedures, see the
+[Tenant Service Accounts guide](../../docs/guides/tenant-service-accounts.md).
+
+The create file uses the public type URL and tenant-owned fields:
+
+```json
+{
+  "@type": "type.googleapis.com/osac.public.v1.ServiceAccount",
+  "metadata": {
+    "name": "batch-worker",
+    "labels": { "team": "data" }
+  }
+}
+```
+
+Generic `osac create` reports the created account; provisioning then completes asynchronously.
+After the account is `READY`, tenant admins can read the credential Secret by following the ID in
+`status.client_secret`, for example with `osac get secrets <client-secret-id> -o json`; the
+Secret's byte values are base64-encoded in JSON. The API Create and RegenerateSecret responses do not
+return secret bytes. `osac regenerate serviceaccount`
+waits for rotation to complete, reads the replacement through `Secrets/Get`, and emits the new
+`client_id` and `client_secret` once as JSON. Treat that output as a credential and keep it out of
+source files, shell history, and logs.
+
+Get and list output the account and its tenant-scoped Secret reference, never credential bytes.
+Updates may change `metadata.labels`. `ServiceAccountSpec` has no role grants. To grant API
+access, create a RoleBinding whose `spec.role.id` is a catalog role ID and whose
+`spec.service_accounts` includes the service-account ID. To revoke that grant, delete its
+RoleBinding. Use a separate binding per account when you want revocation to be a single
+non-interactive delete:
+
+```json
+{
+  "@type": "type.googleapis.com/osac.public.v1.RoleBinding",
+  "metadata": { "name": "batch-worker-automation" },
+  "spec": {
+    "role": { "id": "<tenant-automation-role-id>" },
+    "service_accounts": [{ "id": "<service-account-id>" }]
+  }
+}
+```
+
+```shell
+osac create -f service-account-role-binding.json
+osac delete rolebindings batch-worker-automation
+```
+
+An ordinary service-account user cannot read raw Secrets or watch managed Events. Its API calls
+are limited to the role on its active tenant RoleBinding. A tenant admin can retrieve the
+service-account credential through the authorized `Secrets/Get` API; do not expose that operation
+or the CLI's one-time credential output to the service-account workload itself.
 
 ## REST transcoding
 
@@ -732,7 +931,7 @@ Repeated references (e.g., security groups in a network attachment) are arrays o
 
 ### Cross-project references
 
-To reference an object in a different project within the same tenant, set the `project` field:
+To reference an object by name in a different project within the same tenant, set the `project` field:
 
 ```json
 {
@@ -742,7 +941,7 @@ To reference an object in a different project within the same tenant, set the `p
 }
 ```
 
-To reference an object owned by the shared tenant (e.g., a globally available template), set
+To reference an object by name in the shared tenant (e.g., a globally available template), set
 `shared` to `true`:
 
 ```json
@@ -755,18 +954,26 @@ To reference an object owned by the shared tenant (e.g., a globally available te
 
 ### Server-side validation and resolution
 
-The server validates references automatically via a gRPC interceptor on `Create` and `Update`
-requests. For each reference field the interceptor:
+The server validates references on `Create` and `Update`. A gRPC interceptor handles most
+reference fields. For each field it handles, the interceptor:
 
-1. Determines the lookup scope (caller's tenant/project for local references; explicit
-   `project`/`shared` overrides for full references).
-2. Looks up the referenced object by `id`, `name`, or both.
+1. Determines the lookup scope from the object's tenant and project. For a full reference by
+   name, the `project` and `shared` fields can select another scope.
+2. Looks up the referenced object by `id` or `name`.
 3. If both `id` and `name` are provided, verifies they refer to the same object.
-4. Auto-populates whichever of `id` or `name` was not provided by the caller.
+4. Fills in whichever of `id` or `name` the caller omitted.
 
-Invalid references produce an `InvalidArgument` error with `google.rpc.BadRequest` details
-containing one `FieldViolation` per invalid reference. The `field` value is the dot-separated
-path to the reference field (e.g., `object.spec.template`, `object.spec.network_attachments[0].subnet`).
+For an `Update` with a non-empty mask containing only `status` or `status.*`
+paths, the interceptor does not revalidate references in the unchanged
+`object.spec`. References in `object.status` are still validated. `Create`,
+spec or mixed updates, and updates with an empty mask validate spec references.
+
+Some references are validated by the object's handler after the complete object to be saved is
+known.
+
+For invalid references found by the interceptor, the server returns `InvalidArgument` with
+`google.rpc.BadRequest` details. Each `FieldViolation` names the reference field (e.g.,
+`object.spec.network_attachments[0].subnet`).
 
 ## Documentation
 

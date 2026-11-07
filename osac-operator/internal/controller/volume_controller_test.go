@@ -26,6 +26,7 @@ import (
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	mcreconcile "sigs.k8s.io/multicluster-runtime/pkg/reconcile"
 
@@ -44,11 +45,13 @@ var _ = Describe("VolumeReconciler", func() {
 		testCtx = context.TODO()
 		mockProv = NewMockVendorProvisioner()
 		reconciler = &VolumeReconciler{
-			Client:            k8sClient,
-			Scheme:            k8sClient.Scheme(),
-			mgr:               testMcManager,
-			VolumeNamespace:   "default",
-			VendorProvisioner: mockProv,
+			Client:          k8sClient,
+			Scheme:          k8sClient.Scheme(),
+			mgr:             testMcManager,
+			VolumeNamespace: "default",
+			VendorProvisioners: VendorProvisionerRegistry{
+				"vast-primary": mockProv,
+			},
 		}
 
 		vol = &osacv1alpha1.Volume{
@@ -64,12 +67,12 @@ var _ = Describe("VolumeReconciler", func() {
 		}
 	})
 
-	// stampBackendProtocol simulates the fulfillment-service stamping
-	// status.backend and status.protocol on the Volume CR after creation.
-	stampBackendProtocol := func(v *osacv1alpha1.Volume) {
+	// stampProviderProtocol simulates the fulfillment-service stamping
+	// status.provider and status.protocol on the Volume CR after creation.
+	stampProviderProtocol := func(v *osacv1alpha1.Volume) {
 		fresh := &osacv1alpha1.Volume{}
 		ExpectWithOffset(1, k8sClient.Get(testCtx, types.NamespacedName{Name: v.Name, Namespace: v.Namespace}, fresh)).To(Succeed())
-		fresh.Status.Backend = "vast-primary"
+		fresh.Status.Provider = "vast-primary"
 		fresh.Status.Protocol = osacv1alpha1.VolumeProtocolBlock
 		ExpectWithOffset(1, k8sClient.Status().Update(testCtx, fresh)).To(Succeed())
 	}
@@ -83,6 +86,17 @@ var _ = Describe("VolumeReconciler", func() {
 			_ = k8sClient.Delete(testCtx, existingVol)
 		}
 	})
+
+	DescribeTable("adds the TopoLVM watch only when an LVMS provisioner is registered",
+		func(provisioners VendorProvisionerRegistry, expected bool) {
+			reconciler.VendorProvisioners = provisioners
+			Expect(reconciler.hasLVMSProvisioner()).To(Equal(expected))
+		},
+		Entry("no vendor provisioners", VendorProvisionerRegistry{}, false),
+		Entry("a network provider only", VendorProvisionerRegistry{"vast-primary": NewMockVendorProvisioner()}, false),
+		Entry("LVMS registered", VendorProvisionerRegistry{lvmsProvider: NewLvmsVendorProvisioner(nil, nil)}, true),
+		Entry("LVMS entry without an implementation", VendorProvisionerRegistry{lvmsProvider: nil}, false),
+	)
 
 	It("should add finalizer on first reconcile", func() {
 		Expect(k8sClient.Create(testCtx, vol)).To(Succeed())
@@ -99,9 +113,46 @@ var _ = Describe("VolumeReconciler", func() {
 		Expect(updated.Finalizers).To(ContainElement(osacVolumeFinalizer))
 	})
 
+	It("should ignore unmanaged volumes", func() {
+		vol.Annotations = map[string]string{osacManagementStateAnnotation: ManagementStateUnmanaged}
+		Expect(k8sClient.Create(testCtx, vol)).To(Succeed())
+
+		_, err := reconciler.Reconcile(testCtx, mcreconcile.Request{
+			Request: reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: vol.Name, Namespace: vol.Namespace},
+			},
+		})
+		Expect(err).ToNot(HaveOccurred())
+
+		updated := &osacv1alpha1.Volume{}
+		Expect(k8sClient.Get(testCtx, types.NamespacedName{Name: vol.Name, Namespace: vol.Namespace}, updated)).To(Succeed())
+		Expect(updated.Finalizers).To(BeEmpty())
+		Expect(updated.Status.Phase).To(BeEmpty())
+	})
+
+	It("should persist pending vendor state and requeue", func() {
+		mockProv.Pending = true
+		Expect(k8sClient.Create(testCtx, vol)).To(Succeed())
+		stampProviderProtocol(vol)
+
+		result, err := reconciler.Reconcile(testCtx, mcreconcile.Request{
+			Request: reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: vol.Name, Namespace: vol.Namespace},
+			},
+		})
+		Expect(err).ToNot(HaveOccurred())
+		Expect(result.RequeueAfter).To(BeZero())
+
+		updated := &osacv1alpha1.Volume{}
+		Expect(k8sClient.Get(testCtx, types.NamespacedName{Name: vol.Name, Namespace: vol.Namespace}, updated)).To(Succeed())
+		Expect(updated.Status.Phase).To(Equal(osacv1alpha1.VolumePhaseProgressing))
+		Expect(updated.Status.VendorContext).To(Equal(map[string]string{"pending": "true"}))
+		Expect(updated.Status.VendorVolumeID).To(BeEmpty())
+	})
+
 	It("should reach Ready on first reconcile when the mock provisioner succeeds", func() {
 		Expect(k8sClient.Create(testCtx, vol)).To(Succeed())
-		stampBackendProtocol(vol)
+		stampProviderProtocol(vol)
 
 		_, err := reconciler.Reconcile(testCtx, mcreconcile.Request{
 			Request: reconcile.Request{
@@ -116,9 +167,68 @@ var _ = Describe("VolumeReconciler", func() {
 		Expect(updated.Status.Phase).To(Equal(osacv1alpha1.VolumePhaseReady))
 	})
 
+	DescribeTable("rejects invalid vendor responses before Ready", func(response VendorCreateVolumeResponse, message string) {
+		mockProv.UseCreateResponse = true
+		mockProv.CreateResponse = response
+		Expect(k8sClient.Create(testCtx, vol)).To(Succeed())
+		stampProviderProtocol(vol)
+
+		_, err := reconciler.Reconcile(testCtx, mcreconcile.Request{Request: reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: vol.Name, Namespace: vol.Namespace},
+		}})
+		Expect(err).NotTo(HaveOccurred())
+		updated := &osacv1alpha1.Volume{}
+		Expect(k8sClient.Get(testCtx, types.NamespacedName{Name: vol.Name, Namespace: vol.Namespace}, updated)).To(Succeed())
+		Expect(updated.Status.Phase).To(Equal(osacv1alpha1.VolumePhaseFailed))
+		Expect(updated.Status.VendorVolumeID).To(BeEmpty())
+		Expect(updated.Status.Conditions[0].Message).To(ContainSubstring(message))
+	},
+		Entry("empty ID", VendorCreateVolumeResponse{Protocol: "Block"}, "empty volume ID"),
+	)
+
+	It("accepts an NFS vendor response without making it billable", func() {
+		mockProv.UseCreateResponse = true
+		mockProv.CreateResponse = VendorCreateVolumeResponse{VendorVolumeID: "vendor-nfs", Protocol: "NFS"}
+		Expect(k8sClient.Create(testCtx, vol)).To(Succeed())
+		stamped := &osacv1alpha1.Volume{}
+		Expect(k8sClient.Get(testCtx, types.NamespacedName{Name: vol.Name, Namespace: vol.Namespace}, stamped)).To(Succeed())
+		stamped.Status.Provider = "vast-primary"
+		stamped.Status.Protocol = osacv1alpha1.VolumeProtocolNFS
+		Expect(k8sClient.Status().Update(testCtx, stamped)).To(Succeed())
+
+		_, err := reconciler.Reconcile(testCtx, mcreconcile.Request{Request: reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: vol.Name, Namespace: vol.Namespace},
+		}})
+		Expect(err).NotTo(HaveOccurred())
+		updated := &osacv1alpha1.Volume{}
+		Expect(k8sClient.Get(testCtx, types.NamespacedName{Name: vol.Name, Namespace: vol.Namespace}, updated)).To(Succeed())
+		Expect(updated.Status.Phase).To(Equal(osacv1alpha1.VolumePhaseReady))
+		Expect(updated.Status.Protocol).To(Equal(osacv1alpha1.VolumeProtocolNFS))
+	})
+
+	It("rejects a vendor identity replacement", func() {
+		mockProv.UseCreateResponse = true
+		mockProv.CreateResponse = VendorCreateVolumeResponse{VendorVolumeID: "vendor-new", Protocol: "Block"}
+		Expect(k8sClient.Create(testCtx, vol)).To(Succeed())
+		stampProviderProtocol(vol)
+		current := &osacv1alpha1.Volume{}
+		Expect(k8sClient.Get(testCtx, types.NamespacedName{Name: vol.Name, Namespace: vol.Namespace}, current)).To(Succeed())
+		current.Status.VendorVolumeID = "vendor-old"
+		current.Status.Phase = osacv1alpha1.VolumePhaseProgressing
+		Expect(k8sClient.Status().Update(testCtx, current)).To(Succeed())
+
+		_, err := reconciler.Reconcile(testCtx, mcreconcile.Request{Request: reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: vol.Name, Namespace: vol.Namespace},
+		}})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(k8sClient.Get(testCtx, types.NamespacedName{Name: vol.Name, Namespace: vol.Namespace}, current)).To(Succeed())
+		Expect(current.Status.Phase).To(Equal(osacv1alpha1.VolumePhaseFailed))
+		Expect(current.Status.VendorVolumeID).To(Equal("vendor-old"))
+	})
+
 	It("should provision volume and set status fields on success", func() {
 		Expect(k8sClient.Create(testCtx, vol)).To(Succeed())
-		stampBackendProtocol(vol)
+		stampProviderProtocol(vol)
 
 		// A single reconcile adds the finalizer and provisions to Ready:
 		// handleUpdate adds the finalizer, then falls through to
@@ -143,7 +253,7 @@ var _ = Describe("VolumeReconciler", func() {
 
 		Expect(updated.Status.Phase).To(Equal(osacv1alpha1.VolumePhaseReady))
 		Expect(updated.Status.VendorVolumeID).To(HavePrefix("mock-"))
-		Expect(updated.Status.Backend).To(Equal("mock-backend"))
+		Expect(updated.Status.Provider).To(Equal("vast-primary"))
 		Expect(updated.Status.Protocol).To(Equal(osacv1alpha1.VolumeProtocolBlock))
 		Expect(mockProv.CreateCallCount()).To(BeNumerically(">=", 1))
 
@@ -153,11 +263,96 @@ var _ = Describe("VolumeReconciler", func() {
 		Expect(cond.Reason).To(Equal("Provisioned"))
 	})
 
+	It("should retry a conflicting status update without re-provisioning", func() {
+		Expect(k8sClient.Create(testCtx, vol)).To(Succeed())
+		stampProviderProtocol(vol)
+
+		reconciler.Client = &conflictOnceStatusClient{Client: k8sClient}
+
+		_, err := reconciler.Reconcile(testCtx, mcreconcile.Request{
+			Request: reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: vol.Name, Namespace: vol.Namespace},
+			},
+		})
+		Expect(err).ToNot(HaveOccurred())
+
+		updated := &osacv1alpha1.Volume{}
+		Expect(k8sClient.Get(testCtx, types.NamespacedName{Name: vol.Name, Namespace: vol.Namespace}, updated)).To(Succeed())
+		Expect(updated.Status.Phase).To(Equal(osacv1alpha1.VolumePhaseReady))
+		Expect(updated.Status.VendorVolumeID).To(Equal("mock-1"))
+		Expect(mockProv.CreateCallCount()).To(Equal(int64(1)))
+	})
+
+	It("preserves vendor state persisted during a conflicting status update", func() {
+		mockProv.Pending = true
+		Expect(k8sClient.Create(testCtx, vol)).To(Succeed())
+		stampProviderProtocol(vol)
+		reconciler.Client = &conflictOnceStatusClient{
+			Client: k8sClient,
+			beforeConflict: func(ctx context.Context, obj client.Object) {
+				current := &osacv1alpha1.Volume{}
+				Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(obj), current)).To(Succeed())
+				current.Status.VendorContext = map[string]string{"pending": "newer"}
+				Expect(k8sClient.Status().Update(ctx, current)).To(Succeed())
+			},
+		}
+
+		_, err := reconciler.Reconcile(testCtx, mcreconcile.Request{Request: reconcile.Request{
+			NamespacedName: client.ObjectKeyFromObject(vol),
+		}})
+		Expect(err).To(HaveOccurred())
+		current := &osacv1alpha1.Volume{}
+		Expect(k8sClient.Get(testCtx, client.ObjectKeyFromObject(vol), current)).To(Succeed())
+		Expect(current.Status.VendorContext).To(Equal(map[string]string{"pending": "newer"}))
+	})
+
+	DescribeTable("refuses a provisioning result for a changed Volume lifecycle", func(recreate bool) {
+		mockProv.Pending = true
+		Expect(k8sClient.Create(testCtx, vol)).To(Succeed())
+		stampProviderProtocol(vol)
+		reconciler.Client = &conflictOnceStatusClient{
+			Client: k8sClient,
+			beforeConflict: func(ctx context.Context, obj client.Object) {
+				current := &osacv1alpha1.Volume{}
+				Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(obj), current)).To(Succeed())
+				if recreate {
+					current.Finalizers = nil
+					Expect(k8sClient.Update(ctx, current)).To(Succeed())
+				}
+				Expect(k8sClient.Delete(ctx, current)).To(Succeed())
+				if recreate {
+					replacement := &osacv1alpha1.Volume{
+						ObjectMeta: metav1.ObjectMeta{Name: vol.Name, Namespace: vol.Namespace},
+						Spec:       vol.Spec,
+					}
+					Expect(k8sClient.Create(ctx, replacement)).To(Succeed())
+					stampProviderProtocol(replacement)
+				}
+			},
+		}
+
+		_, err := reconciler.Reconcile(testCtx, mcreconcile.Request{Request: reconcile.Request{
+			NamespacedName: client.ObjectKeyFromObject(vol),
+		}})
+		Expect(err).To(HaveOccurred())
+		current := &osacv1alpha1.Volume{}
+		Expect(k8sClient.Get(testCtx, client.ObjectKeyFromObject(vol), current)).To(Succeed())
+		Expect(current.Status.VendorContext).To(BeEmpty())
+		if recreate {
+			Expect(current.UID).NotTo(Equal(vol.UID))
+		} else {
+			Expect(current.DeletionTimestamp.IsZero()).To(BeFalse())
+		}
+	},
+		Entry("deletion starts during provisioning", false),
+		Entry("a same-name resource has a different UID", true),
+	)
+
 	It("should set phase to Failed when vendor provisioning fails", func() {
 		mockProv.CreateErr = fmt.Errorf("vendor array unreachable")
 
 		Expect(k8sClient.Create(testCtx, vol)).To(Succeed())
-		stampBackendProtocol(vol)
+		stampProviderProtocol(vol)
 
 		// A single reconcile adds the finalizer and attempts provisioning,
 		// which fails and transitions the phase to Failed (no error returned;
@@ -185,7 +380,7 @@ var _ = Describe("VolumeReconciler", func() {
 		mockProv.CreateErr = fmt.Errorf("vendor array unreachable")
 
 		Expect(k8sClient.Create(testCtx, vol)).To(Succeed())
-		stampBackendProtocol(vol)
+		stampProviderProtocol(vol)
 
 		// First reconcile provisions, fails, and lands in Failed.
 		_, err := reconciler.Reconcile(testCtx, mcreconcile.Request{
@@ -217,7 +412,7 @@ var _ = Describe("VolumeReconciler", func() {
 
 	It("should not re-provision when already Ready", func() {
 		Expect(k8sClient.Create(testCtx, vol)).To(Succeed())
-		stampBackendProtocol(vol)
+		stampProviderProtocol(vol)
 
 		// Reconcile until Ready
 		for range 3 {
@@ -243,7 +438,7 @@ var _ = Describe("VolumeReconciler", func() {
 
 	It("should handle deletion with vendor deprovisioning", func() {
 		Expect(k8sClient.Create(testCtx, vol)).To(Succeed())
-		stampBackendProtocol(vol)
+		stampProviderProtocol(vol)
 
 		// Reconcile to Ready
 		for range 3 {
@@ -264,9 +459,19 @@ var _ = Describe("VolumeReconciler", func() {
 			},
 		})
 		Expect(err).ToNot(HaveOccurred())
+		_, err = reconciler.Reconcile(testCtx, mcreconcile.Request{
+			Request: reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: vol.Name, Namespace: vol.Namespace},
+			},
+		})
+		Expect(err).ToNot(HaveOccurred())
 		Expect(mockProv.DeleteCallCount()).To(BeNumerically(">=", 1))
 
 		// Volume should be gone after finalizer removal
+		_, err = reconciler.Reconcile(testCtx, mcreconcile.Request{Request: reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: vol.Name, Namespace: vol.Namespace},
+		}})
+		Expect(err).ToNot(HaveOccurred())
 		deleted := &osacv1alpha1.Volume{}
 		err = k8sClient.Get(testCtx, types.NamespacedName{Name: vol.Name, Namespace: vol.Namespace}, deleted)
 		Expect(errors.IsNotFound(err)).To(BeTrue())
@@ -274,7 +479,7 @@ var _ = Describe("VolumeReconciler", func() {
 
 	It("should return error and keep finalizer when vendor deprovisioning fails", func() {
 		Expect(k8sClient.Create(testCtx, vol)).To(Succeed())
-		stampBackendProtocol(vol)
+		stampProviderProtocol(vol)
 
 		// Reconcile to Ready
 		for range 3 {
@@ -296,6 +501,12 @@ var _ = Describe("VolumeReconciler", func() {
 				NamespacedName: types.NamespacedName{Name: vol.Name, Namespace: vol.Namespace},
 			},
 		})
+		Expect(err).ToNot(HaveOccurred())
+		_, err = reconciler.Reconcile(testCtx, mcreconcile.Request{
+			Request: reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: vol.Name, Namespace: vol.Namespace},
+			},
+		})
 		Expect(err).To(HaveOccurred())
 
 		// Finalizer must still be present — the volume was not deprovisioned
@@ -308,7 +519,7 @@ var _ = Describe("VolumeReconciler", func() {
 
 	It("should keep finalizer when provisioned but no VendorProvisioner is configured", func() {
 		Expect(k8sClient.Create(testCtx, vol)).To(Succeed())
-		stampBackendProtocol(vol)
+		stampProviderProtocol(vol)
 
 		// Reconcile to Ready so the volume has a VendorVolumeID.
 		for range 3 {
@@ -322,11 +533,17 @@ var _ = Describe("VolumeReconciler", func() {
 
 		// Simulate a misconfigured restart: provisioner is gone but the volume
 		// was already provisioned on the array.
-		reconciler.VendorProvisioner = nil
+		reconciler.VendorProvisioners = nil
 
 		Expect(k8sClient.Delete(testCtx, vol)).To(Succeed())
 
 		_, err := reconciler.Reconcile(testCtx, mcreconcile.Request{
+			Request: reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: vol.Name, Namespace: vol.Namespace},
+			},
+		})
+		Expect(err).ToNot(HaveOccurred())
+		_, err = reconciler.Reconcile(testCtx, mcreconcile.Request{
 			Request: reconcile.Request{
 				NamespacedName: types.NamespacedName{Name: vol.Name, Namespace: vol.Namespace},
 			},
@@ -339,18 +556,21 @@ var _ = Describe("VolumeReconciler", func() {
 		Expect(still.Finalizers).To(ContainElement(osacVolumeFinalizer))
 	})
 
-	It("should pass tenant, tier, protocol, and backend through to the vendor create request", func() {
+	It("should pass tenant, tier, protocol, and provider through to the vendor create request", func() {
 		// The controller derives the vendor create request from the CR: tenant
-		// from the annotation, tier from the spec, backend/protocol from the
+		// from the annotation, tier from the spec, provider/protocol from the
 		// status stamped by fulfillment-service. A regression that drops or
 		// mis-maps any of these would silently provision on the wrong
-		// backend/tenant, so assert every field the controller populates.
+		// provider/tenant, so assert every field the controller populates.
 		vol.Annotations = map[string]string{osacTenantKey: "acme"}
+		vol.Spec.Topology = &osacv1alpha1.VolumeTopology{
+			Segments: map[string]string{"osac.io/node": "worker-1"},
+		}
 		Expect(k8sClient.Create(testCtx, vol)).To(Succeed())
 
-		// Stamp the backend/protocol that fulfillment-service resolves before
+		// Stamp the provider/protocol that fulfillment-service resolves before
 		// the operator provisions.
-		vol.Status.Backend = "vast-primary"
+		vol.Status.Provider = "vast-primary"
 		vol.Status.Protocol = osacv1alpha1.VolumeProtocolBlock
 		Expect(k8sClient.Status().Update(testCtx, vol)).To(Succeed())
 
@@ -364,20 +584,21 @@ var _ = Describe("VolumeReconciler", func() {
 		Expect(mockProv.CreateCallCount()).To(BeNumerically(">=", 1))
 		req := mockProv.LastCreateReq
 		Expect(req.Name).To(Equal("test-vol"))
-		Expect(req.Backend).To(Equal("vast-primary"))
+		Expect(req.Provider).To(Equal("vast-primary"))
 		Expect(req.Tenant).To(Equal("acme"))
 		Expect(req.Tier).To(Equal("gold"))
 		Expect(req.SizeGiB).To(Equal(int64(100)))
 		Expect(req.AccessMode).To(Equal(osacv1alpha1.VolumeAccessModeReadWriteOnce))
 		Expect(req.Protocol).To(Equal(osacv1alpha1.VolumeProtocolBlock))
+		Expect(req.Topology.Segments).To(Equal(map[string]string{"osac.io/node": "worker-1"}))
 	})
 
-	It("should pass tenant, backend, and vendor volume ID through to the vendor delete request", func() {
+	It("should pass tenant, provider, and vendor volume ID through to the vendor delete request", func() {
 		vol.Annotations = map[string]string{osacTenantKey: "acme"}
 		Expect(k8sClient.Create(testCtx, vol)).To(Succeed())
-		stampBackendProtocol(vol)
+		stampProviderProtocol(vol)
 
-		// Reconcile to Ready so the volume has a VendorVolumeID and backend.
+		// Reconcile to Ready so the volume has a VendorVolumeID and provider.
 		for range 3 {
 			_, err := reconciler.Reconcile(testCtx, mcreconcile.Request{
 				Request: reconcile.Request{
@@ -390,6 +611,8 @@ var _ = Describe("VolumeReconciler", func() {
 		provisioned := &osacv1alpha1.Volume{}
 		Expect(k8sClient.Get(testCtx, types.NamespacedName{Name: vol.Name, Namespace: vol.Namespace}, provisioned)).To(Succeed())
 		Expect(provisioned.Status.VendorVolumeID).To(HavePrefix("mock-"))
+		provisioned.Status.VendorContext = map[string]string{"logicalvolume": "pvc-test-vol-abc"}
+		Expect(k8sClient.Status().Update(testCtx, provisioned)).To(Succeed())
 
 		Expect(k8sClient.Delete(testCtx, vol)).To(Succeed())
 
@@ -399,22 +622,85 @@ var _ = Describe("VolumeReconciler", func() {
 			},
 		})
 		Expect(err).ToNot(HaveOccurred())
+		_, err = reconciler.Reconcile(testCtx, mcreconcile.Request{
+			Request: reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: vol.Name, Namespace: vol.Namespace},
+			},
+		})
+		Expect(err).ToNot(HaveOccurred())
 
 		Expect(mockProv.DeleteCallCount()).To(BeNumerically(">=", 1))
 		req := mockProv.LastDeleteReq
 		Expect(req.Tenant).To(Equal("acme"))
-		Expect(req.Backend).To(Equal(provisioned.Status.Backend))
+		Expect(req.Provider).To(Equal(provisioned.Status.Provider))
 		Expect(req.VendorVolumeID).To(Equal(provisioned.Status.VendorVolumeID))
+		Expect(req.VendorContext).To(Equal(provisioned.Status.VendorContext))
+	})
+
+	It("dispatches by provider and does not call another registered provider", func() {
+		otherProv := NewMockVendorProvisioner()
+		reconciler.VendorProvisioners = VendorProvisionerRegistry{
+			"vast-primary": mockProv,
+			"other":        otherProv,
+		}
+		vol.Spec.Topology = &osacv1alpha1.VolumeTopology{
+			Segments: map[string]string{"osac.io/node": "worker-2"},
+		}
+		Expect(k8sClient.Create(testCtx, vol)).To(Succeed())
+
+		stamped := &osacv1alpha1.Volume{}
+		Expect(k8sClient.Get(testCtx, types.NamespacedName{Name: vol.Name, Namespace: vol.Namespace}, stamped)).To(Succeed())
+		stamped.Status.Provider = "other"
+		stamped.Status.Protocol = osacv1alpha1.VolumeProtocolBlock
+		Expect(k8sClient.Status().Update(testCtx, stamped)).To(Succeed())
+
+		_, err := reconciler.Reconcile(testCtx, mcreconcile.Request{
+			Request: reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: vol.Name, Namespace: vol.Namespace},
+			},
+		})
+		Expect(err).ToNot(HaveOccurred())
+
+		Expect(otherProv.CreateCallCount()).To(Equal(int64(1)))
+		Expect(mockProv.CreateCallCount()).To(Equal(int64(0)))
+		Expect(otherProv.LastCreateReq.Provider).To(Equal("other"))
+		Expect(otherProv.LastCreateReq.Topology.Segments).To(Equal(map[string]string{"osac.io/node": "worker-2"}))
+	})
+
+	It("fails clearly when the resolved provider is not registered", func() {
+		Expect(k8sClient.Create(testCtx, vol)).To(Succeed())
+		stampProviderProtocol(vol)
+
+		stamped := &osacv1alpha1.Volume{}
+		Expect(k8sClient.Get(testCtx, types.NamespacedName{Name: vol.Name, Namespace: vol.Namespace}, stamped)).To(Succeed())
+		stamped.Status.Provider = "netapp"
+		Expect(k8sClient.Status().Update(testCtx, stamped)).To(Succeed())
+
+		_, err := reconciler.Reconcile(testCtx, mcreconcile.Request{
+			Request: reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: vol.Name, Namespace: vol.Namespace},
+			},
+		})
+		Expect(err).ToNot(HaveOccurred())
+
+		updated := &osacv1alpha1.Volume{}
+		Expect(k8sClient.Get(testCtx, types.NamespacedName{Name: vol.Name, Namespace: vol.Namespace}, updated)).To(Succeed())
+		Expect(updated.Status.Phase).To(Equal(osacv1alpha1.VolumePhaseFailed))
+		condition := apimeta.FindStatusCondition(updated.Status.Conditions, string(osacv1alpha1.VolumeConditionVendorProvisioned))
+		Expect(condition).ToNot(BeNil())
+		Expect(condition.Reason).To(Equal("ProviderNotImplemented"))
+		Expect(condition.Message).To(ContainSubstring(`provider "netapp" is not implemented`))
+		Expect(mockProv.CreateCallCount()).To(Equal(int64(0)))
 	})
 
 	It("should stay in Progressing (not crash) when no VendorProvisioner is configured", func() {
 		// Most setups (LVMS/dev) run with no vendor backend configured. The
 		// controller must not dereference a nil provisioner; it leaves the volume
 		// in Progressing and does not error, so the operator stays healthy.
-		reconciler.VendorProvisioner = nil
+		reconciler.VendorProvisioners = nil
 
 		Expect(k8sClient.Create(testCtx, vol)).To(Succeed())
-		stampBackendProtocol(vol)
+		stampProviderProtocol(vol)
 
 		for range 2 {
 			_, err := reconciler.Reconcile(testCtx, mcreconcile.Request{
@@ -435,23 +721,26 @@ var _ = Describe("VolumeReconciler", func() {
 		// A volume that never provisioned has no VendorVolumeID, so deletion must
 		// remove the finalizer without needing a provisioner — nothing leaks on
 		// the array because nothing was created.
-		reconciler.VendorProvisioner = nil
+		reconciler.VendorProvisioners = nil
 
+		vol.Finalizers = []string{osacVolumeFinalizer}
+		vol.Status.Phase = osacv1alpha1.VolumePhaseProgressing
 		Expect(k8sClient.Create(testCtx, vol)).To(Succeed())
-		stampBackendProtocol(vol)
+
+		Expect(k8sClient.Delete(testCtx, vol)).To(Succeed())
 		_, err := reconciler.Reconcile(testCtx, mcreconcile.Request{
 			Request: reconcile.Request{
 				NamespacedName: types.NamespacedName{Name: vol.Name, Namespace: vol.Namespace},
 			},
 		})
 		Expect(err).ToNot(HaveOccurred())
-
-		Expect(k8sClient.Delete(testCtx, vol)).To(Succeed())
-		_, err = reconciler.Reconcile(testCtx, mcreconcile.Request{
-			Request: reconcile.Request{
-				NamespacedName: types.NamespacedName{Name: vol.Name, Namespace: vol.Namespace},
-			},
-		})
+		_, err = reconciler.Reconcile(testCtx, mcreconcile.Request{Request: reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: vol.Name, Namespace: vol.Namespace},
+		}})
+		Expect(err).ToNot(HaveOccurred())
+		_, err = reconciler.Reconcile(testCtx, mcreconcile.Request{Request: reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: vol.Name, Namespace: vol.Namespace},
+		}})
 		Expect(err).ToNot(HaveOccurred())
 
 		deleted := &osacv1alpha1.Volume{}
@@ -468,10 +757,10 @@ var _ = Describe("VolumeReconciler", func() {
 		Expect(err).ToNot(HaveOccurred())
 	})
 
-	It("should requeue without writing status when backend is empty", func() {
+	It("should requeue without writing status when provider is empty", func() {
 		Expect(k8sClient.Create(testCtx, vol)).To(Succeed())
 
-		// First reconcile adds finalizer but backend/protocol are empty so it
+		// First reconcile adds finalizer but provider/protocol are empty so it
 		// should requeue without setting Phase — no status mutations at all.
 		res, err := reconciler.Reconcile(testCtx, mcreconcile.Request{
 			Request: reconcile.Request{
@@ -490,8 +779,8 @@ var _ = Describe("VolumeReconciler", func() {
 	It("should requeue without writing status when protocol is empty", func() {
 		Expect(k8sClient.Create(testCtx, vol)).To(Succeed())
 
-		// Stamp only backend, leave protocol empty.
-		vol.Status.Backend = "vast-primary"
+		// Stamp only provider, leave protocol empty.
+		vol.Status.Provider = "vast-primary"
 		Expect(k8sClient.Status().Update(testCtx, vol)).To(Succeed())
 
 		res, err := reconciler.Reconcile(testCtx, mcreconcile.Request{
@@ -508,10 +797,10 @@ var _ = Describe("VolumeReconciler", func() {
 		Expect(mockProv.CreateCallCount()).To(Equal(int64(0)))
 	})
 
-	It("should provision once backend and protocol are populated", func() {
+	It("should provision once provider and protocol are populated", func() {
 		Expect(k8sClient.Create(testCtx, vol)).To(Succeed())
 
-		// First reconcile: backend/protocol empty → requeue.
+		// First reconcile: provider/protocol empty → requeue.
 		res, err := reconciler.Reconcile(testCtx, mcreconcile.Request{
 			Request: reconcile.Request{
 				NamespacedName: types.NamespacedName{Name: vol.Name, Namespace: vol.Namespace},
@@ -521,14 +810,14 @@ var _ = Describe("VolumeReconciler", func() {
 		Expect(res.RequeueAfter).To(BeNumerically(">", 0))
 		Expect(mockProv.CreateCallCount()).To(Equal(int64(0)))
 
-		// Simulate FS stamping backend/protocol.
+		// Simulate FS stamping provider/protocol.
 		updated := &osacv1alpha1.Volume{}
 		Expect(k8sClient.Get(testCtx, types.NamespacedName{Name: vol.Name, Namespace: vol.Namespace}, updated)).To(Succeed())
-		updated.Status.Backend = "vast-primary"
+		updated.Status.Provider = "vast-primary"
 		updated.Status.Protocol = osacv1alpha1.VolumeProtocolBlock
 		Expect(k8sClient.Status().Update(testCtx, updated)).To(Succeed())
 
-		// Second reconcile: backend/protocol present → provisions.
+		// Second reconcile: provider/protocol present → provisions.
 		_, err = reconciler.Reconcile(testCtx, mcreconcile.Request{
 			Request: reconcile.Request{
 				NamespacedName: types.NamespacedName{Name: vol.Name, Namespace: vol.Namespace},

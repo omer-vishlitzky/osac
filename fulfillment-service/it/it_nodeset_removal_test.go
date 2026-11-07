@@ -21,76 +21,113 @@ import (
 	. "github.com/onsi/gomega"
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
-	publicv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/public/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/uuid"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
 
 var _ = Describe("Node set removal", func() {
 	var (
-		ctx               context.Context
-		clustersClient    publicv1.ClustersClient
-		hostTypesClient   privatev1.HostTypesClient
-		templatesClient   privatev1.ClusterTemplatesClient
-		workerHostTypeId  string
-		storageHostTypeId string
-		templateId        string
+		ctx                 context.Context
+		clustersClient      publicv1.ClustersClient
+		instanceTypesClient privatev1.BareMetalInstanceTypesClient
+		templatesClient     privatev1.ClusterTemplatesClient
+		workerBmitName      string
+		storageBmitName     string
+		templateId          string
 	)
 
 	BeforeEach(func() {
 		ctx = context.Background()
+		// A persisted tenant-default subnet can be injected into Cluster creates;
+		// keep a ready NetworkClass available for its canonical Hub validation.
+		ensureTenantDefaultNetworkingFixture(ctx, usersGroup, "")
 
 		clustersClient = publicv1.NewClustersClient(tool.ExternalView().UserConn())
-		hostTypesClient = privatev1.NewHostTypesClient(tool.InternalView().AdminConn())
+		instanceTypesClient = privatev1.NewBareMetalInstanceTypesClient(tool.InternalView().AdminConn())
 		templatesClient = privatev1.NewClusterTemplatesClient(tool.InternalView().AdminConn())
 
-		// Create worker host type:
-		workerHostTypeId = fmt.Sprintf("worker_type_%s", uuid.New())
-		_, err := hostTypesClient.Create(ctx, privatev1.HostTypesCreateRequest_builder{
-			Object: privatev1.HostType_builder{
-				Id: workerHostTypeId,
+		// Create worker bare metal instance type:
+		workerBmitName = fmt.Sprintf("worker-bmit-%s", uuid.New()[24:32])
+		_, err := instanceTypesClient.Create(ctx, privatev1.BareMetalInstanceTypesCreateRequest_builder{
+			Object: privatev1.BareMetalInstanceType_builder{
 				Metadata: privatev1.Metadata_builder{
-					Name: fmt.Sprintf("worker-type-%s", uuid.New()),
+					Name: workerBmitName,
+				}.Build(),
+				Spec: privatev1.BareMetalInstanceTypeSpec_builder{
+					Hardware: privatev1.BareMetalHardwareSpec_builder{
+						Cpu:    privatev1.BareMetalCPUSpec_builder{Cores: 32, Architecture: "amd64", ThreadsPerCore: 2}.Build(),
+						Memory: privatev1.BareMetalMemorySpec_builder{TotalGb: 128}.Build(),
+						NetworkPorts: []*privatev1.BareMetalNetworkPortSpec{
+							privatev1.BareMetalNetworkPortSpec_builder{
+								Name:  "eth0",
+								Role:  "fabric",
+								Type:  "Ethernet",
+								Speed: "10Gbps",
+							}.Build(),
+						},
+					}.Build(),
+					HostLabelSelector: privatev1.BareMetalLabelSelector_builder{
+						MatchLabels: map[string]string{"hardware.profile": "worker"},
+					}.Build(),
 				}.Build(),
 			}.Build(),
 		}.Build())
 		Expect(err).ToNot(HaveOccurred())
+		deferCatalogItemFixtureDeletion(func(ctx context.Context) error {
+			_, err := instanceTypesClient.Delete(ctx, privatev1.BareMetalInstanceTypesDeleteRequest_builder{Id: workerBmitName}.Build())
+			return err
+		}, nil)
 
-		// Create storage host type:
-		storageHostTypeId = fmt.Sprintf("storage_type_%s", uuid.New())
-		_, err = hostTypesClient.Create(ctx, privatev1.HostTypesCreateRequest_builder{
-			Object: privatev1.HostType_builder{
-				Id: storageHostTypeId,
+		// Create storage bare metal instance type:
+		storageBmitName = fmt.Sprintf("storage-bmit-%s", uuid.New()[24:32])
+		_, err = instanceTypesClient.Create(ctx, privatev1.BareMetalInstanceTypesCreateRequest_builder{
+			Object: privatev1.BareMetalInstanceType_builder{
 				Metadata: privatev1.Metadata_builder{
-					Name: fmt.Sprintf("storage-type-%s", uuid.New()),
+					Name: storageBmitName,
+				}.Build(),
+				Spec: privatev1.BareMetalInstanceTypeSpec_builder{
+					Hardware: privatev1.BareMetalHardwareSpec_builder{
+						Cpu:    privatev1.BareMetalCPUSpec_builder{Cores: 32, Architecture: "amd64", ThreadsPerCore: 2}.Build(),
+						Memory: privatev1.BareMetalMemorySpec_builder{TotalGb: 128}.Build(),
+						NetworkPorts: []*privatev1.BareMetalNetworkPortSpec{
+							privatev1.BareMetalNetworkPortSpec_builder{
+								Name:  "eth0",
+								Role:  "fabric",
+								Type:  "Ethernet",
+								Speed: "10Gbps",
+							}.Build(),
+						},
+					}.Build(),
+					HostLabelSelector: privatev1.BareMetalLabelSelector_builder{
+						MatchLabels: map[string]string{"hardware.profile": "storage"},
+					}.Build(),
 				}.Build(),
 			}.Build(),
 		}.Build())
 		Expect(err).ToNot(HaveOccurred())
+		deferCatalogItemFixtureDeletion(func(ctx context.Context) error {
+			_, err := instanceTypesClient.Delete(ctx, privatev1.BareMetalInstanceTypesDeleteRequest_builder{Id: storageBmitName}.Build())
+			return err
+		}, nil)
 
-		// Create a template with 2 node sets:
-		templateId = fmt.Sprintf("template_2_nodesets_%s", uuid.New())
+		// Create a provisioning template; the Cluster supplies its two node sets.
+		templateId = newTemplateID("template_2_nodesets")
 		_, err = templatesClient.Create(ctx, privatev1.ClusterTemplatesCreateRequest_builder{
 			Object: privatev1.ClusterTemplate_builder{
 				Id: templateId,
 				Metadata: privatev1.Metadata_builder{
 					Name: fmt.Sprintf("template-2-nodesets-%s", uuid.New()),
 				}.Build(),
-				Title:       "Template with 2 node sets",
-				Description: "A template with workers and storage node sets.",
-				NodeSets: map[string]*privatev1.ClusterTemplateNodeSet{
-					"workers": privatev1.ClusterTemplateNodeSet_builder{
-						HostType: privatev1.HostTypeReference_builder{Id: workerHostTypeId}.Build(),
-						Size:     3,
-					}.Build(),
-					"storage": privatev1.ClusterTemplateNodeSet_builder{
-						HostType: privatev1.HostTypeReference_builder{Id: storageHostTypeId}.Build(),
-						Size:     2,
-					}.Build(),
-				},
+				Title:       "Provisioning template",
+				Description: "Template for a cluster with workers and storage nodes.",
 			}.Build(),
 		}.Build())
 		Expect(err).ToNot(HaveOccurred())
+		deferCatalogItemFixtureDeletion(func(ctx context.Context) error {
+			_, err := templatesClient.Delete(ctx, privatev1.ClusterTemplatesDeleteRequest_builder{Id: templateId}.Build())
+			return err
+		}, nil)
 	})
 
 	It("Should keep node set removed after edit", func() {
@@ -102,11 +139,16 @@ var _ = Describe("Node set removal", func() {
 				}.Build(),
 				Spec: publicv1.ClusterSpec_builder{
 					Template: publicv1.ClusterTemplateReference_builder{Id: templateId}.Build(),
+					NodeSets: map[string]*publicv1.ClusterNodeSet{
+						"workers": publicv1.ClusterNodeSet_builder{Size: new(int32(3)), BaremetalInstanceType: publicv1.BareMetalInstanceTypeReference_builder{Id: workerBmitName, Shared: true}.Build()}.Build(),
+						"storage": publicv1.ClusterNodeSet_builder{Size: new(int32(2)), BaremetalInstanceType: publicv1.BareMetalInstanceTypeReference_builder{Id: storageBmitName, Shared: true}.Build()}.Build(),
+					},
 				}.Build(),
 			}.Build(),
 		}.Build())
 		Expect(err).ToNot(HaveOccurred())
 		clusterId := createResponse.Object.Id
+		deferClusterDeletion(clusterId, tool.ExternalView().UserConn())
 
 		// Step 2: Verify cluster has 2 node sets
 		getResponse, err := clustersClient.Get(ctx, publicv1.ClustersGetRequest_builder{

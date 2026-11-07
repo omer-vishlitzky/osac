@@ -1,0 +1,695 @@
+/*
+Copyright 2025.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package controller
+
+import (
+	"context"
+	"time"
+
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	osacv1alpha1 "github.com/osac-project/osac/osac-operator/api/v1alpha1"
+	"github.com/osac-project/osac/osac-operator/pkg/provisioning"
+)
+
+var _ = Describe("ClusterOrder Integration Tests", func() {
+	const (
+		clusterOrderTestNamespace = "default"
+		statusPollInterval        = 100 * time.Millisecond
+	)
+
+	var (
+		reconciler *ClusterOrderReconciler
+		provider   *controllableProvider
+	)
+
+	BeforeEach(func() {
+		provider = newControllableProvider()
+		reconciler = NewClusterOrderReconciler(
+			k8sClient, k8sClient, k8sClient.Scheme(),
+			clusterOrderTestNamespace, "",
+			provider, statusPollInterval, provisioning.DefaultMaxJobHistory,
+		)
+	})
+
+	ctx := context.Background()
+
+	newTestClusterOrder := func(name string) *osacv1alpha1.ClusterOrder {
+		return &osacv1alpha1.ClusterOrder{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      name,
+				Namespace: clusterOrderTestNamespace,
+			},
+			Spec: osacv1alpha1.ClusterOrderSpec{
+				TemplateID: "test.template",
+			},
+		}
+	}
+
+	getClusterOrder := func(name string) *osacv1alpha1.ClusterOrder {
+		instance := &osacv1alpha1.ClusterOrder{}
+		ExpectWithOffset(1, k8sClient.Get(ctx, types.NamespacedName{
+			Name: name, Namespace: clusterOrderTestNamespace,
+		}, instance)).To(Succeed())
+		return instance
+	}
+
+	It("rejects changes to the complete network attachment", func() {
+		const name = "cluster-order-immutable-network-attachment"
+		instance := newTestClusterOrder(name)
+		instance.Spec.NetworkAttachment = &osacv1alpha1.ClusterNetworkAttachment{
+			SubnetRef:         "subnet-a",
+			SecurityGroupRefs: []string{"sg-a"},
+		}
+		Expect(k8sClient.Create(ctx, instance)).To(Succeed())
+		DeferCleanup(func() { Expect(k8sClient.Delete(ctx, instance)).To(Succeed()) })
+
+		instance = getClusterOrder(name)
+		instance.Spec.NetworkAttachment.SecurityGroupRefs = []string{"sg-b"}
+		err := k8sClient.Update(ctx, instance)
+		Expect(err).To(HaveOccurred())
+		Expect(apierrors.IsInvalid(err)).To(BeTrue())
+		Expect(err.Error()).To(ContainSubstring("networkAttachment is immutable after creation"))
+
+		instance = getClusterOrder(name)
+		instance.Spec.NetworkAttachment.SubnetRef = "subnet-b"
+		err = k8sClient.Update(ctx, instance)
+		Expect(err).To(HaveOccurred())
+		Expect(apierrors.IsInvalid(err)).To(BeTrue())
+		Expect(err.Error()).To(ContainSubstring("networkAttachment is immutable after creation"))
+	})
+
+	It("rejects adding or removing the optional network attachment", func() {
+		const addName = "cluster-order-add-network-attachment"
+		withoutAttachment := newTestClusterOrder(addName)
+		Expect(k8sClient.Create(ctx, withoutAttachment)).To(Succeed())
+		DeferCleanup(func() { Expect(k8sClient.Delete(ctx, withoutAttachment)).To(Succeed()) })
+
+		withoutAttachment = getClusterOrder(addName)
+		withoutAttachment.Spec.NetworkAttachment = &osacv1alpha1.ClusterNetworkAttachment{SubnetRef: "subnet-a"}
+		err := k8sClient.Update(ctx, withoutAttachment)
+		Expect(err).To(HaveOccurred())
+		Expect(apierrors.IsInvalid(err)).To(BeTrue())
+		Expect(err.Error()).To(ContainSubstring("networkAttachment is immutable after creation"))
+
+		const removeName = "cluster-order-remove-network-attachment"
+		withAttachment := newTestClusterOrder(removeName)
+		withAttachment.Spec.NetworkAttachment = &osacv1alpha1.ClusterNetworkAttachment{SubnetRef: "subnet-a"}
+		Expect(k8sClient.Create(ctx, withAttachment)).To(Succeed())
+		DeferCleanup(func() { Expect(k8sClient.Delete(ctx, withAttachment)).To(Succeed()) })
+
+		withAttachment = getClusterOrder(removeName)
+		withAttachment.Spec.NetworkAttachment = nil
+		err = k8sClient.Update(ctx, withAttachment)
+		Expect(err).To(HaveOccurred())
+		Expect(apierrors.IsInvalid(err)).To(BeTrue())
+		Expect(err.Error()).To(ContainSubstring("networkAttachment is immutable after creation"))
+	})
+
+	It("rejects removing spec to bypass network attachment immutability", func() {
+		const name = "cluster-order-remove-spec"
+		instance := newTestClusterOrder(name)
+		instance.Spec.NetworkAttachment = &osacv1alpha1.ClusterNetworkAttachment{SubnetRef: "subnet-a"}
+		Expect(k8sClient.Create(ctx, instance)).To(Succeed())
+		DeferCleanup(func() { Expect(k8sClient.Delete(ctx, instance)).To(Succeed()) })
+
+		instance = getClusterOrder(name)
+		err := k8sClient.Patch(ctx, instance, client.RawPatch(types.JSONPatchType, []byte(`[{"op":"remove","path":"/spec"}]`)))
+		Expect(apierrors.IsInvalid(err)).To(BeTrue())
+		Expect(err).To(MatchError(ContainSubstring("spec presence is immutable after creation")))
+	})
+
+	It("allows unrelated worker and status updates with an unchanged network attachment", func() {
+		const name = "cluster-order-network-attachment-lifecycle-update"
+		instance := newTestClusterOrder(name)
+		instance.Spec.NetworkAttachment = &osacv1alpha1.ClusterNetworkAttachment{SubnetRef: "subnet-a"}
+		Expect(k8sClient.Create(ctx, instance)).To(Succeed())
+		DeferCleanup(func() { Expect(k8sClient.Delete(ctx, instance)).To(Succeed()) })
+
+		instance = getClusterOrder(name)
+		instance.Spec.NodeRequests = []osacv1alpha1.NodeRequest{{
+			NodeSet:       "worker",
+			NumberOfNodes: 1,
+			BareMetal:     &osacv1alpha1.BareMetalNodeSpec{InstanceType: "worker"},
+		}}
+		Expect(k8sClient.Update(ctx, instance)).To(Succeed())
+
+		instance.Status.DesiredConfigVersion = "lifecycle-update"
+		Expect(k8sClient.Status().Update(ctx, instance)).To(Succeed())
+	})
+
+	It("skips status when observed replicas is zero and rejects zero desired workers", func() {
+		const name = "cluster-order-zero-observed-workers"
+		instance := newTestClusterOrder(name)
+		instance.Spec.NodeRequests = []osacv1alpha1.NodeRequest{{NodeSet: "worker",
+			NumberOfNodes: 1,
+			BareMetal:     &osacv1alpha1.BareMetalNodeSpec{InstanceType: "worker"},
+		}}
+		Expect(k8sClient.Create(ctx, instance)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, instance) })
+
+		pool := readyClusterOrderNodePool("worker", 0)
+		Expect(reconciler.handleNodePool(ctx, instance, &pool)).To(Succeed())
+		Expect(instance.Status.NodeRequests).To(BeEmpty(),
+			"zero observed replicas must not create a status entry")
+
+		invalid := newTestClusterOrder("cluster-order-zero-desired-workers")
+		invalid.Spec.NodeRequests = []osacv1alpha1.NodeRequest{{NodeSet: "worker",
+			NumberOfNodes: 0,
+			BareMetal:     &osacv1alpha1.BareMetalNodeSpec{InstanceType: "worker"},
+		}}
+		Expect(k8sClient.Create(ctx, invalid)).To(MatchError(ContainSubstring("spec.nodeRequests[0].numberOfNodes")),
+			"desired worker count must remain positive")
+	})
+
+	It("should round-trip add-on operator names through the ClusterOrder CRD", func() {
+		const name = "cluster-order-add-on-operators"
+		instance := newTestClusterOrder(name)
+		instance.Spec.AddOnOperators = []string{"operator-one", "operator-two"}
+		Expect(k8sClient.Create(ctx, instance)).To(Succeed())
+		DeferCleanup(func() { Expect(k8sClient.Delete(ctx, instance)).To(Succeed()) })
+
+		stored := getClusterOrder(name)
+		Expect(stored.Spec.AddOnOperators).To(Equal([]string{"operator-one", "operator-two"}))
+	})
+
+	It("should omit add-on operators when none are requested", func() {
+		const name = "cluster-order-without-add-on-operators"
+		instance := newTestClusterOrder(name)
+		Expect(k8sClient.Create(ctx, instance)).To(Succeed())
+		DeferCleanup(func() { Expect(k8sClient.Delete(ctx, instance)).To(Succeed()) })
+
+		stored := getClusterOrder(name)
+		Expect(stored.Spec.AddOnOperators).To(BeEmpty())
+	})
+
+	It("should reject an empty add-on operator job name", func() {
+		const name = "cluster-order-empty-add-on-operator"
+		instance := newTestClusterOrder(name)
+		Expect(k8sClient.Create(ctx, instance)).To(Succeed())
+		DeferCleanup(func() { Expect(k8sClient.Delete(ctx, instance)).To(Succeed()) })
+
+		instance.Status.AddOnOperatorJobs = []osacv1alpha1.AddOnOperatorJobStatus{{
+			Name: "",
+			JobStatus: osacv1alpha1.JobStatus{
+				JobID:     "addon-job-1",
+				Type:      osacv1alpha1.JobTypeProvision,
+				Timestamp: metav1.Now(),
+				State:     osacv1alpha1.JobStatePending,
+			},
+		}}
+		Expect(k8sClient.Status().Update(ctx, instance)).NotTo(Succeed())
+	})
+
+	It("should reject an empty requested add-on operator name", func() {
+		instance := newTestClusterOrder("cluster-order-empty-requested-operator")
+		instance.Spec.AddOnOperators = []string{""}
+
+		Expect(k8sClient.Create(ctx, instance)).NotTo(Succeed())
+	})
+
+	It("should round-trip fulfillment trust observed status through the ClusterOrder CRD", func() {
+		const name = "cluster-order-fulfillment-trust-status"
+		instance := newTestClusterOrder(name)
+		Expect(k8sClient.Create(ctx, instance)).To(Succeed())
+		DeferCleanup(func() {
+			Expect(k8sClient.Delete(ctx, instance)).To(Succeed())
+		})
+
+		instance.Status.FulfillmentTrustBundleHash = "sha256:bundle"
+		instance.SetStatusCondition(
+			string(osacv1alpha1.ClusterOrderConditionFulfillmentTrustReady),
+			metav1.ConditionTrue,
+			"trust bundle synchronized",
+			"TrustBundleSynchronized",
+		)
+		Expect(k8sClient.Status().Update(ctx, instance)).To(Succeed())
+
+		stored := getClusterOrder(name)
+		Expect(stored.Status.FulfillmentTrustBundleHash).To(Equal("sha256:bundle"))
+		Expect(stored.IsStatusConditionTrue(string(osacv1alpha1.ClusterOrderConditionFulfillmentTrustReady))).To(BeTrue())
+	})
+
+	countProvisionJobs := func(instance *osacv1alpha1.ClusterOrder) int {
+		count := 0
+		for _, j := range instance.Status.ProvisioningJobs {
+			if j.Type == osacv1alpha1.JobTypeProvision {
+				count++
+			}
+		}
+		return count
+	}
+
+	Context("Provisioning workflow", func() {
+		It("does not submit another cluster job after an attachment update is rejected and continues polling status", func() {
+			const name = "cluster-order-immutable-network-attachment-job"
+			instance := newTestClusterOrder(name)
+			instance.Spec.NetworkAttachment = &osacv1alpha1.ClusterNetworkAttachment{
+				SubnetRef:         "subnet-a",
+				SecurityGroupRefs: []string{"sg-a"},
+			}
+			Expect(k8sClient.Create(ctx, instance)).To(Succeed())
+			DeferCleanup(func() { Expect(k8sClient.Delete(ctx, instance)).To(Succeed()) })
+
+			instance.Status.DesiredConfigVersion = "v1"
+			Expect(k8sClient.Status().Update(ctx, instance)).To(Succeed())
+			_, err := reconciler.handleProvisioning(ctx, instance)
+			Expect(err).NotTo(HaveOccurred())
+
+			instance = getClusterOrder(name)
+			instance.Spec.NetworkAttachment.SecurityGroupRefs = []string{"sg-b"}
+			err = k8sClient.Update(ctx, instance)
+			Expect(err).To(HaveOccurred())
+			Expect(apierrors.IsInvalid(err)).To(BeTrue())
+
+			instance = getClusterOrder(name)
+			provider.setProvisionJobState(osacv1alpha1.JobStateRunning, "Running")
+			result, err := reconciler.handleProvisioning(ctx, instance)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(Equal(statusPollInterval))
+			Expect(k8sClient.Status().Update(ctx, instance)).To(Succeed())
+
+			provider.mu.Lock()
+			provisionCalls := provider.provisionCallCount
+			provider.mu.Unlock()
+			Expect(provisionCalls).To(Equal(1))
+			job := provisioning.FindLatestJobByType(instance.Status.ProvisioningJobs, osacv1alpha1.JobTypeProvision)
+			Expect(job).NotTo(BeNil())
+			Expect(job.State).To(Equal(osacv1alpha1.JobStateRunning))
+		})
+
+		It("should provision through the full lifecycle: trigger, running, succeeded", func() {
+			const name = "cluster-order-provision-success"
+			instance := newTestClusterOrder(name)
+			Expect(k8sClient.Create(ctx, instance)).To(Succeed())
+			DeferCleanup(func() {
+				Expect(k8sClient.Delete(ctx, instance)).To(Succeed())
+			})
+
+			instance.Status.DesiredConfigVersion = "v1"
+			Expect(k8sClient.Status().Update(ctx, instance)).To(Succeed())
+
+			// First reconcile — trigger provision job
+			result, err := reconciler.handleProvisioning(ctx, instance)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(Equal(statusPollInterval))
+
+			instance = getClusterOrder(name)
+			job := provisioning.FindLatestJobByType(instance.Status.ProvisioningJobs, osacv1alpha1.JobTypeProvision)
+			Expect(job).NotTo(BeNil())
+			Expect(job.JobID).To(HavePrefix("prov-job-" + name))
+			Expect(job.State).To(Equal(osacv1alpha1.JobStatePending))
+			Expect(job.ConfigVersion).To(Equal("v1"), "job should record the DesiredConfigVersion it was triggered for")
+
+			// Simulate running
+			provider.setProvisionJobState(osacv1alpha1.JobStateRunning, "Running")
+			result, err = reconciler.handleProvisioning(ctx, instance)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(Equal(statusPollInterval))
+			Expect(k8sClient.Status().Update(ctx, instance)).To(Succeed())
+
+			instance = getClusterOrder(name)
+			job = provisioning.FindLatestJobByType(instance.Status.ProvisioningJobs, osacv1alpha1.JobTypeProvision)
+			Expect(job.State).To(Equal(osacv1alpha1.JobStateRunning))
+
+			// Simulate succeeded
+			provider.setProvisionJobState(osacv1alpha1.JobStateSucceeded, "Completed")
+			result, err = reconciler.handleProvisioning(ctx, instance)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(BeZero(), "should not requeue after terminal success")
+			Expect(k8sClient.Status().Update(ctx, instance)).To(Succeed())
+
+			instance = getClusterOrder(name)
+			job = provisioning.FindLatestJobByType(instance.Status.ProvisioningJobs, osacv1alpha1.JobTypeProvision)
+			Expect(job.State).To(Equal(osacv1alpha1.JobStateSucceeded))
+		})
+
+		It("should set Failed phase when provision job fails", func() {
+			const name = "cluster-order-provision-failure"
+			instance := newTestClusterOrder(name)
+			Expect(k8sClient.Create(ctx, instance)).To(Succeed())
+			DeferCleanup(func() {
+				Expect(k8sClient.Delete(ctx, instance)).To(Succeed())
+			})
+
+			instance.Status.DesiredConfigVersion = "v1"
+			Expect(k8sClient.Status().Update(ctx, instance)).To(Succeed())
+
+			// Trigger and fail
+			_, err := reconciler.handleProvisioning(ctx, instance)
+			Expect(err).NotTo(HaveOccurred())
+			instance = getClusterOrder(name)
+
+			provider.setProvisionJobState(osacv1alpha1.JobStateFailed, "No agents available")
+			_, err = reconciler.handleProvisioning(ctx, instance)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(k8sClient.Status().Update(ctx, instance)).To(Succeed())
+			Expect(instance.Status.Phase).To(Equal(osacv1alpha1.ClusterOrderPhaseFailed))
+		})
+
+		It("should not trigger duplicate jobs on rapid reconciles (stale cache guard)", func() {
+			const name = "cluster-order-no-duplicate"
+			instance := newTestClusterOrder(name)
+			Expect(k8sClient.Create(ctx, instance)).To(Succeed())
+			DeferCleanup(func() {
+				Expect(k8sClient.Delete(ctx, instance)).To(Succeed())
+			})
+
+			instance.Status.DesiredConfigVersion = "v1"
+			Expect(k8sClient.Status().Update(ctx, instance)).To(Succeed())
+
+			// First reconcile triggers and persists
+			_, err := reconciler.handleProvisioning(ctx, instance)
+			Expect(err).NotTo(HaveOccurred())
+			instance = getClusterOrder(name)
+
+			// Simulate stale cache: in-memory instance has no jobs
+			staleInstance := &osacv1alpha1.ClusterOrder{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      name,
+					Namespace: clusterOrderTestNamespace,
+				},
+				Status: osacv1alpha1.ClusterOrderStatus{
+					DesiredConfigVersion: "v1",
+				},
+			}
+
+			provState := &provisioning.State{
+				Jobs:                 &staleInstance.Status.ProvisioningJobs,
+				DesiredConfigVersion: staleInstance.Status.DesiredConfigVersion,
+			}
+			action, _ := provisioning.EvaluateAction(provState, func() bool {
+				return provisioning.CheckAPIServerForNonTerminalProvisionJob(ctx, k8sClient, client.ObjectKeyFromObject(staleInstance), &osacv1alpha1.ClusterOrder{}, func(obj client.Object) []osacv1alpha1.JobStatus {
+					return obj.(*osacv1alpha1.ClusterOrder).Status.ProvisioningJobs
+				})
+			})
+			Expect(action).To(Equal(provisioning.Requeue), "should detect non-terminal job via API server and requeue")
+		})
+	})
+
+	Context("Deprovisioning workflow", func() {
+		It("should deprovision successfully", func() {
+			const name = "cluster-order-deprovision-success"
+			instance := newTestClusterOrder(name)
+			Expect(k8sClient.Create(ctx, instance)).To(Succeed())
+			DeferCleanup(func() {
+				Expect(k8sClient.Delete(ctx, instance)).To(Succeed())
+			})
+
+			// Trigger deprovision
+			result, err := reconciler.handleDeprovisioning(ctx, instance)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(Equal(statusPollInterval))
+			Expect(k8sClient.Status().Update(ctx, instance)).To(Succeed())
+
+			job := provisioning.FindLatestJobByType(instance.Status.ProvisioningJobs, osacv1alpha1.JobTypeDeprovision)
+			Expect(job).NotTo(BeNil())
+			Expect(job.BlockDeletionOnFailure).To(BeTrue())
+
+			// Simulate succeeded
+			provider.setDeprovisionJobState(osacv1alpha1.JobStateSucceeded, "Completed")
+			instance = getClusterOrder(name)
+			result, err = reconciler.handleDeprovisioning(ctx, instance)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(BeZero(), "should proceed with deletion")
+		})
+
+		It("should block deletion when deprovision fails with BlockDeletionOnFailure", func() {
+			const name = "cluster-order-deprovision-blocked"
+			instance := newTestClusterOrder(name)
+			Expect(k8sClient.Create(ctx, instance)).To(Succeed())
+			DeferCleanup(func() {
+				Expect(k8sClient.Delete(ctx, instance)).To(Succeed())
+			})
+
+			_, err := reconciler.handleDeprovisioning(ctx, instance)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(k8sClient.Status().Update(ctx, instance)).To(Succeed())
+
+			provider.setDeprovisionJobState(osacv1alpha1.JobStateFailed, "Cleanup failed")
+			instance = getClusterOrder(name)
+			result, err := reconciler.handleDeprovisioning(ctx, instance)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(BeNumerically("<=", provisioning.BackoffBaseDelay), "should wait for backoff before retry")
+			Expect(result.RequeueAfter).To(BeNumerically(">", 0))
+		})
+	})
+
+	Context("Config version tracking", func() {
+		It("should produce consistent hash for same spec", func() {
+			instance := newTestClusterOrder("cluster-order-hash-idempotent")
+			Expect(reconciler.handleDesiredConfigVersion(instance)).To(Succeed())
+			firstHash := instance.Status.DesiredConfigVersion
+			Expect(firstHash).NotTo(BeEmpty())
+
+			Expect(reconciler.handleDesiredConfigVersion(instance)).To(Succeed())
+			Expect(instance.Status.DesiredConfigVersion).To(Equal(firstHash))
+		})
+
+		It("should produce different hash when spec changes", func() {
+			instance1 := newTestClusterOrder("cluster-order-hash-diff-a")
+			instance1.Spec.TemplateID = "template.alpha"
+			instance2 := newTestClusterOrder("cluster-order-hash-diff-b")
+			instance2.Spec.TemplateID = "template.beta"
+
+			Expect(reconciler.handleDesiredConfigVersion(instance1)).To(Succeed())
+			Expect(reconciler.handleDesiredConfigVersion(instance2)).To(Succeed())
+			Expect(instance1.Status.DesiredConfigVersion).NotTo(Equal(instance2.Status.DesiredConfigVersion))
+		})
+
+		It("should skip provisioning when latest job succeeded with matching ConfigVersion", func() {
+			instance := newTestClusterOrder("cluster-order-skip-match")
+			instance.Status.DesiredConfigVersion = "v1"
+			instance.Status.ProvisioningJobs = []osacv1alpha1.JobStatus{
+				{Type: osacv1alpha1.JobTypeProvision, JobID: "job-1", State: osacv1alpha1.JobStateSucceeded, ConfigVersion: "v1"},
+			}
+
+			provState := &provisioning.State{
+				Jobs:                 &instance.Status.ProvisioningJobs,
+				DesiredConfigVersion: instance.Status.DesiredConfigVersion,
+			}
+			action, job := provisioning.EvaluateAction(provState, func() bool {
+				return provisioning.CheckAPIServerForNonTerminalProvisionJob(ctx, k8sClient, client.ObjectKeyFromObject(instance), &osacv1alpha1.ClusterOrder{}, func(obj client.Object) []osacv1alpha1.JobStatus {
+					return obj.(*osacv1alpha1.ClusterOrder).Status.ProvisioningJobs
+				})
+			})
+			Expect(action).To(Equal(provisioning.Skip))
+			Expect(job).NotTo(BeNil())
+		})
+	})
+
+	Context("Infinite retry prevention", func() {
+		// Known bug: when a provision job fails and the AAP playbook never sets the
+		It("should not create additional provision jobs when previous job failed for same config", func() {
+			const name = "cluster-order-no-infinite-retry"
+			instance := newTestClusterOrder(name)
+			Expect(k8sClient.Create(ctx, instance)).To(Succeed())
+			DeferCleanup(func() {
+				Expect(k8sClient.Delete(ctx, instance)).To(Succeed())
+			})
+
+			instance.Status.DesiredConfigVersion = "v1"
+			Expect(k8sClient.Status().Update(ctx, instance)).To(Succeed())
+
+			// Trigger and fail
+			_, err := reconciler.handleProvisioning(ctx, instance)
+			Expect(err).NotTo(HaveOccurred())
+			instance = getClusterOrder(name)
+
+			provider.setProvisionJobState(osacv1alpha1.JobStateFailed, "Failed")
+			_, err = reconciler.handleProvisioning(ctx, instance)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(k8sClient.Status().Update(ctx, instance)).To(Succeed())
+
+			// Next reconcile should back off, not trigger a new job immediately
+			instance = getClusterOrder(name)
+			result, err := reconciler.handleProvisioning(ctx, instance)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(BeNumerically(">", 0), "should requeue with backoff delay")
+			Expect(result.RequeueAfter).To(BeNumerically("<=", provisioning.BackoffMaxDelay))
+			Expect(countProvisionJobs(instance)).To(Equal(1), "should not create additional jobs during backoff")
+		})
+
+		It("should retry after backoff elapses and increase backoff on successive failures", func() {
+			const name = "cluster-order-backoff-retry"
+			instance := newTestClusterOrder(name)
+			Expect(k8sClient.Create(ctx, instance)).To(Succeed())
+			DeferCleanup(func() {
+				Expect(k8sClient.Delete(ctx, instance)).To(Succeed())
+			})
+
+			instance.Status.DesiredConfigVersion = "v1"
+			Expect(k8sClient.Status().Update(ctx, instance)).To(Succeed())
+
+			// First failure: trigger → poll (fails) → backoff
+			_, err := reconciler.handleProvisioning(ctx, instance)
+			Expect(err).NotTo(HaveOccurred())
+			instance = getClusterOrder(name)
+
+			provider.setProvisionJobState(osacv1alpha1.JobStateFailed, "Failed")
+			_, err = reconciler.handleProvisioning(ctx, instance)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(k8sClient.Status().Update(ctx, instance)).To(Succeed())
+
+			// Verify first backoff uses base delay
+			instance = getClusterOrder(name)
+			result1, err := reconciler.handleProvisioning(ctx, instance)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result1.RequeueAfter).To(BeNumerically("~", provisioning.BackoffBaseDelay, 5*time.Second), "first failure should use base delay")
+			Expect(countProvisionJobs(instance)).To(Equal(1), "should not retry during backoff")
+
+			// Backdate the first failed job to 5 minutes ago to simulate backoff elapsed
+			instance = getClusterOrder(name)
+			latestJob := provisioning.FindLatestJobByType(instance.Status.ProvisioningJobs, osacv1alpha1.JobTypeProvision)
+			latestJob.Timestamp = metav1.NewTime(time.Now().UTC().Add(-5 * time.Minute))
+			provisioning.UpdateJob(instance.Status.ProvisioningJobs, *latestJob)
+			Expect(k8sClient.Status().Update(ctx, instance)).To(Succeed())
+
+			// Second failure: backoff elapsed → trigger → poll (fails)
+			instance = getClusterOrder(name)
+			_, err = reconciler.handleProvisioning(ctx, instance)
+			Expect(err).NotTo(HaveOccurred())
+			instance = getClusterOrder(name)
+			Expect(countProvisionJobs(instance)).To(Equal(2), "should create new job after backoff elapsed")
+
+			provider.setProvisionJobState(osacv1alpha1.JobStateFailed, "Failed again")
+			instance = getClusterOrder(name)
+			_, err = reconciler.handleProvisioning(ctx, instance)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(k8sClient.Status().Update(ctx, instance)).To(Succeed())
+
+			// Second backoff should be longer: gap between two failed jobs is ~5min, so backoff = 10min
+			instance = getClusterOrder(name)
+			result2, err := reconciler.handleProvisioning(ctx, instance)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result2.RequeueAfter).To(BeNumerically(">", result1.RequeueAfter), "second failure should have longer backoff")
+			Expect(result2.RequeueAfter).To(BeNumerically("~", 10*time.Minute, 30*time.Second), "backoff should double the 5-minute gap")
+		})
+	})
+
+	Context("Phase transition time stamping", func() {
+		It("stamps the phase transition time once per phase change", func() {
+			const name = "cluster-order-phase-transition-time"
+			instance := newTestClusterOrder(name)
+			Expect(k8sClient.Create(ctx, instance)).To(Succeed())
+			DeferCleanup(func() {
+				Expect(k8sClient.Delete(ctx, instance)).To(Succeed())
+			})
+
+			nn := types.NamespacedName{Name: name, Namespace: clusterOrderTestNamespace}
+			_, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: nn})
+			Expect(err).NotTo(HaveOccurred())
+
+			// The first reconcile initializes the empty phase to Progressing and stamps it.
+			instance = getClusterOrder(name)
+			Expect(instance.Status.Phase).To(Equal(osacv1alpha1.ClusterOrderPhaseProgressing))
+			Expect(instance.Status.PhaseTransitionTime).NotTo(BeNil())
+			firstStamp := instance.Status.PhaseTransitionTime.Time
+
+			// A status write that leaves the phase unchanged keeps the stamp.
+			computed := instance.Status.DeepCopy()
+			computed.ApiEndpoint = "192.0.2.10"
+			_, err = reconciler.patchStatusWithRetry(ctx, nn, *computed)
+			Expect(err).NotTo(HaveOccurred())
+			instance = getClusterOrder(name)
+			Expect(instance.Status.ApiEndpoint).To(Equal("192.0.2.10"))
+			Expect(instance.Status.PhaseTransitionTime.Time).To(Equal(firstStamp))
+
+			// A phase change moves it. The CR stores whole seconds, so wait past the
+			// second boundary of the first stamp to make the move observable.
+			time.Sleep(time.Until(firstStamp.Truncate(time.Second).Add(2 * time.Second)))
+			computed = instance.Status.DeepCopy()
+			computed.Phase = osacv1alpha1.ClusterOrderPhaseReady
+			_, err = reconciler.patchStatusWithRetry(ctx, nn, *computed)
+			Expect(err).NotTo(HaveOccurred())
+			instance = getClusterOrder(name)
+			Expect(instance.Status.Phase).To(Equal(osacv1alpha1.ClusterOrderPhaseReady))
+			Expect(instance.Status.PhaseTransitionTime.Time).To(BeTemporally(">", firstStamp))
+		})
+	})
+
+	Context("Status patch safety", func() {
+		It("should preserve controller-owned fields when patching status", func() {
+			const name = "cluster-order-patch-preserves-storage"
+			instance := newTestClusterOrder(name)
+			Expect(k8sClient.Create(ctx, instance)).To(Succeed())
+			DeferCleanup(func() {
+				Expect(k8sClient.Delete(ctx, instance)).To(Succeed())
+			})
+
+			instance = getClusterOrder(name)
+			instance.Status.ClusterStorageJobs = []osacv1alpha1.JobStatus{
+				{JobID: "storage-job-1", Type: osacv1alpha1.JobTypeProvision, State: osacv1alpha1.JobStateSucceeded, Timestamp: metav1.Now()},
+			}
+			instance.Status.Conditions = []metav1.Condition{{
+				Type:               string(osacv1alpha1.ClusterOrderConditionAddOnOperatorsReady),
+				Status:             metav1.ConditionFalse,
+				LastTransitionTime: metav1.Now(),
+				Reason:             "OperatorInstallFailed",
+				Message:            "operator-one failed to install",
+			}}
+			instance.Status.AddOnOperatorJobs = []osacv1alpha1.AddOnOperatorJobStatus{{
+				Name: "operator-one",
+				JobStatus: osacv1alpha1.JobStatus{
+					JobID:     "addon-job-1",
+					Type:      osacv1alpha1.JobTypeProvision,
+					Timestamp: metav1.Now(),
+					State:     osacv1alpha1.JobStateFailed,
+					Message:   "operator-one failed to install",
+				},
+			}}
+			Expect(k8sClient.Status().Update(ctx, instance)).To(Succeed())
+
+			nn := types.NamespacedName{Name: name, Namespace: clusterOrderTestNamespace}
+			_, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: nn})
+			Expect(err).NotTo(HaveOccurred())
+
+			instance = getClusterOrder(name)
+			Expect(instance.Status.ClusterStorageJobs).To(HaveLen(1))
+			Expect(instance.Status.ClusterStorageJobs[0].JobID).To(Equal("storage-job-1"))
+			Expect(instance.Status.AddOnOperatorJobs).To(HaveLen(1))
+			Expect(instance.Status.AddOnOperatorJobs[0].Name).To(Equal("operator-one"))
+			operatorCondition := apimeta.FindStatusCondition(instance.Status.Conditions, string(osacv1alpha1.ClusterOrderConditionAddOnOperatorsReady))
+			Expect(operatorCondition).NotTo(BeNil())
+			Expect(operatorCondition.Status).To(Equal(metav1.ConditionFalse))
+		})
+	})
+
+	Context("Field immutability", func() {
+		It("should reject updates to templateID", func() {
+			const name = "cluster-order-immutable-template"
+			instance := newTestClusterOrder(name)
+			Expect(k8sClient.Create(ctx, instance)).To(Succeed())
+			DeferCleanup(func() {
+				Expect(k8sClient.Delete(ctx, instance)).To(Succeed())
+			})
+
+			instance = getClusterOrder(name)
+			instance.Spec.TemplateID = "different.template"
+			err := k8sClient.Update(ctx, instance)
+			Expect(err).To(HaveOccurred(), "patching templateID should be rejected")
+			Expect(err.Error()).To(ContainSubstring("immutable"))
+		})
+	})
+})

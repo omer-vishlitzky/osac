@@ -32,15 +32,35 @@ import (
 	"google.golang.org/protobuf/reflect/protoregistry"
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
 	"github.com/osac-project/osac/fulfillment-service/internal/collections"
 	"github.com/osac-project/osac/fulfillment-service/internal/database/dao"
-	"github.com/osac-project/osac/fulfillment-service/internal/events"
 	"github.com/osac-project/osac/fulfillment-service/internal/masks"
-	"github.com/osac-project/osac/fulfillment-service/internal/util"
-	"github.com/osac-project/osac/fulfillment-service/internal/uuid"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
+
+// PrepareCandidateFunc may modify the proposed object (candidate) before it is returned or saved.
+// On Create, current is nil. On Update, current is a copy of the stored object before the request
+// changes, and candidate is a separate copy containing those changes. Returning an error rejects
+// the operation without changing the request or stored object.
+type PrepareCandidateFunc[O dao.Object] func(ctx context.Context, current, candidate O) error
+
+type publicAPIViewContextKey struct{}
+
+func withPublicAPIView(ctx context.Context) context.Context {
+	return context.WithValue(ctx, publicAPIViewContextKey{}, true)
+}
+
+func isPublicAPIView(ctx context.Context) bool {
+	isPublic, _ := ctx.Value(publicAPIViewContextKey{}).(bool)
+	return isPublic
+}
+
+func restoreReservedMetadataForPublicAPIView(ctx context.Context, current, candidate proto.Message) {
+	if isPublicAPIView(ctx) {
+		restoreReservedMetadata(current, candidate)
+	}
+}
 
 // GenericServerBuilder contains the data and logic needed to create new generic servers.
 type GenericServerBuilder[O dao.Object] struct {
@@ -48,8 +68,6 @@ type GenericServerBuilder[O dao.Object] struct {
 	service           string
 	table             string
 	ignoredFields     []any
-	notifier          events.Notifier
-	redactFunc        func(O) O
 	attributionLogic  auth.AttributionLogic
 	tenancyLogic      auth.TenancyLogic
 	allowedTenants    collections.Set[string]
@@ -80,13 +98,18 @@ type GenericServer[O dao.Object] struct {
 	deleteResponse   proto.Message
 	signalRequest    proto.Message
 	signalResponse   proto.Message
-	notifier         events.Notifier
-	redactFunc       func(O) O
-	payloadField     protoreflect.FieldDescriptor
 	pathCompiler     *masks.PathCompiler[O]
 	pathCache        map[string]*masks.Path[O]
 	pathCacheLock    *sync.Mutex
 	validator        protovalidate.Validator
+}
+
+type objectIface interface {
+	proto.Message
+	GetId() string
+	SetId(string)
+	GetMetadata() *privatev1.Metadata
+	SetMetadata(*privatev1.Metadata)
 }
 
 type metadataIface interface {
@@ -145,20 +168,6 @@ func (b *GenericServerBuilder[O]) AddIgnoredFields(values ...any) *GenericServer
 	return b
 }
 
-// SetNotifier sets the notifier that the server will use to send change notifications. This is optional.
-func (b *GenericServerBuilder[O]) SetNotifier(value events.Notifier) *GenericServerBuilder[O] {
-	b.notifier = util.NormalizeNil(value)
-	return b
-}
-
-// SetRedactFunc sets a function that will be called to redact sensitive fields from objects before they are included in
-// event notification payloads. The function receives a clone of the object and should return it with the sensitive
-// fields cleared. This is optional.
-func (b *GenericServerBuilder[O]) SetRedactFunc(value func(O) O) *GenericServerBuilder[O] {
-	b.redactFunc = value
-	return b
-}
-
 // SetAttributionLogic sets the logic that will be used to determine the creator for objects.
 func (b *GenericServerBuilder[O]) SetAttributionLogic(value auth.AttributionLogic) *GenericServerBuilder[O] {
 	b.attributionLogic = value
@@ -177,6 +186,14 @@ func (b *GenericServerBuilder[O]) SetTenancyLogic(value auth.TenancyLogic) *Gene
 // resource servers that legitimately need to create objects in those tenants.
 func (b *GenericServerBuilder[O]) AddAllowedTenants(values ...string) *GenericServerBuilder[O] {
 	b.allowedTenants = b.allowedTenants.Union(collections.NewSet(values...))
+	return b
+}
+
+// SetAllowedTenants replaces the allowed-tenant set with exactly the supplied tenants. Use this
+// for platform-scoped servers whose objects must live in one specific tenant (e.g. shared-only
+// resources), rather than unioning onto the default which also allows all normal tenants.
+func (b *GenericServerBuilder[O]) SetAllowedTenants(values ...string) *GenericServerBuilder[O] {
+	b.allowedTenants = collections.NewSet(values...)
 	return b
 }
 
@@ -238,15 +255,11 @@ func (b *GenericServerBuilder[O]) Build() (result *GenericServer[O], err error) 
 		attributionLogic: b.attributionLogic,
 		tenancyLogic:     b.tenancyLogic,
 		allowedTenants:   b.allowedTenants,
-		notifier:         b.notifier,
 		pathCompiler:     pathCompiler,
 		pathCache:        map[string]*masks.Path[O]{},
 		pathCacheLock:    &sync.Mutex{},
 		validator:        validator,
 	}
-
-	// Set the redact function:
-	s.redactFunc = b.redactFunc
 
 	// Create the DAO:
 	daoBuilder := dao.NewGenericDAO[O]()
@@ -256,9 +269,6 @@ func (b *GenericServerBuilder[O]) Build() (result *GenericServer[O], err error) 
 	}
 	daoBuilder.SetFilterDesc(b.filterDesc)
 	daoBuilder.SetTenancyLogic(b.tenancyLogic)
-	if b.notifier != nil {
-		daoBuilder.AddEventCallback(s.notifyEvent)
-	}
 	if b.metricsRegisterer != nil {
 		daoBuilder.SetMetricsRegisterer(b.metricsRegisterer)
 	}
@@ -274,7 +284,7 @@ func (b *GenericServerBuilder[O]) Build() (result *GenericServer[O], err error) 
 		return
 	}
 
-	// Prepare the template for the object:
+	// Keep an empty object to clone when a Create request omits one:
 	var object O
 	reflect := object.ProtoReflect()
 	s.template = reflect.New().Interface()
@@ -288,8 +298,7 @@ func (b *GenericServerBuilder[O]) Build() (result *GenericServer[O], err error) 
 		return
 	}
 
-	// Prepare templates for the request and response types. These are empty messages that will be cloned when
-	// it is necessary to create new instances.
+	// Find the request and response types for each method. Responses are cloned when needed.
 	s.listRequest, s.listResponse, err = b.findRequestAndResponse(service, listMethod)
 	if err != nil {
 		return
@@ -311,12 +320,6 @@ func (b *GenericServerBuilder[O]) Build() (result *GenericServer[O], err error) 
 		return
 	}
 	s.signalRequest, s.signalResponse, err = b.findRequestAndResponse(service, signalMethod)
-	if err != nil {
-		return
-	}
-
-	// Find the payload field in the event message:
-	s.payloadField, err = b.findPayloadField()
 	if err != nil {
 		return
 	}
@@ -371,30 +374,6 @@ func (b *GenericServerBuilder[O]) findRequestAndResponse(service protoreflect.Se
 		}
 	}
 	err = fmt.Errorf("failed to find method '%s' in service '%s'", methodName, service.FullName())
-	return
-}
-
-// findPayloadField finds the field in the event message that corresponds to this object type. This is used later to
-// set the payload of event notifications without having to iterate the oneof fields every time. Returns nil if there
-// is no such field.
-func (b *GenericServerBuilder[O]) findPayloadField() (result protoreflect.FieldDescriptor, err error) {
-	var objectTempl O
-	objectDesc := objectTempl.ProtoReflect().Descriptor()
-	var eventTempl *privatev1.Event
-	eventDesc := eventTempl.ProtoReflect().Descriptor()
-	oneofDesc := eventDesc.Oneofs().ByName(eventPayloadField)
-	if oneofDesc == nil {
-		err = fmt.Errorf("failed to find the 'payload' field of the event type '%s'", eventDesc.FullName())
-		return
-	}
-	oneofFields := oneofDesc.Fields()
-	for i := range oneofFields.Len() {
-		payloadField := oneofFields.Get(i)
-		if payloadField.Message() != nil && payloadField.Message() == objectDesc {
-			result = payloadField
-			break
-		}
-	}
 	return
 }
 
@@ -472,25 +451,7 @@ func (s *GenericServer[O]) Get(ctx context.Context, request any, response any) e
 		SetId(requestId).
 		Do(ctx)
 	if err != nil {
-		var notFoundErr *dao.ErrNotFound
-		if errors.As(err, &notFoundErr) {
-			return grpcstatus.Errorf(grpccodes.NotFound, "object with identifier '%s' not found", requestId)
-		}
-		var deniedErr *dao.ErrDenied
-		if errors.As(err, &deniedErr) {
-			return grpcstatus.Errorf(grpccodes.PermissionDenied, "%s", deniedErr.Reason)
-		}
-		var deadlockErr *dao.ErrDeadlock
-		if errors.As(err, &deadlockErr) {
-			return grpcstatus.Errorf(grpccodes.Aborted, "%s", deadlockErr.Error())
-		}
-		s.logger.ErrorContext(
-			ctx,
-			"Failed to get",
-			slog.String("id", requestId),
-			slog.Any("error", err),
-		)
-		return grpcstatus.Errorf(grpccodes.Internal, "failed to get object with identifier '%s'", requestId)
+		return ConvertDAOErrorToGRPC(err, "get", requestId)
 	}
 	object := daoResponse.GetObject()
 
@@ -513,71 +474,69 @@ func isSingletonConstraintViolation(constraintName string) bool {
 }
 
 func (s *GenericServer[O]) Create(ctx context.Context, request any, response any) error {
-	// Route dry-run requests to skip persistence and event emission. Resource-specific
-	// validation (template resolution, catalog item field definitions, spec defaults)
-	// runs in the calling server before reaching GenericServer. The dry-run flag is
-	// carried as gRPC metadata (HTTP header X-Dry-Run: true) rather than a proto field
-	// to keep request messages purely declarative.
-	if isDryRun(ctx) {
-		return s.createDryRun(ctx, request, response)
-	}
+	return s.CreateWithCandidatePreparation(ctx, request, response, nil)
+}
 
+// CreateWithCandidatePreparation copies the requested object and assigns its creator and tenant.
+// If provided, prepareCandidate may modify that copy before its final validation. A successful
+// request saves the result; a dry run returns it without saving.
+func (s *GenericServer[O]) CreateWithCandidatePreparation(
+	ctx context.Context,
+	request any,
+	response any,
+	prepareCandidate PrepareCandidateFunc[O],
+) error {
 	requestObject, err := s.prepareForCreate(ctx, request)
 	if err != nil {
 		return err
 	}
 
-	// Save the object:
-	daoResponse, err := s.dao.Create().
-		SetObject(requestObject).
-		Do(ctx)
-	if err != nil {
-		var alreadyExistsErr *dao.ErrAlreadyExists
-		if errors.As(err, &alreadyExistsErr) {
-			// A unique partial index on a constant expression (e.g. network_classes_singleton,
-			// network_classes_single_default) models a "singleton" or "single default" invariant rather than a
-			// per-object name/ID collision. Report those as FailedPrecondition (retry may succeed once the
-			// conflicting row is gone) instead of AlreadyExists (which implies the *new* object is a duplicate).
-			if isSingletonConstraintViolation(alreadyExistsErr.ConstraintName) {
-				return grpcstatus.Errorf(grpccodes.FailedPrecondition,
-					"concurrent create violated a singleton invariant (constraint '%s'); please retry",
-					alreadyExistsErr.ConstraintName)
-			}
-			return grpcstatus.Errorf(grpccodes.AlreadyExists, "%s", alreadyExistsErr.Error())
+	var nilObject O
+	if prepareCandidate != nil {
+		preparedID := requestObject.GetId()
+		preparedMetadata := proto.Clone(s.getMetadata(requestObject)).(metadataIface)
+		if err = prepareCandidate(ctx, nilObject, requestObject); err != nil {
+			return err
 		}
-		var notUniqueErr *dao.ErrNotUnique
-		if errors.As(err, &notUniqueErr) {
-			return grpcstatus.Errorf(grpccodes.AlreadyExists, "%s", notUniqueErr.Error())
+		if err = s.validatePreparedCandidate(ctx, requestObject, preparedID, preparedMetadata); err != nil {
+			return err
 		}
-		var deniedErr *dao.ErrDenied
-		if errors.As(err, &deniedErr) {
-			return grpcstatus.Errorf(grpccodes.PermissionDenied, "%s", deniedErr.Error())
-		}
-		var referenceErr *dao.ErrReference
-		if errors.As(err, &referenceErr) {
-			return grpcstatus.Errorf(grpccodes.InvalidArgument, "%s", referenceErr.Error())
-		}
-		var deadlockErr *dao.ErrDeadlock
-		if errors.As(err, &deadlockErr) {
-			return grpcstatus.Errorf(grpccodes.Aborted, "%s", deadlockErr.Error())
-		}
-		s.logger.ErrorContext(
-			ctx,
-			"Failed to create",
-			slog.Any("error", err),
-		)
-		return grpcstatus.Errorf(grpccodes.Internal, "failed to create object")
 	}
-	responseObject := daoResponse.GetObject()
+
+	return s.createPrepared(ctx, requestObject, response)
+}
+
+func (s *GenericServer[O]) createPrepared(ctx context.Context, requestObject O, response any) error {
+	if s.isNil(requestObject) {
+		return grpcstatus.Errorf(grpccodes.InvalidArgument, "object is mandatory")
+	}
+
+	// In dry-run mode, return the validated candidate in a fresh create response.
+	// The response includes defaults and resolved references produced during
+	// preparation. Database writes and creation events are skipped; validation may
+	// still perform database reads.
+	if isDryRun(ctx) {
+		type responseIface interface {
+			SetObject(O)
+		}
+		responseMsg := proto.Clone(s.createResponse).(responseIface)
+		responseMsg.SetObject(requestObject)
+		s.setPointer(response, responseMsg)
+		return nil
+	}
+
+	daoResponse, err := s.dao.Create().SetObject(requestObject).Do(ctx)
+	if err != nil {
+		return ConvertDAOErrorToGRPC(err, "create", requestObject.GetId())
+	}
 
 	// Create the response message:
 	type responseIface interface {
 		SetObject(O)
 	}
 	responseMsg := proto.Clone(s.createResponse).(responseIface)
-	responseMsg.SetObject(responseObject)
+	responseMsg.SetObject(daoResponse.GetObject())
 	s.setPointer(response, responseMsg)
-
 	return nil
 }
 
@@ -591,6 +550,16 @@ func (s *GenericServer[O]) prepareForCreate(ctx context.Context, request any) (O
 	requestObject := requestMsg.GetObject()
 	if s.isNil(requestObject) {
 		requestObject = proto.Clone(s.template).(O)
+	} else {
+		requestObject = proto.Clone(requestObject).(O)
+	}
+
+	// Clear any user-provided status field for public API requests. Status is OUTPUT_ONLY
+	// and should only be set by controllers. This provides defense-in-depth against
+	// malicious or buggy clients. Private API requests from controllers are allowed to
+	// set status on creation.
+	if isPublicAPIView(ctx) {
+		clearStatusField(requestObject)
 	}
 
 	requestMetadata := s.getMetadata(requestObject)
@@ -634,19 +603,26 @@ func (s *GenericServer[O]) checkAllowedTenant(tenant string) error {
 	return nil
 }
 
-func (s *GenericServer[O]) createDryRun(ctx context.Context, request any, response any) error {
-	requestObject, err := s.prepareForCreate(ctx, request)
-	if err != nil {
+// validatePreparedCandidate checks the object after preparation. The callback may change its
+// contents, but not the ID, creator, tenant, or project established before the callback. The
+// resulting metadata and object must also pass validation.
+func (s *GenericServer[O]) validatePreparedCandidate(
+	ctx context.Context, candidate O, preparedID string, preparedMetadata metadataIface,
+) error {
+	metadata := s.getMetadata(candidate)
+	if metadata == nil {
+		return grpcstatus.Errorf(grpccodes.InvalidArgument, "metadata is required")
+	}
+	if candidate.GetId() != preparedID || metadata.GetTenant() != preparedMetadata.GetTenant() ||
+		metadata.GetProject() != preparedMetadata.GetProject() || metadata.GetCreator() != preparedMetadata.GetCreator() {
+		return grpcstatus.Errorf(grpccodes.PermissionDenied, "candidate preparation cannot change identity or ownership metadata")
+	}
+	if err := s.validateMetadata(ctx, metadata); err != nil {
 		return err
 	}
-
-	type responseIface interface {
-		SetObject(O)
+	if err := s.validator.Validate(candidate); err != nil {
+		return grpcstatus.Errorf(grpccodes.InvalidArgument, "validation failed: %s", err)
 	}
-	responseMsg := proto.Clone(s.createResponse).(responseIface)
-	responseMsg.SetObject(requestObject)
-	s.setPointer(response, responseMsg)
-
 	return nil
 }
 
@@ -655,6 +631,28 @@ func (s *GenericServer[O]) createDryRun(ctx context.Context, request any, respon
 const DryRunHTTPHeader = "X-Dry-Run"
 
 const DryRunMetadataKey = "x-dry-run"
+
+// validateNoStatusInMask checks that the update mask does not contain status paths.
+// Status fields are OUTPUT_ONLY and controller-managed, so public API requests
+// must not include status paths in their update masks.
+func validateNoStatusInMask(mask *fieldmaskpb.FieldMask) error {
+	for _, path := range mask.GetPaths() {
+		// Normalize path: remove spaces and collapse consecutive dots to catch malformed paths
+		normalizedPath := strings.ReplaceAll(strings.TrimSpace(path), " ", "")
+		for strings.Contains(normalizedPath, "..") {
+			normalizedPath = strings.ReplaceAll(normalizedPath, "..", ".")
+		}
+
+		if strings.HasPrefix(normalizedPath, "status.") || normalizedPath == "status" {
+			return grpcstatus.Errorf(
+				grpccodes.InvalidArgument,
+				"update mask path '%s' is not allowed: status fields are OUTPUT_ONLY and cannot be modified by users",
+				path,
+			)
+		}
+	}
+	return nil
+}
 
 func isDryRun(ctx context.Context) bool {
 	md, ok := grpcmetadata.FromIncomingContext(ctx)
@@ -670,7 +668,81 @@ func isDryRun(ctx context.Context) bool {
 	return false
 }
 
+// applyMaskAndRestoreProtectedFields applies the update mask to merge request fields into the
+// current object, then restores protected fields (reserved metadata and status) based on API type.
+func (s *GenericServer[O]) applyMaskAndRestoreProtectedFields(
+	ctx context.Context,
+	requestObject O,
+	currentObject O,
+	requestMask *fieldmaskpb.FieldMask,
+) (O, error) {
+	var tmpObject O
+
+	if requestMask != nil {
+		// Reject public API requests that attempt to modify status fields via update mask.
+		if isPublicAPIView(ctx) {
+			if err := validateNoStatusInMask(requestMask); err != nil {
+				return tmpObject, err
+			}
+		}
+
+		// Keep the stored object unchanged for comparison and detach any values copied from the request.
+		tmpObject = proto.Clone(currentObject).(O)
+		fieldPaths, err := s.compilePaths(requestMask.GetPaths())
+		if err != nil {
+			return tmpObject, err
+		}
+		for _, fieldPath := range fieldPaths {
+			value, ok := fieldPath.Get(requestObject)
+			if ok {
+				fieldPath.Set(tmpObject, value)
+			} else {
+				fieldPath.Clear(tmpObject)
+			}
+		}
+		tmpObject = proto.Clone(tmpObject).(O)
+	} else {
+		tmpObject = proto.Clone(requestObject).(O)
+	}
+
+	// Restore protected fields based on API type
+	restoreReservedMetadataForPublicAPIView(ctx, currentObject, tmpObject)
+
+	// Restore controller-managed status from the stored object. Status fields are OUTPUT_ONLY
+	// and should never be modified by user input. This provides defense-in-depth protection.
+	// Only restore status for public API (user) requests. Private API requests from controllers
+	// are allowed to update status fields.
+	if isPublicAPIView(ctx) {
+		restoreStatusField(currentObject, tmpObject)
+	}
+
+	return tmpObject, nil
+}
+
 func (s *GenericServer[O]) Update(ctx context.Context, request any, response any) error {
+	return s.UpdateWithCandidatePreparation(ctx, request, response, nil)
+}
+
+// UpdateWithCandidatePreparation builds a proposed object by applying masked fields to a copy
+// of the stored object, or copying the full request when there is no mask. If provided, the
+// callback sees a separate copy of the stored object and may modify the proposal. The result
+// is validated, then saved only if it differs from the stored object.
+func (s *GenericServer[O]) UpdateWithCandidatePreparation(
+	ctx context.Context,
+	request any,
+	response any,
+	prepareCandidate PrepareCandidateFunc[O],
+) error {
+	return s.updateWithCandidatePreparation(ctx, request, response, prepareCandidate, false)
+}
+
+func (s *GenericServer[O]) updateWithCandidatePreparation(
+	ctx context.Context,
+	request any,
+	response any,
+	prepareCandidate PrepareCandidateFunc[O],
+	prepareBeforeValidation bool,
+) error {
 	// Extract the object from the request message:
 	type requestIface interface {
 		GetObject() O
@@ -747,44 +819,29 @@ func (s *GenericServer[O]) Update(ctx context.Context, request any, response any
 		}
 	}
 
-	// Clone the current object so that in-place modifications (mask application, tenant calculation) don't
-	// affect the original that we use for the equivalence comparison later.
-	tmpObject := proto.Clone(currentObject).(O)
-
-	// Update the fields indicated in the update mask, or all the fields if there is no update mask:
-	requestMask := requestMsg.GetUpdateMask()
-	if requestMask != nil {
-		fieldPaths, err := s.compilePaths(requestMask.GetPaths())
-		if err != nil {
-			return err
-		}
-		for _, fieldPath := range fieldPaths {
-			value, ok := fieldPath.Get(requestObject)
-			if ok {
-				fieldPath.Set(tmpObject, value)
-			} else {
-				fieldPath.Clear(tmpObject)
-			}
-		}
-	} else {
-		tmpObject = requestObject
-	}
-
-	// Validate the merged object using protovalidate.
-	// This ensures all validation constraints are checked after applying the update mask,
-	// avoiding false positives from partial request objects.
-	err = s.validator.Validate(tmpObject)
+	// Apply the update mask and restore protected fields:
+	tmpObject, err := s.applyMaskAndRestoreProtectedFields(ctx, requestObject, currentObject, requestMsg.GetUpdateMask())
 	if err != nil {
-		s.logger.DebugContext(ctx, "Object validation failed after mask merge", "error", err.Error())
-		return grpcstatus.Errorf(grpccodes.InvalidArgument, "validation failed: %s", err.Error())
+		return err
 	}
 
-	// Validate the resulting metadata:
-	tmpMetadata := s.getMetadata(tmpObject)
-	if tmpMetadata != nil {
-		err = s.validateMetadata(ctx, tmpMetadata)
+	if !prepareBeforeValidation {
+		// Validate the merged object using protovalidate.
+		// This ensures all validation constraints are checked after applying the update mask,
+		// avoiding false positives from partial request objects.
+		err = s.validator.Validate(tmpObject)
 		if err != nil {
-			return err
+			s.logger.DebugContext(ctx, "Object validation failed after mask merge", "error", err.Error())
+			return grpcstatus.Errorf(grpccodes.InvalidArgument, "validation failed: %s", err.Error())
+		}
+
+		// Validate the resulting metadata:
+		tmpMetadata := s.getMetadata(tmpObject)
+		if tmpMetadata != nil {
+			err = s.validateMetadata(ctx, tmpMetadata)
+			if err != nil {
+				return err
+			}
 		}
 	}
 
@@ -802,6 +859,18 @@ func (s *GenericServer[O]) Update(ctx context.Context, request any, response any
 	currentTenant := s.getMetadata(currentObject).GetTenant()
 	if assignedTenant != currentTenant {
 		if err = s.checkAllowedTenant(assignedTenant); err != nil {
+			return err
+		}
+	}
+
+	if prepareCandidate != nil {
+		preparedID := tmpObject.GetId()
+		preparedMetadata := proto.Clone(s.getMetadata(tmpObject)).(metadataIface)
+		if err = prepareCandidate(ctx, proto.Clone(currentObject).(O), tmpObject); err != nil {
+			return err
+		}
+		restoreReservedMetadataForPublicAPIView(ctx, currentObject, tmpObject)
+		if err = s.validatePreparedCandidate(ctx, tmpObject, preparedID, preparedMetadata); err != nil {
 			return err
 		}
 	}
@@ -831,50 +900,23 @@ func (s *GenericServer[O]) Update(ctx context.Context, request any, response any
 	return nil
 }
 
+// UpdateWithValidation adapts the networking resource validators to the generic
+// candidate-preparation update path. It preserves the validator's candidate-first
+// argument order while keeping the stored object read and field-mask merge single-pass.
+func (s *GenericServer[O]) UpdateWithValidation(
+	ctx context.Context,
+	request any,
+	response any,
+	validate func(context.Context, O, O) error,
+) error {
+	return s.updateWithCandidatePreparation(ctx, request, response,
+		func(ctx context.Context, current, candidate O) error {
+			return validate(ctx, candidate, current)
+		}, true)
+}
+
 func (s *GenericServer[O]) translateUpdateError(ctx context.Context, requestId string, err error) error {
-	var conflictErr *dao.ErrConflict
-	if errors.As(err, &conflictErr) {
-		return grpcstatus.Errorf(grpccodes.Aborted, "%s", conflictErr.Error())
-	}
-	var alreadyExistsErr *dao.ErrAlreadyExists
-	if errors.As(err, &alreadyExistsErr) {
-		return grpcstatus.Errorf(grpccodes.AlreadyExists, "%s", alreadyExistsErr.Error())
-	}
-	var referenceErr *dao.ErrReference
-	if errors.As(err, &referenceErr) {
-		return grpcstatus.Errorf(grpccodes.FailedPrecondition, "%s", referenceErr.Error())
-	}
-	var inUseErr *dao.ErrInUse
-	if errors.As(err, &inUseErr) {
-		return grpcstatus.Errorf(grpccodes.FailedPrecondition, "%s", inUseErr.Error())
-	}
-	var notUniqueErr *dao.ErrNotUnique
-	if errors.As(err, &notUniqueErr) {
-		return grpcstatus.Errorf(grpccodes.AlreadyExists, "%s", notUniqueErr.Error())
-	}
-	var deniedErr *dao.ErrDenied
-	if errors.As(err, &deniedErr) {
-		return grpcstatus.Errorf(grpccodes.PermissionDenied, "%s", deniedErr.Error())
-	}
-	var immutableErr *dao.ErrImmutable
-	if errors.As(err, &immutableErr) {
-		return grpcstatus.Errorf(grpccodes.InvalidArgument, "%s", immutableErr.Error())
-	}
-	var deadlockErr *dao.ErrDeadlock
-	if errors.As(err, &deadlockErr) {
-		return grpcstatus.Errorf(grpccodes.Aborted, "%s", deadlockErr.Error())
-	}
-	s.logger.ErrorContext(
-		ctx,
-		"Failed to update object",
-		slog.String("id", requestId),
-		slog.Any("error", err),
-	)
-	return grpcstatus.Errorf(
-		grpccodes.Internal,
-		"failed to update object with identifier '%s'",
-		requestId,
-	)
+	return ConvertDAOErrorToGRPC(err, "update", requestId)
 }
 
 func (s *GenericServer[O]) compilePaths(paths []string) (result []*masks.Path[O], err error) {
@@ -920,36 +962,7 @@ func (s *GenericServer[O]) Delete(ctx context.Context, request any, response any
 		SetId(requestId).
 		Do(ctx)
 	if err != nil {
-		_, ok := errors.AsType[*dao.ErrNotFound](err)
-		if ok {
-			return grpcstatus.Errorf(
-				grpccodes.NotFound,
-				"object with identifier '%s' not found",
-				requestId,
-			)
-		}
-		deniedErr, ok := errors.AsType[*dao.ErrDenied](err)
-		if ok {
-			return grpcstatus.Errorf(grpccodes.PermissionDenied, "%s", deniedErr.Error())
-		}
-		inUseErr, ok := errors.AsType[*dao.ErrInUse](err)
-		if ok {
-			return grpcstatus.Errorf(grpccodes.FailedPrecondition, "%s", inUseErr.Error())
-		}
-		if _, ok := errors.AsType[*dao.ErrDeadlock](err); ok {
-			return grpcstatus.Errorf(grpccodes.Aborted, "concurrent modification detected, please retry")
-		}
-		s.logger.ErrorContext(
-			ctx,
-			"Failed to delete object",
-			slog.String("id", requestId),
-			slog.Any("error", err),
-		)
-		return grpcstatus.Errorf(
-			grpccodes.Internal,
-			"failed to delete object with identifier '%s'",
-			requestId,
-		)
+		return ConvertDAOErrorToGRPC(err, "delete", requestId)
 	}
 
 	// Create the response message:
@@ -970,100 +983,18 @@ func (s *GenericServer[O]) Signal(ctx context.Context, request any, response any
 		return grpcstatus.Errorf(grpccodes.InvalidArgument, "identifier is mandatory")
 	}
 
-	// Fetch the current representation of the object:
-	daoResponse, err := s.dao.Get().
+	// Signal the object:
+	_, err := s.dao.Signal().
 		SetId(requestId).
 		Do(ctx)
 	if err != nil {
-		var notFoundErr *dao.ErrNotFound
-		if errors.As(err, &notFoundErr) {
-			return grpcstatus.Errorf(
-				grpccodes.NotFound,
-				"object with identifier '%s' not found",
-				requestId,
-			)
-		}
-		var deniedErr *dao.ErrDenied
-		if errors.As(err, &deniedErr) {
-			return grpcstatus.Errorf(grpccodes.PermissionDenied, "%s", deniedErr.Reason)
-		}
-		var deadlockErr *dao.ErrDeadlock
-		if errors.As(err, &deadlockErr) {
-			return grpcstatus.Errorf(grpccodes.Aborted, "%s", deadlockErr.Error())
-		}
-		s.logger.ErrorContext(
-			ctx,
-			"Failed to signal object",
-			slog.String("id", requestId),
-			slog.Any("error", err),
-		)
-		return grpcstatus.Errorf(
-			grpccodes.Internal,
-			"failed to signal object with identifier '%s'",
-			requestId,
-		)
-	}
-	object := daoResponse.GetObject()
-
-	// Send the signal event:
-	if s.notifier != nil {
-		event := privatev1.Event_builder{
-			Id:   uuid.New(),
-			Type: privatev1.EventType_EVENT_TYPE_OBJECT_SIGNALED,
-		}.Build()
-		err = s.setPayload(event, object)
-		if err != nil {
-			return err
-		}
-		err = s.notifier.Notify(ctx, event)
-		if err != nil {
-			s.logger.ErrorContext(
-				ctx,
-				"Failed to send signal notification",
-				slog.String("id", requestId),
-				slog.Any("error", err),
-			)
-		}
+		return ConvertDAOErrorToGRPC(err, "signal", requestId)
 	}
 
 	// Create the response:
 	responseMsg := proto.Clone(s.signalResponse)
 	s.setPointer(response, responseMsg)
 
-	return nil
-}
-
-// notifyEvent converts the DAO event into an API event and publishes it using the PostgreSQL NOTIFY command.
-func (s *GenericServer[O]) notifyEvent(ctx context.Context, e dao.Event) error {
-	event := &privatev1.Event{}
-	event.SetId(uuid.New())
-	switch e.Type {
-	case dao.EventTypeCreated:
-		event.SetType(privatev1.EventType_EVENT_TYPE_OBJECT_CREATED)
-	case dao.EventTypeUpdated:
-		event.SetType(privatev1.EventType_EVENT_TYPE_OBJECT_UPDATED)
-	case dao.EventTypeDeleted:
-		event.SetType(privatev1.EventType_EVENT_TYPE_OBJECT_DELETED)
-	default:
-		return fmt.Errorf("unknown event kind '%s'", e.Type)
-	}
-	err := s.setPayload(event, e.Object)
-	if err != nil {
-		return err
-	}
-	return s.notifier.Notify(ctx, event)
-}
-
-// setPayload sets the payload of the event message. If the payload field is not found the event is left unchanged. If a
-// redact function has been configured, the object is cloned and redacted before being set.
-func (s *GenericServer[O]) setPayload(event *privatev1.Event, object proto.Message) error {
-	if s.payloadField == nil {
-		return nil
-	}
-	if s.redactFunc != nil {
-		object = s.redactFunc(proto.Clone(object).(O))
-	}
-	event.ProtoReflect().Set(s.payloadField, protoreflect.ValueOfMessage(object.ProtoReflect()))
 	return nil
 }
 
@@ -1092,6 +1023,13 @@ func (s *GenericServer[O]) validateMetadata(ctx context.Context, metadata metada
 		if err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+func validateDefaultProjectForCreate(metadata *privatev1.Metadata) error {
+	if metadata != nil && metadata.GetProject() != "" {
+		return grpcstatus.Errorf(grpccodes.InvalidArgument, "field 'metadata.project' must be empty")
 	}
 	return nil
 }
@@ -1311,19 +1249,7 @@ func (s *GenericServer[O]) setCreator(ctx context.Context, object O, creator str
 // being created or updated. In case of error it returns a gRPC error that can be directly returned to the client.
 func (s *GenericServer[O]) determineAssignedTenant(ctx context.Context,
 	requestObject, currentObject O) (result string, err error) {
-	// Determine the visibility:
-	visibility, err := s.tenancyLogic.DetermineVisibility(ctx)
-	if err != nil {
-		s.logger.ErrorContext(
-			ctx,
-			"Failed to determine visibility",
-			slog.Any("error", err),
-		)
-		err = grpcstatus.Errorf(grpccodes.Internal, "failed to determine visibility")
-		return
-	}
-
-	// Determine the tenants that can be assigned to the object:
+	// Perform upfront validation to ensure the user has at least one assignable tenant
 	assignableTenants, err := s.tenancyLogic.DetermineAssignableTenants(ctx)
 	if err != nil {
 		s.logger.ErrorContext(
@@ -1339,64 +1265,23 @@ func (s *GenericServer[O]) determineAssignedTenant(ctx context.Context,
 		return
 	}
 
-	// Determine the default tenant:
-	defaultTenant, err := s.tenancyLogic.DetermineDefaultTenant(ctx)
-	if err != nil {
-		s.logger.ErrorContext(
-			ctx,
-			"Failed to determine default tenant",
-			slog.Any("error", err),
-		)
-		err = grpcstatus.Errorf(grpccodes.Internal, "failed to determine default tenant")
+	// Get the tenant from the request and current object
+	requestTenant := s.getTenant(requestObject)
+	currentTenant := s.getTenant(currentObject)
+
+	// Use shared tenant determination logic
+	result, tenantErr := auth.DetermineTenantForOperation(ctx, s.tenancyLogic, requestTenant, currentTenant)
+	if tenantErr != nil {
+		err = convertTenantErrorToGRPC(ctx, tenantErr, s.logger, requestTenant)
 		return
 	}
-	if defaultTenant == "" {
+
+	// Validate that the determined tenant is not empty
+	if result == "" {
 		err = grpcstatus.Errorf(grpccodes.PermissionDenied, "there is no default tenant")
 		return
 	}
 
-	// Get the tenant from the request and current object:
-	requestTenant := s.getTenant(requestObject)
-	currentTenant := s.getTenant(currentObject)
-
-	// If the request specifies a tenant, check that it is visible and assignable:
-	if requestTenant != "" {
-		if !visibility.IsTenantVisible(requestTenant) {
-			s.logger.WarnContext(
-				ctx,
-				"User is trying to assign a tenant that is invisible to them",
-				slog.String("requested", requestTenant),
-			)
-			err = grpcstatus.Errorf(
-				grpccodes.PermissionDenied,
-				"tenant '%s' doesn't exist",
-				requestTenant,
-			)
-			return
-		}
-		if !assignableTenants.Contains(requestTenant) {
-			s.logger.WarnContext(
-				ctx,
-				"User is trying to assign a tenant that is unassignable",
-				slog.String("requested", requestTenant),
-			)
-			err = grpcstatus.Errorf(
-				grpccodes.PermissionDenied,
-				"tenant '%s' can't be assigned",
-				requestTenant,
-			)
-			return
-		}
-		result = requestTenant
-		return
-	}
-
-	// Fall back to the current tenant or the default:
-	if currentTenant != "" {
-		result = currentTenant
-	} else {
-		result = defaultTenant
-	}
 	return
 }
 
@@ -1490,9 +1375,4 @@ const (
 	updateMethod = "Update"
 	deleteMethod = "Delete"
 	signalMethod = "Signal"
-)
-
-// Names of fields:
-const (
-	eventPayloadField = "payload"
 )

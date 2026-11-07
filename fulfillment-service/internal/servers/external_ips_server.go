@@ -22,18 +22,17 @@ import (
 	grpccodes "google.golang.org/grpc/codes"
 	grpcstatus "google.golang.org/grpc/status"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
-	publicv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/public/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
-	"github.com/osac-project/osac/fulfillment-service/internal/events"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
 
 type ExternalIPsServerBuilder struct {
-	logger            *slog.Logger
-	notifier          events.Notifier
-	attributionLogic  auth.AttributionLogic
-	tenancyLogic      auth.TenancyLogic
-	metricsRegisterer prometheus.Registerer
+	logger             *slog.Logger
+	attributionLogic   auth.AttributionLogic
+	tenancyLogic       auth.TenancyLogic
+	metricsRegisterer  prometheus.Registerer
+	networkingSettings *NetworkingSettings
 }
 
 var _ publicv1.ExternalIPsServer = (*ExternalIPsServer)(nil)
@@ -56,11 +55,6 @@ func (b *ExternalIPsServerBuilder) SetLogger(value *slog.Logger) *ExternalIPsSer
 	return b
 }
 
-func (b *ExternalIPsServerBuilder) SetNotifier(value events.Notifier) *ExternalIPsServerBuilder {
-	b.notifier = value
-	return b
-}
-
 func (b *ExternalIPsServerBuilder) SetAttributionLogic(value auth.AttributionLogic) *ExternalIPsServerBuilder {
 	b.attributionLogic = value
 	return b
@@ -73,6 +67,13 @@ func (b *ExternalIPsServerBuilder) SetTenancyLogic(value auth.TenancyLogic) *Ext
 
 func (b *ExternalIPsServerBuilder) SetMetricsRegisterer(value prometheus.Registerer) *ExternalIPsServerBuilder {
 	b.metricsRegisterer = value
+	return b
+}
+
+// SetNetworkingSettings sets the networking installation settings. This is optional; the default is
+// DefaultNetworkingSettings.
+func (b *ExternalIPsServerBuilder) SetNetworkingSettings(value NetworkingSettings) *ExternalIPsServerBuilder {
+	b.networkingSettings = &value
 	return b
 }
 
@@ -107,11 +108,11 @@ func (b *ExternalIPsServerBuilder) Build() (result *ExternalIPsServer, err error
 
 	delegate, err := NewPrivateExternalIPsServer().
 		SetLogger(b.logger).
-		SetNotifier(b.notifier).
 		SetAttributionLogic(b.attributionLogic).
 		SetTenancyLogic(b.tenancyLogic).
 		SetMetricsRegisterer(b.metricsRegisterer).
 		SetFilterDesc((*publicv1.ExternalIP)(nil).ProtoReflect().Descriptor()).
+		SetNetworkingSettings(resolveNetworkingSettings(b.networkingSettings)).
 		Build()
 	if err != nil {
 		return
@@ -198,6 +199,9 @@ func (s *ExternalIPsServer) Create(ctx context.Context,
 		err = grpcstatus.Errorf(grpccodes.InvalidArgument, "object is mandatory")
 		return
 	}
+	if err = rejectOutputStatusOnCreate(publicExternalIP.HasStatus()); err != nil {
+		return
+	}
 	privateExternalIP := &privatev1.ExternalIP{}
 	err = s.inMapper.Copy(ctx, publicExternalIP, privateExternalIP)
 	if err != nil {
@@ -206,7 +210,7 @@ func (s *ExternalIPsServer) Create(ctx context.Context,
 			"Failed to map public external IP to private",
 			slog.Any("error", err),
 		)
-		err = grpcstatus.Errorf(grpccodes.Internal, "failed to process external IP")
+		err = publicInputMappingError(err, "failed to process external IP")
 		return
 	}
 
@@ -232,52 +236,6 @@ func (s *ExternalIPsServer) Create(ctx context.Context,
 
 	response = &publicv1.ExternalIPsCreateResponse{}
 	response.SetObject(createdPublicExternalIP)
-	return
-}
-
-func (s *ExternalIPsServer) Update(ctx context.Context,
-	request *publicv1.ExternalIPsUpdateRequest) (response *publicv1.ExternalIPsUpdateResponse, err error) {
-	publicExternalIP := request.GetObject()
-	if publicExternalIP == nil {
-		err = grpcstatus.Errorf(grpccodes.InvalidArgument, "object is mandatory")
-		return
-	}
-	privateExternalIP := &privatev1.ExternalIP{}
-	err = s.inMapper.Copy(ctx, publicExternalIP, privateExternalIP)
-	if err != nil {
-		s.logger.ErrorContext(
-			ctx,
-			"Failed to map public external IP to private",
-			slog.Any("error", err),
-		)
-		err = grpcstatus.Errorf(grpccodes.Internal, "failed to process external IP")
-		return
-	}
-
-	privateRequest := &privatev1.ExternalIPsUpdateRequest{}
-	privateRequest.SetObject(privateExternalIP)
-	privateRequest.SetUpdateMask(request.GetUpdateMask())
-	privateRequest.SetLock(request.GetLock())
-	privateResponse, err := s.delegate.Update(ctx, privateRequest)
-	if err != nil {
-		return nil, err
-	}
-
-	updatedPrivateExternalIP := privateResponse.GetObject()
-	updatedPublicExternalIP := &publicv1.ExternalIP{}
-	err = s.outMapper.Copy(ctx, updatedPrivateExternalIP, updatedPublicExternalIP)
-	if err != nil {
-		s.logger.ErrorContext(
-			ctx,
-			"Failed to map private external IP to public",
-			slog.Any("error", err),
-		)
-		err = grpcstatus.Errorf(grpccodes.Internal, "failed to process external IP")
-		return
-	}
-
-	response = &publicv1.ExternalIPsUpdateResponse{}
-	response.SetObject(updatedPublicExternalIP)
 	return
 }
 

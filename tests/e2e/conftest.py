@@ -3,13 +3,16 @@ from __future__ import annotations
 import contextlib
 import os
 import subprocess
-import textwrap
+import time
 from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 
+from tests.e2e.core import failure_report, failure_snapshot, telemetry
+from tests.e2e.core.caas_versions import ensure_caas_disk_image_version
 from tests.e2e.core.grpc_client import PRIVATE_API, GRPCClient
+from tests.e2e.core.helpers import unique_name, wait_for_grpc_subnet_ready, wait_for_tenant_condition
 from tests.e2e.core.k8s_client import K8sClient
 from tests.e2e.core.keycloak import get_jwt
 from tests.e2e.core.keycloak_admin import (
@@ -22,7 +25,8 @@ from tests.e2e.core.keycloak_admin import (
 )
 from tests.e2e.core.metering import MeteringCollector
 from tests.e2e.core.osac_cli import OsacCLI
-from tests.e2e.core.runner import env, run
+from tests.e2e.core.runner import env, poll_until, run, run_unchecked
+from tests.e2e.core.wait_kinds import WaitResourceKind
 
 
 @pytest.fixture(scope="session")
@@ -30,17 +34,16 @@ def default_storage_tier() -> str:
     """Reference installer-provided storage tier.
 
     Defaults to "local" tier created by osac-installer when lvms.enabled=true.
-    Available to all suites that create ComputeInstances (vmaas, catalog, references).
+    Available to all suites that create ComputeInstances (VMaaS and references).
     """
     return env("OSAC_STORAGE_TIER", "local")
 
 
-def _bmaas_requires_serial_xdist(args: list[str]) -> bool:
-    """True when CLI targets BMaaS serial or the full e2e/bmaas suite.
+def _requires_serial_xdist(args: list[str]) -> bool:
+    """True when CLI targets a suite that must run sequentially.
 
-    Inventory exhaust lives in ``tests/e2e/bmaas/serial`` and must run ``-n 0``.
-    Sanity and regression stay on pyproject ``-n 4``. Broader invocations like
-    ``pytest tests/`` are not detected.
+    CaaS, BMaaS serial/full, and enablement suites require ``-n 0``.
+    Broader invocations like ``pytest tests/`` are not detected.
     """
     normalized = [str(a).replace("\\", "/").rstrip("/") for a in args]
     if not normalized:
@@ -51,6 +54,12 @@ def _bmaas_requires_serial_xdist(args: list[str]) -> bool:
         or a.endswith("tests/e2e/bmaas")
         or a.endswith("/e2e/bmaas")
         or a == "e2e/bmaas"
+        or a.endswith("e2e/caas")
+        or "/e2e/caas/" in (a + "/")
+        or a.endswith("e2e/networking")
+        or "/e2e/networking/" in (a + "/")
+        or a.endswith("e2e/enablement")
+        or "/e2e/enablement/" in (a + "/")
         for a in normalized
     )
 
@@ -64,7 +73,7 @@ def pytest_cmdline_main(config: pytest.Config) -> None:
     has already populated ``config.option.tx``. Must return None (cmdline_main
     is firstresult).
     """
-    if not _bmaas_requires_serial_xdist(list(config.args or [])):
+    if not _requires_serial_xdist(list(config.args or [])):
         return None
     config.option.numprocesses = 0
     if hasattr(config.option, "dist"):
@@ -82,6 +91,24 @@ def pytest_configure(config: pytest.Config) -> None:
     e2e.log artifact.
     """
     config.addinivalue_line("markers", "metering: test verifies metering events via the test adapter HTTP API")
+    config.addinivalue_line("markers", "caas_cluster_create_focus: temporarily isolate the primary CaaS PR E2E")
+    config.addinivalue_line("markers", "requires_caas: test requires the CaaS service to be enabled")
+    config.addinivalue_line("markers", "requires_bmaas: test requires the BMaaS service to be enabled")
+    config.addinivalue_line("markers", "requires_vmaas: test requires the VMaaS service to be enabled")
+    config.addinivalue_line("markers", "reference_common: reference test shared by all service profiles")
+    config.addinivalue_line("markers", "reference_networking: shared networking reference test")
+    config.addinivalue_line("markers", "sanity: fast, low-risk smoke test suitable for every PR")
+    config.addinivalue_line("markers", "regression: broader/slower coverage, run on a schedule or on demand")
+    config.addinivalue_line(
+        "markers", "serial: must run alone, not in parallel with other tests (e.g. exhausts a shared resource)"
+    )
+    failure_report.register(config)
+    # Worker attribution and fixture-reuse spans; inert without OpenTelemetry.
+    telemetry.register(config)
+    if config.option.tbstyle == "auto":
+        # The long style prints every frame's arguments: tokens, passwords and kubeconfig values. An explicit
+        # --tb on the command line is left alone.
+        config.option.tbstyle = "short"
     worker_id = os.environ.get("PYTEST_XDIST_WORKER")
     if worker_id is not None:
         log_dir = Path(config.getini("log_file")).parent
@@ -92,6 +119,55 @@ def pytest_configure(config: pytest.Config) -> None:
 @pytest.fixture(scope="session")
 def namespace() -> str:
     return env("OSAC_NAMESPACE", "osac-devel")
+
+
+@pytest.fixture(scope="session", autouse=True)
+def failure_snapshot_sources(private_grpc: GRPCClient, k8s_hub_client: K8sClient, namespace: str) -> Iterator[None]:
+    """Register the generic snapshot sources (API, Kubernetes, logs, fabric) for the failure reporter."""
+    names = failure_snapshot.register_generic_sources(
+        failure_snapshot.SOURCES, private_grpc=private_grpc, k8s=k8s_hub_client, namespace=namespace
+    )
+    yield
+    for name in names:
+        failure_snapshot.SOURCES.unregister(name)
+
+
+def _apply_manifest(manifest: str) -> None:
+    subprocess.run(["oc", "apply", "-f", "-"], input=manifest, text=True, capture_output=True, check=True, timeout=120)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def cluster_tenants(namespace: str, k8s_hub_client: K8sClient) -> None:
+    """Apply the install namespace's Tenant and the shared Tenant before tests.
+
+    The E2E workflows apply these two CRs between install and test; doing it
+    here keeps a bare pytest run against a deployed install self-sufficient.
+    Applying is idempotent, so parallel workers and repeated runs converge on
+    the same objects.
+    """
+    for name in sorted({namespace, "shared"}):
+        _apply_manifest(
+            "apiVersion: osac.openshift.io/v1alpha1\n"
+            "kind: Tenant\n"
+            "metadata:\n"
+            f"  name: {name}\n"
+            f"  namespace: {namespace}\n"
+            "spec: {}\n"
+        )
+    # Per-tenant StorageClasses come from an AAP job; wait for the test
+    # tenant's classes so provisioning jobs do not queue behind storage jobs.
+    # When the condition never appears the environment has no storage
+    # configured and the wait is skipped.
+    condition = ""
+    for _ in range(6):
+        condition = k8s_hub_client.get_tenant_condition_status(
+            name=namespace, condition_type="ClusterStorageReady", checked=False
+        )
+        if condition:
+            break
+        time.sleep(5)
+    if condition and condition != "True":
+        wait_for_tenant_condition(k8s=k8s_hub_client, name=namespace, condition_type="ClusterStorageReady")
 
 
 @pytest.fixture(scope="session")
@@ -130,6 +206,16 @@ def jwt_username() -> str:
 
 
 @pytest.fixture(scope="session")
+def jwt_tenant(jwt_username: str) -> str:
+    """The fulfillment tenant the JWT user belongs to.
+
+    The mapping mirrors ensure_jwt_users: every fixture user of tenant1 maps
+    to the tenant1 tenant, and tenant2's users to tenant2.
+    """
+    return f"tenant{jwt_username.removeprefix('tenant').split('_')[0]}"
+
+
+@pytest.fixture(scope="session")
 def grpc(
     fulfillment_address: str,
     keycloak_url: str,
@@ -158,10 +244,56 @@ def private_grpc(fulfillment_private_address: str, namespace: str, service_accou
     return GRPCClient(address=fulfillment_private_address, token=token)
 
 
+@pytest.fixture(scope="session")
+def caas_disk_image_version(private_grpc: GRPCClient) -> str:
+    """Explicit backed version for positive bare-metal CaaS scenarios."""
+    return ensure_caas_disk_image_version(private_grpc)
+
+
 @pytest.fixture(scope="session", autouse=True)
-def ensure_tenants(ensure_k8s_only_network_class: None, private_grpc: GRPCClient) -> None:
+def ensure_tenants(private_grpc: GRPCClient) -> None:
     for name in ("tenant1", "tenant2"):
         private_grpc.ensure_tenant(name=name)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _wait_for_default_subnets_ready(
+    ensure_jwt_users: None, setup_organization_memberships: None, grpc: GRPCClient, jwt_tenant: str
+) -> None:
+    """Wait for tenant-default subnets to reach READY in the fulfillment database.
+
+    Tenant creation triggers the DefaultNetworkingProvisioner which creates a
+    default VirtualNetwork, Subnet, and SecurityGroup in SUBNET_STATE_PENDING.
+    The osac-operator marks the K8s CRs Ready, then the subnet feedback
+    controller syncs that state back to PostgreSQL.  Tests that implicitly
+    reference these subnets (e.g. BareMetalInstance creation inherits the
+    tenant's default subnet) hit FailedPrecondition if the DB update hasn't
+    landed yet.
+
+    Depends on ``ensure_jwt_users`` (which itself depends on ``ensure_tenants``)
+    so that the ``grpc`` client's first call does not trigger JIT user
+    provisioning before ``ensure_jwt_users`` creates the RoleBinding.
+
+    Depends on ``setup_organization_memberships`` so that the Keycloak
+    organization membership is in place before the first JWT is obtained;
+    without it the token may lack the tenant claim and
+    ``list_subnet_ids()`` returns an empty list (``WHERE tenant = $1``
+    receives an empty string).
+    """
+    # Timeout must exceed 2x the operator's statusPollInterval (30s) to
+    # accommodate two sequential polling cycles (VirtualNetwork -> Subnet).
+    subnet_ids: list[str] = poll_until(
+        fn=lambda: grpc.list_subnet_ids(),
+        until=lambda ids: len(ids) > 0,
+        retries=60,
+        delay=2,
+        description="at least one subnet to appear in gRPC",
+        retry_on_error=True,
+        resource_kind=WaitResourceKind.TENANT,
+        resource_id=jwt_tenant,
+    )
+    for subnet_id in subnet_ids:
+        wait_for_grpc_subnet_ready(grpc=grpc, subnet_id=subnet_id)
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -205,8 +337,10 @@ def setup_organization_memberships(ensure_tenants: None, keycloak_url: str, keyc
     org_users = {"tenant1": ["tenant1_user", "tenant1_admin"], "tenant2": ["tenant2_user", "tenant2_admin"]}
 
     for org_name, usernames in org_users.items():
+        admin_token = get_admin_token(keycloak_url=keycloak_url, username="admin", password=keycloak_admin_password)
         # Wait for the organization to be synced to Keycloak by the tenant controller
         org_id = wait_for_organization(keycloak_url=keycloak_url, admin_token=admin_token, org_name=org_name)
+        admin_token = get_admin_token(keycloak_url=keycloak_url, username="admin", password=keycloak_admin_password)
 
         # Add each user to the organization
         for username in usernames:
@@ -241,49 +375,16 @@ def setup_organization_memberships(ensure_tenants: None, keycloak_url: str, keyc
 
 @pytest.fixture(scope="session")
 def k8s_hub_client(namespace: str) -> K8sClient:
-    return K8sClient(namespace=namespace)
-
-
-_K8S_ONLY_NETWORK_MANAGER_CONFIGMAP = textwrap.dedent("""\
-    apiVersion: v1
-    kind: ConfigMap
-    metadata:
-      name: osac-network-k8s-manager-k8s-only
-      namespace: {namespace}
-      labels:
-        osac.openshift.io/network-k8s-manager: "true"
-    data:
-      name: k8s_only
-      description: "Composite k8s-only manager (CUDN + NetworkPolicy + MetalLB), no separate physical fabric"
-      capabilities: "ipv4,ipv6,dualStack"
-""")
-
-
-@pytest.fixture(scope="session", autouse=True)
-def ensure_k8s_only_network_class(private_grpc: GRPCClient, k8s_hub_client: K8sClient, namespace: str) -> None:
-    """No-op unless OSAC_NETWORK_CLASS_K8S_ONLY is set. When set, registers the
-    k8s_only k8s-manager ConfigMap and points the environment's singleton
-    NetworkClass at it (k8s_manager: k8s_only, fabric_manager cleared)."""
-    if not env("OSAC_NETWORK_CLASS_K8S_ONLY", ""):
-        return
-
-    k8s_hub_client.apply(manifest=_K8S_ONLY_NETWORK_MANAGER_CONFIGMAP.format(namespace=namespace))
-
-    network_classes = private_grpc.list_network_classes()
-    if not network_classes:
-        raise RuntimeError(
-            "OSAC_NETWORK_CLASS_K8S_ONLY is set but no NetworkClass exists — "
-            "expected the platform default to already be published by the publish-templates job"
-        )
-    private_grpc.update_network_class(
-        network_class_id=network_classes[0]["id"], fabric_manager="", k8s_manager="k8s_only"
-    )
+    client = K8sClient(namespace=namespace)
+    # Fail on broken initial hub access before entering retrying polls.
+    client.get_json(resource="namespace", name=namespace)
+    return client
 
 
 @pytest.fixture(scope="session")
 def cli(
     namespace: str, fulfillment_address: str, keycloak_url: str, jwt_username: str, jwt_password: str
-) -> Iterator[OsacCLI]:  # noqa: E501
+) -> Iterator[OsacCLI]:
     instance = OsacCLI(
         binary=env("OSAC_CLI_PATH", "osac"),
         address=f"https://{fulfillment_address.rsplit(':', 1)[0]}",
@@ -292,6 +393,17 @@ def cli(
     )
     yield instance
     instance.close()
+
+
+@pytest.fixture
+def pull_secret_name(cli: OsacCLI, pull_secret_path: str) -> Iterator[str]:
+    """Create a tenant-scoped pull Secret for a CaaS cluster, then remove it."""
+    name = unique_name("e2e-pull-secret")
+    cli.create_secret(name=name, from_files={".dockerconfigjson": pull_secret_path}, secret_type="pull-secret")
+    try:
+        yield name
+    finally:
+        cli.delete_secret(name=name)
 
 
 @pytest.fixture(scope="session")
@@ -351,6 +463,34 @@ def jwt_cli_admin(namespace: str, fulfillment_address: str, keycloak_url: str, j
 
 
 @pytest.fixture(scope="session")
+def jwt_cli_tenant2_admin(
+    namespace: str, fulfillment_address: str, keycloak_url: str, jwt_password: str
+) -> Iterator[OsacCLI]:
+    instance = OsacCLI(
+        binary=env("OSAC_CLI_PATH", "osac"),
+        address=f"https://{fulfillment_address.rsplit(':', 1)[0]}",
+        token_script=_make_jwt_token_script(keycloak_url, "tenant2_admin", jwt_password),
+        namespace=namespace,
+    )
+    yield instance
+    instance.close()
+
+
+@pytest.fixture(scope="session")
+def jwt_grpc_tenant2_admin(fulfillment_address: str, keycloak_url: str, jwt_password: str) -> GRPCClient:
+    return GRPCClient(
+        address=fulfillment_address,
+        token_factory=lambda: get_jwt(
+            keycloak_url=keycloak_url,
+            realm="osac",
+            client_id="osac-cli",
+            username="tenant2_admin",
+            password=jwt_password,
+        ),
+    )
+
+
+@pytest.fixture(scope="session")
 def jwt_grpc_tenant1_admin(fulfillment_address: str, keycloak_url: str, jwt_password: str) -> GRPCClient:
     return GRPCClient(
         address=fulfillment_address,
@@ -395,25 +535,74 @@ def jwt_grpc_tenant2(fulfillment_address: str, keycloak_url: str, jwt_password: 
 # --- Cross-cutting concern: Metering ---
 
 
-def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
-    metering_tests = [item for item in items if item.get_closest_marker("metering")]
+def _expose_metering_adapter_route(namespace: str) -> str:
+    """Expose the echo adapter Service and return its HTTP route URL."""
+    service, rc = run_unchecked(
+        "oc",
+        "get",
+        "svc",
+        "-n",
+        namespace,
+        "-l",
+        "app.kubernetes.io/component=echo-adapter",
+        "-o",
+        "jsonpath={.items[0].metadata.name}",
+    )
+    if rc != 0 or not service:
+        raise RuntimeError(f"no echo-adapter Service found in namespace {namespace}")
+    # Exposing an existing route fails; the route itself is what matters.
+    run_unchecked("oc", "expose", "svc", service, "-n", namespace, "--name=metering-test-adapter")
+    host, rc = run_unchecked(
+        "oc", "get", "route", "metering-test-adapter", "-n", namespace, "-o", "jsonpath={.spec.host}"
+    )
+    if rc != 0 or not host:
+        raise RuntimeError(f"failed to expose the echo adapter route in namespace {namespace}")
+    return f"http://{host}"
+
+
+def pytest_collection_finish(session: pytest.Session) -> None:
+    # Collect-only does not execute metering fixtures or contact the adapter.
+    if session.config.getoption("collectonly"):
+        return
+    metering_tests = [item for item in session.items if item.get_closest_marker("metering")]
     if metering_tests and not os.environ.get("METERING_ADAPTER_URL"):
-        pytest.fail(
-            f"METERING_ADAPTER_URL is not set but {len(metering_tests)} test(s) require metering. "
-            "Set the env var or run with -m 'not metering' to exclude metering tests.",
-            pytrace=False,
-        )
+        try:
+            _expose_metering_adapter_route(env("OSAC_NAMESPACE", "osac-devel"))
+        except RuntimeError as exc:
+            pytest.fail(
+                f"METERING_ADAPTER_URL is not set and the echo adapter route could not be exposed "
+                f"for {len(metering_tests)} metering test(s): {exc}. "
+                "Set the env var, enable metering.echoAdapter, or run with -m 'not metering'.",
+                pytrace=False,
+            )
+
+
+@pytest.fixture(scope="session")
+def metering_adapter_url(namespace: str) -> str:
+    """The metering echo adapter's URL.
+
+    METERING_ADAPTER_URL wins when set (CI exports it after creating the
+    route); otherwise the echo adapter Service is exposed here, so a local
+    run needs no preparation beyond the install.
+    """
+    if url := os.environ.get("METERING_ADAPTER_URL"):
+        return url
+    return _expose_metering_adapter_route(namespace)
 
 
 @pytest.fixture
-def metering() -> Iterator[MeteringCollector]:
+def metering(metering_adapter_url: str, jwt_tenant: str) -> Iterator[MeteringCollector]:
     """Composable metering verifier. Inject into any test to verify
     that lifecycle events appear via the test adapter HTTP API.
 
     Records a start timestamp on setup, verifies all expectations
-    (including CloudEvent structure validation) on teardown.
+    (including CloudEvent structure validation) on teardown. Every
+    heartbeat must name the JWT user's tenant: the echo adapter
+    aggregates every tenant's topics, so only the value catches an
+    event published to the wrong tenant.
     """
-    collector = MeteringCollector(base_url=env("METERING_ADAPTER_URL"))
+    collector = MeteringCollector(base_url=metering_adapter_url)
+    collector.with_tenant(jwt_tenant)
     collector.start()
     yield collector
     try:

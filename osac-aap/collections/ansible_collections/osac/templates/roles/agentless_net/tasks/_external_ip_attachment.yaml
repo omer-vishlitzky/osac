@@ -1,0 +1,69 @@
+---
+- name: Apply AgentlessNet ExternalIPAttachment task
+  block:
+    - name: Validate the ExternalIPAttachment task input
+      ansible.builtin.include_tasks: _validate_task_input.yaml
+      vars:
+        agentless_net_expected_kind: ExternalIPAttachment
+        agentless_net_expected_tasks: [attach_external_ip, detach_external_ip]
+
+    - name: Validate controller-supplied ExternalIP and destination
+      ansible.builtin.assert:
+        that:
+          - osac_job_vars.external_ip is mapping
+          - osac_job_vars.external_ip.id is string
+          - osac_job_vars.external_ip.address is string
+          - osac_job_vars.destination is mapping
+          - osac_job_vars.destination.address is string
+          - osac_job_vars.destination.routing_domain is mapping
+          - osac_job_vars.destination.routing_domain.type == 'tenant_virtual_network'
+          - osac_job_vars.destination.routing_domain.virtual_network_id is string
+          - osac_job_vars.destination.routing_domain.subnet_id is string
+        fail_msg: AgentlessNet requires a tenant VirtualNetwork destination snapshot.
+      no_log: true
+
+    - name: Classify provider failures as retryable
+      ansible.builtin.set_fact:
+        _agentless_net_failure_retryable: true
+
+    - name: Load AgentlessNet network-node inventory
+      ansible.builtin.include_tasks: _load_network_node_inventory.yaml
+      vars:
+        agentless_net_require_switches: false
+
+    - name: Apply the DNAT consumer by API ID
+      osac.templates.agentless_net_state:
+        action: "{{ agentless_net_attachment_action }}"
+        state_file: "{{ agentless_net_network_state_file }}"
+        uid: "{{ osac_job_vars.resource.id }}"
+        fulfillment_id: "{{ osac_job_vars.resource.id }}"
+        tenant_id: "{{ osac_job_vars.tenant }}"
+        attachment_context:
+          external_ip: "{{ osac_job_vars.external_ip }}"
+          destination: "{{ osac_job_vars.destination }}"
+        external_interface: "{{ agentless_net_external_interface }}"
+      delegate_to: "{{ groups['agentless_net_vn_network_node'][0] }}"
+      become: true
+      no_log: true
+      when: agentless_net_attachment_action == 'ensure_external_ip_attachment'
+
+    - name: Remove the DNAT consumer by API ID
+      osac.templates.agentless_net_state:
+        action: "{{ agentless_net_attachment_action }}"
+        state_file: "{{ agentless_net_network_state_file }}"
+        uid: "{{ osac_job_vars.resource.id }}"
+        fulfillment_id: "{{ osac_job_vars.resource.id }}"
+        tenant_id: "{{ osac_job_vars.tenant }}"
+        attachment_context:
+          external_ip: "{{ osac_job_vars.external_ip }}"
+          destination: "{{ osac_job_vars.destination }}"
+      delegate_to: "{{ groups['agentless_net_vn_network_node'][0] }}"
+      become: true
+      no_log: true
+      when: agentless_net_attachment_action == 'delete_external_ip_attachment'
+  rescue:
+    - name: Publish a sanitized ExternalIPAttachment error
+      ansible.builtin.include_tasks: _report_task_error.yaml
+  always:
+    - name: Remove temporary AgentlessNet SSH credentials
+      ansible.builtin.include_tasks: _cleanup_network_node_inventory.yaml

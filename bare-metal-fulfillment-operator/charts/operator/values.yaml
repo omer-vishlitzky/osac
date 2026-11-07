@@ -1,8 +1,13 @@
+global:
+  networking:
+    # Shared provider-networking setting, independent of service/controller enablement.
+    provisioningEnabled: true
+
 fullnameOverride: "bmf-operator"
 
 image:
   repository: ghcr.io/osac-project/bare-metal-fulfillment-operator
-  tag: latest  # PLACEHOLDER -- overwritten at release time by publish-charts.yaml
+  tag: latest  # PLACEHOLDER -- overwritten at release time by osac-build-and-publish.yaml
   pullPolicy: Always
 
 replicaCount: 1
@@ -24,6 +29,8 @@ secrets:
   managementConfig: "osac-management-config"
   osClouds: "osac-os-clouds"
   bcmCerts: "osac-bcm-certs"
+  netboxToken: "osac-netbox-token"
+  netboxCA: "osac-netbox-ca"
 
 configMaps:
   profiles: "osac-profiles"
@@ -33,7 +40,27 @@ env:
   aapTokenSecretName: "osac-aap-api-token"
   aapTokenSecretKey: "token"
   aapInsecureSkipVerify: ""
-  enableNetworkingProvisioning: "false"
+
+secretAPI:
+  url: "https://fulfillment-internal-api:8001"
+  # Must match the OIDC issuer configured for the Fulfillment Service.
+  issuerUrl: ""
+  caBundle:
+    # Fresh installs using system-trusted certificates can leave this empty.
+    # Standalone upgrades that relied on the former "ca-bundle" default must
+    # set the existing ConfigMap here before rollout.
+    configMap: ""
+    key: "bundle.pem"
+
+netbox:
+  enabled: false
+  # BMH namespace used for Metal3 management and BMC Secret RBAC in NetBox mode.
+  bmhNamespace: ""
+  url: ""
+  tokenSecretKey: "token"
+  tokenValue: ""
+  caCert: ""
+  allowInsecureHTTP: false
 
 bcm:
   enabled: false

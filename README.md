@@ -1,9 +1,86 @@
 # OSAC
 
+## Introduction
+
+There is a worldwide trend towards local and specialized clouds, where
+governments and service providers want to offer their own cloud services under
+local jurisdiction and specific compliance regimes. Use cases include
+traditional VMaaS clouds, neoclouds, and sovereign clouds.
+
+Open Sovereign AI Cloud (OSAC) is an open-source project for organizations
+standing up their own clouds. It offers multi-tenant self-service provisioning
+of VMs, OpenShift clusters, bare-metal servers, Model-aaS, and more. OSAC
+offers standard cloud features including tenancy, RBAC, quota, metering, and
+tenant isolation at every layer.
+
+OSAC interfaces:
+* **gRPC API**: scalable, secure, and safe to put in front of unrelated tenants. It is standards-based and designed for automation.
+* **CLI**: an out-of-the-box CLI for admins and tenants to accomplish their work with OSAC.
+* **UI**: a brandable web interface for service providers who prefer an out-of-the-box UI vs building their own.
+
+## Core Services
+
+**Bare Metal-aaS** (BMaaS) allows tenants to allocate groups of computers, place
+those computers onto isolated networks, and manage/configure those computers
+themselves.  BMaaS is needed by tenants who want to install their own workload
+management software (e.g., SLURM), and tenants who want OpenShift clusters with
+bare metal nodes.
+
+**VMaaS** allows tenants to create virtual machines using primitives that are
+familiar to users of public clouds. VMaaS utilizes [Kubevirt](https://kubevirt.io/)
+as the backend VM platform.
+
+**Cluster-aaS** creates OpenShift clusters on demand. By default it uses [Hosted
+Control
+Planes](https://www.redhat.com/en/topics/containers/what-are-hosted-control-planes)
+to achieve the best compute density, provision quickly, and give the service
+provider exclusive access to manage critical parts of the control plane.
+Cluster-aaS utilizes BMaaS and VMaaS to provision nodes.
+
+**Model-aaS** (MaaS) delivers token-based access to cloud-local inference
+endpoints running a curated selection of models. MaaS builds on [OpenShift AI's
+MaaS](https://www.redhat.com/en/products/ai/openshift-ai), which is implemented
+with [vLLM](https://vllm.ai/).
+
+In addition to the above, OSAC includes a number of supporting services such as
+standard cloud storage features and isolated networking via a full Virtual
+Private Cloud (VPC) implementation.
+
+## Customization
+
+Each Cloud Service Provider (CSP) makes their own choices about the supporting
+infrastructure on which their cloud runs. Those choices include server hardware,
+network gear and fabric, GPU selection, hardware inventory, storage solution,
+DNS platform, secret store, etc. OSAC needs to interface with each of those
+while provisioning and managing cloud services.
+
+Furthermore, CSPs have good reason to customize the details of how provisionable
+assets, such as VMs and Clusters, get implemented. For example a CSP may need to
+influence the way kubevirt APIs are utilized in order to include
+hardware-specific optimizations or other features. Or they may need to customize
+the way OpenShift clusters are created in order to turn on or off certain
+features.
+
+OSAC comes out of the box with working default integrations, while enabling the
+CSP to customize or even replace portions of OSAC's workflows. OSAC does so by
+utilizing Ansible roles to implement those portions of workflows that CSPs may
+need to customize.
+
+[Ansible Automation
+Platform](https://www.redhat.com/en/technologies/management/ansible) (AAP) comes
+with an extensive [ecosystem of
+Collections](https://docs.ansible.com/projects/ansible/latest/collections/index.html)
+that can interface with most of the infrastructure that would be found in a
+datacenter. That ecosystem, combined with AAP's job management capabilities,
+make AAP an ideal execution engine for OSAC.
+
+## Code Layout
+
 This is the mono-repo for the [Open Sovereign AI Cloud (OSAC)](https://github.com/osac-project)
 project. It hosts multiple components as subdirectories, each retaining its own
 documentation:
 
+- **[docs/](docs/README.md)** — documentation of features and architecture.
 - **[fulfillment-service/](fulfillment-service/README.md)** — a gRPC server (with REST gateway)
   that manages infrastructure resources such as clusters, hosts, compute instances, and
   networking. It uses PostgreSQL for storage and OPA for authorization, and ships an `osac` CLI
@@ -21,13 +98,158 @@ documentation:
   presents a single CSI identity to Kubernetes and routes storage requests to vendor-specific
   CSI drivers (NetApp Trident, VAST, Pure Storage) based on storage tier resolution from the
   fulfillment service.
+- **[osac-metering/](osac-metering/README.md)** — the metering pipeline: watches the
+  fulfillment service's gRPC event stream, maps resource lifecycle events to CloudEvents via a
+  shared schema, and publishes them to Kafka for downstream billing adapters.
 
 See each subdirectory's `README.md` (and `docs/`, where present) for setup, build, test, and
-deployment instructions specific to that component. This repo's own top-level
-**[docs/](docs/README.md)** holds hand-trimmed cross-component architecture and
-conventions content that doesn't belong in any single component's docs (not to be confused
-with the external [osac-project/docs](https://github.com/osac-project/docs) repo, which
-covers broader project-level architecture guides and diagrams).
+deployment instructions specific to that component. This repo's top-level
+**[docs/](docs/README.md)** holds both hand-trimmed cross-component architecture and
+conventions content and the broader project-level documentation (features, architecture
+guides, admin/developer guides — formerly the separate `osac-project/docs` repo, merged
+in with its full commit history).
+
+## Verifying container image signatures
+
+Container images published to `ghcr.io/osac-project/*` from this repo's GitHub
+Actions workflows are signed keylessly with [cosign](https://docs.sigstore.dev/),
+using each workflow run's GitHub Actions OIDC identity via Fulcio/Rekor — no
+long-lived private key is involved.
+
+`osac-build-and-publish.yaml` (called by `nightly-build.yaml` and
+`osac-release.yaml`) is the sole publisher of any image at a real version —
+each component's own tag-triggered build workflow only reacts to a push to
+`main` now (for a `sha-<short>`-tagged dev image) or a pull request (build
+only, never pushed or signed); pushing a `<component>/vX.Y.Z` tag doesn't
+trigger anything. So `osac-build-and-publish.yaml@refs/heads/main` is the one
+signer identity for any real-version image in this repo:
+
+```bash
+cosign verify \
+  --certificate-identity-regexp '^https://github\.com/osac-project/osac/\.github/workflows/osac-build-and-publish\.yaml@refs/heads/main$' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  ghcr.io/<image>@sha256:<digest>
+```
+
+`nightly-build.yaml` always rebuilds and republishes every component's image
+as part of its nightly run. `osac-release.yaml` only rebuilds and republishes
+images whose components are actually selected for rebuilding (named in that
+release's `component_versions`, and not already published at the requested
+version) — every other component is pinned to its existing published image,
+untouched, not resigned. Signing isn't skipped for an already-signed digest:
+every run signs whatever digest it pushes, even when a rebuild is
+byte-identical to an already-published one, so that digest ends up with more
+than one valid signature from different identities rather than only the
+newest. A manual dispatch against a non-`main` ref signs under that ref's
+identity instead (the reusable workflow call follows whatever ref
+`nightly-build.yaml`/`osac-release.yaml` were themselves dispatched
+against) — match the regex to the ref actually used if you dispatched it
+yourself.
+
+**Verifying an older image, published before each component's own
+tag-triggered build workflow stopped reacting to tag pushes:** that older
+build's own workflow file and tag prefix are a second valid identity for that
+specific digest —
+
+| Component | Image | Workflow file | Release tag prefix |
+|---|---|---|---|
+| osac-operator | `osac-project/osac-operator` | `build-image.yaml` | `osac-operator` |
+| fulfillment-service | `osac-project/fulfillment-service` | `publish-image.yaml` | `fulfillment-service` |
+| bare-metal-fulfillment-operator | `osac-project/bare-metal-fulfillment-operator` | `build-bmf-image.yaml` | `bare-metal-fulfillment-operator` |
+| osac-aap | `osac-project/osac-aap` | `execution-environment.yml` | `osac-aap` |
+| metering-service | `osac-project/metering-service` | `build-metering-service-image.yaml` | `osac-metering` |
+| metering-m360-adapter | `osac-project/metering-m360-adapter` | `build-metering-m360-adapter-image.yaml` | `osac-metering` |
+| metering-echo-adapter | `osac-project/metering-echo-adapter` | `build-metering-echo-adapter-image.yaml` | `osac-metering` |
+| osac-csi-driver | `osac-project/osac-csi-driver` | `publish-csi-driver-image.yaml` | `osac-csi-driver` |
+
+```bash
+cosign verify \
+  --certificate-identity-regexp '^https://github\.com/osac-project/osac/\.github/workflows/<workflow-file>@refs/tags/<tag-prefix>/.+$' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  ghcr.io/<image>@sha256:<digest>
+```
+
+## Verifying Helm chart signatures
+
+Helm charts published to `oci://ghcr.io/osac-project/charts/*` are signed the
+same way. Every chart here — every mono-repo component's sub-chart and the
+`osac` umbrella chart itself — is packaged, pushed, and signed by
+`osac-build-and-publish.yaml`, as part of a nightly run or a real release
+(`nightly-build.yaml`/`osac-release.yaml` both call into that same shared
+reusable workflow to do so). There is no other publisher for any chart in
+this registry.
+
+`helm pull`/`helm push` print the artifact's digest directly, so no extra
+tooling is needed to resolve it:
+
+```bash
+helm pull oci://ghcr.io/osac-project/charts/<chart-name> --version <version>
+# Digest: sha256:<digest>
+
+cosign verify \
+  --certificate-identity-regexp '^https://github\.com/osac-project/osac/\.github/workflows/osac-build-and-publish\.yaml@refs/.+$' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  ghcr.io/osac-project/charts/<chart-name>@sha256:<digest>
+```
+
+The identity accepts any ref (not pinned to `refs/heads/main`), since a
+nightly run or a manually dispatched release can run from a different
+branch or tag.
+
+The umbrella chart (`osac`) only ever has one signer identity —
+`osac-build-and-publish.yaml`. For a normal nightly run or a release
+dispatched from `main` (the common case), verify with just:
+
+```bash
+cosign verify \
+  --certificate-identity-regexp '^https://github\.com/osac-project/osac/\.github/workflows/osac-build-and-publish\.yaml@refs/heads/main$' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  ghcr.io/osac-project/charts/osac@sha256:<digest>
+```
+
+If `osac-release.yaml` was manually dispatched against a different ref
+(GitHub's "Use workflow from" selector), the signature carries that ref
+instead — replace `refs/heads/main` above with the exact ref actually used
+(e.g. `refs/heads/<branch>`).
+
+Always verify by digest (`@sha256:...`), not by mutable tag — resolve a tag to
+its digest first with `skopeo inspect docker://ghcr.io/osac-project/<component>:<tag>`
+if needed. Images pushed to `quay.io/redhat-user-workloads/osac-tenant/...` via
+Konflux are signed separately by Konflux's own Enterprise Contract pipeline;
+see that pipeline's documentation for verifying those instead.
+
+## Verifying binary signatures
+
+The `osac` CLI and `fulfillment-service` binaries are released to GitHub
+Releases by `publish-binaries.yaml`, called directly by
+`osac-build-and-publish.yaml` right after it tags a release that bumps
+fulfillment-service (it has no trigger of its own). Each release binary is
+signed the same keyless way as the images and charts above; goreleaser's
+`signs` step produces a single Sigstore bundle (`<binary>.sigstore.json`,
+containing both the certificate and signature) alongside every binary in
+the release.
+
+Download a binary with its bundle, then verify:
+
+```bash
+gh release download fulfillment-service/<version> \
+  --repo osac-project/osac \
+  --pattern 'osac_<os>_<arch>*'
+
+cosign verify-blob \
+  --bundle osac_<os>_<arch>.sigstore.json \
+  --certificate-identity-regexp '^https://github\.com/osac-project/osac/\.github/workflows/publish-binaries\.yaml@refs/heads/main$' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  osac_<os>_<arch>
+```
+
+If `osac-release.yaml` was manually dispatched against a different ref,
+replace `refs/heads/main` with the exact ref used (same caveat as the
+image/chart identities above).
+
+Substitute `fulfillment-service` for `osac` to verify that binary instead —
+both are built and signed from the same release. `<os>`/`<arch>` match the
+asset names on the release page (e.g. `osac_Linux_x86_64`).
 
 ## Local development with go.work
 
@@ -51,7 +273,7 @@ discovery. Requires an authenticated `gh` session unless you pass `--no-fork`.
 `upstream` = osac-project; it does not change this checkout or skill vendor
 remotes. `--no-fork` wins over `--fork-name`. After `--fork-name origin`, a
 later `--no-fork` run skips updates on those origin-as-fork siblings rather
-than calling `gh`. The GitHub fork of `osac-project/docs` is `osac-docs`. This
+than calling `gh`. This
 repo is the project root. A nested `osac-workspace/osac/` checkout aborts;
 use a standalone clone or worktree instead.
 
@@ -64,19 +286,6 @@ for bootstrap details and component conventions.
 Using OpenAI Codex? See [`docs/codex-getting-started.md`](docs/codex-getting-started.md)
 for Codex-specific onboarding (install, `/import`, permissions, trusting the
 repo's hooks, and skill discovery under `.agents/skills`).
-
-## Distrobox (Linux/x86_64)
-
-Requires [podman](https://podman.io/) and [distrobox](https://distrobox.it/) on Linux. Image tool binaries are x86_64 only. From this repo root:
-
-```bash
-make enter                     # Build image and enter
-make claude                    # Run Claude Code inside the distrobox
-make status
-make rebuild
-```
-
-The image lives in `tools/distrobox/`. It shares `$HOME` by default (`HOME_DIR` to override).
 
 ## Parallel worktrees
 

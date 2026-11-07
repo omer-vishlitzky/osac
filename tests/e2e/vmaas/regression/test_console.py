@@ -4,6 +4,7 @@ import base64
 import contextlib
 import json
 import logging
+import os
 import queue
 import ssl
 import subprocess
@@ -16,10 +17,10 @@ from typing import Any
 import pytest
 import websocket
 
-from tests.e2e.catalog.conftest import unique_name
 from tests.e2e.core.grpc_client import GRPCClient
 from tests.e2e.core.helpers import (
     assert_grpc_rejected,
+    unique_name,
     wait_for_cr,
     wait_for_deletion,
     wait_for_provision,
@@ -27,6 +28,8 @@ from tests.e2e.core.helpers import (
 )
 from tests.e2e.core.k8s_client import K8sClient
 from tests.e2e.core.osac_cli import OsacCLI
+
+pytestmark = pytest.mark.regression
 
 logger = logging.getLogger(__name__)
 
@@ -41,31 +44,31 @@ def console_vm(
     k8s_hub_client: K8sClient,
     k8s_virt_client: K8sClient,
     vm_template: str,
-    default_subnet: str,
+    default_network_attachment: dict[str, object],
 ) -> Iterator[dict[str, str]]:
     """Create a single compute instance for all console tests in this module."""
     print("\nCreating console test VM...")
     name = unique_name("e2e-ci")
     uuid: str = cli.create_compute_instance(
-        name=name, template=vm_template, network_attachments=[{"subnet": default_subnet}]
+        name=name, template=vm_template, network_attachments=[default_network_attachment]
     )
     ci_name: str | None = None
     try:
         ci_name = wait_for_cr(k8s=k8s_hub_client, uuid=uuid)
-        print(f"Waiting for {ci_name} to provision and reach Running...")
+        print("Waiting for console test VM to provision and reach Running...")
         wait_for_provision(k8s=k8s_hub_client, name=ci_name)
         wait_for_running(k8s=k8s_hub_client, name=ci_name)
-        print(f"Console test VM {ci_name} is Running")
+        print("Console test VM is Running")
 
         yield {"uuid": uuid, "name": ci_name}
     finally:
-        print(f"\nCleaning up console test VM {uuid}...")
+        print("\nCleaning up console test VM...")
         try:
             cli.delete_compute_instance(uuid=uuid)
             if ci_name is not None:
                 wait_for_deletion(k8s=k8s_hub_client, name=ci_name)
-        except Exception as e:
-            print(f"WARNING: Failed to cleanup console VM {uuid}: {e}")
+        except Exception:
+            print("WARNING: Failed to cleanup console VM")
 
 
 # ---------------------------------------------------------------------------
@@ -138,21 +141,38 @@ def _ws_try_connect(url: str, ticket: str) -> bool:
             ws.shutdown()
 
 
-def _grpc_popen(address: str, ticket: str) -> subprocess.Popen:
-    """Start a gRPC console stream subprocess. Caller must manage stdin/lifecycle."""
+def _grpc_popen(address: str, ticket: str, reflect_token: str) -> subprocess.Popen:
+    """Start a gRPC console stream subprocess. Caller must manage stdin/lifecycle.
+
+    gRPC reflection now requires authentication. Console stream calls use JWE
+    tickets that the JWT validator does not recognise, so we send different
+    credentials for reflection vs the actual RPC: -reflect-header carries the
+    admin JWT for the reflection call, -rpc-header carries the console ticket
+    for ConsoleProxy/Connect. -expand-headers substitutes the env-var references
+    at runtime so neither token appears verbatim in the command arguments.
+    """
+    env = os.environ.copy()
+    env["REFLECTION_JWT"] = reflect_token
+    env["CONSOLE_TICKET"] = ticket
     return subprocess.Popen(
-        ["grpcurl", "-insecure", "-H", f"Authorization: Bearer {ticket}", "-d", "@", address, CONSOLE_GRPC_SERVICE],
+        [
+            "grpcurl", "-insecure", "-expand-headers",
+            "-reflect-header", "Authorization: Bearer ${REFLECTION_JWT}",
+            "-rpc-header", "Authorization: Bearer ${CONSOLE_TICKET}",
+            "-d", "@", address, CONSOLE_GRPC_SERVICE,
+        ],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        env=env,
     )
 
 
 class _GrpcSession:
     """Interactive gRPC console session via grpcurl subprocess."""
 
-    def __init__(self, address: str, ticket: str) -> None:
-        self._proc = _grpc_popen(address, ticket)
+    def __init__(self, address: str, ticket: str, reflect_token: str) -> None:
+        self._proc = _grpc_popen(address, ticket, reflect_token)
         self._output_q: queue.Queue[str | None] = queue.Queue()
         self._connected = threading.Event()
         self._reader = threading.Thread(target=self._read_stdout, daemon=True)
@@ -208,16 +228,17 @@ class _GrpcSession:
         self._proc.stdin = None  # prevent communicate() from flushing closed stdin
         with contextlib.suppress(OSError):
             self._proc.kill()
-        self._proc.communicate()
+        self._reader.join(timeout=5)
+        self._proc.wait()
 
 
-def _grpc_stream(address: str, ticket: str) -> tuple[str, str, int]:
+def _grpc_stream(address: str, ticket: str, reflect_token: str) -> tuple[str, str, int]:
     """Open a gRPC console stream via grpcurl, close stdin, and collect output.
 
     Returns (stdout, stderr, returncode).
     """
     logger.info("gRPC stream opening to %s", address)
-    proc = _grpc_popen(address, ticket)
+    proc = _grpc_popen(address, ticket, reflect_token)
     try:
         proc.stdin.close()  # type: ignore[union-attr]
         proc.stdin = None  # prevent communicate() from flushing closed stdin
@@ -321,7 +342,7 @@ def test_console_serial_websocket(console_vm: dict[str, str], grpc: GRPCClient, 
 def test_console_serial_grpc_stream(console_vm: dict[str, str], grpc: GRPCClient, fulfillment_address: str) -> None:
     """Connect to the serial console via gRPC bidi stream and verify interactive login prompt."""
     session: dict[str, Any] = _create_ticket(grpc, console_vm["uuid"])
-    gs = _GrpcSession(fulfillment_address, session["ticket"])
+    gs = _GrpcSession(fulfillment_address, session["ticket"], reflect_token=grpc.token)
     try:
         _wait_for_login_prompt(send=gs.send, recv=gs.recv)
     finally:
@@ -361,12 +382,12 @@ def test_console_concurrent_session_rejected(
     session1: dict[str, Any] = _create_ticket(grpc, console_vm["uuid"])
     session2: dict[str, Any] = _create_ticket(grpc, console_vm["uuid"])
 
-    gs1 = _GrpcSession(fulfillment_address, session1["ticket"])
+    gs1 = _GrpcSession(fulfillment_address, session1["ticket"], reflect_token=grpc.token)
     try:
         assert gs1.wait_connected(), "First session failed to connect"
         assert gs1.alive, "First session should still be running"
 
-        stdout, stderr, rc = _grpc_stream(fulfillment_address, session2["ticket"])
+        stdout, stderr, rc = _grpc_stream(fulfillment_address, session2["ticket"], reflect_token=grpc.token)
         combined: str = stdout + stderr
         logger.info("Concurrent session2 rc=%d", rc)
         assert rc != 0, f"Second connection should fail, got: {combined!r}"
@@ -394,7 +415,7 @@ def test_console_expired_ticket_rejected(
 
     expires_at = datetime.fromisoformat(expires_at_str.replace("Z", "+00:00"))
     seconds_until_expiry: float = (expires_at - datetime.now(tz=UTC)).total_seconds()
-    wait_seconds: float = min(60.0, max(0.0, seconds_until_expiry) + 15.0)
+    wait_seconds: float = max(0.0, seconds_until_expiry) + 15.0
 
     logger.info("Ticket expires at %s, waiting %.0fs past expiry", expires_at_str, wait_seconds)
     time.sleep(wait_seconds)

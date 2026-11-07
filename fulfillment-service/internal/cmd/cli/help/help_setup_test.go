@@ -22,10 +22,36 @@ import (
 	. "github.com/onsi/ginkgo/v2/dsl/core"
 	. "github.com/onsi/gomega"
 	"github.com/spf13/cobra"
+
+	"github.com/osac-project/osac/fulfillment-service/internal/cmd/cli/color"
 )
 
 // ansiPattern matches ANSI escape sequences (CSI sequences for colors, styles, etc.).
 var ansiPattern = regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]`)
+
+// saveAndSetEnv sets an environment variable and registers cleanup to restore its original state.
+func saveAndSetEnv(name, value string) {
+	origVal, wasSet := os.LookupEnv(name)
+	Expect(os.Setenv(name, value)).To(Succeed())
+	DeferCleanup(func() {
+		if wasSet {
+			os.Setenv(name, origVal)
+		} else {
+			os.Unsetenv(name)
+		}
+	})
+}
+
+// saveAndUnsetEnv unsets an environment variable and registers cleanup to restore its original state.
+func saveAndUnsetEnv(name string) {
+	origVal, wasSet := os.LookupEnv(name)
+	os.Unsetenv(name)
+	DeferCleanup(func() {
+		if wasSet {
+			os.Setenv(name, origVal)
+		}
+	})
+}
 
 func newTestCommand() *cobra.Command {
 	cmd := &cobra.Command{
@@ -53,7 +79,20 @@ var _ = Describe("Help output", func() {
 	)
 
 	BeforeEach(func() {
+		for _, name := range []string{"NO_COLOR", "FORCE_COLOR"} {
+			origVal, wasSet := os.LookupEnv(name)
+			os.Unsetenv(name)
+			DeferCleanup(func() {
+				if wasSet {
+					os.Setenv(name, origVal)
+				} else {
+					os.Unsetenv(name)
+				}
+			})
+		}
+
 		cmd = newTestCommand()
+		color.AddFlag(cmd)
 		Setup(cmd)
 		output = &bytes.Buffer{}
 		cmd.SetOut(output)
@@ -89,12 +128,97 @@ var _ = Describe("Help output", func() {
 		Expect(output.String()).To(ContainSubstring("sub"))
 	})
 
+	It("renders flag emphasis without Markdown markers in neutral help", func() {
+		saveAndSetEnv("NO_COLOR", "1")
+		cmd.Flags().Bool("log-headers", false, "_[BOOLEAN]_ - Include gRPC/HTTP headers in log messages.")
+		cmd.SetArgs([]string{"--help"})
+		Expect(cmd.Execute()).To(Succeed())
+		Expect(output.String()).To(ContainSubstring("--log-headers [BOOLEAN] - Include gRPC/HTTP headers"))
+		Expect(output.String()).NotTo(ContainSubstring("**"))
+		Expect(output.String()).NotTo(ContainSubstring("*["))
+		Expect(ansiPattern.FindString(output.String())).To(BeEmpty())
+	})
+
 	It("Does not emit ANSI escape codes for subcommand help", func() {
 		cmd.SetArgs([]string{"sub", "--help"})
 		err := cmd.Execute()
 		Expect(err).ToNot(HaveOccurred())
 		Expect(ansiPattern.FindString(output.String())).To(BeEmpty(),
 			"subcommand help output should not contain ANSI escape codes when writing to a non-TTY")
+	})
+
+	It("Emits ANSI escape codes when FORCE_COLOR is set", func() {
+		saveAndSetEnv("FORCE_COLOR", "1")
+		saveAndUnsetEnv("NO_COLOR")
+
+		cmd.SetArgs([]string{"--help"})
+		err := cmd.Execute()
+		Expect(err).ToNot(HaveOccurred())
+		Expect(output.String()).ToNot(BeEmpty())
+		Expect(ansiPattern.FindString(output.String())).ToNot(BeEmpty(),
+			"help output should contain ANSI escape codes when FORCE_COLOR is set")
+	})
+
+	It("Does not emit ANSI escape codes when both FORCE_COLOR and NO_COLOR are set", func() {
+		saveAndSetEnv("FORCE_COLOR", "1")
+		saveAndSetEnv("NO_COLOR", "1")
+
+		cmd.SetArgs([]string{"--help"})
+		err := cmd.Execute()
+		Expect(err).ToNot(HaveOccurred())
+		Expect(output.String()).ToNot(BeEmpty())
+		Expect(ansiPattern.FindString(output.String())).To(BeEmpty(),
+			"help output should not contain ANSI escape codes when NO_COLOR overrides FORCE_COLOR")
+	})
+
+	It("Emits ANSI escape codes when --color is set", func() {
+		cmd.SetArgs([]string{"--color", "--help"})
+		err := cmd.Execute()
+		Expect(err).ToNot(HaveOccurred())
+		Expect(output.String()).ToNot(BeEmpty())
+		Expect(ansiPattern.FindString(output.String())).ToNot(BeEmpty(),
+			"help output should contain ANSI escape codes when --color is set")
+	})
+
+	It("Does not include heading prefixes in plain output", func() {
+		cmd.SetArgs([]string{"--help"})
+		err := cmd.Execute()
+		Expect(err).ToNot(HaveOccurred())
+		Expect(output.String()).ToNot(HavePrefix("# "),
+			"help output should not contain Markdown heading prefix in plain mode")
+	})
+
+	It("Does not emit ANSI escape codes when --color=false", func() {
+		cmd.SetArgs([]string{"--color=false", "--help"})
+		err := cmd.Execute()
+		Expect(err).ToNot(HaveOccurred())
+		Expect(output.String()).ToNot(BeEmpty())
+		Expect(ansiPattern.FindString(output.String())).To(BeEmpty(),
+			"help output should not contain ANSI escape codes when --color=false")
+	})
+
+	It("Does not emit ANSI escape codes when --color=false overrides FORCE_COLOR", func() {
+		saveAndSetEnv("FORCE_COLOR", "1")
+		saveAndUnsetEnv("NO_COLOR")
+
+		cmd.SetArgs([]string{"--color=false", "--help"})
+		err := cmd.Execute()
+		Expect(err).ToNot(HaveOccurred())
+		Expect(output.String()).ToNot(BeEmpty())
+		Expect(ansiPattern.FindString(output.String())).To(BeEmpty(),
+			"help output should not contain ANSI escape codes when --color=false overrides FORCE_COLOR")
+	})
+
+	It("Does not emit ANSI escape codes when NO_COLOR overrides --color", func() {
+		saveAndSetEnv("NO_COLOR", "1")
+		saveAndUnsetEnv("FORCE_COLOR")
+
+		cmd.SetArgs([]string{"--color", "--help"})
+		err := cmd.Execute()
+		Expect(err).ToNot(HaveOccurred())
+		Expect(output.String()).ToNot(BeEmpty())
+		Expect(ansiPattern.FindString(output.String())).To(BeEmpty(),
+			"help output should not contain ANSI escape codes when NO_COLOR overrides --color")
 	})
 })
 

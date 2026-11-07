@@ -16,23 +16,22 @@ package servers
 import (
 	"context"
 	"errors"
+	"google.golang.org/protobuf/proto"
 	"log/slog"
+	"maps"
 
+	"github.com/osac-project/osac/fulfillment-service/internal/auth"
+	"github.com/osac-project/osac/fulfillment-service/internal/database/dao"
+	"github.com/osac-project/osac/fulfillment-service/internal/utils"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 	"github.com/prometheus/client_golang/prometheus"
 	grpccodes "google.golang.org/grpc/codes"
 	grpcstatus "google.golang.org/grpc/status"
 	"google.golang.org/protobuf/reflect/protoreflect"
-	"google.golang.org/protobuf/types/known/structpb"
-
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
-	"github.com/osac-project/osac/fulfillment-service/internal/auth"
-	"github.com/osac-project/osac/fulfillment-service/internal/database/dao"
-	"github.com/osac-project/osac/fulfillment-service/internal/events"
 )
 
 type PrivateClusterCatalogItemsServerBuilder struct {
 	logger            *slog.Logger
-	notifier          events.Notifier
 	attributionLogic  auth.AttributionLogic
 	tenancyLogic      auth.TenancyLogic
 	metricsRegisterer prometheus.Registerer
@@ -43,9 +42,14 @@ var _ privatev1.ClusterCatalogItemsServer = (*PrivateClusterCatalogItemsServer)(
 
 type PrivateClusterCatalogItemsServer struct {
 	privatev1.UnimplementedClusterCatalogItemsServer
-	logger             *slog.Logger
-	clusterVersionsDao *dao.GenericDAO[*privatev1.ClusterVersion]
-	generic            *GenericServer[*privatev1.ClusterCatalogItem]
+	templatesDao              *dao.GenericDAO[*privatev1.ClusterTemplate]
+	clusterVersionsDao        *dao.GenericDAO[*privatev1.ClusterVersion]
+	secretsDao                *dao.GenericDAO[*privatev1.Secret]
+	subnetsDao                *dao.GenericDAO[*privatev1.Subnet]
+	securityGroupsDao         *dao.GenericDAO[*privatev1.SecurityGroup]
+	addOnOperatorsDao         *dao.GenericDAO[*privatev1.AddOnOperator]
+	generic                   *GenericServer[*privatev1.ClusterCatalogItem]
+	bareMetalInstanceTypesDao *dao.GenericDAO[*privatev1.BareMetalInstanceType]
 }
 
 func NewPrivateClusterCatalogItemsServer() *PrivateClusterCatalogItemsServerBuilder {
@@ -54,12 +58,6 @@ func NewPrivateClusterCatalogItemsServer() *PrivateClusterCatalogItemsServerBuil
 
 func (b *PrivateClusterCatalogItemsServerBuilder) SetLogger(value *slog.Logger) *PrivateClusterCatalogItemsServerBuilder {
 	b.logger = value
-	return b
-}
-
-func (b *PrivateClusterCatalogItemsServerBuilder) SetNotifier(
-	value events.Notifier) *PrivateClusterCatalogItemsServerBuilder {
-	b.notifier = value
 	return b
 }
 
@@ -78,8 +76,8 @@ func (b *PrivateClusterCatalogItemsServerBuilder) SetMetricsRegisterer(value pro
 	return b
 }
 
-// SetFilterDesc sets the protobuf message descriptor used to validate and translate CEL filter
-// expressions. This is optional. When unset, the descriptor of this server's own private message type is used.
+// SetFilterDesc sets the protobuf descriptor used to validate public CEL filters. When omitted, the private Catalog
+// Item descriptor is used.
 func (b *PrivateClusterCatalogItemsServerBuilder) SetFilterDesc(value protoreflect.MessageDescriptor) *PrivateClusterCatalogItemsServerBuilder {
 	b.filterDesc = value
 	return b
@@ -95,8 +93,53 @@ func (b *PrivateClusterCatalogItemsServerBuilder) Build() (result *PrivateCluste
 		return
 	}
 
+	templatesDao, err := dao.NewGenericDAO[*privatev1.ClusterTemplate]().
+		SetLogger(b.logger).
+		SetTenancyLogic(b.tenancyLogic).
+		SetMetricsRegisterer(b.metricsRegisterer).
+		Build()
+	if err != nil {
+		return
+	}
+
 	// Create the cluster versions DAO:
 	clusterVersionsDao, err := dao.NewGenericDAO[*privatev1.ClusterVersion]().
+		SetLogger(b.logger).
+		SetTenancyLogic(b.tenancyLogic).
+		SetMetricsRegisterer(b.metricsRegisterer).
+		Build()
+	if err != nil {
+		return
+	}
+
+	secretsDao, err := dao.NewGenericDAO[*privatev1.Secret]().
+		SetLogger(b.logger).
+		SetTenancyLogic(b.tenancyLogic).
+		SetMetricsRegisterer(b.metricsRegisterer).
+		Build()
+	if err != nil {
+		return
+	}
+
+	subnetsDao, err := dao.NewGenericDAO[*privatev1.Subnet]().
+		SetLogger(b.logger).
+		SetTenancyLogic(b.tenancyLogic).
+		SetMetricsRegisterer(b.metricsRegisterer).
+		Build()
+	if err != nil {
+		return
+	}
+
+	securityGroupsDao, err := dao.NewGenericDAO[*privatev1.SecurityGroup]().
+		SetLogger(b.logger).
+		SetTenancyLogic(b.tenancyLogic).
+		SetMetricsRegisterer(b.metricsRegisterer).
+		Build()
+	if err != nil {
+		return
+	}
+
+	addOnOperatorsDao, err := dao.NewGenericDAO[*privatev1.AddOnOperator]().
 		SetLogger(b.logger).
 		SetTenancyLogic(b.tenancyLogic).
 		SetMetricsRegisterer(b.metricsRegisterer).
@@ -108,7 +151,6 @@ func (b *PrivateClusterCatalogItemsServerBuilder) Build() (result *PrivateCluste
 	generic, err := NewGenericServer[*privatev1.ClusterCatalogItem]().
 		SetLogger(b.logger).
 		SetService(privatev1.ClusterCatalogItems_ServiceDesc.ServiceName).
-		SetNotifier(b.notifier).
 		SetAttributionLogic(b.attributionLogic).
 		SetTenancyLogic(b.tenancyLogic).
 		SetMetricsRegisterer(b.metricsRegisterer).
@@ -119,10 +161,23 @@ func (b *PrivateClusterCatalogItemsServerBuilder) Build() (result *PrivateCluste
 		return
 	}
 
+	bareMetalInstanceTypesDao, err := dao.NewGenericDAO[*privatev1.BareMetalInstanceType]().
+		SetLogger(b.logger).
+		SetTenancyLogic(b.tenancyLogic).
+		SetMetricsRegisterer(b.metricsRegisterer).
+		Build()
+	if err != nil {
+		return
+	}
 	result = &PrivateClusterCatalogItemsServer{
-		logger:             b.logger,
-		clusterVersionsDao: clusterVersionsDao,
-		generic:            generic,
+		bareMetalInstanceTypesDao: bareMetalInstanceTypesDao,
+		templatesDao:              templatesDao,
+		clusterVersionsDao:        clusterVersionsDao,
+		secretsDao:                secretsDao,
+		subnetsDao:                subnetsDao,
+		securityGroupsDao:         securityGroupsDao,
+		addOnOperatorsDao:         addOnOperatorsDao,
+		generic:                   generic,
 	}
 	return
 }
@@ -141,67 +196,81 @@ func (s *PrivateClusterCatalogItemsServer) Get(ctx context.Context,
 
 func (s *PrivateClusterCatalogItemsServer) Create(ctx context.Context,
 	request *privatev1.ClusterCatalogItemsCreateRequest) (response *privatev1.ClusterCatalogItemsCreateResponse, err error) {
-	if object := request.GetObject(); object != nil {
-		if err = validateFieldDefinitions(object.GetFieldDefinitions()); err != nil {
-			return
-		}
-		if err = s.validateFieldDefinitionsVersion(ctx, object.GetFieldDefinitions()); err != nil {
-			return
-		}
-	}
-	err = s.generic.Create(ctx, request, &response)
+	err = s.generic.CreateWithCandidatePreparation(ctx, request, &response, s.prepareCatalogItemCandidate)
 	return
 }
 
 func (s *PrivateClusterCatalogItemsServer) Update(ctx context.Context,
 	request *privatev1.ClusterCatalogItemsUpdateRequest) (response *privatev1.ClusterCatalogItemsUpdateResponse, err error) {
-	if object := request.GetObject(); object != nil {
-		if updateIncludesField(request.GetUpdateMask(), "field_definitions") {
-			if err = validateFieldDefinitions(object.GetFieldDefinitions()); err != nil {
-				return
-			}
-			if err = s.validateFieldDefinitionsVersion(ctx, object.GetFieldDefinitions()); err != nil {
-				return
-			}
-		}
-	}
-	err = s.generic.Update(ctx, request, &response)
+	err = s.generic.UpdateWithCandidatePreparation(ctx, request, &response, s.prepareCatalogItemCandidate)
 	return
 }
 
-// validateFieldDefinitionsVersion validates version constraints in field_definitions.
-// Rejects OBSOLETE, disabled, or non-existent cluster versions used as defaults.
-func (s *PrivateClusterCatalogItemsServer) validateFieldDefinitionsVersion(
-	ctx context.Context,
-	fieldDefinitions []*privatev1.FieldDefinition,
+// prepareCatalogItemCandidate checks the Catalog Item that Create or Update would store.
+// GenericServer has assigned its tenant on Create or merged the update mask on Update, so
+// references are checked against that complete item. Recheck dependencies when an offering
+// changes or is published; descriptive edits and unpublishing need no new dependency lookup.
+func (s *PrivateClusterCatalogItemsServer) prepareCatalogItemCandidate(
+	ctx context.Context, current *privatev1.ClusterCatalogItem, candidate *privatev1.ClusterCatalogItem,
 ) error {
-	var versionName string
-	for _, fd := range fieldDefinitions {
-		if fd.GetPath() == "version" {
-			defaultValue := fd.GetDefault()
-			if defaultValue == nil {
-				break
-			}
-			switch v := defaultValue.GetKind().(type) {
-			case *structpb.Value_StructValue:
-				if v.StructValue != nil {
-					if nameField, ok := v.StructValue.GetFields()["name"]; ok {
-						versionName = nameField.GetStringValue()
-					}
-				}
-			case *structpb.Value_NullValue, nil:
-				// No default specified.
-			default:
-				return grpcstatus.Errorf(grpccodes.InvalidArgument,
-					"field_definitions: version default must be a reference object with a 'name' field")
-			}
-			break
+	if candidate == nil {
+		return grpcstatus.Errorf(grpccodes.InvalidArgument, "catalog item is mandatory")
+	}
+	if current != nil {
+		publishing := !current.GetPublished() && candidate.GetPublished()
+		configurationChanged := current.GetMetadata().GetTenant() != candidate.GetMetadata().GetTenant() ||
+			current.GetMetadata().GetProject() != candidate.GetMetadata().GetProject() ||
+			!proto.Equal(current.GetTemplate(), candidate.GetTemplate()) ||
+			!proto.Equal(current.GetFields(), candidate.GetFields()) ||
+			!maps.EqualFunc(current.GetTemplateParameters(), candidate.GetTemplateParameters(), func(a, b *privatev1.TemplateParameterPolicy) bool { return proto.Equal(a, b) })
+		// Unpublishing and descriptive edits must work even when dependencies are no longer usable.
+		if !publishing && !configurationChanged {
+			return nil
 		}
 	}
-	if versionName == "" {
-		return nil
+	if err := s.validateAndCanonicalizeTemplate(ctx, current, candidate); err != nil {
+		return err
 	}
-	return lookupAndValidateClusterVersion(ctx, s.logger, s.clusterVersionsDao, versionName)
+	if err := validateAndCanonicalizeClusterCatalogItemPolicies(ctx, candidate, s.bareMetalInstanceTypesDao, s.clusterVersionsDao, s.secretsDao, s.subnetsDao, s.securityGroupsDao, s.addOnOperatorsDao); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateAndCanonicalizeTemplate finds the Template named by this Catalog Item. A name lookup
+// starts in the item's tenant/project; project or shared selectors can choose another scope.
+// It stores the Template's actual ID/name/scope, checks parameter policies against that
+// Template, and forbids changing the Template on Update. Node-set policies are
+// resolved independently in the Catalog Item's scope.
+func (s *PrivateClusterCatalogItemsServer) validateAndCanonicalizeTemplate(
+	ctx context.Context, current *privatev1.ClusterCatalogItem, candidate *privatev1.ClusterCatalogItem,
+) error {
+	ref := candidate.GetTemplate()
+	if ref == nil || (ref.GetId() == "" && ref.GetName() == "") {
+		return grpcstatus.Errorf(grpccodes.InvalidArgument, "field 'template' must specify id or name")
+	}
+	resolved, err := resolveLockedFullResourceReference(ctx, s.templatesDao, catalogItemScope(candidate), ref,
+		"cluster template", " in template", grpccodes.InvalidArgument)
+	if err != nil {
+		return err
+	}
+	if err := validateResourceNotDeleted("cluster template", refKey(ref), " in template", resolved.GetMetadata()); err != nil {
+		return err
+	}
+	if current != nil {
+		currentRef := current.GetTemplate()
+		if currentRef == nil || currentRef.GetId() == "" {
+			return grpcstatus.Errorf(grpccodes.InvalidArgument, "existing catalog item has no valid template reference")
+		}
+		if currentRef.GetId() != resolved.GetId() {
+			return grpcstatus.Errorf(grpccodes.InvalidArgument, "cannot change template from '%s' to '%s': template is immutable", currentRef.GetName(), resolved.GetMetadata().GetName())
+		}
+	}
+	if err := validateCatalogItemTemplateParameterPolicies(utils.ClusterTemplateAdapter{ClusterTemplate: resolved}, candidate.GetTemplateParameters()); err != nil {
+		return err
+	}
+	candidate.SetTemplate(canonicalClusterTemplateReference(resolved))
+	return nil
 }
 
 func (s *PrivateClusterCatalogItemsServer) Delete(ctx context.Context,

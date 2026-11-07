@@ -1,0 +1,90 @@
+import { describe, expect, it } from 'vitest';
+
+import { buildCatalogListFilter } from './catalog-item-list-filter';
+import {
+  type CatalogListFilterableItem,
+  catalogItemMatchesListFilter,
+} from '../../test-utils/catalog-item-list-filter';
+
+describe('buildCatalogListFilter', () => {
+  it.each([
+    ['no criteria', {}, undefined],
+    [
+      'search only',
+      { search: 'fedora' },
+      '(this.metadata.name.contains("fedora") || this.title.contains("fedora"))',
+    ],
+    [
+      'search escapes quotes and backslashes',
+      { search: 'a"b\\c' },
+      '(this.metadata.name.contains("a\\"b\\\\c") || this.title.contains("a\\"b\\\\c"))',
+    ],
+    ['published only', { published: 'published' as const }, 'this.published == true'],
+    ['unpublished only', { published: 'unpublished' as const }, 'this.published == false'],
+    [
+      'tenant only',
+      { tenant: 'acme' },
+      '(this.metadata.tenant == "shared" || this.metadata.tenant == "acme")',
+    ],
+    [
+      'multiple dimensions combine with &&',
+      { search: 'rhel', published: 'published' as const, tenant: 'acme' },
+      '(this.metadata.name.contains("rhel") || this.title.contains("rhel")) && this.published == true && (this.metadata.tenant == "shared" || this.metadata.tenant == "acme")',
+    ],
+  ])('%s', (_name, criteria, expected) => {
+    expect(buildCatalogListFilter(criteria)).toBe(expected);
+  });
+});
+
+describe('catalogItemMatchesListFilter', () => {
+  const item: CatalogListFilterableItem = {
+    metadata: { name: 'catalog-rhel-9', tenant: 'shared' },
+    title: 'RHEL 9 catalog',
+    published: true,
+  };
+
+  it('matches when filter is undefined', () => {
+    expect(catalogItemMatchesListFilter(item, undefined)).toBe(true);
+  });
+
+  it('matches search terms against name and title', () => {
+    const filter = buildCatalogListFilter({ search: 'RHEL 9' });
+    expect(catalogItemMatchesListFilter(item, filter)).toBe(true);
+    expect(catalogItemMatchesListFilter(item, buildCatalogListFilter({ search: 'missing' }))).toBe(
+      false,
+    );
+  });
+
+  it('does not match a search term across separate fields', () => {
+    const splitFieldItem = {
+      ...item,
+      metadata: { ...item.metadata, name: 'catalog' },
+      title: 'RHEL',
+    };
+
+    expect(
+      catalogItemMatchesListFilter(
+        splitFieldItem,
+        buildCatalogListFilter({ search: 'catalog RHEL' }),
+      ),
+    ).toBe(false);
+  });
+
+  it('matches published and tenant clauses', () => {
+    expect(
+      catalogItemMatchesListFilter(item, buildCatalogListFilter({ published: 'published' })),
+    ).toBe(true);
+    expect(
+      catalogItemMatchesListFilter(item, buildCatalogListFilter({ published: 'unpublished' })),
+    ).toBe(false);
+    expect(catalogItemMatchesListFilter(item, buildCatalogListFilter({ tenant: 'acme' }))).toBe(
+      true,
+    );
+    expect(
+      catalogItemMatchesListFilter(
+        { ...item, metadata: { ...item.metadata, tenant: 'other' } },
+        buildCatalogListFilter({ tenant: 'acme' }),
+      ),
+    ).toBe(false);
+  });
+});

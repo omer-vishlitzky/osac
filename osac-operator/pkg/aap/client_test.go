@@ -39,6 +39,27 @@ var _ = Describe("Client", func() {
 	})
 
 	Describe("LaunchJobTemplate", func() {
+		It("rejects protected Netris settings before sending a request", func() {
+			requests := 0
+			server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				requests++
+				w.WriteHeader(http.StatusInternalServerError)
+			}))
+			client = aap.NewClient(server.URL, "test-token", false)
+
+			_, err := client.LaunchJobTemplate(ctx, aap.LaunchJobTemplateRequest{
+				TemplateID: 42,
+				ExtraVars: map[string]any{
+					"osac_job_vars": map[string]any{
+						"resource": map[string]any{"NETRIS_CONTROLLER_URL": "https://attacker.example"},
+					},
+				},
+			})
+			Expect(err).To(HaveOccurred())
+			Expect(err).To(MatchError(ContainSubstring("protected Netris setting")))
+			Expect(requests).To(Equal(0))
+		})
+
 		Context("when request succeeds", func() {
 			BeforeEach(func() {
 				server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -63,6 +84,46 @@ var _ = Describe("Client", func() {
 				Expect(err).NotTo(HaveOccurred())
 				Expect(resp.JobID).To(Equal(123))
 			})
+
+			It("does not attach credentials when none are requested", func() {
+				request := aap.LaunchJobTemplateRequest{
+					TemplateName: "test-template",
+					ExtraVars:    map[string]any{"key": "value"},
+				}
+
+				server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					defer GinkgoRecover()
+					var payload map[string]any
+					Expect(json.NewDecoder(r.Body).Decode(&payload)).To(Succeed())
+					Expect(payload).To(HaveKeyWithValue("extra_vars", HaveKeyWithValue("key", "value")))
+					Expect(payload).NotTo(HaveKey("credentials"))
+					Expect(json.NewEncoder(w).Encode(map[string]any{"id": 123})).To(Succeed())
+				})
+
+				_, err := client.LaunchJobTemplate(ctx, request)
+				Expect(err).NotTo(HaveOccurred())
+			})
+
+			It("attaches only requested credential identifiers", func() {
+				request := aap.LaunchJobTemplateRequest{
+					TemplateName:  "test-template",
+					ExtraVars:     map[string]any{"key": "value"},
+					CredentialIDs: []int{42},
+				}
+
+				server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					defer GinkgoRecover()
+					var payload map[string]any
+					Expect(json.NewDecoder(r.Body).Decode(&payload)).To(Succeed())
+					Expect(payload).To(HaveKeyWithValue("credentials", ConsistOf(float64(42))))
+					Expect(payload).NotTo(HaveKey("kubeconfig"))
+					Expect(payload).NotTo(HaveKey("admin_kubeconfig"))
+					Expect(json.NewEncoder(w).Encode(map[string]any{"id": 123})).To(Succeed())
+				})
+
+				_, err := client.LaunchJobTemplate(ctx, request)
+				Expect(err).NotTo(HaveOccurred())
+			})
 		})
 
 		Context("when request fails", func() {
@@ -82,10 +143,58 @@ var _ = Describe("Client", func() {
 				var notFoundErr *aap.NotFoundError
 				Expect(errors.As(err, &notFoundErr)).To(BeTrue())
 			})
+
+			It("does not return a sensitive response body", func() {
+				server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+					defer GinkgoRecover()
+					w.WriteHeader(http.StatusBadRequest)
+					_, err := w.Write([]byte("bundle.pem: confidential-response"))
+					Expect(err).NotTo(HaveOccurred())
+				})
+				_, err := client.LaunchJobTemplate(ctx, aap.LaunchJobTemplateRequest{
+					TemplateName: "trust-template", Sensitive: true,
+				})
+				Expect(err).To(HaveOccurred())
+				Expect(err.Error()).NotTo(ContainSubstring("confidential-response"))
+			})
+
+			It("redacts error bodies for credential-bearing launches by default", func() {
+				server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+					defer GinkgoRecover()
+					w.WriteHeader(http.StatusBadRequest)
+					_, err := w.Write([]byte("credential launch response: confidential-response"))
+					Expect(err).NotTo(HaveOccurred())
+				})
+				_, err := client.LaunchJobTemplate(ctx, aap.LaunchJobTemplateRequest{
+					TemplateName:  "credential-template",
+					CredentialIDs: []int{42},
+				})
+				Expect(err).To(HaveOccurred())
+				Expect(err.Error()).NotTo(ContainSubstring("confidential-response"))
+			})
 		})
 	})
 
 	Describe("LaunchWorkflowTemplate", func() {
+		It("rejects protected Netris settings before sending a request", func() {
+			requests := 0
+			server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				requests++
+				w.WriteHeader(http.StatusInternalServerError)
+			}))
+			client = aap.NewClient(server.URL, "test-token", false)
+
+			_, err := client.LaunchWorkflowTemplate(ctx, aap.LaunchWorkflowTemplateRequest{
+				TemplateName: "protected-workflow",
+				ExtraVars: map[string]any{
+					"nested": []any{map[string]any{"validate-certs": false}},
+				},
+			})
+			Expect(err).To(HaveOccurred())
+			Expect(err).To(MatchError(ContainSubstring("protected Netris setting")))
+			Expect(requests).To(Equal(0))
+		})
+
 		Context("when request succeeds", func() {
 			BeforeEach(func() {
 				server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -108,6 +217,123 @@ var _ = Describe("Client", func() {
 				Expect(err).NotTo(HaveOccurred())
 				Expect(resp.JobID).To(Equal(456))
 			})
+
+			It("does not return a sensitive response body", func() {
+				server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+					defer GinkgoRecover()
+					w.WriteHeader(http.StatusBadRequest)
+					_, err := w.Write([]byte("workflow response: confidential-response"))
+					Expect(err).NotTo(HaveOccurred())
+				})
+				_, err := client.LaunchWorkflowTemplate(ctx, aap.LaunchWorkflowTemplateRequest{
+					TemplateName: "test-workflow",
+					Sensitive:    true,
+				})
+				Expect(err).To(HaveOccurred())
+				Expect(err.Error()).NotTo(ContainSubstring("confidential-response"))
+			})
+		})
+	})
+
+	Describe("LaunchJobTemplate labels", func() {
+		It("sends the label IDs", func() {
+			var body map[string]any
+			server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				Expect(json.NewDecoder(r.Body).Decode(&body)).To(Succeed())
+				w.WriteHeader(http.StatusCreated)
+				_, _ = w.Write([]byte(`{"id": 7}`))
+			}))
+			client = aap.NewClient(server.URL, "test-token", false)
+			resp, err := client.LaunchJobTemplate(ctx, aap.LaunchJobTemplateRequest{
+				TemplateName: "osac-create-subnet",
+				ExtraVars:    map[string]any{"osac_job_vars": map[string]any{"task": "create_subnet"}},
+				Labels:       []int{11},
+			})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(resp.JobID).To(Equal(7))
+			Expect(body["labels"]).To(Equal([]any{float64(11)}))
+		})
+	})
+
+	Describe("EnsureLabel", func() {
+		It("returns an existing label of the organization", func() {
+			posts := 0
+			server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.URL.Path == "/v2/organizations/":
+					Expect(r.URL.Query().Get("name")).To(Equal("osac"))
+					_, _ = w.Write([]byte(`{"count":1,"results":[{"id":3,"name":"osac"}]}`))
+				case r.URL.Path == "/v2/labels/" && r.Method == http.MethodGet:
+					Expect(r.URL.Query().Get("organization")).To(Equal("3"))
+					_, _ = w.Write([]byte(`{"count":1,"results":[{"id":9,"name":"osac-create_subnet-fabric-a-1"}]}`))
+				default:
+					posts++
+					w.WriteHeader(http.StatusInternalServerError)
+				}
+			}))
+			client = aap.NewClient(server.URL, "test-token", false)
+			id, err := client.EnsureLabel(ctx, "osac", "osac-create_subnet-fabric-a-1")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(id).To(Equal(9))
+			Expect(posts).To(Equal(0))
+		})
+
+		It("creates a missing label, with a numeric organization, and caches no label", func() {
+			var created map[string]any
+			labels := 0
+			server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				Expect(r.URL.Path).To(Equal("/v2/labels/"))
+				if r.Method == http.MethodGet {
+					if labels > 0 {
+						_, _ = w.Write([]byte(`{"count":1,"results":[{"id":12,"name":"l"}]}`))
+						return
+					}
+					_, _ = w.Write([]byte(`{"count":0,"results":[]}`))
+					return
+				}
+				labels++
+				Expect(json.NewDecoder(r.Body).Decode(&created)).To(Succeed())
+				w.WriteHeader(http.StatusCreated)
+				_, _ = w.Write([]byte(`{"id":12,"name":"l"}`))
+			}))
+			client = aap.NewClient(server.URL, "test-token", false)
+			id, err := client.EnsureLabel(ctx, "5", "l")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(id).To(Equal(12))
+			Expect(created).To(Equal(map[string]any{"name": "l", "organization": float64(5)}))
+			// Not cached: a second call looks the label up again and finds it.
+			id, err = client.EnsureLabel(ctx, "5", "l")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(id).To(Equal(12))
+			Expect(labels).To(Equal(1))
+		})
+	})
+
+	Describe("ListJobsByLabel", func() {
+		It("lists jobs by label name, lowest ID first", func() {
+			server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				Expect(r.URL.Path).To(Equal("/v2/jobs/"))
+				Expect(r.URL.Query().Get("labels__name")).To(Equal("osac-x-fabric-a-2"))
+				Expect(r.URL.Query().Get("order_by")).To(Equal("id"))
+				_, _ = w.Write([]byte(`{"next":null,"results":[{"id":4,"status":"running"},{"id":6,"status":"pending"}]}`))
+			}))
+			client = aap.NewClient(server.URL, "test-token", false)
+			jobs, err := client.ListJobsByLabel(ctx, "osac-x-fabric-a-2")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(jobs).To(HaveLen(2))
+			Expect(jobs[0].ID).To(Equal(4))
+		})
+	})
+
+	Describe("GetJob job_explanation", func() {
+		It("reads job_explanation", func() {
+			server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, _ = w.Write([]byte(`{"id":4,"status":"failed","job_explanation":"Job terminated due to timeout"}`))
+			}))
+			client = aap.NewClient(server.URL, "test-token", false)
+			job, err := client.GetJob(ctx, "4")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(job.JobExplanation).To(Equal("Job terminated due to timeout"))
 		})
 	})
 
@@ -125,6 +351,7 @@ var _ = Describe("Client", func() {
 						"started":          time.Now().UTC().Format(time.RFC3339),
 						"finished":         time.Now().UTC().Add(time.Minute).Format(time.RFC3339),
 						"extra_vars":       "{\"key\": \"value\"}",
+						"artifacts":        map[string]any{"l2_vni": 14, "l3_vni": 11},
 						"result_traceback": "",
 					})
 				}))
@@ -136,6 +363,7 @@ var _ = Describe("Client", func() {
 				Expect(err).NotTo(HaveOccurred())
 				Expect(job.ID).To(Equal(789))
 				Expect(job.Status).To(Equal("successful"))
+				Expect(string(job.Artifacts)).To(MatchJSON(`{"l2_vni":14,"l3_vni":11}`))
 			})
 		})
 

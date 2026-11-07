@@ -15,7 +15,6 @@ package oauth
 
 import (
 	"context"
-	"crypto/x509"
 	"fmt"
 	"net/http"
 	"os"
@@ -27,8 +26,8 @@ import (
 	"go.uber.org/mock/gomock"
 
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
-	"github.com/osac-project/osac/fulfillment-service/internal/network"
 	"github.com/osac-project/osac/fulfillment-service/internal/testing"
+	"github.com/osac-project/osac/fulfillment-service/internal/trust"
 )
 
 var _ = Describe("Token source", func() {
@@ -37,7 +36,7 @@ var _ = Describe("Token source", func() {
 		ctrl   *gomock.Controller
 		store  auth.TokenStore
 		server *Server
-		caPool *x509.CertPool
+		caPool *trust.CertPool
 	)
 
 	BeforeEach(func() {
@@ -83,11 +82,12 @@ var _ = Describe("Token source", func() {
 		)
 
 		// Create CA pool with the server's certificate
-		caPool, err = network.NewCertPool().
+		loadedCaPool, err := trust.NewCertPool().
 			SetLogger(logger).
 			AddFile(caFile).
 			Build()
 		Expect(err).ToNot(HaveOccurred())
+		caPool = loadedCaPool
 
 	})
 
@@ -269,6 +269,73 @@ var _ = Describe("Token source", func() {
 		// Verify that the token is the one loaded from the store:
 		Expect(token).ToNot(BeNil())
 		Expect(token.Access).To(Equal("my_access_token"))
+	})
+
+	It("Retries endpoint discovery after a transient failure", func() {
+		oauthDiscoveryRequests := 0
+		openidDiscoveryRequests := 0
+		var tokenRequests []string
+
+		server.RouteToHandler(
+			http.MethodGet,
+			"/retry/.well-known/oauth-authorization-server",
+			http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				oauthDiscoveryRequests++
+				if oauthDiscoveryRequests == 1 {
+					w.WriteHeader(http.StatusServiceUnavailable)
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusOK)
+				_, err := fmt.Fprintf(
+					w,
+					`{"issuer":%q,"token_endpoint":%q}`,
+					server.URL()+"/retry",
+					server.URL()+"/token",
+				)
+				Expect(err).To(Succeed())
+			}),
+		)
+		server.RouteToHandler(
+			http.MethodGet,
+			"/retry/.well-known/openid-configuration",
+			http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				openidDiscoveryRequests++
+				w.WriteHeader(http.StatusServiceUnavailable)
+			}),
+		)
+		server.RouteToHandler(
+			http.MethodPost,
+			"/token",
+			http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				tokenRequests = append(tokenRequests, r.URL.Path)
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusOK)
+				_, err := fmt.Fprint(w, `{"access_token":"my_access_token","token_type":"Bearer","expires_in":3600}`)
+				Expect(err).To(Succeed())
+			}),
+		)
+
+		source, err := NewTokenSource().
+			SetLogger(logger).
+			SetIssuer(server.URL() + "/retry").
+			SetStore(store).
+			SetFlow(CredentialsFlow).
+			SetClientId("my_client").
+			SetClientSecret("my_secret").
+			SetCaPool(caPool).
+			Build()
+		Expect(err).ToNot(HaveOccurred())
+
+		_, err = source.Token(ctx)
+		Expect(err).To(HaveOccurred())
+
+		token, err := source.Token(ctx)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(token.Access).To(Equal("my_access_token"))
+		Expect(oauthDiscoveryRequests).To(Equal(2))
+		Expect(openidDiscoveryRequests).To(Equal(1))
+		Expect(tokenRequests).To(Equal([]string{"/token"}))
 	})
 
 	It("Refreshes the access token it is expired", func() {
@@ -626,11 +693,12 @@ var _ = Describe("Token source", func() {
 		})
 
 		// Create CA pool with the discovery server's certificate
-		caPool, err := network.NewCertPool().
+		loadedCaPool, err := trust.NewCertPool().
 			SetLogger(logger).
 			AddFile(caFile).
 			Build()
 		Expect(err).ToNot(HaveOccurred())
+		caPool := loadedCaPool
 
 		// Create the server that doesn't respond to discovery requests:
 		source, err := NewTokenSource().
@@ -667,11 +735,12 @@ var _ = Describe("Token source", func() {
 			err := os.Remove(caFile)
 			Expect(err).ToNot(HaveOccurred())
 		})
-		caPool, err := network.NewCertPool().
+		loadedCaPool, err := trust.NewCertPool().
 			SetLogger(logger).
 			AddFile(caFile).
 			Build()
 		Expect(err).ToNot(HaveOccurred())
+		caPool := loadedCaPool
 		count := 0
 		server.RouteToHandler(
 			http.MethodGet,
@@ -752,11 +821,12 @@ var _ = Describe("Token source", func() {
 			err := os.Remove(caFile)
 			Expect(err).ToNot(HaveOccurred())
 		})
-		caPool, err := network.NewCertPool().
+		loadedCaPool, err := trust.NewCertPool().
 			SetLogger(logger).
 			AddFile(caFile).
 			Build()
 		Expect(err).ToNot(HaveOccurred())
+		caPool := loadedCaPool
 		server.RouteToHandler(
 			http.MethodGet,
 			"/.well-known/oauth-authorization-server",
@@ -818,11 +888,12 @@ var _ = Describe("Token source", func() {
 			err := os.Remove(caFile)
 			Expect(err).ToNot(HaveOccurred())
 		})
-		caPool, err := network.NewCertPool().
+		loadedCaPool, err := trust.NewCertPool().
 			SetLogger(logger).
 			AddFile(caFile).
 			Build()
 		Expect(err).ToNot(HaveOccurred())
+		caPool := loadedCaPool
 		server.RouteToHandler(
 			http.MethodGet,
 			"/.well-known/oauth-authorization-server",
@@ -884,11 +955,12 @@ var _ = Describe("Token source", func() {
 			err := os.Remove(caFile)
 			Expect(err).ToNot(HaveOccurred())
 		})
-		caPool, err := network.NewCertPool().
+		loadedCaPool, err := trust.NewCertPool().
 			SetLogger(logger).
 			AddFile(caFile).
 			Build()
 		Expect(err).ToNot(HaveOccurred())
+		caPool := loadedCaPool
 		server.RouteToHandler(
 			http.MethodGet,
 			"/.well-known/oauth-authorization-server",
@@ -951,11 +1023,12 @@ var _ = Describe("Token source", func() {
 			err := os.Remove(caFile)
 			Expect(err).ToNot(HaveOccurred())
 		})
-		caPool, err := network.NewCertPool().
+		loadedCaPool, err := trust.NewCertPool().
 			SetLogger(logger).
 			AddFile(caFile).
 			Build()
 		Expect(err).ToNot(HaveOccurred())
+		caPool := loadedCaPool
 		server.RouteToHandler(
 			http.MethodGet,
 			"/.well-known/oauth-authorization-server",
@@ -1019,11 +1092,12 @@ var _ = Describe("Token source", func() {
 			err := os.Remove(caFile)
 			Expect(err).ToNot(HaveOccurred())
 		})
-		caPool, err := network.NewCertPool().
+		loadedCaPool, err := trust.NewCertPool().
 			SetLogger(logger).
 			AddFile(caFile).
 			Build()
 		Expect(err).ToNot(HaveOccurred())
+		caPool := loadedCaPool
 		server.RouteToHandler(
 			http.MethodGet,
 			"/.well-known/oauth-authorization-server",

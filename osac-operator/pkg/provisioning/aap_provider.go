@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 
 	"github.com/stoewer/go-strcase"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -31,10 +32,12 @@ type AAPClient interface {
 //   - Prefix-based: templatePrefix is set, and template names are derived from the
 //     resource Kind (e.g., prefix "osac" + Kind "VirtualNetwork" → "osac-create-virtual-network")
 type AAPProvider struct {
-	client              AAPClient
-	provisionTemplate   string
-	deprovisionTemplate string
-	templatePrefix      string
+	client               AAPClient
+	provisionTemplate    string
+	deprovisionTemplate  string
+	templatePrefix       string
+	fulfillmentEndpoint  string
+	fulfillmentIssuerURL string
 }
 
 // NewAAPProvider creates a new AAP provider with explicit template names.
@@ -95,7 +98,12 @@ func (p *AAPProvider) resolveTemplateName(action string, resource client.Object)
 // TriggerProvision triggers provisioning via AAP API.
 // Autodetects whether the template is a job_template or workflow_job_template.
 func (p *AAPProvider) TriggerProvision(ctx context.Context, resource client.Object) (*ProvisionResult, error) {
-	jobID, err := p.launchProvisionJob(ctx, resource)
+	return p.TriggerProvisionWithExtraVars(ctx, resource, nil)
+}
+
+// TriggerProvisionWithExtraVars triggers provisioning with additional variables.
+func (p *AAPProvider) TriggerProvisionWithExtraVars(ctx context.Context, resource client.Object, extraVars map[string]any) (*ProvisionResult, error) {
+	jobID, err := p.launchProvisionJob(ctx, resource, extraVars)
 	if err != nil {
 		return nil, err
 	}
@@ -108,17 +116,50 @@ func (p *AAPProvider) TriggerProvision(ctx context.Context, resource client.Obje
 }
 
 // launchProvisionJob launches the provision template and returns the job ID.
-func (p *AAPProvider) launchProvisionJob(ctx context.Context, resource client.Object) (string, error) {
+func (p *AAPProvider) launchProvisionJob(ctx context.Context, resource client.Object, extraVars map[string]any) (string, error) {
 	templateName, err := p.resolveTemplateName("create", resource)
 	if err != nil {
 		return "", err
 	}
-	return p.launchTemplate(ctx, templateName, resource)
+	return p.launchTemplate(ctx, templateName, resource, extraVars)
 }
 
 // GetProvisionStatus checks provisioning job status via AAP API.
 func (p *AAPProvider) GetProvisionStatus(ctx context.Context, resource client.Object, jobID string) (ProvisionStatus, error) {
 	return p.getJobStatus(ctx, jobID)
+}
+
+// CancelJob cancels a running provisioning job during resource deletion.
+func (p *AAPProvider) CancelJob(ctx context.Context, jobID string) error {
+	return p.cancelProvisionJob(ctx, jobID)
+}
+
+// GetProvisionStatusWithExtraVars checks provisioning job status and returns its submitted inputs
+// and output artifacts from the same AAP job response.
+func (p *AAPProvider) GetProvisionStatusWithExtraVars(ctx context.Context, resource client.Object, jobID string) (ProvisionStatusWithExtraVars, error) {
+	job, err := p.client.GetJob(ctx, jobID)
+	if err != nil {
+		return ProvisionStatusWithExtraVars{}, fmt.Errorf("failed to get job: %w", err)
+	}
+
+	status := ProvisionStatusWithExtraVars{ProvisionStatus: provisionStatusFromAAPJob(ctx, jobID, job)}
+	if status.State != v1alpha1.JobStateSucceeded {
+		return status, nil
+	}
+	if strings.TrimSpace(job.ExtraVars) != "" {
+		if err := json.Unmarshal([]byte(job.ExtraVars), &status.InputExtraVars); err != nil {
+			// Avoid including the input or decoder error in the returned message. AAP inputs can
+			// contain secrets for unrelated provisioning jobs.
+			return status, fmt.Errorf("failed to decode AAP job input variables for job %s", jobID)
+		}
+	}
+	if len(job.Artifacts) == 0 {
+		return status, nil
+	}
+	if err := json.Unmarshal(job.Artifacts, &status.ExtraVars); err != nil {
+		return status, fmt.Errorf("failed to decode AAP job artifacts for job %s: %w", jobID, err)
+	}
+	return status, nil
 }
 
 // TriggerDeprovision attempts to start deprovisioning for a resource.
@@ -193,9 +234,23 @@ func (p *AAPProvider) isReadyForDeprovision(ctx context.Context, resource client
 		if !errors.As(err, &methodNotAllowedErr) {
 			return false, &status, fmt.Errorf("failed to cancel provision job: %w", err)
 		}
-		// 405 means already terminal, proceed
-		log.Info("job cancel returned 405 (already terminal), ready to deprovision", "jobID", latestProvisionJob.JobID)
-		return true, &status, nil
+		// The job may have completed after the status read above. Confirm its
+		// current state before allowing cleanup to overlap a still-running job.
+		status, err = p.GetProvisionStatus(ctx, resource, latestProvisionJob.JobID)
+		if err != nil {
+			var notFoundErr *aap.NotFoundError
+			if errors.As(err, &notFoundErr) {
+				log.Info("AAP job disappeared after cancel returned 405, ready to deprovision", "jobID", latestProvisionJob.JobID)
+				return true, nil, nil
+			}
+			return false, nil, fmt.Errorf("failed to confirm provision job status after cancel: %w", err)
+		}
+		if status.State.IsTerminal() {
+			log.Info("job cancel returned 405 and job is terminal, ready to deprovision", "jobID", latestProvisionJob.JobID, "state", status.State)
+			return true, &status, nil
+		}
+		log.Info("job cancel returned 405 but job remains active, waiting before deprovision", "jobID", latestProvisionJob.JobID, "state", status.State)
+		return false, &status, nil
 	}
 
 	// Cancellation initiated - need to wait, return current status for CR update
@@ -230,20 +285,21 @@ func (p *AAPProvider) launchDeprovisionJob(ctx context.Context, resource client.
 	if err != nil {
 		return "", err
 	}
-	return p.launchTemplate(ctx, templateName, resource)
+	return p.launchTemplate(ctx, templateName, resource, nil)
 }
 
 // launchTemplate launches the named template (job or workflow) and returns the job ID.
-func (p *AAPProvider) launchTemplate(ctx context.Context, templateName string, resource client.Object) (string, error) {
+func (p *AAPProvider) launchTemplate(ctx context.Context, templateName string, resource client.Object, inheritedExtraVars map[string]any) (string, error) {
 	template, err := p.client.GetTemplate(ctx, templateName)
 	if err != nil {
 		return "", fmt.Errorf("failed to get template: %w", err)
 	}
-
-	extraVars, err := extractExtraVars(ctx, resource)
+	extraVars, err := p.extractExtraVars(ctx, resource)
 	if err != nil {
 		return "", fmt.Errorf("failed to extract extra vars: %w", err)
 	}
+	extraVars = mergeExtraVars(extraVars, inheritedExtraVars)
+	sensitive := adminKubeconfigInExtraVars(extraVars)
 
 	var jobID int
 	switch template.Type {
@@ -252,6 +308,7 @@ func (p *AAPProvider) launchTemplate(ctx context.Context, templateName string, r
 			TemplateID:   template.ID,
 			TemplateName: templateName,
 			ExtraVars:    extraVars,
+			Sensitive:    sensitive,
 		})
 		if err != nil {
 			return "", fmt.Errorf("failed to launch job template: %w", err)
@@ -262,6 +319,7 @@ func (p *AAPProvider) launchTemplate(ctx context.Context, templateName string, r
 			TemplateID:   template.ID,
 			TemplateName: templateName,
 			ExtraVars:    extraVars,
+			Sensitive:    sensitive,
 		})
 		if err != nil {
 			return "", fmt.Errorf("failed to launch workflow template: %w", err)
@@ -272,6 +330,63 @@ func (p *AAPProvider) launchTemplate(ctx context.Context, templateName string, r
 	}
 
 	return strconv.Itoa(jobID), nil
+}
+
+func adminKubeconfigInExtraVars(extraVars map[string]any) bool {
+	jobVars, ok := extraVars["osac_job_vars"].(map[string]any)
+	if !ok {
+		return false
+	}
+	_, ok = jobVars["admin_kubeconfig"]
+	return ok
+}
+
+func mergeExtraVars(extraVars, inheritedExtraVars map[string]any) map[string]any {
+	if len(inheritedExtraVars) == 0 {
+		return extraVars
+	}
+
+	merged := make(map[string]any)
+	for key, value := range extraVars {
+		merged[key] = value
+	}
+	for key, value := range inheritedExtraVars {
+		merged[key] = value
+	}
+	return merged
+}
+
+// extractExtraVars adds provider-wide tenant CSI configuration to the common
+// resource payload without exposing client credentials.
+func (p *AAPProvider) extractExtraVars(ctx context.Context, resource client.Object) (map[string]any, error) {
+	extraVars, err := extractExtraVars(ctx, resource)
+	if err != nil {
+		return nil, err
+	}
+	for key, value := range AAPExtraVarsFromContext(ctx) {
+		if key == "osac_job_vars" {
+			continue
+		}
+		extraVars[key] = value
+	}
+	if p.fulfillmentEndpoint == "" {
+		return extraVars, nil
+	}
+
+	jobVars := extraVars["osac_job_vars"].(map[string]any)
+	jobVars["fulfillment_endpoint"] = p.fulfillmentEndpoint
+	jobVars["fulfillment_issuer_url"] = p.fulfillmentIssuerURL
+	return extraVars, nil
+}
+
+// GetDeprovisionStatusWithExtraVars returns status, submitted inputs, and artifacts from an AAP
+// deprovisioning job.
+func (p *AAPProvider) GetDeprovisionStatusWithExtraVars(
+	ctx context.Context,
+	resource client.Object,
+	jobID string,
+) (ProvisionStatusWithExtraVars, error) {
+	return p.GetProvisionStatusWithExtraVars(ctx, resource, jobID)
 }
 
 // GetDeprovisionStatus checks deprovisioning job status via AAP API.
@@ -291,6 +406,10 @@ func (p *AAPProvider) getJobStatus(ctx context.Context, jobID string) (Provision
 		return ProvisionStatus{}, fmt.Errorf("failed to get job: %w", err)
 	}
 
+	return provisionStatusFromAAPJob(ctx, jobID, job), nil
+}
+
+func provisionStatusFromAAPJob(ctx context.Context, jobID string, job *aap.Job) ProvisionStatus {
 	status := ProvisionStatus{
 		JobID:     jobID,
 		State:     mapAAPStatusToJobState(job.Status),
@@ -298,13 +417,18 @@ func (p *AAPProvider) getJobStatus(ctx context.Context, jobID string) (Provision
 		StartTime: job.Started,
 		EndTime:   job.Finished,
 	}
+	if len(job.Artifacts) > 0 {
+		if err := json.Unmarshal(job.Artifacts, &status.Outputs); err != nil {
+			ctrllog.FromContext(ctx).Error(err, "AAP job returned non-object artifacts", "jobID", jobID)
+		}
+	}
 
 	// Populate error details if job failed
 	if status.State == v1alpha1.JobStateFailed && job.ResultTraceback != "" {
 		status.ErrorDetails = job.ResultTraceback
 	}
 
-	return status, nil
+	return status
 }
 
 // mapAAPStatusToJobState converts AAP job status to JobState.
@@ -353,6 +477,9 @@ func extractExtraVars(ctx context.Context, resource client.Object) (map[string]a
 	if kc := AdminKubeconfigFromContext(ctx); kc != "" {
 		vars["admin_kubeconfig"] = kc
 	}
+	if name := AddOnOperatorNameFromContext(ctx); name != "" {
+		vars["addon_operator_name"] = strings.ReplaceAll(name, "-", "_")
+	}
 
 	if tiers := StorageTierDefinitionsFromContext(ctx); len(tiers) > 0 {
 		vars["storage_tier_definitions"] = tierDefinitionsToExtraVars(tiers)
@@ -369,6 +496,19 @@ func extractExtraVars(ctx context.Context, resource client.Object) (map[string]a
 	return map[string]any{
 		"osac_job_vars": vars,
 	}, nil
+}
+
+// JobVars returns the osac_job_vars of a job for resource: the serialized
+// resource plus the job inputs carried by ctx (tenant storage classes, storage
+// tier definitions and backend connections). Controllers that launch their jobs
+// through the network task engine use it to build the same input the AAP
+// provider sends.
+func JobVars(ctx context.Context, resource client.Object) (map[string]any, error) {
+	extraVars, err := extractExtraVars(ctx, resource)
+	if err != nil {
+		return nil, err
+	}
+	return extraVars["osac_job_vars"].(map[string]any), nil
 }
 
 // tierDefinitionsToExtraVars converts tier definitions to the AAP-schema-shaped map

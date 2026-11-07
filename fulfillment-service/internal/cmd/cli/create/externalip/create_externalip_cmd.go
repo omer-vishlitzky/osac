@@ -20,11 +20,12 @@ import (
 	"github.com/spf13/cobra"
 	"google.golang.org/protobuf/proto"
 
-	publicv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/public/v1"
+	"github.com/osac-project/osac/fulfillment-service/internal/cmd/cli/create/metautil"
 	"github.com/osac-project/osac/fulfillment-service/internal/cmd/cli/lookup"
 	"github.com/osac-project/osac/fulfillment-service/internal/config"
 	"github.com/osac-project/osac/fulfillment-service/internal/logging"
 	"github.com/osac-project/osac/fulfillment-service/internal/terminal"
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
 
 func Cmd() *cobra.Command {
@@ -101,10 +102,7 @@ func (c *runnerContext) run(cmd *cobra.Command, args []string) error {
 	client := publicv1.NewExternalIPsClient(conn)
 
 	externalIP := publicv1.ExternalIP_builder{
-		Metadata: publicv1.Metadata_builder{
-			Name:   c.args.name,
-			Tenant: c.settings.Tenant(),
-		}.Build(),
+		Metadata: metautil.ForCreate(ctx, c.args.name).Build(),
 		Spec: publicv1.ExternalIPSpec_builder{
 			Pool: &publicv1.ExternalIPPoolReference{Id: pool.GetId()},
 		}.Build(),

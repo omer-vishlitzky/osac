@@ -15,7 +15,6 @@ package login
 
 import (
 	"context"
-	"crypto/x509"
 	"embed"
 	"fmt"
 	"log/slog"
@@ -30,7 +29,6 @@ import (
 	"google.golang.org/grpc"
 	healthv1 "google.golang.org/grpc/health/grpc_health_v1"
 
-	publicv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/public/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
 	"github.com/osac-project/osac/fulfillment-service/internal/config"
 	"github.com/osac-project/osac/fulfillment-service/internal/exit"
@@ -38,6 +36,8 @@ import (
 	"github.com/osac-project/osac/fulfillment-service/internal/network"
 	"github.com/osac-project/osac/fulfillment-service/internal/oauth"
 	"github.com/osac-project/osac/fulfillment-service/internal/terminal"
+	"github.com/osac-project/osac/fulfillment-service/internal/trust"
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
 
 //go:embed templates
@@ -244,7 +244,7 @@ type runnerContext struct {
 	flags      *pflag.FlagSet
 	address    string
 	plaintext  bool
-	caPool     *x509.CertPool
+	caPool     *trust.CertPool
 	tokenStore auth.TokenStore
 	args       struct {
 		plaintext        bool
@@ -348,7 +348,7 @@ func (c *runnerContext) run(cmd *cobra.Command, args []string) error {
 	}
 
 	// Create the CA pool:
-	c.caPool, err = network.NewCertPool().
+	c.caPool, err = trust.NewCertPool().
 		SetLogger(c.logger).
 		AddSystemFiles(true).
 		AddKubernetesFiles(true).

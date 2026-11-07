@@ -20,7 +20,7 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
 var _ = Describe("ApplySpecDefaults", func() {
@@ -465,7 +465,7 @@ var _ = Describe("ValidateRequiredSpecFields", func() {
 				SizeGib:     proto.Int32(20),
 				StorageTier: privatev1.StorageTierReference_builder{Name: "standard"}.Build(),
 			}.Build(),
-			AdditionalDisks: []*privatev1.ComputeInstanceDisk{
+			AdditionalDisks: privatev1.ComputeInstanceDiskList_builder{Items: []*privatev1.ComputeInstanceDisk{
 				privatev1.ComputeInstanceDisk_builder{
 					SizeGib:     proto.Int32(100),
 					StorageTier: privatev1.StorageTierReference_builder{Name: "standard"}.Build(),
@@ -474,7 +474,7 @@ var _ = Describe("ValidateRequiredSpecFields", func() {
 					SizeGib:     proto.Int32(200),
 					StorageTier: privatev1.StorageTierReference_builder{Name: ""}.Build(),
 				}.Build(),
-			},
+			}}.Build(),
 			RunStrategy: privatev1.ComputeInstanceRunStrategy_COMPUTE_INSTANCE_RUN_STRATEGY_ALWAYS.Enum(),
 		}.Build()
 
@@ -493,7 +493,7 @@ var _ = Describe("ValidateRequiredSpecFields", func() {
 				SizeGib:     proto.Int32(20),
 				StorageTier: privatev1.StorageTierReference_builder{Name: "standard"}.Build(),
 			}.Build(),
-			AdditionalDisks: []*privatev1.ComputeInstanceDisk{
+			AdditionalDisks: privatev1.ComputeInstanceDiskList_builder{Items: []*privatev1.ComputeInstanceDisk{
 				privatev1.ComputeInstanceDisk_builder{
 					SizeGib:     proto.Int32(100),
 					StorageTier: privatev1.StorageTierReference_builder{Name: "standard"}.Build(),
@@ -501,7 +501,7 @@ var _ = Describe("ValidateRequiredSpecFields", func() {
 				privatev1.ComputeInstanceDisk_builder{
 					SizeGib: proto.Int32(200),
 				}.Build(),
-			},
+			}}.Build(),
 			RunStrategy: privatev1.ComputeInstanceRunStrategy_COMPUTE_INSTANCE_RUN_STRATEGY_ALWAYS.Enum(),
 		}.Build()
 

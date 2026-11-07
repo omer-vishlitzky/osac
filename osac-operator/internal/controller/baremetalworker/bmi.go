@@ -1,0 +1,287 @@
+// Copyright (c) 2026 Red Hat Inc.
+// SPDX-License-Identifier: Apache-2.0
+
+package baremetalworker
+
+import (
+	"context"
+	"errors"
+	"fmt"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
+	ctrl "sigs.k8s.io/controller-runtime"
+	ctrllog "sigs.k8s.io/controller-runtime/pkg/log"
+
+	"github.com/osac-project/osac/osac-operator/api/v1alpha1"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
+)
+
+type bmiState struct {
+	bmi    *privatev1.BareMetalInstance
+	absent bool
+}
+
+const (
+	systemBMITemplateID = "osac.templates.bm_host_provisioning"
+)
+
+// errBMICreateRejected marks a BMI Create the fulfillment service definitively
+// rejected with a terminal gRPC status code and a server-side rollback: no BMI
+// record was persisted for the attempt. The underlying error and its status
+// code remain reachable through wrapping.
+var errBMICreateRejected = errors.New("BMI create rejected")
+
+// isDefinitiveCreateRejection reports whether err is a terminal fulfillment
+// rejection of a BMI Create: the server refused the request and rolled back its
+// transaction, so no BMI can exist for the attempt. Transport-class failures
+// (Unavailable, DeadlineExceeded, Canceled) and unknown outcomes (Unknown,
+// Internal, DataLoss) stay conservative — absence is never inferred from them.
+func isDefinitiveCreateRejection(err error) bool {
+	switch status.Code(err) {
+	case codes.InvalidArgument,
+		codes.NotFound,
+		codes.FailedPrecondition,
+		codes.PermissionDenied,
+		codes.ResourceExhausted,
+		codes.OutOfRange,
+		codes.Unimplemented:
+		return true
+	default:
+		return false
+	}
+}
+
+// ensureBMI creates a single BareMetalInstance, handling the AlreadyExists race by re-listing.
+// Returns the BMI, a non-zero result on unavailability backoff, or an error.
+// A successful create is not written back into the invocation's observation:
+// the caller persists the returned identity and the next invocation re-observes.
+func (r *Reconciler) ensureBMI(
+	ctx context.Context, co *v1alpha1.ClusterOrder, cluster *privatev1.Cluster, nodeSet v1alpha1.NodeRequest,
+	workerName string, image *privatev1.DiskImageReference, ignitionRaw, filter string,
+) (*privatev1.BareMetalInstance, ctrl.Result, error) {
+	// The worker lives in its cluster's project and records its cluster in status.cluster.
+	req, err := r.buildBMICreateRequest(co, cluster.GetMetadata().GetTenant(), cluster, nodeSet, workerName, image, ignitionRaw)
+	if err != nil {
+		return nil, ctrl.Result{}, err
+	}
+	created, err := r.fulfillment.CreateBareMetalInstance(ctx, req)
+	if err == nil {
+		return created, ctrl.Result{}, nil
+	}
+
+	if st, ok := status.FromError(err); ok && st.Code() == codes.AlreadyExists {
+		bmi, listErr := r.findBMIByName(ctx, co, cluster.GetMetadata().GetTenant(), filter, workerName)
+		if listErr != nil {
+			return nil, ctrl.Result{}, listErr
+		}
+		return bmi, ctrl.Result{}, nil
+	}
+
+	if isDefinitiveCreateRejection(err) {
+		return nil, ctrl.Result{}, fmt.Errorf("%w: creating BMI %s: %w", errBMICreateRejected, workerName, err)
+	}
+
+	return nil, ctrl.Result{}, fmt.Errorf("creating BMI %s: %w", workerName, err)
+}
+
+// findBMIByName re-lists BMIs and returns the one matching the given name.
+func (r *Reconciler) findBMIByName(ctx context.Context, co *v1alpha1.ClusterOrder, tenant, filter, name string) (*privatev1.BareMetalInstance, error) {
+	ctrllog.FromContext(ctx).Info("BMI create returned AlreadyExists, re-listing", "name", name)
+	refreshed, err := r.fulfillment.ListBareMetalInstances(ctx, filter)
+	if err != nil {
+		return nil, fmt.Errorf("re-listing BMIs after AlreadyExists: %w", err)
+	}
+	indexed := indexWorkerBMIs(refreshed)
+	bmi, err := indexed.exactOwnedName(co, tenant, name)
+	if err != nil {
+		return nil, r.rejectWorkerIdentity(co, err.Error())
+	}
+	if bmi != nil {
+		// AlreadyExists is a recovery hint, not permission to adopt a stale
+		// List snapshot. Verify this incarnation's current ownership/liveness.
+		id := bmi.GetId()
+		bmi, err = r.fulfillment.GetBareMetalInstance(ctx, id)
+		if err != nil {
+			return nil, fmt.Errorf("verifying recovered BMI %s: %w", name, err)
+		}
+		ref := v1alpha1.WorkerStatus{BareMetalInstance: v1alpha1.BareMetalInstanceReference{Name: name, ID: id}}
+		if err := checkRecordedWorkerBMI(co, tenant, ref, bmi); err != nil {
+			return nil, r.rejectWorkerIdentity(co, err.Error())
+		}
+		if err := checkBMIRecoveryCandidate(bmi); err != nil {
+			return nil, err
+		}
+		return bmi, nil
+	}
+	return nil, fmt.Errorf("BMI %s returned AlreadyExists but not found in re-list", name)
+}
+
+func (r *Reconciler) buildBMICreateRequest(
+	co *v1alpha1.ClusterOrder, tenant string, cluster *privatev1.Cluster, nodeSet v1alpha1.NodeRequest,
+	workerName string, image *privatev1.DiskImageReference, ignitionRaw string,
+) (*privatev1.BareMetalInstance, error) {
+	labels := map[string]string{clusterOrderLabel: co.Name}
+	annotations := map[string]string{ownerReferenceAnnotation: fmt.Sprintf("ClusterOrder/%s", co.Name)}
+
+	var netAttachments []*privatev1.BareMetalNetworkAttachment
+	if na := co.Spec.NetworkAttachment; na != nil && na.SubnetRef != "" {
+		if nodeSet.FabricInterface == "" {
+			return nil, fmt.Errorf("node request %q has no stored fabric interface for network attachment", nodeSet.NodeSet)
+		}
+		fabricInterface := nodeSet.FabricInterface
+		sgRefs := make([]*privatev1.SecurityGroupLocalReference, 0, len(na.SecurityGroupRefs))
+		for _, sg := range na.SecurityGroupRefs {
+			sgRefs = append(sgRefs, privatev1.SecurityGroupLocalReference_builder{Name: sg}.Build())
+		}
+		primary := true
+		netAttachments = []*privatev1.BareMetalNetworkAttachment{
+			privatev1.BareMetalNetworkAttachment_builder{
+				Subnet:         privatev1.SubnetLocalReference_builder{Name: na.SubnetRef}.Build(),
+				SecurityGroups: sgRefs,
+				Interface:      &fabricInterface,
+				Primary:        &primary,
+			}.Build(),
+		}
+	}
+
+	var instanceType *privatev1.BareMetalInstanceTypeReference
+	if nodeSet.BareMetal.InstanceType != "" {
+		instanceType = privatev1.BareMetalInstanceTypeReference_builder{
+			Name: nodeSet.BareMetal.InstanceType, Shared: true,
+		}.Build()
+	}
+
+	specBuilder := privatev1.BareMetalInstanceSpec_builder{
+		Template: privatev1.BareMetalInstanceTemplateReference_builder{
+			Id: systemBMITemplateID, Shared: true,
+		}.Build(),
+		DiskImage:          image,
+		UserDataSource:     privatev1.UserDataSource_builder{Inline: &ignitionRaw}.Build(),
+		InstanceType:       instanceType,
+		NetworkAttachments: netAttachments,
+	}
+	// The child BMI carries the Cluster's canonical Secret reference, never
+	// key bytes. Cloning preserves a non-default project selector.
+	if clusterKey := cluster.GetSpec().GetSshKey(); clusterKey.GetId() != "" {
+		specBuilder.SshKey = proto.Clone(clusterKey).(*privatev1.SecretReference)
+	}
+
+	return privatev1.BareMetalInstance_builder{
+		Metadata: privatev1.Metadata_builder{
+			Tenant:      tenant,
+			Project:     cluster.GetMetadata().GetProject(),
+			Name:        workerName,
+			Labels:      labels,
+			Annotations: annotations,
+		}.Build(),
+		Spec: specBuilder.Build(),
+		Status: privatev1.BareMetalInstanceStatus_builder{
+			Cluster: privatev1.ClusterLocalReference_builder{
+				Id: cluster.GetId(),
+			}.Build(),
+			NodeSet: &nodeSet.NodeSet,
+		}.Build(),
+	}.Build(), nil
+}
+
+func (r *Reconciler) resolveNodeSetInstanceType(
+	ctx context.Context, co *v1alpha1.ClusterOrder, instanceTypeName string,
+) (*privatev1.BareMetalInstanceType, ctrl.Result, error) {
+	it, err := r.fulfillment.GetBareMetalInstanceType(ctx, instanceTypeName)
+	if err != nil {
+		if status.Code(err) == codes.NotFound {
+			ctrllog.FromContext(ctx).Info("BareMetalInstanceType not found, requeuing", "instanceType", instanceTypeName)
+			return nil, ctrl.Result{RequeueAfter: infraEnvRequeueInterval}, nil
+		}
+		return nil, ctrl.Result{}, fmt.Errorf("getting BareMetalInstanceType %s: %w", instanceTypeName, err)
+	}
+	if it == nil {
+		ctrllog.FromContext(ctx).Info("BareMetalInstanceType is empty, requeuing", "instanceType", instanceTypeName)
+		return nil, ctrl.Result{RequeueAfter: infraEnvRequeueInterval}, nil
+	}
+	return it, ctrl.Result{}, nil
+}
+
+// checkBMIRecoveryCandidate applies only to creation/name recovery. Existing
+// recorded IDs and finalization still need to observe deleting resources.
+func checkBMIRecoveryCandidate(bmi *privatev1.BareMetalInstance) error {
+	if bmiDeleting(bmi) {
+		return fmt.Errorf("BMI %s is deleting; cannot recover a created worker", bmi.GetId())
+	}
+	return nil
+}
+
+// verifyRecordedBMI checks owned identities even in protected lifecycle states.
+// List omission requires one memoized authoritative Get. Unknown ownership is
+// an error, not the old independent best-effort existence probe's permission to
+// continue. Neither this lookup nor reconcileBMI persists status.
+func (r *Reconciler) verifyRecordedBMI(ctx context.Context, co *v1alpha1.ClusterOrder, tenant string, w v1alpha1.WorkerStatus, o *workerObservation) (bmiState, error) {
+	if w.BareMetalInstance.ID == "" {
+		bmi, err := o.exactOwnedName(co, tenant, w.BareMetalInstance.Name)
+		if err != nil {
+			return bmiState{}, r.rejectWorkerIdentity(co, err.Error())
+		}
+		if bmi != nil && co.DeletionTimestamp.IsZero() && eligibleForBMIRecovery(w) {
+			if err := checkBMIRecoveryCandidate(bmi); err != nil {
+				return bmiState{}, err
+			}
+		}
+		return bmiState{bmi: bmi}, nil
+	}
+	bmi, err := o.getBMI(ctx, r.fulfillment, w.BareMetalInstance.ID)
+	if status.Code(err) == codes.NotFound {
+		return bmiState{absent: true}, nil
+	}
+	if err != nil {
+		return bmiState{}, fmt.Errorf("checking worker BMI %s: %w", w.BareMetalInstance.ID, err)
+	}
+	if err := checkRecordedWorkerBMI(co, tenant, w, bmi); err != nil {
+		return bmiState{}, r.rejectWorkerIdentity(co, err.Error())
+	}
+	return bmiState{bmi: bmi}, nil
+}
+
+// reconcileBMI is one worker's identity decision. Nil removes only an active
+// slot with confirmed absence; protected states stay owned by retry/teardown.
+func reconcileBMI(w v1alpha1.WorkerStatus, state bmiState) *v1alpha1.WorkerStatus {
+	if state.absent && eligibleForBMIAbsence(w) {
+		return nil
+	}
+	if eligibleForBMIRecovery(w) && state.bmi != nil {
+		w.BareMetalInstance.ID = state.bmi.GetId()
+		if w.Phase == workerPhaseProvisioning {
+			workerCreated(&w, w.BareMetalInstance.Name, state.bmi.GetId())
+		}
+	}
+	return &w
+}
+
+func eligibleForBMIRecovery(w v1alpha1.WorkerStatus) bool {
+	return w.Kind == workerKindBMI && w.BareMetalInstance.ID == "" && w.Phase != workerPhaseUnbinding && w.Phase != workerPhaseDeleting && (w.Phase != workerPhaseFailed || w.NextRetryTime == nil)
+}
+
+func eligibleForBMIAbsence(w v1alpha1.WorkerStatus) bool {
+	return w.Kind == workerKindBMI && w.BareMetalInstance.ID != "" && w.Phase != workerPhaseFailed && w.Phase != workerPhaseUnbinding && w.Phase != workerPhaseDeleting
+}
+
+func bmiDeleting(bmi *privatev1.BareMetalInstance) bool {
+	return bmi.GetMetadata().GetDeletionTimestamp() != nil || bmi.GetStatus().GetState() == privatev1.BareMetalInstanceState_BARE_METAL_INSTANCE_STATE_DELETING
+}
+
+// Only a fresh Get NotFound proves recorded-incarnation absence. List omission,
+// deleting state, Delete success and lookup failures never release the identity.
+func (r *Reconciler) readCleanupBMI(ctx context.Context, co *v1alpha1.ClusterOrder, tenant string, w v1alpha1.WorkerStatus) (bmiState, error) {
+	bmi, err := r.fulfillment.GetBareMetalInstance(ctx, w.BareMetalInstance.ID)
+	if status.Code(err) == codes.NotFound {
+		return bmiState{absent: true}, nil
+	}
+	if err != nil {
+		return bmiState{}, err
+	}
+	if err := checkRecordedWorkerBMI(co, tenant, w, bmi); err != nil {
+		return bmiState{}, r.rejectWorkerIdentity(co, err.Error())
+	}
+	return bmiState{bmi: bmi}, nil
+}

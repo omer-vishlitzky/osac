@@ -21,11 +21,11 @@ import (
 	grpcstatus "google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
-	publicv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/public/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
 	"github.com/osac-project/osac/fulfillment-service/internal/collections"
 	"github.com/osac-project/osac/fulfillment-service/internal/database/dao"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
 
 var _ = Describe("Tenancy logic", func() {
@@ -53,6 +53,8 @@ var _ = Describe("Tenancy logic", func() {
 		}
 		createTenant("my-tenant")
 		createTenant("your-tenant")
+		seedReadyDefaultNetworking("my-tenant", 0)
+		seedReadyDefaultNetworking("your-tenant", 0)
 
 		// Create a default cluster version for version resolution:
 		seedClusterVersion(ctx, privatev1.ClusterVersion_builder{
@@ -69,6 +71,21 @@ var _ = Describe("Tenancy logic", func() {
 				State:     privatev1.ClusterVersionState_CLUSTER_VERSION_STATE_ACTIVE,
 			}.Build(),
 		}.Build())
+		instanceTypesDao, err := dao.NewGenericDAO[*privatev1.BareMetalInstanceType]().
+			SetLogger(logger).SetTenancyLogic(tenancy).Build()
+		Expect(err).ToNot(HaveOccurred())
+		_, err = instanceTypesDao.Create().SetObject(privatev1.BareMetalInstanceType_builder{
+			Id:       "worker-bmit",
+			Metadata: privatev1.Metadata_builder{Name: "worker-bmit", Tenant: auth.SharedTenant}.Build(),
+			Spec: privatev1.BareMetalInstanceTypeSpec_builder{
+				Hardware: privatev1.BareMetalHardwareSpec_builder{
+					NetworkPorts: []*privatev1.BareMetalNetworkPortSpec{
+						privatev1.BareMetalNetworkPortSpec_builder{Name: "data-0", Role: "fabric"}.Build(),
+					},
+				}.Build(),
+			}.Build(),
+		}.Build()).Do(ctx)
+		Expect(err).ToNot(HaveOccurred())
 	})
 
 	It("Returns tenant in metadata when object is created", func() {
@@ -128,6 +145,9 @@ var _ = Describe("Tenancy logic", func() {
 					}.Build(),
 					Spec: publicv1.ClusterSpec_builder{
 						Template: publicv1.ClusterTemplateReference_builder{Id: "my-template"}.Build(),
+						NodeSets: map[string]*publicv1.ClusterNodeSet{"workers": publicv1.ClusterNodeSet_builder{
+							Size: proto.Int32(2), BaremetalInstanceType: publicv1.BareMetalInstanceTypeReference_builder{Id: "worker-bmit", Shared: true}.Build(),
+						}.Build()},
 					}.Build(),
 				}.Build(),
 			}.Build(),
@@ -264,6 +284,7 @@ var _ = Describe("Tenancy logic", func() {
 				}.Build(),
 				Spec: publicv1.ClusterSpec_builder{
 					Template: publicv1.ClusterTemplateReference_builder{Id: "my-template"}.Build(),
+					NodeSets: map[string]*publicv1.ClusterNodeSet{"workers": publicv1.ClusterNodeSet_builder{Size: proto.Int32(2), BaremetalInstanceType: publicv1.BareMetalInstanceTypeReference_builder{Id: "worker-bmit", Shared: true}.Build()}.Build()},
 				}.Build(),
 			}.Build(),
 		}.Build())
@@ -330,6 +351,7 @@ var _ = Describe("Tenancy logic", func() {
 				}.Build(),
 				Spec: publicv1.ClusterSpec_builder{
 					Template: publicv1.ClusterTemplateReference_builder{Id: "my-template"}.Build(),
+					NodeSets: map[string]*publicv1.ClusterNodeSet{"workers": publicv1.ClusterNodeSet_builder{Size: proto.Int32(2), BaremetalInstanceType: publicv1.BareMetalInstanceTypeReference_builder{Id: "worker-bmit", Shared: true}.Build()}.Build()},
 				}.Build(),
 			}.Build(),
 		}.Build())
@@ -391,6 +413,9 @@ var _ = Describe("Tenancy logic", func() {
 				}.Build(),
 				Spec: publicv1.ClusterSpec_builder{
 					Template: publicv1.ClusterTemplateReference_builder{Id: "my-template"}.Build(),
+					NodeSets: map[string]*publicv1.ClusterNodeSet{"compute": publicv1.ClusterNodeSet_builder{
+						Size: proto.Int32(2), BaremetalInstanceType: publicv1.BareMetalInstanceTypeReference_builder{Id: "worker-bmit", Shared: true}.Build(),
+					}.Build()},
 				}.Build(),
 			}.Build(),
 		}.Build())
@@ -462,6 +487,7 @@ var _ = Describe("Tenancy logic", func() {
 				}.Build(),
 				Spec: publicv1.ClusterSpec_builder{
 					Template: publicv1.ClusterTemplateReference_builder{Id: "my-template"}.Build(),
+					NodeSets: map[string]*publicv1.ClusterNodeSet{"compute": publicv1.ClusterNodeSet_builder{Size: proto.Int32(2), BaremetalInstanceType: publicv1.BareMetalInstanceTypeReference_builder{Id: "worker-bmit", Shared: true}.Build()}.Build()},
 				}.Build(),
 			}.Build(),
 		}.Build())
@@ -475,8 +501,8 @@ var _ = Describe("Tenancy logic", func() {
 				Spec: publicv1.ClusterSpec_builder{
 					NodeSets: map[string]*publicv1.ClusterNodeSet{
 						"compute": publicv1.ClusterNodeSet_builder{
-							HostType: publicv1.HostTypeReference_builder{Id: "acme_1tib"}.Build(),
-							Size:     proto.Int32(4),
+							BaremetalInstanceType: publicv1.BareMetalInstanceTypeReference_builder{Id: "worker-bmit", Shared: true}.Build(),
+							Size:                  proto.Int32(4),
 						}.Build(),
 					},
 				}.Build(),
@@ -546,7 +572,7 @@ var _ = Describe("Tenancy logic", func() {
 		status, ok := grpcstatus.FromError(err)
 		Expect(ok).To(BeTrue())
 		Expect(status.Code()).To(Equal(grpccodes.PermissionDenied))
-		Expect(status.Message()).To(Equal("tenant 'your-tenant' doesn't exist"))
+		Expect(status.Message()).To(Equal("you are not authorized to use the specified tenant"))
 	})
 
 	It("Rejects object creation when tenant is visible to the user, but doesn't exist in the database", func() {
@@ -570,7 +596,7 @@ var _ = Describe("Tenancy logic", func() {
 			Build()
 		Expect(err).ToNot(HaveOccurred())
 
-		// Create the template using the DAO:
+		// Use a shared Template so dependency scope is valid and creation reaches the nonexistent-tenant check.
 		templatesDao, err := dao.NewGenericDAO[*privatev1.ClusterTemplate]().
 			SetLogger(logger).
 			SetTenancyLogic(tenancy).
@@ -584,7 +610,7 @@ var _ = Describe("Tenancy logic", func() {
 					Description: "My template",
 					Metadata: privatev1.Metadata_builder{
 						Name:   "test-template",
-						Tenant: "my-tenant",
+						Tenant: auth.SharedTenant,
 					}.Build(),
 				}.Build(),
 			).
@@ -600,6 +626,7 @@ var _ = Describe("Tenancy logic", func() {
 				}.Build(),
 				Spec: publicv1.ClusterSpec_builder{
 					Template: publicv1.ClusterTemplateReference_builder{Id: "my-template"}.Build(),
+					NodeSets: map[string]*publicv1.ClusterNodeSet{"workers": publicv1.ClusterNodeSet_builder{Size: proto.Int32(2), BaremetalInstanceType: publicv1.BareMetalInstanceTypeReference_builder{Id: "worker-bmit", Shared: true}.Build()}.Build()},
 				}.Build(),
 			}.Build(),
 		}.Build())

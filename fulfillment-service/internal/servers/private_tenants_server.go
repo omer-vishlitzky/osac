@@ -15,11 +15,9 @@ package servers
 
 import (
 	"context"
-	"crypto/rand"
 	"errors"
 	"fmt"
 	"log/slog"
-	"math/big"
 	"strconv"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -28,21 +26,19 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protoreflect"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
 	"github.com/osac-project/osac/fulfillment-service/internal/database"
 	"github.com/osac-project/osac/fulfillment-service/internal/database/dao"
-	"github.com/osac-project/osac/fulfillment-service/internal/events"
+	"github.com/osac-project/osac/fulfillment-service/internal/password"
 	"github.com/osac-project/osac/fulfillment-service/internal/references"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
 type PrivateTenantsServerBuilder struct {
 	logger            *slog.Logger
-	notifier          events.Notifier
 	attributionLogic  auth.AttributionLogic
 	tenancyLogic      auth.TenancyLogic
 	metricsRegisterer prometheus.Registerer
-	defaultNetworking *DefaultNetworkingProvisioner
 	filterDesc        protoreflect.MessageDescriptor
 }
 
@@ -50,11 +46,11 @@ var _ privatev1.TenantsServer = (*PrivateTenantsServer)(nil)
 
 type PrivateTenantsServer struct {
 	privatev1.UnimplementedTenantsServer
-	logger            *slog.Logger
-	generic           *GenericServer[*privatev1.Tenant]
-	dao               *dao.GenericDAO[*privatev1.Tenant]
-	secretsDao        *dao.GenericDAO[*privatev1.Secret]
-	defaultNetworking *DefaultNetworkingProvisioner
+	logger     *slog.Logger
+	generic    *GenericServer[*privatev1.Tenant]
+	dao        *dao.GenericDAO[*privatev1.Tenant]
+	secretsDao *dao.GenericDAO[*privatev1.Secret]
+	guards     *networkingGuards
 }
 
 func NewPrivateTenantsServer() *PrivateTenantsServerBuilder {
@@ -63,11 +59,6 @@ func NewPrivateTenantsServer() *PrivateTenantsServerBuilder {
 
 func (b *PrivateTenantsServerBuilder) SetLogger(value *slog.Logger) *PrivateTenantsServerBuilder {
 	b.logger = value
-	return b
-}
-
-func (b *PrivateTenantsServerBuilder) SetNotifier(value events.Notifier) *PrivateTenantsServerBuilder {
-	b.notifier = value
 	return b
 }
 
@@ -85,11 +76,6 @@ func (b *PrivateTenantsServerBuilder) SetTenancyLogic(value auth.TenancyLogic) *
 // access objects. This is optional. If not set, no metrics will be recorded.
 func (b *PrivateTenantsServerBuilder) SetMetricsRegisterer(value prometheus.Registerer) *PrivateTenantsServerBuilder {
 	b.metricsRegisterer = value
-	return b
-}
-
-func (b *PrivateTenantsServerBuilder) SetDefaultNetworkingProvisioner(value *DefaultNetworkingProvisioner) *PrivateTenantsServerBuilder {
-	b.defaultNetworking = value
 	return b
 }
 
@@ -116,7 +102,6 @@ func (b *PrivateTenantsServerBuilder) Build() (result *PrivateTenantsServer, err
 		SetLogger(b.logger).
 		SetService(privatev1.Tenants_ServiceDesc.ServiceName).
 		SetTableName("tenants").
-		SetNotifier(b.notifier).
 		SetAttributionLogic(b.attributionLogic).
 		SetTenancyLogic(b.tenancyLogic).
 		SetMetricsRegisterer(b.metricsRegisterer).
@@ -147,12 +132,16 @@ func (b *PrivateTenantsServerBuilder) Build() (result *PrivateTenantsServer, err
 	}
 
 	// Create and populate the object:
+	guards, err := newNetworkingGuards(b.logger)
+	if err != nil {
+		return
+	}
 	result = &PrivateTenantsServer{
-		logger:            b.logger,
-		generic:           generic,
-		dao:               tenantsDao,
-		secretsDao:        secretsDao,
-		defaultNetworking: b.defaultNetworking,
+		guards:     guards,
+		logger:     b.logger,
+		generic:    generic,
+		dao:        tenantsDao,
+		secretsDao: secretsDao,
 	}
 	return
 }
@@ -217,7 +206,7 @@ func (s *PrivateTenantsServer) Create(ctx context.Context,
 	// Only generate break-glass credentials when the caller did NOT supply a secret reference.
 	// When a reference is provided the reconciler reads the password from the Secret directly.
 	if object.GetSpec().GetBreakGlassCredentialsSecret() == nil {
-		password, genErr := generatePassword()
+		pw, genErr := password.Generate()
 		if genErr != nil {
 			err = grpcstatus.Errorf(grpccodes.Internal, "failed to generate break-glass password: %v", genErr)
 			return
@@ -227,7 +216,7 @@ func (s *PrivateTenantsServer) Create(ctx context.Context,
 		}
 		creds := privatev1.BreakGlassCredentials_builder{
 			Username: fmt.Sprintf("%s-osac-break-glass", name),
-			Password: password,
+			Password: pw,
 		}.Build()
 		object.GetStatus().SetBreakGlassCredentials(creds)
 	}
@@ -237,17 +226,6 @@ func (s *PrivateTenantsServer) Create(ctx context.Context,
 	err = s.generic.Create(ctx, request, &response)
 	if err != nil {
 		return
-	}
-
-	if s.defaultNetworking != nil {
-		if provisionErr := s.defaultNetworking.Provision(ctx, name); provisionErr != nil {
-			s.logger.ErrorContext(ctx, "Failed to provision default networking",
-				slog.String("tenant", name),
-				slog.Any("error", provisionErr))
-			err = grpcstatus.Errorf(grpccodes.Internal,
-				"failed to provision default networking resources")
-			return
-		}
 	}
 
 	return
@@ -279,6 +257,10 @@ func (s *PrivateTenantsServer) Update(ctx context.Context,
 
 func (s *PrivateTenantsServer) Delete(ctx context.Context,
 	request *privatev1.TenantsDeleteRequest) (response *privatev1.TenantsDeleteResponse, err error) {
+	// Lock the Tenant, so the guard and the creates in the tenant, which lock it too, run one after the other.
+	if err = s.rejectDeleteWhileResourcesExist(ctx, request.GetId()); err != nil {
+		return
+	}
 	getResponse, getErr := s.dao.Get().SetId(request.GetId()).Do(ctx)
 	// Delete the break-glass secret before generic.Delete so its project and
 	// tenant FKs cannot deadlock teardown (projects cannot be removed while
@@ -298,20 +280,6 @@ func (s *PrivateTenantsServer) Signal(ctx context.Context,
 	request *privatev1.TenantsSignalRequest) (response *privatev1.TenantsSignalResponse, err error) {
 	err = s.generic.Signal(ctx, request, &response)
 	return
-}
-
-func generatePassword() (string, error) {
-	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%"
-	const length = 24
-	b := make([]byte, length)
-	for i := range b {
-		n, err := rand.Int(rand.Reader, big.NewInt(int64(len(charset))))
-		if err != nil {
-			return "", err
-		}
-		b[i] = charset[n.Int64()]
-	}
-	return string(b), nil
 }
 
 func stripBreakGlassCredentials(tenant *privatev1.Tenant) {
@@ -456,6 +424,10 @@ func (s *PrivateTenantsServer) validateBreakGlassCredentialsSecret(ctx context.C
 		return grpcstatus.Errorf(grpccodes.InvalidArgument,
 			"shared secrets cannot be used as break_glass_credentials_secret references")
 	}
+	if err := validateResolvedSecretType(ctx, s.logger, s.secretsDao, ref, resolved,
+		"break_glass_credentials_secret", privatev1.SecretType_SECRET_TYPE_OPAQUE); err != nil {
+		return err
+	}
 	resolvedRef := &privatev1.SecretLocalReference{}
 	resolvedRef.SetId(resolved.ID)
 	resolvedRef.SetName(resolved.Name)
@@ -474,3 +446,57 @@ func (s *PrivateTenantsServer) validateBreakGlassCredentialsSecret(ctx context.C
 // - At least two labels (CEL: min_two_labels, checks for '.')
 // - Valid DNS labels (CEL: valid_dns_labels, validates each segment)
 // - No duplicates (unique: true)
+
+// rejectDeleteWhileResourcesExist locks the Tenant record and rejects its delete while any workload, or any networking
+// resource without the default label, exists in the tenant. The default networking resources are deleted by the tenant
+// reconciler after the delete is accepted.
+func (s *PrivateTenantsServer) rejectDeleteWhileResourcesExist(ctx context.Context, tenant string) error {
+	locked, err := lockRecord(ctx, s.guards.tenants, tenant)
+	if err != nil {
+		if grpcstatus.Code(err) == grpccodes.NotFound {
+			return grpcstatus.Errorf(grpccodes.NotFound, "tenant '%s' not found", tenant)
+		}
+		return err
+	}
+	if deleteAlreadyAccepted(locked.GetMetadata()) {
+		return nil
+	}
+	nonDefault := fmt.Sprintf(`this.metadata.tenant == %q && this.metadata.labels["%s"] != "true"`, tenant, defaultLabel)
+	inTenant := fmt.Sprintf(`this.metadata.tenant == %q`, tenant)
+	checks := []struct {
+		kind  string
+		count func() (int, string, error)
+	}{
+		{"ComputeInstance", func() (int, string, error) { return countRecords(ctx, s.guards.computeInstances, inTenant) }},
+		{"BareMetalInstance", func() (int, string, error) {
+			return countRecords(ctx, s.guards.bareMetalInstances, inTenant)
+		}},
+		{"Cluster", func() (int, string, error) { return countRecords(ctx, s.guards.clusters, inTenant) }},
+		{"ExternalIPAttachment", func() (int, string, error) {
+			return countRecords(ctx, s.guards.externalIPAttachments, nonDefault)
+		}},
+		{"NATGateway", func() (int, string, error) { return countRecords(ctx, s.guards.natGateways, nonDefault) }},
+		{"ExternalIP", func() (int, string, error) { return countRecords(ctx, s.guards.externalIPs, nonDefault) }},
+		{"FabricDomain", func() (int, string, error) { return countRecords(ctx, s.guards.fabricDomains, inTenant) }},
+		{"SecurityGroup", func() (int, string, error) {
+			return countRecords(ctx, s.guards.securityGroups, nonDefault)
+		}},
+		{"Subnet", func() (int, string, error) { return countRecords(ctx, s.guards.subnets, nonDefault) }},
+		{"VirtualNetwork", func() (int, string, error) {
+			return countRecords(ctx, s.guards.virtualNetworks, nonDefault)
+		}},
+	}
+	for _, check := range checks {
+		count, firstID, err := check.count()
+		if err != nil {
+			s.logger.ErrorContext(ctx, "Failed to check tenant resources", slog.Any("error", err))
+			return grpcstatus.Errorf(grpccodes.Internal, "failed to check the resources of tenant '%s'", tenant)
+		}
+		if count > 0 {
+			return grpcstatus.Errorf(grpccodes.FailedPrecondition,
+				"cannot delete tenant '%s': %d %s resource(s) still exist (including '%s')",
+				tenant, count, check.kind, firstID)
+		}
+	}
+	return nil
+}

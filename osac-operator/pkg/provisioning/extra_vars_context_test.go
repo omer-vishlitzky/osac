@@ -38,6 +38,18 @@ var _ = Describe("ExtraVarsContext", func() {
 		})
 	})
 
+	Describe("AddOnOperatorName", func() {
+		It("should round-trip an operator name", func() {
+			ctx := provisioning.WithAddOnOperatorName(context.Background(), "cert-manager")
+
+			Expect(provisioning.AddOnOperatorNameFromContext(ctx)).To(Equal("cert-manager"))
+		})
+
+		It("should return empty string from a context without an operator name", func() {
+			Expect(provisioning.AddOnOperatorNameFromContext(context.Background())).To(BeEmpty())
+		})
+	})
+
 	Describe("StorageTierDefinitions", func() {
 		It("should round-trip tier definitions", func() {
 			ctx := context.Background()
@@ -85,6 +97,34 @@ var _ = Describe("ExtraVarsContext", func() {
 			result := provisioning.StorageBackendConnectionsFromContext(ctx)
 
 			Expect(result).To(BeNil())
+		})
+	})
+
+	Describe("NetworkAttachmentMACs", func() {
+		It("should round-trip subnet to MAC mappings", func() {
+			macs := map[string]string{"subnet-1": "02:00:00:00:00:01"}
+			ctx := provisioning.WithNetworkAttachmentMACs(context.Background(), macs)
+
+			Expect(provisioning.NetworkAttachmentMACsFromContext(ctx)).To(Equal(macs))
+		})
+
+		It("should return nil when no mappings are set", func() {
+			Expect(provisioning.NetworkAttachmentMACsFromContext(context.Background())).To(BeNil())
+		})
+	})
+
+	Describe("AAPExtraVars", func() {
+		It("should round-trip additional top-level AAP variables", func() {
+			vars := map[string]any{
+				"ansible_eda": map[string]any{"event": map[string]any{"payload": map[string]any{"kind": "ServerCluster"}}},
+			}
+			ctx := provisioning.WithAAPExtraVars(context.Background(), vars)
+
+			Expect(provisioning.AAPExtraVarsFromContext(ctx)).To(Equal(vars))
+		})
+
+		It("should return nil when no extra variables are set", func() {
+			Expect(provisioning.AAPExtraVarsFromContext(context.Background())).To(BeNil())
 		})
 	})
 })

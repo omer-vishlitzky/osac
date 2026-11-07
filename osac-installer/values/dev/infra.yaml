@@ -21,3 +21,10 @@ caIssuer:
   enabled: true
 keycloak:
   enabled: true
+kafka:
+  enabled: true
+
+# --- Bundled OpenBao ---
+bundledVault:
+  enabled: true
+  keycloakIssuerUrl: "https://keycloak.example.com/realms/osac"

@@ -27,11 +27,11 @@ import (
 	"google.golang.org/protobuf/types/known/wrapperspb"
 	crclient "sigs.k8s.io/controller-runtime/pkg/client"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
-	publicv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/public/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/kubernetes/labels"
 	"github.com/osac-project/osac/fulfillment-service/internal/uuid"
 	osacv1alpha1 "github.com/osac-project/osac/osac-operator/api/v1alpha1"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
 
 // dockerConfigJSON is a representative (fake) container registry pull secret payload.
@@ -39,12 +39,12 @@ const dockerConfigJSON = `{"auths":{"registry.example.com":{"auth":"dGVzdDp0ZXN0
 
 var _ = Describe("Cluster pull_secret_secret", Label("secrets", "cluster"), func() {
 	var (
-		ctx             context.Context
-		clustersClient  publicv1.ClustersClient
-		secretsClient   publicv1.SecretsClient
-		hostTypesClient privatev1.HostTypesClient
-		templatesClient privatev1.ClusterTemplatesClient
-		hostTypeId      string
+		ctx                 context.Context
+		clustersClient      publicv1.ClustersClient
+		secretsClient       publicv1.SecretsClient
+		instanceTypesClient privatev1.BareMetalInstanceTypesClient
+		templatesClient     privatev1.ClusterTemplatesClient
+		bmitName            string
 
 		makeAny = func(value proto.Message) *anypb.Any {
 			result, err := anypb.New(value)
@@ -60,6 +60,7 @@ var _ = Describe("Cluster pull_secret_secret", Label("secrets", "cluster"), func
 		name = fmt.Sprintf("pull-secret-%s", uuid.New()[24:32])
 		response, err := secretsClient.Create(ctx, publicv1.SecretsCreateRequest_builder{
 			Object: publicv1.Secret_builder{
+				Type: publicv1.SecretType_SECRET_TYPE_PULL_SECRET,
 				Metadata: publicv1.Metadata_builder{
 					Name: name,
 				}.Build(),
@@ -74,10 +75,28 @@ var _ = Describe("Cluster pull_secret_secret", Label("secrets", "cluster"), func
 		return id, name
 	}
 
-	// createTemplate creates a cluster template with a single required node set. When defaults is
-	// non-nil it is attached as the template's spec_defaults.
+	// createOpaqueSecret creates a valid secret which cannot be used as a cluster pull secret.
+	createOpaqueSecret := func(ctx context.Context) (id, name string) {
+		name = fmt.Sprintf("opaque-secret-%s", uuid.New()[24:32])
+		response, err := secretsClient.Create(ctx, publicv1.SecretsCreateRequest_builder{
+			Object: publicv1.Secret_builder{
+				Type: publicv1.SecretType_SECRET_TYPE_OPAQUE,
+				Metadata: publicv1.Metadata_builder{
+					Name: name,
+				}.Build(),
+			}.Build(),
+		}.Build())
+		Expect(err).ToNot(HaveOccurred())
+		id = response.GetObject().GetId()
+		DeferCleanup(func(ctx context.Context) {
+			_, _ = secretsClient.Delete(ctx, publicv1.SecretsDeleteRequest_builder{Id: id}.Build())
+		})
+		return id, name
+	}
+
+	// createTemplate creates a cluster template with provisioning defaults but no hardware selection.
 	createTemplate := func(ctx context.Context, defaults *privatev1.ClusterTemplateSpecDefaults) string {
-		templateId := fmt.Sprintf("my_template_%s", uuid.New())
+		templateId := newTemplateID("my_template")
 		_, err := templatesClient.Create(ctx, privatev1.ClusterTemplatesCreateRequest_builder{
 			Object: privatev1.ClusterTemplate_builder{
 				Id:          templateId,
@@ -93,12 +112,6 @@ var _ = Describe("Cluster pull_secret_secret", Label("secrets", "cluster"), func
 						Title:       "My required parameter",
 						Description: "My required parameter.",
 						Required:    true,
-					}.Build(),
-				},
-				NodeSets: map[string]*privatev1.ClusterTemplateNodeSet{
-					"my_node_set": privatev1.ClusterTemplateNodeSet_builder{
-						HostType: privatev1.HostTypeReference_builder{Id: hostTypeId}.Build(),
-						Size:     3,
 					}.Build(),
 				},
 				SpecDefaults: defaults,
@@ -136,18 +149,36 @@ var _ = Describe("Cluster pull_secret_secret", Label("secrets", "cluster"), func
 
 	BeforeEach(func() {
 		ctx = context.Background()
+		ensureTenantDefaultNetworkingFixture(ctx, usersGroup, "")
 
 		clustersClient = publicv1.NewClustersClient(tool.ExternalView().UserConn())
 		secretsClient = publicv1.NewSecretsClient(tool.ExternalView().UserConn())
-		hostTypesClient = privatev1.NewHostTypesClient(tool.InternalView().AdminConn())
+		instanceTypesClient = privatev1.NewBareMetalInstanceTypesClient(tool.InternalView().AdminConn())
 		templatesClient = privatev1.NewClusterTemplatesClient(tool.InternalView().AdminConn())
 
-		hostTypeId = fmt.Sprintf("my_host_type_%s", uuid.New())
-		_, err := hostTypesClient.Create(ctx, privatev1.HostTypesCreateRequest_builder{
-			Object: privatev1.HostType_builder{
-				Id: hostTypeId,
+		bmitName = fmt.Sprintf("test-bmit-%s", uuid.New()[24:32])
+		_, err := instanceTypesClient.Create(ctx, privatev1.BareMetalInstanceTypesCreateRequest_builder{
+			Object: privatev1.BareMetalInstanceType_builder{
+				Id: bmitName,
 				Metadata: privatev1.Metadata_builder{
-					Name: fmt.Sprintf("test-ht-%s", uuid.New()[24:32]),
+					Name: bmitName,
+				}.Build(),
+				Spec: privatev1.BareMetalInstanceTypeSpec_builder{
+					Hardware: privatev1.BareMetalHardwareSpec_builder{
+						Cpu:    privatev1.BareMetalCPUSpec_builder{Cores: 32, Architecture: "amd64", ThreadsPerCore: 2}.Build(),
+						Memory: privatev1.BareMetalMemorySpec_builder{TotalGb: 128}.Build(),
+						NetworkPorts: []*privatev1.BareMetalNetworkPortSpec{
+							privatev1.BareMetalNetworkPortSpec_builder{
+								Name:  "eth0",
+								Role:  "fabric",
+								Type:  "Ethernet",
+								Speed: "10Gbps",
+							}.Build(),
+						},
+					}.Build(),
+					HostLabelSelector: privatev1.BareMetalLabelSelector_builder{
+						MatchLabels: map[string]string{"hardware.profile": "compute"},
+					}.Build(),
 				}.Build(),
 			}.Build(),
 		}.Build())
@@ -165,6 +196,9 @@ var _ = Describe("Cluster pull_secret_secret", Label("secrets", "cluster"), func
 				}.Build(),
 				Spec: publicv1.ClusterSpec_builder{
 					Template: publicv1.ClusterTemplateReference_builder{Id: templateId}.Build(),
+					NodeSets: map[string]*publicv1.ClusterNodeSet{"workers": publicv1.ClusterNodeSet_builder{
+						Size: proto.Int32(2), BaremetalInstanceType: publicv1.BareMetalInstanceTypeReference_builder{Id: bmitName, Shared: true}.Build(),
+					}.Build()},
 					TemplateParameters: map[string]*anypb.Any{
 						"my": makeAny(wrapperspb.String("my_value")),
 					},
@@ -193,6 +227,9 @@ var _ = Describe("Cluster pull_secret_secret", Label("secrets", "cluster"), func
 				}.Build(),
 				Spec: publicv1.ClusterSpec_builder{
 					Template: publicv1.ClusterTemplateReference_builder{Id: templateId}.Build(),
+					NodeSets: map[string]*publicv1.ClusterNodeSet{"workers": publicv1.ClusterNodeSet_builder{
+						Size: proto.Int32(2), BaremetalInstanceType: publicv1.BareMetalInstanceTypeReference_builder{Id: bmitName, Shared: true}.Build(),
+					}.Build()},
 					TemplateParameters: map[string]*anypb.Any{
 						"my": makeAny(wrapperspb.String("my_value")),
 					},
@@ -220,6 +257,9 @@ var _ = Describe("Cluster pull_secret_secret", Label("secrets", "cluster"), func
 				}.Build(),
 				Spec: publicv1.ClusterSpec_builder{
 					Template: publicv1.ClusterTemplateReference_builder{Id: templateId}.Build(),
+					NodeSets: map[string]*publicv1.ClusterNodeSet{"workers": publicv1.ClusterNodeSet_builder{
+						Size: proto.Int32(2), BaremetalInstanceType: publicv1.BareMetalInstanceTypeReference_builder{Id: bmitName, Shared: true}.Build(),
+					}.Build()},
 					TemplateParameters: map[string]*anypb.Any{
 						"my": makeAny(wrapperspb.String("my_value")),
 					},
@@ -235,19 +275,22 @@ var _ = Describe("Cluster pull_secret_secret", Label("secrets", "cluster"), func
 		Expect(status.Code()).To(Equal(grpccodes.InvalidArgument))
 	})
 
-	It("Reports SecretResolutionFailed and creates no ClusterOrder when the secret lacks .dockerconfigjson", func() {
-		// The secret exists (so create-time existence validation passes) but has the wrong shape,
-		// so the reconciler fails to resolve it.
-		secretId, _ := createSecret(ctx, map[string][]byte{"wrong-key": []byte("nope")})
+	It("Rejects pull_secret_secret with an incompatible secret type", func() {
+		// Typed-secret validation prevents malformed pull secrets from being created. Use a
+		// valid opaque secret to exercise the cluster API's reference type validation.
+		secretId, _ := createOpaqueSecret(ctx)
 		templateId := createTemplate(ctx, nil)
 
-		response, err := clustersClient.Create(ctx, publicv1.ClustersCreateRequest_builder{
+		_, err := clustersClient.Create(ctx, publicv1.ClustersCreateRequest_builder{
 			Object: publicv1.Cluster_builder{
 				Metadata: publicv1.Metadata_builder{
 					Name: fmt.Sprintf("test-cluster-%s", uuid.New()[24:32]),
 				}.Build(),
 				Spec: publicv1.ClusterSpec_builder{
 					Template: publicv1.ClusterTemplateReference_builder{Id: templateId}.Build(),
+					NodeSets: map[string]*publicv1.ClusterNodeSet{"workers": publicv1.ClusterNodeSet_builder{
+						Size: proto.Int32(2), BaremetalInstanceType: publicv1.BareMetalInstanceTypeReference_builder{Id: bmitName, Shared: true}.Build(),
+					}.Build()},
 					TemplateParameters: map[string]*anypb.Any{
 						"my": makeAny(wrapperspb.String("my_value")),
 					},
@@ -255,48 +298,12 @@ var _ = Describe("Cluster pull_secret_secret", Label("secrets", "cluster"), func
 				}.Build(),
 			}.Build(),
 		}.Build())
-		Expect(err).ToNot(HaveOccurred())
-		clusterId := response.GetObject().GetId()
-		DeferCleanup(func(ctx context.Context) {
-			_, _ = clustersClient.Delete(ctx, publicv1.ClustersDeleteRequest_builder{Id: clusterId}.Build())
-		})
-
-		// The cluster should report the resolution failure on its PROGRESSING condition.
-		Eventually(
-			func(g Gomega) {
-				getResponse, err := clustersClient.Get(ctx, publicv1.ClustersGetRequest_builder{
-					Id: clusterId,
-				}.Build())
-				g.Expect(err).ToNot(HaveOccurred())
-				var progressing *publicv1.ClusterCondition
-				for _, condition := range getResponse.GetObject().GetStatus().GetConditions() {
-					if condition.GetType() == publicv1.ClusterConditionType_CLUSTER_CONDITION_TYPE_PROGRESSING {
-						progressing = condition
-						break
-					}
-				}
-				g.Expect(progressing).ToNot(BeNil())
-				g.Expect(progressing.GetStatus()).To(Equal(publicv1.ConditionStatus_CONDITION_STATUS_FALSE))
-				g.Expect(progressing.GetReason()).To(Equal("SecretResolutionFailed"))
-			},
-			time.Minute,
-			time.Second,
-		).Should(Succeed())
-
-		// No ClusterOrder should be created while the pull secret cannot be resolved.
-		kubeClient := tool.KubeClient()
-		Consistently(
-			func(g Gomega) {
-				clusterOrderList := &osacv1alpha1.ClusterOrderList{}
-				err := kubeClient.List(ctx, clusterOrderList, crclient.MatchingLabels{
-					labels.ClusterOrderUuid: clusterId,
-				})
-				g.Expect(err).ToNot(HaveOccurred())
-				g.Expect(clusterOrderList.Items).To(BeEmpty())
-			},
-			10*time.Second,
-			time.Second,
-		).Should(Succeed())
+		Expect(err).To(HaveOccurred())
+		status, ok := grpcstatus.FromError(err)
+		Expect(ok).To(BeTrue())
+		Expect(status.Code()).To(Equal(grpccodes.InvalidArgument))
+		Expect(status.Message()).To(ContainSubstring("SECRET_TYPE_OPAQUE"))
+		Expect(status.Message()).To(ContainSubstring("SECRET_TYPE_PULL_SECRET"))
 	})
 
 	It("Propagates a template default pull_secret_secret into the ClusterOrder", func() {
@@ -313,6 +320,9 @@ var _ = Describe("Cluster pull_secret_secret", Label("secrets", "cluster"), func
 				}.Build(),
 				Spec: publicv1.ClusterSpec_builder{
 					Template: publicv1.ClusterTemplateReference_builder{Id: templateId}.Build(),
+					NodeSets: map[string]*publicv1.ClusterNodeSet{"workers": publicv1.ClusterNodeSet_builder{
+						Size: proto.Int32(2), BaremetalInstanceType: publicv1.BareMetalInstanceTypeReference_builder{Id: bmitName, Shared: true}.Build(),
+					}.Build()},
 					TemplateParameters: map[string]*anypb.Any{
 						"my": makeAny(wrapperspb.String("my_value")),
 					},
@@ -346,6 +356,9 @@ var _ = Describe("Cluster pull_secret_secret", Label("secrets", "cluster"), func
 				}.Build(),
 				Spec: publicv1.ClusterSpec_builder{
 					Template: publicv1.ClusterTemplateReference_builder{Id: templateId}.Build(),
+					NodeSets: map[string]*publicv1.ClusterNodeSet{"workers": publicv1.ClusterNodeSet_builder{
+						Size: proto.Int32(2), BaremetalInstanceType: publicv1.BareMetalInstanceTypeReference_builder{Id: bmitName, Shared: true}.Build(),
+					}.Build()},
 					TemplateParameters: map[string]*anypb.Any{
 						"my": makeAny(wrapperspb.String("my_value")),
 					},

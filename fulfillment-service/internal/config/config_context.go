@@ -15,6 +15,8 @@ package config
 
 import (
 	"context"
+
+	"github.com/osac-project/osac/fulfillment-service/internal/packages"
 )
 
 // contextKey is the type used to store the settings in the context.
@@ -23,6 +25,7 @@ type contextKey int
 const (
 	contextSettingsKey contextKey = iota
 	contextTenantKey
+	contextProjectKey
 )
 
 // SettingsFromContext returns the settings from the context. It panics if the given context doesn't contain settings.
@@ -32,6 +35,23 @@ func SettingsFromContext(ctx context.Context) *Settings {
 		panic("failed to get settings from context")
 	}
 	return settings
+}
+
+// TrySettingsFromContext returns the settings from the context if they are present, or nil if not.
+func TrySettingsFromContext(ctx context.Context) *Settings {
+	settings, _ := ctx.Value(contextSettingsKey).(*Settings)
+	return settings
+}
+
+// PackageNamesFromContext returns the active package names from the context, falling back to the public packages
+// when the settings are not available (for example, before login or during tests).
+func PackageNamesFromContext(ctx context.Context) []string {
+	if ctx != nil {
+		if cfg := TrySettingsFromContext(ctx); cfg != nil {
+			return cfg.PackageNames()
+		}
+	}
+	return packages.Public
 }
 
 // SettingsIntoContext creates a new context that contains the given settings.
@@ -48,4 +68,15 @@ func TenantFromContext(ctx context.Context) string {
 // TenantIntoContext creates a new context that contains the given tenant.
 func TenantIntoContext(ctx context.Context, tenant string) context.Context {
 	return context.WithValue(ctx, contextTenantKey, tenant)
+}
+
+// ProjectFromContext returns the resolved project from the context. Returns an empty string if no project is set.
+func ProjectFromContext(ctx context.Context) string {
+	v, _ := ctx.Value(contextProjectKey).(string)
+	return v
+}
+
+// ProjectIntoContext creates a new context that contains the given project.
+func ProjectIntoContext(ctx context.Context, project string) context.Context {
+	return context.WithValue(ctx, contextProjectKey, project)
 }

@@ -30,6 +30,8 @@ const (
 	storageTierDefinitionsKey
 	storageBackendConnectionsKey
 	networkAttachmentMACsKey
+	aapExtraVarsKey
+	addOnOperatorNameKey
 )
 
 // TierDefinition is the flat, AAP-schema-shaped representation of a storage tier
@@ -86,6 +88,19 @@ func AdminKubeconfigFromContext(ctx context.Context) string {
 	return kc
 }
 
+// WithAddOnOperatorName returns a context carrying the operator role name for
+// an add-on installation AAP job.
+func WithAddOnOperatorName(ctx context.Context, name string) context.Context {
+	return context.WithValue(ctx, addOnOperatorNameKey, name)
+}
+
+// AddOnOperatorNameFromContext retrieves the operator role name for an
+// add-on installation AAP job, or an empty string if it is not set.
+func AddOnOperatorNameFromContext(ctx context.Context) string {
+	name, _ := ctx.Value(addOnOperatorNameKey).(string)
+	return name
+}
+
 // WithStorageTierDefinitions returns a context carrying the resolved storage tier
 // definitions. The AAP provider reads this when building extra_vars.
 func WithStorageTierDefinitions(ctx context.Context, tiers []TierDefinition) context.Context {
@@ -113,16 +128,27 @@ func StorageBackendConnectionsFromContext(ctx context.Context) map[string]Backen
 	return conns
 }
 
-// WithNetworkAttachmentMACs returns a context carrying the subnet-ref → MAC-address
-// map for a resource's network attachments. The AAP provider reads this when building
-// extra_vars so the query_dhcp_lease role can match a DHCP lease by MAC.
+// WithNetworkAttachmentMACs carries the subnet-ref to MAC-address map used by
+// the bare-metal IP discovery provider when building AAP extra_vars.
 func WithNetworkAttachmentMACs(ctx context.Context, macs map[string]string) context.Context {
 	return context.WithValue(ctx, networkAttachmentMACsKey, macs)
 }
 
-// NetworkAttachmentMACsFromContext retrieves the subnet-ref → MAC-address map from the
-// context, or nil if not set.
+// NetworkAttachmentMACsFromContext retrieves the network attachment MAC map,
+// or nil when it was not set.
 func NetworkAttachmentMACsFromContext(ctx context.Context) map[string]string {
 	macs, _ := ctx.Value(networkAttachmentMACsKey).(map[string]string)
 	return macs
+}
+
+// WithAAPExtraVars returns a context carrying additional top-level AAP extra
+// variables. The AAP provider merges these with its standard osac_job_vars.
+func WithAAPExtraVars(ctx context.Context, extraVars map[string]any) context.Context {
+	return context.WithValue(ctx, aapExtraVarsKey, extraVars)
+}
+
+// AAPExtraVarsFromContext retrieves additional top-level AAP extra variables.
+func AAPExtraVarsFromContext(ctx context.Context) map[string]any {
+	extraVars, _ := ctx.Value(aapExtraVarsKey).(map[string]any)
+	return extraVars
 }

@@ -14,6 +14,9 @@
 columns:
 
 - header: NAME
+  value: "has(this.metadata.name) && this.metadata.name != '' ? this.metadata.name : this.id"
+
+- header: ID
   value: this.id
 
 - header: SOURCE_REF
@@ -25,6 +28,7 @@ columns:
 
 - header: ARCHITECTURE
   value: this.spec.architecture
+  type: osac.public.v1.Architecture
 
 - header: LIFECYCLE
   value: this.spec.lifecycle

@@ -14,26 +14,52 @@ language governing permissions and limitations under the License.
 package servers
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"log/slog"
 	"math"
+	"strings"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"google.golang.org/genproto/googleapis/rpc/errdetails"
+	"google.golang.org/grpc"
 	grpccodes "google.golang.org/grpc/codes"
 	grpcstatus "google.golang.org/grpc/status"
+	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
+	"google.golang.org/protobuf/types/known/emptypb"
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
-	"google.golang.org/protobuf/types/known/structpb"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
 	"github.com/osac-project/osac/fulfillment-service/internal/database/dao"
+	"github.com/osac-project/osac/fulfillment-service/internal/references"
 	"github.com/osac-project/osac/fulfillment-service/internal/uuid"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
 func seedClusterVersion(ctx context.Context, cv *privatev1.ClusterVersion) {
+	GinkgoHelper()
+	cv = proto.Clone(cv).(*privatev1.ClusterVersion)
+	if refKey(cv.GetSpec().GetDiskImage()) == "" {
+		cv.GetSpec().SetDiskImage(privatev1.DiskImageReference_builder{Id: "test-disk-image-id"}.Build())
+	}
+	seedClusterVersionObject(ctx, cv)
+}
+
+func seedClusterVersionWithoutDiskImage(ctx context.Context, cv *privatev1.ClusterVersion) {
+	GinkgoHelper()
+	cv = proto.Clone(cv).(*privatev1.ClusterVersion)
+	cv.GetSpec().SetDiskImage(nil)
+	seedClusterVersionObject(ctx, cv)
+}
+
+func seedClusterVersionObject(ctx context.Context, cv *privatev1.ClusterVersion) {
 	GinkgoHelper()
 	cvDao, err := dao.NewGenericDAO[*privatev1.ClusterVersion]().
 		SetLogger(logger).
@@ -44,7 +70,264 @@ func seedClusterVersion(ctx context.Context, cv *privatev1.ClusterVersion) {
 	Expect(err).ToNot(HaveOccurred())
 }
 
+func seedAddOnOperator(ctx context.Context, id, name string, published bool) {
+	GinkgoHelper()
+	seedAddOnOperatorObject(ctx, newTestAddOnOperator(id, name, published))
+}
+
+func newTestAddOnOperator(id, name string, published bool) *privatev1.AddOnOperator {
+	return privatev1.AddOnOperator_builder{
+		Id: id,
+		Metadata: privatev1.Metadata_builder{
+			Name:   name,
+			Tenant: auth.SharedTenant,
+		}.Build(),
+		Title:     name,
+		Published: proto.Bool(published),
+	}.Build()
+}
+
+func seedAddOnOperatorObject(ctx context.Context, object *privatev1.AddOnOperator) {
+	GinkgoHelper()
+	operatorDao, err := dao.NewGenericDAO[*privatev1.AddOnOperator]().
+		SetLogger(logger).
+		SetTenancyLogic(tenancy).
+		Build()
+	Expect(err).ToNot(HaveOccurred())
+	_, err = operatorDao.Create().SetObject(object).Do(ctx)
+	Expect(err).ToNot(HaveOccurred())
+}
+
+type clusterCreator interface {
+	Create(context.Context, *privatev1.ClustersCreateRequest) (*privatev1.ClustersCreateResponse, error)
+}
+
+func createClusterWithAddOnOperators(ctx context.Context, server clusterCreator,
+	operators []*privatev1.AddOnOperatorReference) (*privatev1.Cluster, error) {
+	response, err := server.Create(ctx, privatev1.ClustersCreateRequest_builder{
+		Object: privatev1.Cluster_builder{
+			Metadata: privatev1.Metadata_builder{Name: fmt.Sprintf("test-%s", uuid.New()[24:32])}.Build(),
+			Spec: privatev1.ClusterSpec_builder{
+				Template:       privatev1.ClusterTemplateReference_builder{Id: "my-template-id"}.Build(),
+				AddOnOperators: operators,
+			}.Build(),
+		}.Build(),
+	}.Build())
+	if err != nil {
+		return nil, err
+	}
+	return response.GetObject(), nil
+}
+
+func expectAddOnOperatorFieldViolation(err error, field string) {
+	GinkgoHelper()
+	status, ok := grpcstatus.FromError(err)
+	Expect(ok).To(BeTrue())
+	Expect(status.Code()).To(Equal(grpccodes.InvalidArgument))
+	for _, detail := range status.Details() {
+		badRequest, ok := detail.(*errdetails.BadRequest)
+		if !ok {
+			continue
+		}
+		for _, violation := range badRequest.GetFieldViolations() {
+			if violation.GetField() == field {
+				return
+			}
+		}
+	}
+	Fail(fmt.Sprintf("expected a field violation for %q, got %q", field, status.Message()))
+}
+
+func seedCaaSTestBareMetalInstanceType(
+	ctx context.Context, id, name, tenant string, ports []*privatev1.BareMetalNetworkPortSpec,
+) {
+	GinkgoHelper()
+	bmitDao, err := dao.NewGenericDAO[*privatev1.BareMetalInstanceType]().
+		SetLogger(logger).
+		SetTenancyLogic(tenancy).
+		Build()
+	Expect(err).ToNot(HaveOccurred())
+	_, err = bmitDao.Create().SetObject(privatev1.BareMetalInstanceType_builder{
+		Id: id,
+		Metadata: privatev1.Metadata_builder{
+			Name:   name,
+			Tenant: tenant,
+		}.Build(),
+		Spec: privatev1.BareMetalInstanceTypeSpec_builder{
+			Hardware: privatev1.BareMetalHardwareSpec_builder{NetworkPorts: ports}.Build(),
+		}.Build(),
+	}.Build()).Do(ctx)
+	Expect(err).ToNot(HaveOccurred())
+}
+
+func newCaaSNodeSetCreateRequest(
+	name string,
+	nodeSets map[string]*privatev1.ClusterNodeSet,
+	attachment *privatev1.ClusterNetworkAttachment,
+) *privatev1.ClustersCreateRequest {
+	return privatev1.ClustersCreateRequest_builder{
+		Object: privatev1.Cluster_builder{
+			Metadata: privatev1.Metadata_builder{Name: name}.Build(),
+			Spec: privatev1.ClusterSpec_builder{
+				Template:          privatev1.ClusterTemplateReference_builder{Id: "my-template-id"}.Build(),
+				NodeSets:          nodeSets,
+				NetworkAttachment: attachment,
+			}.Build(),
+			Status: privatev1.ClusterStatus_builder{Hub: "my-hub-id"}.Build(),
+		}.Build(),
+	}.Build()
+}
+
+// clusterCreationFixture supplies explicit Cluster NodeSets for tests of unrelated
+// fields that previously depended on template-supplied hardware. It also runs the
+// reference interceptor for NodeSets, as a gRPC request would before reaching the handler.
+type clusterCreationFixture struct{ *PrivateClustersServer }
+
+func (s *clusterCreationFixture) Create(ctx context.Context, request *privatev1.ClustersCreateRequest) (*privatev1.ClustersCreateResponse, error) {
+	request = proto.Clone(request).(*privatev1.ClustersCreateRequest)
+	if spec := request.GetObject().GetSpec(); spec != nil && spec.GetTemplate() != nil &&
+		spec.GetNodeSets() == nil && spec.GetTemplate().GetId() != "no-bmit-template-id" {
+		spec = request.GetObject().GetSpec()
+		nodeSets := map[string]*privatev1.ClusterNodeSet{
+			"compute": privatev1.ClusterNodeSet_builder{
+				Size: proto.Int32(3), BaremetalInstanceType: privatev1.BareMetalInstanceTypeReference_builder{Id: "acme-bmit-id", Shared: true}.Build(),
+			}.Build(),
+		}
+		if spec.GetTemplate().GetId() == "my-template-id" || spec.GetTemplate().GetName() == "my-template-name" {
+			nodeSets["gpu"] = privatev1.ClusterNodeSet_builder{
+				Size: proto.Int32(1), BaremetalInstanceType: privatev1.BareMetalInstanceTypeReference_builder{Id: "acme-gpu-bmit-id", Shared: true}.Build(),
+			}.Build()
+		}
+		spec.SetNodeSets(nodeSets)
+	}
+	if err := s.resolveNodeSetReferences(ctx, request.GetObject().GetSpec().GetNodeSets()); err != nil {
+		return nil, err
+	}
+	return s.PrivateClustersServer.Create(ctx, request)
+}
+
+func (s *clusterCreationFixture) Update(ctx context.Context, request *privatev1.ClustersUpdateRequest) (*privatev1.ClustersUpdateResponse, error) {
+	request = proto.Clone(request).(*privatev1.ClustersUpdateRequest)
+	if err := s.resolveNodeSetReferences(ctx, request.GetObject().GetSpec().GetNodeSets()); err != nil {
+		return nil, err
+	}
+	return s.PrivateClustersServer.Update(ctx, request)
+}
+
+func (s *clusterCreationFixture) resolveNodeSetReferences(ctx context.Context, nodeSets map[string]*privatev1.ClusterNodeSet) error {
+	request := privatev1.ClustersCreateRequest_builder{
+		Object: privatev1.Cluster_builder{
+			Spec: privatev1.ClusterSpec_builder{NodeSets: nodeSets}.Build(),
+		}.Build(),
+	}.Build()
+	return resolveClusterNodeSetReferencesForTest(ctx, request, privatev1.Clusters_Create_FullMethodName)
+}
+
+// resolveClusterNodeSetReferencesForTest runs the real interceptor on a request
+// containing only NodeSets. Other references remain under their existing handler
+// tests, and Catalog Item defaults are applied later by the handler.
+func resolveClusterNodeSetReferencesForTest(ctx context.Context, request proto.Message, method string) error {
+	validator, err := references.NewReferenceValidator().SetLogger(logger).Build()
+	if err != nil {
+		return err
+	}
+	bmitDao, err := dao.NewGenericDAO[*privatev1.BareMetalInstanceType]().
+		SetLogger(logger).SetTenancyLogic(tenancy).Build()
+	if err != nil {
+		return err
+	}
+	references.RegisterDAOLookup(validator, "osac.private.v1.BareMetalInstanceTypeReference", bmitDao)
+	references.RegisterDAOLookup(validator, "osac.public.v1.BareMetalInstanceTypeReference", bmitDao)
+	clusterVersionsDao, err := dao.NewGenericDAO[*privatev1.ClusterVersion]().
+		SetLogger(logger).SetTenancyLogic(tenancy).Build()
+	if err != nil {
+		return err
+	}
+	references.RegisterDAOLookup(validator, "osac.private.v1.ClusterVersionReference", clusterVersionsDao)
+	references.RegisterDAOLookup(validator, "osac.public.v1.ClusterVersionReference", clusterVersionsDao)
+	_, err = validator.UnaryServer(ctx, request,
+		&grpc.UnaryServerInfo{FullMethod: method},
+		func(context.Context, any) (any, error) { return nil, nil })
+	return err
+}
+
 var _ = Describe("Private clusters server", func() {
+	Describe("node-set validation", func() {
+		It("rejects a cluster without an effective node-set map", func() {
+			cluster := privatev1.Cluster_builder{Spec: privatev1.ClusterSpec_builder{}.Build()}.Build()
+			err := (&PrivateClustersServer{}).resolveClusterNodeSets(ctx, cluster)
+			Expect(grpcstatus.Code(err)).To(Equal(grpccodes.InvalidArgument))
+			Expect(err).To(MatchError(ContainSubstring("at least one node set")))
+		})
+
+		It("validates the resolved node-set map", func() {
+			size := int32(2)
+			valid := map[string]*privatev1.ClusterNodeSet{
+				"workers": privatev1.ClusterNodeSet_builder{
+					Size:                  &size,
+					BaremetalInstanceType: privatev1.BareMetalInstanceTypeReference_builder{Id: "worker"}.Build(),
+				}.Build(),
+			}
+			Expect(validateClusterNodeSetMap(valid)).To(Succeed())
+			Expect(validateClusterNodeSetMap(map[string]*privatev1.ClusterNodeSet{
+				"workers": privatev1.ClusterNodeSet_builder{Size: &size}.Build(),
+			})).To(MatchError("bare metal instance type for node set 'workers' is required"))
+			Expect(validateClusterNodeSetMap(map[string]*privatev1.ClusterNodeSet{
+				"workers": nil,
+			})).To(MatchError("node set 'workers' must not be null"))
+
+			zero := int32(0)
+			Expect(validateClusterNodeSetMap(map[string]*privatev1.ClusterNodeSet{
+				"workers": privatev1.ClusterNodeSet_builder{Size: &zero}.Build(),
+			})).To(MatchError("size for node set 'workers' should be greater than zero, but it is 0"))
+		})
+
+		DescribeTable("accepts valid DNS label node-set names",
+			func(name string) {
+				size := int32(2)
+				Expect(validateClusterNodeSetMap(map[string]*privatev1.ClusterNodeSet{
+					name: privatev1.ClusterNodeSet_builder{
+						Size:                  &size,
+						BaremetalInstanceType: privatev1.BareMetalInstanceTypeReference_builder{Id: "worker"}.Build(),
+					}.Build(),
+				})).To(Succeed())
+			},
+			Entry("simple name", "workers"),
+			Entry("hyphenated name", "my-workers"),
+			Entry("single character", "a"),
+			Entry("name with digits", "worker1"),
+		)
+
+		DescribeTable("rejects invalid node-set names",
+			func(name string) {
+				size := int32(2)
+				Expect(validateClusterNodeSetMap(map[string]*privatev1.ClusterNodeSet{
+					name: privatev1.ClusterNodeSet_builder{
+						Size:                  &size,
+						BaremetalInstanceType: privatev1.BareMetalInstanceTypeReference_builder{Id: "worker"}.Build(),
+					}.Build(),
+				})).To(MatchError(ContainSubstring("node set name '" + name + "' is not a valid DNS label")))
+			},
+			Entry("uppercase", "WORKERS"),
+			Entry("leading hyphen", "-workers"),
+			Entry("trailing hyphen", "workers-"),
+			Entry("underscore", "my_workers"),
+			Entry("empty string", ""),
+			Entry("exceeds 63 characters", "a234567890123456789012345678901234567890123456789012345678901234"),
+		)
+
+		It("validates node-set names via validateNodeSetNames", func() {
+			Expect(validateNodeSetNames(map[string]*privatev1.ClusterNodeSet{
+				"workers": nil,
+			})).To(Succeed())
+			err := validateNodeSetNames(map[string]*privatev1.ClusterNodeSet{
+				"INVALID": nil,
+			})
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("node set name 'INVALID' is not a valid DNS label"))
+		})
+	})
+
 	Describe("Creation", func() {
 		It("Can be built if all the required parameters are set", func() {
 			server, err := NewPrivateClustersServer().
@@ -86,18 +369,19 @@ var _ = Describe("Private clusters server", func() {
 	})
 
 	Describe("Behaviour", func() {
-		var server *PrivateClustersServer
+		var server *clusterCreationFixture
 
 		BeforeEach(func() {
 			var err error
 
 			// Create the server:
-			server, err = NewPrivateClustersServer().
+			privateServer, buildErr := NewPrivateClustersServer().
 				SetLogger(logger).
 				SetAttributionLogic(attribution).
 				SetTenancyLogic(tenancy).
 				Build()
-			Expect(err).ToNot(HaveOccurred())
+			Expect(buildErr).ToNot(HaveOccurred())
+			server = &clusterCreationFixture{PrivateClustersServer: privateServer}
 
 			// Create a default cluster version for version resolution:
 			seedClusterVersion(ctx, privatev1.ClusterVersion_builder{
@@ -115,8 +399,8 @@ var _ = Describe("Private clusters server", func() {
 				}.Build(),
 			}.Build())
 
-			// Create the host types DAO:
-			hostTypesDao, err := dao.NewGenericDAO[*privatev1.HostType]().
+			// Create the bare metal instance types DAO:
+			bmitDao, err := dao.NewGenericDAO[*privatev1.BareMetalInstanceType]().
 				SetLogger(logger).
 				SetTenancyLogic(tenancy).
 				Build()
@@ -129,38 +413,41 @@ var _ = Describe("Private clusters server", func() {
 				Build()
 			Expect(err).ToNot(HaveOccurred())
 
-			// Create the host types:
-			fabricInterfaces := []*privatev1.NetworkInterface{
-				privatev1.NetworkInterface_builder{
-					Name: "data-0", Role: "fabric", Description: "100GbE data interface",
-				}.Build(),
-			}
-			_, err = hostTypesDao.Create().
+			// Create the bare metal instance types (platform-scoped, with a fabric network port
+			// so network attachment specs can resolve a fabric interface):
+			fabricPort := privatev1.BareMetalNetworkPortSpec_builder{
+				Name: "data-0", Role: "fabric", Type: "Ethernet", Speed: "100Gbps",
+			}.Build()
+			_, err = bmitDao.Create().
 				SetObject(
-					privatev1.HostType_builder{
-						Id: "acme-1ti-id",
+					privatev1.BareMetalInstanceType_builder{
+						Id: "acme-bmit-id",
 						Metadata: privatev1.Metadata_builder{
-							Name:   "acme-1ti-name",
-							Tenant: testTenant,
+							Name:   "acme-bmit-name",
+							Tenant: auth.SharedTenant,
 						}.Build(),
-						Title:       "ACME 1TiB",
-						Description: "ACME 1TiB.",
-						Interfaces:  fabricInterfaces,
+						Spec: privatev1.BareMetalInstanceTypeSpec_builder{
+							Hardware: privatev1.BareMetalHardwareSpec_builder{
+								NetworkPorts: []*privatev1.BareMetalNetworkPortSpec{fabricPort},
+							}.Build(),
+						}.Build(),
 					}.Build(),
 				).
 				Do(ctx)
 			Expect(err).ToNot(HaveOccurred())
-			_, err = hostTypesDao.Create().
+			_, err = bmitDao.Create().
 				SetObject(
-					privatev1.HostType_builder{
-						Id: "acme-gpu-id",
+					privatev1.BareMetalInstanceType_builder{
+						Id: "acme-gpu-bmit-id",
 						Metadata: privatev1.Metadata_builder{
 							Name:   "acme-gpu-name",
-							Tenant: testTenant,
+							Tenant: auth.SharedTenant,
 						}.Build(),
-						Title:       "ACME GPU",
-						Description: "ACME GPU.",
-						Interfaces:  fabricInterfaces,
+						Spec: privatev1.BareMetalInstanceTypeSpec_builder{
+							Hardware: privatev1.BareMetalHardwareSpec_builder{
+								NetworkPorts: []*privatev1.BareMetalNetworkPortSpec{fabricPort},
+							}.Build(),
+						}.Build(),
 					}.Build(),
 				).
 				Do(ctx)
@@ -177,22 +464,46 @@ var _ = Describe("Private clusters server", func() {
 						}.Build(),
 						Title:       "My template",
 						Description: "My template",
-						NodeSets: map[string]*privatev1.ClusterTemplateNodeSet{
-							"compute": privatev1.ClusterTemplateNodeSet_builder{
-								HostType: privatev1.HostTypeReference_builder{Id: "acme-1ti-id"}.Build(),
-								Size:     3,
-							}.Build(),
-							"gpu": privatev1.ClusterTemplateNodeSet_builder{
-								HostType: privatev1.HostTypeReference_builder{Id: "acme-gpu-id"}.Build(),
-								Size:     1,
-							}.Build(),
-						},
 					}.Build(),
 				).
 				Do(ctx)
 			Expect(err).ToNot(HaveOccurred())
 
-			// Create a virtual network and subnets for network attachment tests:
+			// Create a second template for missing-node-set cases:
+			_, err = templatesDao.Create().
+				SetObject(
+					privatev1.ClusterTemplate_builder{
+						Id: "no-bmit-template-id",
+						Metadata: privatev1.Metadata_builder{
+							Name:   "no-bmit-template-name",
+							Tenant: testTenant,
+						}.Build(),
+						Title:       "No BMI template",
+						Description: "Template without hardware selections",
+					}.Build(),
+				).
+				Do(ctx)
+			Expect(err).ToNot(HaveOccurred())
+
+			// Create ready networking resources for network attachment tests:
+			networkClassesDao, err := dao.NewGenericDAO[*privatev1.NetworkClass]().
+				SetLogger(logger).
+				SetTenancyLogic(tenancy).
+				Build()
+			Expect(err).ToNot(HaveOccurred())
+			_, err = networkClassesDao.Create().SetObject(privatev1.NetworkClass_builder{
+				Id: "test-network-class",
+				Metadata: privatev1.Metadata_builder{
+					Name:   "test-network-class",
+					Tenant: testTenant,
+				}.Build(),
+				Status: privatev1.NetworkClassStatus_builder{
+					State: privatev1.NetworkClassState_NETWORK_CLASS_STATE_READY,
+					Hub:   "network-hub-a",
+				}.Build(),
+			}.Build()).Do(ctx)
+			Expect(err).ToNot(HaveOccurred())
+
 			vnDao, err := dao.NewGenericDAO[*privatev1.VirtualNetwork]().
 				SetLogger(logger).
 				SetTenancyLogic(tenancy).
@@ -203,6 +514,11 @@ var _ = Describe("Private clusters server", func() {
 				Metadata: privatev1.Metadata_builder{
 					Name:   "test-vnet",
 					Tenant: testTenant,
+				}.Build(),
+				Spec: privatev1.VirtualNetworkSpec_builder{}.Build(),
+				Status: privatev1.VirtualNetworkStatus_builder{
+					State: privatev1.VirtualNetworkState_VIRTUAL_NETWORK_STATE_READY,
+					Hub:   "network-hub-a",
 				}.Build(),
 			}.Build()).Do(ctx)
 			Expect(err).ToNot(HaveOccurred())
@@ -225,6 +541,7 @@ var _ = Describe("Private clusters server", func() {
 					}.Build(),
 					Status: privatev1.SubnetStatus_builder{
 						State: privatev1.SubnetState_SUBNET_STATE_READY,
+						Hub:   "network-hub-a",
 					}.Build(),
 				}.Build()).Do(ctx)
 				Expect(err).ToNot(HaveOccurred())
@@ -246,6 +563,7 @@ var _ = Describe("Private clusters server", func() {
 				}.Build(),
 				Status: privatev1.SecurityGroupStatus_builder{
 					State: privatev1.SecurityGroupState_SECURITY_GROUP_STATE_READY,
+					Hub:   "network-hub-a",
 				}.Build(),
 			}.Build()).Do(ctx)
 			Expect(err).ToNot(HaveOccurred())
@@ -260,6 +578,7 @@ var _ = Describe("Private clusters server", func() {
 				}.Build(),
 				Status: privatev1.SecurityGroupStatus_builder{
 					State: privatev1.SecurityGroupState_SECURITY_GROUP_STATE_READY,
+					Hub:   "network-hub-a",
 				}.Build(),
 			}.Build()).Do(ctx)
 			Expect(err).ToNot(HaveOccurred())
@@ -274,9 +593,13 @@ var _ = Describe("Private clusters server", func() {
 				}.Build(),
 				Status: privatev1.SecurityGroupStatus_builder{
 					State: privatev1.SecurityGroupState_SECURITY_GROUP_STATE_READY,
+					Hub:   "network-hub-a",
 				}.Build(),
 			}.Build()).Do(ctx)
 			Expect(err).ToNot(HaveOccurred())
+
+			// Cluster creates without an explicit attachment resolve the tenant defaults.
+			seedReadyDefaultNetworking(testTenant, 0)
 
 			// Create numbered templates for list tests:
 			for i := range 10 {
@@ -290,17 +613,176 @@ var _ = Describe("Private clusters server", func() {
 								Name:   fmt.Sprintf("my-template-name-%d", i),
 								Tenant: testTenant,
 							}.Build(),
-							NodeSets: map[string]*privatev1.ClusterTemplateNodeSet{
-								"compute": privatev1.ClusterTemplateNodeSet_builder{
-									HostType: privatev1.HostTypeReference_builder{Id: "acme-1ti-id"}.Build(),
-									Size:     3,
-								}.Build(),
-							},
 						}.Build(),
 					).
 					Do(ctx)
 				Expect(err).ToNot(HaveOccurred())
 			}
+
+			seedAddOnOperator(ctx, "operator-1", "operator-one", true)
+			seedAddOnOperator(ctx, "operator-2", "operator-two", true)
+		})
+
+		Describe("Tenant placement", func() {
+			var tenantServer *PrivateClustersServer
+
+			BeforeEach(func() {
+				// Model an administrator explicitly: unlike the suite double, its
+				// default tenant is shared, not testTenant.
+				ctx = auth.ContextWithSubject(ctx, &auth.Subject{User: "admin", Tenants: auth.AllTenants})
+				adminTenancy, err := auth.NewDefaultTenancyLogic().SetLogger(logger).Build()
+				Expect(err).ToNot(HaveOccurred())
+				tenantServer, err = NewPrivateClustersServer().
+					SetLogger(logger).SetAttributionLogic(attribution).SetTenancyLogic(adminTenancy).Build()
+				Expect(err).ToNot(HaveOccurred())
+
+				_, err = tenantServer.templatesDao.Create().SetObject(privatev1.ClusterTemplate_builder{
+					Metadata: privatev1.Metadata_builder{Name: "shared-template", Tenant: auth.SharedTenant}.Build(),
+				}.Build()).Do(ctx)
+				Expect(err).ToNot(HaveOccurred())
+				seedClusterVersion(ctx, privatev1.ClusterVersion_builder{
+					Id:       "shared-version-id",
+					Metadata: privatev1.Metadata_builder{Name: "shared-version", Tenant: auth.SharedTenant}.Build(),
+					Spec: privatev1.ClusterVersionSpec_builder{
+						Version: "4.18.0", Image: "quay.io/openshift-release-dev/ocp-release:4.18.0-multi",
+						Enabled: proto.Bool(true), State: privatev1.ClusterVersionState_CLUSTER_VERSION_STATE_ACTIVE,
+					}.Build(),
+				}.Build())
+				_, err = tenantServer.catalogItemsDao.Create().SetObject(privatev1.ClusterCatalogItem_builder{
+					Metadata:  privatev1.Metadata_builder{Name: "shared-offering", Tenant: auth.SharedTenant}.Build(),
+					Published: true,
+					Template:  privatev1.ClusterTemplateReference_builder{Name: "shared-template", Shared: true}.Build(),
+				}.Build()).Do(ctx)
+				Expect(err).ToNot(HaveOccurred())
+			})
+
+			newRequest := func(tenant string, catalog bool) *privatev1.ClustersCreateRequest {
+				request := newCaaSNodeSetCreateRequest(fmt.Sprintf("tenant-placement-%s", uuid.New()[24:32]),
+					map[string]*privatev1.ClusterNodeSet{
+						"workers": privatev1.ClusterNodeSet_builder{
+							Size: proto.Int32(1),
+							BaremetalInstanceType: privatev1.BareMetalInstanceTypeReference_builder{
+								Id: "acme-bmit-id", Name: "acme-bmit-name", Shared: true,
+							}.Build(),
+						}.Build(),
+					}, nil)
+				request.GetObject().GetMetadata().SetTenant(tenant)
+				spec := request.GetObject().GetSpec()
+				spec.SetVersion(privatev1.ClusterVersionReference_builder{Id: "shared-version-id", Shared: true}.Build())
+				if catalog {
+					spec.ClearTemplate()
+					spec.SetCatalogItem(privatev1.ClusterCatalogItemReference_builder{Name: "shared-offering", Shared: true}.Build())
+				} else {
+					spec.SetTemplate(privatev1.ClusterTemplateReference_builder{Name: "shared-template", Shared: true}.Build())
+				}
+				return request
+			}
+
+			DescribeTable("rejects reserved tenant creation without persistence or request mutation",
+				func(tenant string, catalog bool) {
+					request := newRequest(tenant, catalog)
+					original := proto.Clone(request)
+					response, err := tenantServer.Create(ctx, request)
+					Expect(grpcstatus.Code(err)).To(Equal(grpccodes.PermissionDenied))
+					reserved := tenant
+					if reserved == "" {
+						reserved = auth.SharedTenant
+					}
+					Expect(grpcstatus.Convert(err).Message()).To(Equal(fmt.Sprintf("objects cannot be placed in the '%s' tenant", reserved)))
+					Expect(response).To(BeNil())
+					Expect(proto.Equal(request, original)).To(BeTrue())
+
+					stored, err := tenantServer.generic.dao.List().
+						SetFilter(fmt.Sprintf("this.metadata.name == %q", request.GetObject().GetMetadata().GetName())).Do(ctx)
+					Expect(err).ToNot(HaveOccurred())
+					Expect(stored.GetTotal()).To(BeZero())
+					ips, err := tenantServer.externalIPDao.List().Do(ctx)
+					Expect(err).ToNot(HaveOccurred())
+					Expect(ips.GetTotal()).To(BeZero())
+					attachments, err := tenantServer.externalIPAttachmentDao.List().Do(ctx)
+					Expect(err).ToNot(HaveOccurred())
+					Expect(attachments.GetTotal()).To(BeZero())
+					workersDAO, err := dao.NewGenericDAO[*privatev1.BareMetalInstance]().
+						SetLogger(logger).SetTenancyLogic(tenancy).Build()
+					Expect(err).ToNot(HaveOccurred())
+					workers, err := workersDAO.List().Do(ctx)
+					Expect(err).ToNot(HaveOccurred())
+					Expect(workers.GetTotal()).To(BeZero())
+				},
+				Entry("explicit shared tenant with a template", auth.SharedTenant, false),
+				Entry("explicit shared tenant with a catalog item", auth.SharedTenant, true),
+				Entry("admin default shared tenant with a template", "", false),
+				Entry("admin default shared tenant with a catalog item", "", true),
+				Entry("system tenant", auth.SystemTenant, false),
+			)
+
+			DescribeTable("creates a tenant-owned cluster from shared catalog resources",
+				func(catalog bool) {
+					request := newRequest(testTenant, catalog)
+					original := proto.Clone(request)
+					response, err := tenantServer.Create(ctx, request)
+					Expect(err).ToNot(HaveOccurred())
+					Expect(response.GetObject().GetMetadata().GetTenant()).To(Equal(testTenant))
+					Expect(response.GetObject().GetSpec().GetTemplate().GetName()).To(Equal("shared-template"))
+					Expect(response.GetObject().GetSpec().GetVersion().GetId()).To(Equal("shared-version-id"))
+					Expect(proto.Equal(request, original)).To(BeTrue())
+					stored, err := tenantServer.Get(ctx, privatev1.ClustersGetRequest_builder{Id: response.GetObject().GetId()}.Build())
+					Expect(err).ToNot(HaveOccurred())
+					Expect(stored.GetObject().GetMetadata().GetTenant()).To(Equal(testTenant))
+				},
+				Entry("direct template", false),
+				Entry("catalog item", true),
+			)
+
+			It("rejects moving a cluster into shared without changing the stored tenant", func() {
+				created, err := tenantServer.Create(ctx, newRequest(testTenant, false))
+				Expect(err).ToNot(HaveOccurred())
+				object := created.GetObject()
+				request := privatev1.ClustersUpdateRequest_builder{
+					Object: privatev1.Cluster_builder{
+						Id: object.GetId(), Metadata: privatev1.Metadata_builder{Tenant: auth.SharedTenant}.Build(),
+					}.Build(),
+					UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"metadata.tenant"}},
+				}.Build()
+				original := proto.Clone(request)
+				response, err := tenantServer.Update(ctx, request)
+				Expect(grpcstatus.Code(err)).To(Equal(grpccodes.PermissionDenied))
+				Expect(grpcstatus.Convert(err).Message()).To(Equal("objects cannot be placed in the 'shared' tenant"))
+				Expect(response).To(BeNil())
+				Expect(proto.Equal(request, original)).To(BeTrue())
+				stored, err := tenantServer.Get(ctx, privatev1.ClustersGetRequest_builder{Id: object.GetId()}.Build())
+				Expect(err).ToNot(HaveOccurred())
+				Expect(proto.Equal(stored.GetObject(), object)).To(BeTrue())
+			})
+
+			It("allows reading, status feedback and deletion of a legacy shared cluster", func() {
+				// Bypass Create to model data persisted before shared placement was rejected.
+				created, err := tenantServer.generic.dao.Create().SetObject(newRequest(auth.SharedTenant, false).GetObject()).Do(ctx)
+				Expect(err).ToNot(HaveOccurred())
+				id := created.GetObject().GetId()
+				stored, err := tenantServer.Get(ctx, privatev1.ClustersGetRequest_builder{Id: id}.Build())
+				Expect(err).ToNot(HaveOccurred())
+				Expect(stored.GetObject().GetMetadata().GetTenant()).To(Equal(auth.SharedTenant))
+				updated, err := tenantServer.Update(ctx, privatev1.ClustersUpdateRequest_builder{
+					Object: privatev1.Cluster_builder{
+						Id: id,
+						Status: privatev1.ClusterStatus_builder{
+							State:               privatev1.ClusterState_CLUSTER_STATE_READY,
+							StateTransitionTime: timestamppb.New(time.Now().Truncate(time.Second)),
+						}.Build(),
+					}.Build(),
+					UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"status.state", "status.state_transition_time"}},
+				}.Build())
+				Expect(err).ToNot(HaveOccurred())
+				Expect(updated.GetObject().GetMetadata().GetTenant()).To(Equal(auth.SharedTenant))
+				stored, err = tenantServer.Get(ctx, privatev1.ClustersGetRequest_builder{Id: id}.Build())
+				Expect(err).ToNot(HaveOccurred())
+				Expect(stored.GetObject().GetStatus().GetState()).To(Equal(privatev1.ClusterState_CLUSTER_STATE_READY))
+				_, err = tenantServer.Delete(ctx, privatev1.ClustersDeleteRequest_builder{Id: id}.Build())
+				Expect(err).ToNot(HaveOccurred())
+				_, err = tenantServer.Get(ctx, privatev1.ClustersGetRequest_builder{Id: id}.Build())
+				Expect(grpcstatus.Code(err)).To(Equal(grpccodes.NotFound))
+			})
 		})
 
 		It("Creates object", func() {
@@ -322,6 +804,762 @@ var _ = Describe("Private clusters server", func() {
 			object := response.GetObject()
 			Expect(object).ToNot(BeNil())
 			Expect(object.GetId()).ToNot(BeEmpty())
+			Expect(object.GetStatus().GetObservedVersion()).To(Equal("4.17.0"))
+			Expect(object.GetStatus().GetNodeSets()["compute"].GetObservedVersion()).To(Equal("4.17.0"))
+			Expect(object.GetStatus().GetNodeSets()["gpu"].GetObservedVersion()).To(Equal("4.17.0"))
+
+			// Verify that the node sets inherited from the template carry the canonicalized
+			// bare metal instance type references:
+			nodeSets := object.GetSpec().GetNodeSets()
+			Expect(nodeSets).To(HaveLen(2))
+			Expect(nodeSets["compute"].GetBaremetalInstanceType().GetId()).To(Equal("acme-bmit-id"))
+			Expect(nodeSets["compute"].GetBaremetalInstanceType().GetName()).To(Equal("acme-bmit-name"))
+			Expect(nodeSets["compute"].GetSize()).To(BeNumerically("==", 3))
+			Expect(nodeSets["gpu"].GetBaremetalInstanceType().GetId()).To(Equal("acme-gpu-bmit-id"))
+			Expect(nodeSets["gpu"].GetBaremetalInstanceType().GetName()).To(Equal("acme-gpu-name"))
+			Expect(nodeSets["gpu"].GetSize()).To(BeNumerically("==", 1))
+		})
+
+		It("rejects an IPv6-only pool for automatic ExternalIP allocation", func() {
+			_, err := server.externalIPPoolDao.Create().SetObject(
+				privatev1.ExternalIPPool_builder{
+					Id: "ipv6-auto-pool",
+					Metadata: privatev1.Metadata_builder{
+						Tenant: testTenant,
+					}.Build(),
+					Spec: privatev1.ExternalIPPoolSpec_builder{
+						IpFamily: privatev1.IPFamily_IP_FAMILY_IPV6,
+					}.Build(),
+					Status: privatev1.ExternalIPPoolStatus_builder{
+						State:     privatev1.ExternalIPPoolState_EXTERNAL_IP_POOL_STATE_READY,
+						Available: 2,
+					}.Build(),
+				}.Build(),
+			).Do(ctx)
+			Expect(err).ToNot(HaveOccurred())
+
+			err = server.autoProvisionExternalIPs(ctx, privatev1.Cluster_builder{
+				Id: "cluster-ipv6-only",
+				Metadata: privatev1.Metadata_builder{
+					Tenant: testTenant,
+				}.Build(),
+			}.Build())
+			Expect(grpcstatus.Code(err)).To(Equal(grpccodes.FailedPrecondition))
+			Expect(err.Error()).To(ContainSubstring("no available capacity in any READY pool for IPv4"))
+		})
+
+		It("rejects a cluster whose subnet and security group are assigned to different Hubs", func() {
+			virtualNetworksDao, err := dao.NewGenericDAO[*privatev1.VirtualNetwork]().
+				SetLogger(logger).SetTenancyLogic(tenancy).Build()
+			Expect(err).ToNot(HaveOccurred())
+			virtualNetwork, err := virtualNetworksDao.Create().SetObject(privatev1.VirtualNetwork_builder{
+				Metadata: privatev1.Metadata_builder{Name: "hub-compat-vn", Tenant: testTenant}.Build(),
+				Spec:     privatev1.VirtualNetworkSpec_builder{}.Build(),
+			}.Build()).Do(ctx)
+			Expect(err).ToNot(HaveOccurred())
+
+			subnetsDao, err := dao.NewGenericDAO[*privatev1.Subnet]().SetLogger(logger).SetTenancyLogic(tenancy).Build()
+			Expect(err).ToNot(HaveOccurred())
+			subnet, err := subnetsDao.Create().SetObject(privatev1.Subnet_builder{
+				Metadata: privatev1.Metadata_builder{Name: "hub-compat-subnet", Tenant: testTenant}.Build(),
+				Spec: privatev1.SubnetSpec_builder{
+					VirtualNetwork: privatev1.VirtualNetworkLocalReference_builder{Id: virtualNetwork.GetObject().GetId()}.Build(),
+				}.Build(),
+				Status: privatev1.SubnetStatus_builder{State: privatev1.SubnetState_SUBNET_STATE_READY, Hub: "network-hub-a"}.Build(),
+			}.Build()).Do(ctx)
+			Expect(err).ToNot(HaveOccurred())
+
+			securityGroupsDao, err := dao.NewGenericDAO[*privatev1.SecurityGroup]().SetLogger(logger).SetTenancyLogic(tenancy).Build()
+			Expect(err).ToNot(HaveOccurred())
+			group, err := securityGroupsDao.Create().SetObject(privatev1.SecurityGroup_builder{
+				Metadata: privatev1.Metadata_builder{Name: "hub-compat-sg", Tenant: testTenant}.Build(),
+				Spec: privatev1.SecurityGroupSpec_builder{
+					VirtualNetwork: privatev1.VirtualNetworkLocalReference_builder{Id: virtualNetwork.GetObject().GetId()}.Build(),
+				}.Build(),
+				Status: privatev1.SecurityGroupStatus_builder{State: privatev1.SecurityGroupState_SECURITY_GROUP_STATE_READY, Hub: "network-hub-b"}.Build(),
+			}.Build()).Do(ctx)
+			Expect(err).ToNot(HaveOccurred())
+
+			name := fmt.Sprintf("test-%s", uuid.New()[24:32])
+			response, err := server.Create(ctx, privatev1.ClustersCreateRequest_builder{
+				Object: privatev1.Cluster_builder{
+					Metadata: privatev1.Metadata_builder{Name: name}.Build(),
+					Spec: privatev1.ClusterSpec_builder{
+						Template: privatev1.ClusterTemplateReference_builder{Id: "my-template-id"}.Build(),
+						NetworkAttachment: privatev1.ClusterNetworkAttachment_builder{
+							Subnet:         privatev1.SubnetLocalReference_builder{Id: subnet.GetObject().GetId()}.Build(),
+							SecurityGroups: []*privatev1.SecurityGroupLocalReference{privatev1.SecurityGroupLocalReference_builder{Id: group.GetObject().GetId()}.Build()},
+						}.Build(),
+					}.Build(),
+				}.Build(),
+			}.Build())
+			Expect(response).To(BeNil())
+			Expect(grpcstatus.Code(err)).To(Equal(grpccodes.FailedPrecondition))
+			Expect(err.Error()).To(ContainSubstring("different Hub than the canonical networking Hub"))
+			Expect(err.Error()).ToNot(ContainSubstring("network-hub-a"))
+			Expect(err.Error()).ToNot(ContainSubstring("network-hub-b"))
+
+			clustersDao, err := dao.NewGenericDAO[*privatev1.Cluster]().SetLogger(logger).SetTenancyLogic(tenancy).Build()
+			Expect(err).ToNot(HaveOccurred())
+			stored, err := clustersDao.List().SetFilter(fmt.Sprintf("this.metadata.name == %q", name)).Do(ctx)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(stored.GetItems()).To(BeEmpty())
+		})
+
+		It("creates automatic ExternalIPs without attachments and cleans them up", func() {
+			poolDao, err := dao.NewGenericDAO[*privatev1.ExternalIPPool]().
+				SetLogger(logger).
+				SetTenancyLogic(tenancy).
+				Build()
+			Expect(err).ToNot(HaveOccurred())
+			_, err = poolDao.Create().SetObject(privatev1.ExternalIPPool_builder{
+				Metadata: privatev1.Metadata_builder{Tenant: auth.SharedTenant}.Build(),
+				Spec: privatev1.ExternalIPPoolSpec_builder{
+					Cidrs:    []string{"192.0.2.0/24"},
+					IpFamily: privatev1.IPFamily_IP_FAMILY_IPV4,
+				}.Build(),
+				Status: privatev1.ExternalIPPoolStatus_builder{
+					State:     privatev1.ExternalIPPoolState_EXTERNAL_IP_POOL_STATE_READY,
+					Total:     5,
+					Available: 5,
+				}.Build(),
+			}.Build()).Do(ctx)
+			Expect(err).ToNot(HaveOccurred())
+
+			response, err := server.Create(ctx, privatev1.ClustersCreateRequest_builder{
+				Object: privatev1.Cluster_builder{
+					Metadata: privatev1.Metadata_builder{Name: fmt.Sprintf("deferred-%s", uuid.New()[24:32])}.Build(),
+					Spec: privatev1.ClusterSpec_builder{
+						Template:                 privatev1.ClusterTemplateReference_builder{Id: "my-template-id"}.Build(),
+						AutoExternalIpAttachment: proto.Bool(true),
+					}.Build(),
+				}.Build(),
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+			clusterID := response.GetObject().GetId()
+
+			eipDao, err := dao.NewGenericDAO[*privatev1.ExternalIP]().SetLogger(logger).SetTenancyLogic(tenancy).Build()
+			Expect(err).ToNot(HaveOccurred())
+			filter := fmt.Sprintf("this.metadata.labels['%s'] == '%s'", autoCreatedForLabel, clusterID)
+			eipList, err := eipDao.List().SetFilter(filter).Do(ctx)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(eipList.GetItems()).To(HaveLen(2))
+			endpoints := map[string]bool{}
+			for _, eip := range eipList.GetItems() {
+				Expect(eip.GetMetadata().GetLabels()[autoCreatedLabel]).To(Equal("true"))
+				Expect(eip.GetMetadata().GetLabels()[autoCreatedKindLabel]).To(Equal("cluster"))
+				Expect(eip.GetMetadata().GetAnnotations()[ownerReferenceAnnotation]).To(Equal(clusterID))
+				endpoints[eip.GetMetadata().GetLabels()[autoCreatedEndpointLabel]] = true
+			}
+			Expect(endpoints).To(HaveKey("api"))
+			Expect(endpoints).To(HaveKey("ingress"))
+
+			eiaDao, err := dao.NewGenericDAO[*privatev1.ExternalIPAttachment]().SetLogger(logger).SetTenancyLogic(tenancy).Build()
+			Expect(err).ToNot(HaveOccurred())
+			eiaList, err := eiaDao.List().SetFilter(filter).Do(ctx)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(eiaList.GetItems()).To(BeEmpty())
+
+			_, err = server.Delete(ctx, privatev1.ClustersDeleteRequest_builder{Id: clusterID}.Build())
+			Expect(err).ToNot(HaveOccurred())
+			eipList, err = eipDao.List().SetFilter(filter).Do(ctx)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(eipList.GetItems()).To(BeEmpty())
+		})
+
+		It("Preserves direct add-on operators through create and get", func() {
+			operators := []*privatev1.AddOnOperatorReference{
+				privatev1.AddOnOperatorReference_builder{Id: "operator-1", Name: "operator-one"}.Build(),
+				privatev1.AddOnOperatorReference_builder{Id: "operator-2", Name: "operator-two"}.Build(),
+			}
+
+			createResponse, err := server.Create(ctx, privatev1.ClustersCreateRequest_builder{
+				Object: privatev1.Cluster_builder{
+					Metadata: privatev1.Metadata_builder{Name: fmt.Sprintf("test-%s", uuid.New()[24:32])}.Build(),
+					Spec: privatev1.ClusterSpec_builder{
+						Template:       privatev1.ClusterTemplateReference_builder{Id: "my-template-id"}.Build(),
+						AddOnOperators: operators,
+					}.Build(),
+				}.Build(),
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+
+			getResponse, err := server.Get(ctx, privatev1.ClustersGetRequest_builder{
+				Id: createResponse.GetObject().GetId(),
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+			storedOperators := getResponse.GetObject().GetSpec().GetAddOnOperators()
+			Expect(storedOperators).To(HaveLen(len(operators)))
+			for i, operator := range operators {
+				Expect(storedOperators[i].GetId()).To(Equal(operator.GetId()))
+				Expect(storedOperators[i].GetName()).To(Equal(operator.GetName()))
+				Expect(storedOperators[i].GetShared()).To(BeTrue())
+				Expect(storedOperators[i].GetProject()).To(BeEmpty())
+			}
+		})
+
+		It("resolves a name-only add-on operator reference during create", func() {
+			createResponse, err := server.Create(ctx, privatev1.ClustersCreateRequest_builder{
+				Object: privatev1.Cluster_builder{
+					Metadata: privatev1.Metadata_builder{Name: fmt.Sprintf("test-%s", uuid.New()[24:32])}.Build(),
+					Spec: privatev1.ClusterSpec_builder{
+						Template: privatev1.ClusterTemplateReference_builder{Id: "my-template-id"}.Build(),
+						AddOnOperators: []*privatev1.AddOnOperatorReference{
+							privatev1.AddOnOperatorReference_builder{Name: "operator-one"}.Build(),
+						},
+					}.Build(),
+				}.Build(),
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+
+			operator := createResponse.GetObject().GetSpec().GetAddOnOperators()[0]
+			Expect(operator.GetId()).To(Equal("operator-1"))
+			Expect(operator.GetName()).To(Equal("operator-one"))
+		})
+
+		It("resolves transitive dependencies and deduplicates shared dependencies", func() {
+			dependency := newTestAddOnOperator("operator-dependency", "operator-dependency", true)
+			seedAddOnOperatorObject(ctx, dependency)
+
+			first := newTestAddOnOperator("operator-first", "operator-first", true)
+			first.SetDependencies([]*privatev1.AddOnOperatorLocalReference{
+				privatev1.AddOnOperatorLocalReference_builder{Id: dependency.GetId()}.Build(),
+			})
+			seedAddOnOperatorObject(ctx, first)
+
+			second := newTestAddOnOperator("operator-second", "operator-second", true)
+			second.SetDependencies([]*privatev1.AddOnOperatorLocalReference{
+				privatev1.AddOnOperatorLocalReference_builder{Id: dependency.GetId()}.Build(),
+			})
+			seedAddOnOperatorObject(ctx, second)
+
+			object, err := createClusterWithAddOnOperators(ctx, server, []*privatev1.AddOnOperatorReference{
+				privatev1.AddOnOperatorReference_builder{Id: first.GetId()}.Build(),
+				privatev1.AddOnOperatorReference_builder{Id: second.GetId()}.Build(),
+			})
+			Expect(err).ToNot(HaveOccurred())
+
+			ids := make([]string, 0, len(object.GetSpec().GetAddOnOperators()))
+			for _, operator := range object.GetSpec().GetAddOnOperators() {
+				ids = append(ids, operator.GetId())
+			}
+			Expect(ids).To(ConsistOf(first.GetId(), second.GetId(), dependency.GetId()))
+		})
+
+		It("rejects cluster creation when the expanded dependency closure exceeds the operator limit", func() {
+			dependency := newTestAddOnOperator("operator-expansion-limit-dependency", "operator-expansion-limit-dependency", true)
+			dependencyIDs := make([]string, 0, maxClusterAddOnOperators-1)
+			for i := range maxClusterAddOnOperators - 1 {
+				dependencyID := fmt.Sprintf("operator-expansion-limit-leaf-%d", i)
+				seedAddOnOperatorObject(ctx, newTestAddOnOperator(dependencyID, dependencyID, true))
+				dependencyIDs = append(dependencyIDs, dependencyID)
+			}
+			seedAddOnOperatorObject(ctx, dependency)
+
+			root := newTestAddOnOperator("operator-expansion-limit-root", "operator-expansion-limit-root", true)
+			root.SetDependencies([]*privatev1.AddOnOperatorLocalReference{
+				privatev1.AddOnOperatorLocalReference_builder{Id: dependency.GetId()}.Build(),
+			})
+			seedAddOnOperatorObject(ctx, root)
+
+			operatorServer, err := NewPrivateAddOnOperatorsServer().
+				SetLogger(logger).
+				SetAttributionLogic(attribution).
+				SetTenancyLogic(tenancy).
+				Build()
+			Expect(err).ToNot(HaveOccurred())
+			dependencies := make([]*privatev1.AddOnOperatorLocalReference, 0, len(dependencyIDs))
+			for _, dependencyID := range dependencyIDs {
+				dependencies = append(dependencies,
+					privatev1.AddOnOperatorLocalReference_builder{Id: dependencyID}.Build())
+			}
+			_, err = operatorServer.Update(ctx, privatev1.AddOnOperatorsUpdateRequest_builder{
+				Object: privatev1.AddOnOperator_builder{
+					Id:           dependency.GetId(),
+					Dependencies: dependencies,
+				}.Build(),
+				UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"dependencies"}},
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+
+			_, err = createClusterWithAddOnOperators(ctx, server, []*privatev1.AddOnOperatorReference{
+				privatev1.AddOnOperatorReference_builder{Id: root.GetId()}.Build(),
+			})
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("maximum of 32 operators"))
+		})
+
+		It("allows requested roots that overlap the dependency closure", func() {
+			rootIDs := make([]string, 0, maxClusterAddOnOperators)
+			for i := range maxClusterAddOnOperators {
+				operatorID := fmt.Sprintf("operator-overlapping-root-%d", i)
+				rootIDs = append(rootIDs, operatorID)
+			}
+			for i, operatorID := range rootIDs {
+				operator := newTestAddOnOperator(operatorID, operatorID, true)
+				if i == 0 {
+					operator.SetDependencies([]*privatev1.AddOnOperatorLocalReference{
+						privatev1.AddOnOperatorLocalReference_builder{Id: rootIDs[1]}.Build(),
+					})
+				}
+				seedAddOnOperatorObject(ctx, operator)
+			}
+
+			object, err := createClusterWithAddOnOperators(ctx, server, func() []*privatev1.AddOnOperatorReference {
+				refs := make([]*privatev1.AddOnOperatorReference, 0, len(rootIDs))
+				for _, rootID := range rootIDs {
+					refs = append(refs, privatev1.AddOnOperatorReference_builder{Id: rootID}.Build())
+				}
+				return refs
+			}())
+			Expect(err).ToNot(HaveOccurred())
+			resolvedIDs := make([]string, 0, len(object.GetSpec().GetAddOnOperators()))
+			for _, operator := range object.GetSpec().GetAddOnOperators() {
+				resolvedIDs = append(resolvedIDs, operator.GetId())
+			}
+			Expect(resolvedIDs).To(ConsistOf(rootIDs))
+		})
+
+		It("keeps existing cluster snapshots when dependency edges change", func() {
+			first := newTestAddOnOperator("operator-snapshot-first", "operator-snapshot-first", true)
+			second := newTestAddOnOperator("operator-snapshot-second", "operator-snapshot-second", true)
+			root := newTestAddOnOperator("operator-snapshot-root", "operator-snapshot-root", true)
+			root.SetDependencies([]*privatev1.AddOnOperatorLocalReference{
+				privatev1.AddOnOperatorLocalReference_builder{Id: first.GetId()}.Build(),
+			})
+			seedAddOnOperatorObject(ctx, first)
+			seedAddOnOperatorObject(ctx, second)
+			seedAddOnOperatorObject(ctx, root)
+
+			firstCluster, err := createClusterWithAddOnOperators(ctx, server, []*privatev1.AddOnOperatorReference{
+				privatev1.AddOnOperatorReference_builder{Id: root.GetId()}.Build(),
+			})
+			Expect(err).ToNot(HaveOccurred())
+
+			operatorServer, err := NewPrivateAddOnOperatorsServer().
+				SetLogger(logger).
+				SetAttributionLogic(attribution).
+				SetTenancyLogic(tenancy).
+				Build()
+			Expect(err).ToNot(HaveOccurred())
+			_, err = operatorServer.Update(ctx, privatev1.AddOnOperatorsUpdateRequest_builder{
+				Object: privatev1.AddOnOperator_builder{
+					Id: root.GetId(),
+					Dependencies: []*privatev1.AddOnOperatorLocalReference{
+						privatev1.AddOnOperatorLocalReference_builder{Id: second.GetId()}.Build(),
+					},
+				}.Build(),
+				UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"dependencies"}},
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+
+			secondCluster, err := createClusterWithAddOnOperators(ctx, server, []*privatev1.AddOnOperatorReference{
+				privatev1.AddOnOperatorReference_builder{Id: root.GetId()}.Build(),
+			})
+			Expect(err).ToNot(HaveOccurred())
+
+			firstIDs := make([]string, 0, len(firstCluster.GetSpec().GetAddOnOperators()))
+			for _, operator := range firstCluster.GetSpec().GetAddOnOperators() {
+				firstIDs = append(firstIDs, operator.GetId())
+			}
+			secondIDs := make([]string, 0, len(secondCluster.GetSpec().GetAddOnOperators()))
+			for _, operator := range secondCluster.GetSpec().GetAddOnOperators() {
+				secondIDs = append(secondIDs, operator.GetId())
+			}
+			Expect(firstIDs).To(ConsistOf(root.GetId(), first.GetId()))
+			Expect(secondIDs).To(ConsistOf(root.GetId(), second.GetId()))
+		})
+
+		It("rejects circular dependencies", func() {
+			first := newTestAddOnOperator("operator-cycle-a", "operator-cycle-a", true)
+			first.SetDependencies([]*privatev1.AddOnOperatorLocalReference{
+				privatev1.AddOnOperatorLocalReference_builder{Id: "operator-cycle-b"}.Build(),
+			})
+			second := newTestAddOnOperator("operator-cycle-b", "operator-cycle-b", true)
+			second.SetDependencies([]*privatev1.AddOnOperatorLocalReference{
+				privatev1.AddOnOperatorLocalReference_builder{Id: first.GetId()}.Build(),
+			})
+			seedAddOnOperatorObject(ctx, first)
+			seedAddOnOperatorObject(ctx, second)
+
+			_, err := createClusterWithAddOnOperators(ctx, server, []*privatev1.AddOnOperatorReference{
+				privatev1.AddOnOperatorReference_builder{Id: first.GetId()}.Build(),
+			})
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("dependency cycle detected"))
+		})
+
+		It("rejects mutually exclusive operators", func() {
+			first := newTestAddOnOperator("operator-exclusion-a", "operator-exclusion-a", true)
+			first.SetExclusions([]*privatev1.AddOnOperatorLocalReference{
+				privatev1.AddOnOperatorLocalReference_builder{Id: "operator-exclusion-b"}.Build(),
+			})
+			second := newTestAddOnOperator("operator-exclusion-b", "operator-exclusion-b", true)
+			seedAddOnOperatorObject(ctx, first)
+			seedAddOnOperatorObject(ctx, second)
+
+			_, err := createClusterWithAddOnOperators(ctx, server, []*privatev1.AddOnOperatorReference{
+				privatev1.AddOnOperatorReference_builder{Id: first.GetId()}.Build(),
+				privatev1.AddOnOperatorReference_builder{Id: second.GetId()}.Build(),
+			})
+			Expect(err).To(HaveOccurred())
+			expectAddOnOperatorFieldViolation(err, "spec.add_on_operators[0]")
+			Expect(grpcstatus.Convert(err).Message()).To(ContainSubstring(first.GetId()))
+			Expect(grpcstatus.Convert(err).Message()).To(ContainSubstring(second.GetId()))
+		})
+
+		It("rejects an exclusion declared by either selected operator", func() {
+			first := newTestAddOnOperator("operator-reverse-exclusion-a", "operator-reverse-exclusion-a", true)
+			second := newTestAddOnOperator("operator-reverse-exclusion-b", "operator-reverse-exclusion-b", true)
+			second.SetExclusions([]*privatev1.AddOnOperatorLocalReference{
+				privatev1.AddOnOperatorLocalReference_builder{Id: first.GetId()}.Build(),
+			})
+			seedAddOnOperatorObject(ctx, first)
+			seedAddOnOperatorObject(ctx, second)
+
+			_, err := createClusterWithAddOnOperators(ctx, server, []*privatev1.AddOnOperatorReference{
+				privatev1.AddOnOperatorReference_builder{Id: first.GetId()}.Build(),
+				privatev1.AddOnOperatorReference_builder{Id: second.GetId()}.Build(),
+			})
+			Expect(err).To(HaveOccurred())
+			expectAddOnOperatorFieldViolation(err, "spec.add_on_operators[1]")
+		})
+
+		It("rejects an operator below its minimum cluster version", func() {
+			operator := newTestAddOnOperator("operator-versioned", "operator-versioned", true)
+			operator.SetMinOcpVersion("4.18.0")
+			seedAddOnOperatorObject(ctx, operator)
+
+			_, err := createClusterWithAddOnOperators(ctx, server, []*privatev1.AddOnOperatorReference{
+				privatev1.AddOnOperatorReference_builder{Id: operator.GetId()}.Build(),
+			})
+			Expect(err).To(HaveOccurred())
+			expectAddOnOperatorFieldViolation(err, "spec.add_on_operators[0]")
+			Expect(grpcstatus.Convert(err).Message()).To(ContainSubstring("4.18.0"))
+		})
+
+		It("rejects an operator above its maximum cluster version", func() {
+			operator := newTestAddOnOperator("operator-versioned-max", "operator-versioned-max", true)
+			operator.SetMaxOcpVersion("4.16.0")
+			seedAddOnOperatorObject(ctx, operator)
+
+			_, err := createClusterWithAddOnOperators(ctx, server, []*privatev1.AddOnOperatorReference{
+				privatev1.AddOnOperatorReference_builder{Id: operator.GetId()}.Build(),
+			})
+			Expect(err).To(HaveOccurred())
+			expectAddOnOperatorFieldViolation(err, "spec.add_on_operators[0]")
+			Expect(grpcstatus.Convert(err).Message()).To(ContainSubstring("4.16.0"))
+		})
+
+		It("accepts an operator at inclusive cluster version bounds", func() {
+			operator := newTestAddOnOperator("operator-version-bound", "operator-version-bound", true)
+			operator.SetMinOcpVersion("4.17.0")
+			operator.SetMaxOcpVersion("4.17.0")
+			seedAddOnOperatorObject(ctx, operator)
+
+			_, err := createClusterWithAddOnOperators(ctx, server, []*privatev1.AddOnOperatorReference{
+				privatev1.AddOnOperatorReference_builder{Id: operator.GetId()}.Build(),
+			})
+			Expect(err).ToNot(HaveOccurred())
+		})
+
+		It("rejects an unpublished operator", func() {
+			operator := newTestAddOnOperator("operator-unpublished", "operator-unpublished", false)
+			seedAddOnOperatorObject(ctx, operator)
+
+			_, err := createClusterWithAddOnOperators(ctx, server, []*privatev1.AddOnOperatorReference{
+				privatev1.AddOnOperatorReference_builder{Id: operator.GetId()}.Build(),
+			})
+			Expect(err).To(HaveOccurred())
+			expectAddOnOperatorFieldViolation(err, "spec.add_on_operators[0]")
+			Expect(grpcstatus.Convert(err).Message()).To(ContainSubstring("not published"))
+		})
+
+		It("accepts and canonicalizes an unpublished dependency", func() {
+			dependency := newTestAddOnOperator("operator-unpublished-dependency", "operator-unpublished-dependency", false)
+			seedAddOnOperatorObject(ctx, dependency)
+			root := newTestAddOnOperator("operator-with-unpublished-dependency", "operator-with-unpublished-dependency", true)
+			root.SetDependencies([]*privatev1.AddOnOperatorLocalReference{
+				privatev1.AddOnOperatorLocalReference_builder{Id: dependency.GetId()}.Build(),
+			})
+			seedAddOnOperatorObject(ctx, root)
+
+			object, err := createClusterWithAddOnOperators(ctx, server, []*privatev1.AddOnOperatorReference{
+				privatev1.AddOnOperatorReference_builder{Id: root.GetId()}.Build(),
+			})
+			Expect(err).ToNot(HaveOccurred())
+			operators := object.GetSpec().GetAddOnOperators()
+			Expect(operators).To(HaveLen(2))
+			Expect(operators[0].GetId()).To(Equal(dependency.GetId()))
+			Expect(operators[0].GetName()).To(Equal(dependency.GetMetadata().GetName()))
+			Expect(operators[1].GetId()).To(Equal(root.GetId()))
+			Expect(operators[1].GetName()).To(Equal(root.GetMetadata().GetName()))
+		})
+
+		It("rejects an operator reference whose id and name disagree", func() {
+			operator := newTestAddOnOperator("operator-id-name", "operator-id-name", true)
+			seedAddOnOperatorObject(ctx, operator)
+
+			_, err := createClusterWithAddOnOperators(ctx, server, []*privatev1.AddOnOperatorReference{
+				privatev1.AddOnOperatorReference_builder{
+					Id:   operator.GetId(),
+					Name: "different-name",
+				}.Build(),
+			})
+			Expect(err).To(HaveOccurred())
+			expectAddOnOperatorFieldViolation(err, "spec.add_on_operators[0]")
+			Expect(grpcstatus.Convert(err).Message()).To(ContainSubstring("id and name"))
+		})
+
+		It("honors an explicit shared scope for an operator name", func() {
+			shared := newTestAddOnOperator("operator-shared", "same-operator-name", true)
+			seedAddOnOperatorObject(ctx, shared)
+
+			local := newTestAddOnOperator("operator-local", "same-operator-name", true)
+			local.GetMetadata().SetTenant(testTenant)
+			seedAddOnOperatorObject(ctx, local)
+
+			object, err := createClusterWithAddOnOperators(ctx, server, []*privatev1.AddOnOperatorReference{
+				privatev1.AddOnOperatorReference_builder{Name: "same-operator-name", Shared: true}.Build(),
+			})
+			Expect(err).ToNot(HaveOccurred())
+			Expect(object.GetSpec().GetAddOnOperators()).To(HaveLen(1))
+			resolved := object.GetSpec().GetAddOnOperators()[0]
+			Expect(resolved.GetId()).To(Equal(shared.GetId()))
+			Expect(resolved.GetName()).To(Equal(shared.GetMetadata().GetName()))
+			Expect(resolved.GetShared()).To(BeTrue())
+			Expect(resolved.GetProject()).To(Equal(shared.GetMetadata().GetProject()))
+
+			updateResponse, err := server.Update(ctx, privatev1.ClustersUpdateRequest_builder{
+				Object: privatev1.Cluster_builder{
+					Id: object.GetId(),
+					Spec: privatev1.ClusterSpec_builder{
+						AddOnOperators: []*privatev1.AddOnOperatorReference{
+							privatev1.AddOnOperatorReference_builder{
+								Name:   shared.GetMetadata().GetName(),
+								Shared: true,
+							}.Build(),
+						},
+					}.Build(),
+				}.Build(),
+				UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"spec.add_on_operators"}},
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+			Expect(updateResponse.GetObject().GetSpec().GetAddOnOperators()).To(HaveLen(1))
+			Expect(updateResponse.GetObject().GetSpec().GetAddOnOperators()[0].GetShared()).To(BeTrue())
+		})
+
+		It("resolves an unscoped shared operator name from a non-default project", func() {
+			operator := newTestAddOnOperator("operator-project-scope", "operator-project-scope", true)
+			seedAddOnOperatorObject(ctx, operator)
+			projectsDAO, err := dao.NewGenericDAO[*privatev1.Project]().
+				SetLogger(logger).
+				SetTenancyLogic(tenancy).
+				Build()
+			Expect(err).ToNot(HaveOccurred())
+			_, err = projectsDAO.Create().SetObject(privatev1.Project_builder{
+				Metadata: privatev1.Metadata_builder{Name: "workloads", Tenant: testTenant}.Build(),
+			}.Build()).Do(ctx)
+			Expect(err).ToNot(HaveOccurred())
+
+			response, err := server.Create(ctx, privatev1.ClustersCreateRequest_builder{
+				Object: privatev1.Cluster_builder{
+					Metadata: privatev1.Metadata_builder{
+						Name:    fmt.Sprintf("test-%s", uuid.New()[24:32]),
+						Project: "workloads",
+					}.Build(),
+					Spec: privatev1.ClusterSpec_builder{
+						Template: privatev1.ClusterTemplateReference_builder{Id: "my-template-id"}.Build(),
+						AddOnOperators: []*privatev1.AddOnOperatorReference{
+							privatev1.AddOnOperatorReference_builder{Name: operator.GetMetadata().GetName()}.Build(),
+						},
+					}.Build(),
+				}.Build(),
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+			Expect(response.GetObject().GetSpec().GetAddOnOperators()).To(HaveLen(1))
+			Expect(response.GetObject().GetSpec().GetAddOnOperators()[0].GetId()).To(Equal(operator.GetId()))
+		})
+
+		It("rejects a deleted operator", func() {
+			operator := newTestAddOnOperator("operator-deleted", "operator-deleted", true)
+			seedAddOnOperatorObject(ctx, operator)
+			operatorDao, err := dao.NewGenericDAO[*privatev1.AddOnOperator]().
+				SetLogger(logger).
+				SetTenancyLogic(tenancy).
+				Build()
+			Expect(err).ToNot(HaveOccurred())
+			_, err = operatorDao.Delete().SetId(operator.GetId()).Do(ctx)
+			Expect(err).ToNot(HaveOccurred())
+
+			_, err = createClusterWithAddOnOperators(ctx, server, []*privatev1.AddOnOperatorReference{
+				privatev1.AddOnOperatorReference_builder{Id: operator.GetId()}.Build(),
+			})
+			Expect(err).To(HaveOccurred())
+			expectAddOnOperatorFieldViolation(err, "spec.add_on_operators[0]")
+			Expect(grpcstatus.Convert(err).Message()).To(ContainSubstring("deleted"))
+		})
+
+		It("rejects an expanded operator set over the maximum size", func() {
+			operators := make([]*privatev1.AddOnOperatorReference, 0, 32)
+			for i := range 32 {
+				dependencyID := fmt.Sprintf("operator-limit-dependency-%d", i)
+				seedAddOnOperatorObject(ctx, newTestAddOnOperator(dependencyID, dependencyID, true))
+
+				operatorID := fmt.Sprintf("operator-limit-%d", i)
+				operator := newTestAddOnOperator(operatorID, operatorID, true)
+				operator.SetDependencies([]*privatev1.AddOnOperatorLocalReference{
+					privatev1.AddOnOperatorLocalReference_builder{Id: dependencyID}.Build(),
+				})
+				seedAddOnOperatorObject(ctx, operator)
+				operators = append(operators, privatev1.AddOnOperatorReference_builder{Id: operatorID}.Build())
+			}
+
+			_, err := createClusterWithAddOnOperators(ctx, server, operators)
+			Expect(err).To(HaveOccurred())
+			expectAddOnOperatorFieldViolation(err, "spec.add_on_operators")
+			Expect(grpcstatus.Convert(err).Message()).To(ContainSubstring("32"))
+		})
+
+		It("Rejects changing add-on operators with a field mask", func() {
+			createResponse, err := server.Create(ctx, privatev1.ClustersCreateRequest_builder{
+				Object: privatev1.Cluster_builder{
+					Metadata: privatev1.Metadata_builder{Name: fmt.Sprintf("test-%s", uuid.New()[24:32])}.Build(),
+					Spec: privatev1.ClusterSpec_builder{
+						Template:       privatev1.ClusterTemplateReference_builder{Id: "my-template-id"}.Build(),
+						AddOnOperators: []*privatev1.AddOnOperatorReference{privatev1.AddOnOperatorReference_builder{Id: "operator-1", Name: "operator-one"}.Build()},
+					}.Build(),
+				}.Build(),
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+
+			_, err = server.Update(ctx, privatev1.ClustersUpdateRequest_builder{
+				Object: privatev1.Cluster_builder{
+					Id: createResponse.GetObject().GetId(),
+					Spec: privatev1.ClusterSpec_builder{
+						AddOnOperators: []*privatev1.AddOnOperatorReference{privatev1.AddOnOperatorReference_builder{Id: "operator-2", Name: "operator-two"}.Build()},
+					}.Build(),
+				}.Build(),
+				UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"spec.add_on_operators"}},
+			}.Build())
+			Expect(err).To(HaveOccurred())
+			status, ok := grpcstatus.FromError(err)
+			Expect(ok).To(BeTrue())
+			Expect(status.Code()).To(Equal(grpccodes.InvalidArgument))
+			Expect(status.Message()).To(ContainSubstring("spec.add_on_operators"))
+			Expect(status.Message()).To(ContainSubstring("immutable"))
+		})
+
+		It("Rejects changing add-on operators on a full-object update", func() {
+			createResponse, err := server.Create(ctx, privatev1.ClustersCreateRequest_builder{
+				Object: privatev1.Cluster_builder{
+					Metadata: privatev1.Metadata_builder{Name: fmt.Sprintf("test-%s", uuid.New()[24:32])}.Build(),
+					Spec: privatev1.ClusterSpec_builder{
+						Template:       privatev1.ClusterTemplateReference_builder{Id: "my-template-id"}.Build(),
+						AddOnOperators: []*privatev1.AddOnOperatorReference{privatev1.AddOnOperatorReference_builder{Id: "operator-1", Name: "operator-one"}.Build()},
+					}.Build(),
+				}.Build(),
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+
+			updated := proto.Clone(createResponse.GetObject()).(*privatev1.Cluster)
+			updated.GetSpec().SetAddOnOperators([]*privatev1.AddOnOperatorReference{
+				privatev1.AddOnOperatorReference_builder{Id: "operator-2", Name: "operator-two"}.Build(),
+			})
+			_, err = server.Update(ctx, privatev1.ClustersUpdateRequest_builder{Object: updated}.Build())
+			Expect(err).To(HaveOccurred())
+			status, ok := grpcstatus.FromError(err)
+			Expect(ok).To(BeTrue())
+			Expect(status.Code()).To(Equal(grpccodes.InvalidArgument))
+			Expect(status.Message()).To(ContainSubstring("spec.add_on_operators"))
+			Expect(status.Message()).To(ContainSubstring("immutable"))
+		})
+
+		It("Rejects a spec update when the masked spec is omitted", func() {
+			createResponse, err := server.Create(ctx, privatev1.ClustersCreateRequest_builder{
+				Object: privatev1.Cluster_builder{
+					Metadata: privatev1.Metadata_builder{Name: fmt.Sprintf("test-%s", uuid.New()[24:32])}.Build(),
+					Spec: privatev1.ClusterSpec_builder{
+						Template:       privatev1.ClusterTemplateReference_builder{Id: "my-template-id"}.Build(),
+						AddOnOperators: []*privatev1.AddOnOperatorReference{privatev1.AddOnOperatorReference_builder{Id: "operator-1", Name: "operator-one"}.Build()},
+					}.Build(),
+				}.Build(),
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+
+			for _, path := range []string{"spec.add_on_operators", "spec.version"} {
+				_, err = server.Update(ctx, privatev1.ClustersUpdateRequest_builder{
+					Object:     privatev1.Cluster_builder{Id: createResponse.GetObject().GetId()}.Build(),
+					UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{path}},
+				}.Build())
+				Expect(err).To(HaveOccurred())
+				status, ok := grpcstatus.FromError(err)
+				Expect(ok).To(BeTrue())
+				Expect(status.Code()).To(Equal(grpccodes.InvalidArgument))
+				Expect(status.Message()).To(Equal("object and spec are required"))
+			}
+		})
+
+		It("Preserves add-on operators on a full-object metadata update", func() {
+			createResponse, err := server.Create(ctx, privatev1.ClustersCreateRequest_builder{
+				Object: privatev1.Cluster_builder{
+					Metadata: privatev1.Metadata_builder{Name: fmt.Sprintf("test-%s", uuid.New()[24:32])}.Build(),
+					Spec: privatev1.ClusterSpec_builder{
+						Template:       privatev1.ClusterTemplateReference_builder{Id: "my-template-id"}.Build(),
+						AddOnOperators: []*privatev1.AddOnOperatorReference{privatev1.AddOnOperatorReference_builder{Id: "operator-1", Name: "operator-one"}.Build()},
+					}.Build(),
+				}.Build(),
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+
+			updateResponse, err := server.Update(ctx, privatev1.ClustersUpdateRequest_builder{
+				Object: privatev1.Cluster_builder{
+					Id: createResponse.GetObject().GetId(),
+					Metadata: privatev1.Metadata_builder{
+						Name:   createResponse.GetObject().GetMetadata().GetName(),
+						Labels: map[string]string{"example.com/my-label": "my-value"},
+					}.Build(),
+				}.Build(),
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+			Expect(updateResponse.GetObject().GetSpec().GetAddOnOperators()).To(HaveLen(1))
+			Expect(updateResponse.GetObject().GetSpec().GetAddOnOperators()[0].GetName()).To(Equal("operator-one"))
+			Expect(proto.Equal(updateResponse.GetObject().GetSpec(), createResponse.GetObject().GetSpec())).To(BeTrue())
+		})
+
+		It("preserves add-on operators when the referenced operator is deleted", func() {
+			createResponse, err := server.Create(ctx, privatev1.ClustersCreateRequest_builder{
+				Object: privatev1.Cluster_builder{
+					Metadata: privatev1.Metadata_builder{Name: fmt.Sprintf("test-%s", uuid.New()[24:32])}.Build(),
+					Spec: privatev1.ClusterSpec_builder{
+						Template: privatev1.ClusterTemplateReference_builder{Id: "my-template-id"}.Build(),
+						AddOnOperators: []*privatev1.AddOnOperatorReference{
+							privatev1.AddOnOperatorReference_builder{Id: "operator-1", Name: "operator-one"}.Build(),
+						},
+					}.Build(),
+				}.Build(),
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+
+			operatorDao, err := dao.NewGenericDAO[*privatev1.AddOnOperator]().
+				SetLogger(logger).
+				SetTenancyLogic(tenancy).
+				Build()
+			Expect(err).ToNot(HaveOccurred())
+			_, err = operatorDao.Delete().SetId("operator-1").Do(ctx)
+			Expect(err).ToNot(HaveOccurred())
+
+			updateResponse, err := server.Update(ctx, privatev1.ClustersUpdateRequest_builder{
+				Object: privatev1.Cluster_builder{
+					Id: createResponse.GetObject().GetId(),
+					Metadata: privatev1.Metadata_builder{
+						Name:   createResponse.GetObject().GetMetadata().GetName(),
+						Labels: map[string]string{"example.com/my-label": "my-value"},
+					}.Build(),
+				}.Build(),
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+			Expect(updateResponse.GetObject().GetSpec().GetAddOnOperators()[0].GetId()).To(Equal("operator-1"))
 		})
 
 		It("Creates object with template specified by name", func() {
@@ -332,7 +1570,7 @@ var _ = Describe("Private clusters server", func() {
 						Name: fmt.Sprintf("test-%s", uuid.New()[24:32]),
 					}.Build(),
 					Spec: privatev1.ClusterSpec_builder{
-						Template: privatev1.ClusterTemplateReference_builder{Id: "my-template-name"}.Build(),
+						Template: privatev1.ClusterTemplateReference_builder{Name: "my-template-name"}.Build(),
 					}.Build(),
 					Status: privatev1.ClusterStatus_builder{
 						Hub: "my-hub-id",
@@ -369,93 +1607,323 @@ var _ = Describe("Private clusters server", func() {
 			Expect(ok).To(BeTrue())
 			Expect(status.Code()).To(Equal(grpccodes.InvalidArgument))
 			Expect(status.Message()).To(Equal(
-				"there is no template with identifier or name 'does-not-exist'",
+				"template 'does-not-exist' not found",
 			))
 		})
 
-		It("Creates object with host type specified by name in node set", func() {
-			// Create a cluster specifying the host type by name:
-			response, err := server.Create(ctx, privatev1.ClustersCreateRequest_builder{
-				Object: privatev1.Cluster_builder{
-					Metadata: privatev1.Metadata_builder{
-						Name: fmt.Sprintf("test-%s", uuid.New()[24:32]),
-					}.Build(),
-					Spec: privatev1.ClusterSpec_builder{
-						Template: privatev1.ClusterTemplateReference_builder{Id: "my-template-id"}.Build(),
-						NodeSets: map[string]*privatev1.ClusterNodeSet{
-							"compute": privatev1.ClusterNodeSet_builder{
-								HostType: privatev1.HostTypeReference_builder{Id: "acme-1ti-name"}.Build(),
-								Size:     proto.Int32(5),
-							}.Build(),
-						},
-					}.Build(),
-					Status: privatev1.ClusterStatus_builder{
-						Hub: "my-hub-id",
+		DescribeTable("checks CaaS NodeSet hardware lifecycle without rewriting resolved references",
+			func(path string, shared bool, project string) {
+				ref := privatev1.BareMetalInstanceTypeReference_builder{
+					Id: "acme-bmit-id", Name: "acme-bmit-name", Shared: shared, Project: project,
+				}.Build()
+				original := proto.Clone(ref)
+				cluster := newCaaSNodeSetCreateRequest("reference-selectors", map[string]*privatev1.ClusterNodeSet{
+					"workers": privatev1.ClusterNodeSet_builder{Size: proto.Int32(2), BaremetalInstanceType: ref}.Build(),
+				}, nil).GetObject()
+				cluster.GetMetadata().SetTenant(testTenant)
+				var err error
+				switch path {
+				case "create":
+					err = server.resolveClusterNodeSets(ctx, cluster)
+				case "update":
+					current := privatev1.Cluster_builder{Spec: privatev1.ClusterSpec_builder{}.Build()}.Build()
+					err = server.prepareUpdatedClusterNodeSets(ctx, current, cluster,
+						cluster.GetSpec().GetNodeSets(), &fieldmaskpb.FieldMask{Paths: []string{"spec.node_sets"}}, false)
+				case "fabric":
+					err = server.resolveFabricInterfaces(ctx, cluster)
+				}
+				Expect(err).ToNot(HaveOccurred())
+				if path == "fabric" {
+					Expect(cluster.GetSpec().GetNodeSets()["workers"].GetFabricInterface()).To(Equal("data-0"))
+					return
+				}
+				Expect(proto.Equal(ref, original)).To(BeTrue())
+			},
+			Entry("create without shared=true", "create", false, ""),
+			Entry("update without shared=true", "update", false, ""),
+			Entry("fabric without shared=true", "fabric", false, ""),
+			Entry("create with a project", "create", true, "other"),
+			Entry("update with a project", "update", true, "other"),
+			Entry("fabric with a project", "fabric", true, "other"),
+		)
+
+		It("resolves an explicitly shared name-only CaaS NodeSet reference without mutating the request", func() {
+			request := newCaaSNodeSetCreateRequest("shared-name-only", map[string]*privatev1.ClusterNodeSet{
+				"workers": privatev1.ClusterNodeSet_builder{
+					Size: proto.Int32(2),
+					BaremetalInstanceType: privatev1.BareMetalInstanceTypeReference_builder{
+						Name: "acme-bmit-name", Shared: true,
 					}.Build(),
 				}.Build(),
-			}.Build())
+			}, nil)
+			original := proto.Clone(request)
+			response, err := server.Create(ctx, request)
 			Expect(err).ToNot(HaveOccurred())
-			Expect(response).ToNot(BeNil())
-			object := response.GetObject()
-			Expect(object).ToNot(BeNil())
-			Expect(object.GetId()).ToNot(BeEmpty())
-
-			// Verify that the host type name was replaced by the identifier and name is preserved:
-			nodeSets := object.GetSpec().GetNodeSets()
-			Expect(nodeSets).To(HaveKey("compute"))
-			nodeSet := nodeSets["compute"]
-			Expect(nodeSet.GetHostType().GetId()).To(Equal("acme-1ti-id"))
-			Expect(nodeSet.GetHostType().GetName()).To(Equal("acme-1ti-name"))
+			Expect(proto.Equal(request, original)).To(BeTrue())
+			resolved := response.GetObject().GetSpec().GetNodeSets()["workers"].GetBaremetalInstanceType()
+			Expect(resolved.GetId()).To(Equal("acme-bmit-id"))
+			Expect(resolved.GetName()).To(Equal("acme-bmit-name"))
+			Expect(resolved.GetShared()).To(BeTrue())
 		})
 
-		It("Creates object with host type specified by identifier in node set", func() {
-			// Create a cluster specifying the host type by identifier:
-			response, err := server.Create(ctx, privatev1.ClustersCreateRequest_builder{
-				Object: privatev1.Cluster_builder{
-					Metadata: privatev1.Metadata_builder{
-						Name: fmt.Sprintf("test-%s", uuid.New()[24:32]),
-					}.Build(),
-					Spec: privatev1.ClusterSpec_builder{
-						Template: privatev1.ClusterTemplateReference_builder{Id: "my-template-id"}.Build(),
-						NodeSets: map[string]*privatev1.ClusterNodeSet{
-							"compute": privatev1.ClusterNodeSet_builder{
-								HostType: privatev1.HostTypeReference_builder{Id: "acme-1ti-id"}.Build(),
-								Size:     proto.Int32(7),
-							}.Build(),
-						},
-					}.Build(),
-					Status: privatev1.ClusterStatus_builder{
-						Hub: "my-hub-id",
+		DescribeTable("rejects unavailable resolved CaaS NodeSet hardware", func(path, state string) {
+			id := "acme-bmit-id"
+			if state == "missing" {
+				id = "missing-bmit-id"
+			} else {
+				object, err := getReferenceResource(ctx, server.bareMetalInstanceTypesDao, id)
+				Expect(err).ToNot(HaveOccurred())
+				object.GetMetadata().SetFinalizers([]string{"test-finalizer"})
+				_, err = server.bareMetalInstanceTypesDao.Update().SetObject(object).Do(ctx)
+				Expect(err).ToNot(HaveOccurred())
+				_, err = server.bareMetalInstanceTypesDao.Delete().SetId(id).Do(ctx)
+				Expect(err).ToNot(HaveOccurred())
+			}
+			cluster := newCaaSNodeSetCreateRequest("unavailable-hardware", map[string]*privatev1.ClusterNodeSet{
+				"workers": privatev1.ClusterNodeSet_builder{
+					Size: proto.Int32(2),
+					BaremetalInstanceType: privatev1.BareMetalInstanceTypeReference_builder{
+						Id: id, Name: "acme-bmit-name", Shared: true,
 					}.Build(),
 				}.Build(),
-			}.Build())
-			Expect(err).ToNot(HaveOccurred())
-			Expect(response).ToNot(BeNil())
-			object := response.GetObject()
-			Expect(object).ToNot(BeNil())
-			Expect(object.GetId()).ToNot(BeEmpty())
+			}, nil).GetObject()
+			var err error
+			if path == "create" {
+				err = server.resolveClusterNodeSets(ctx, cluster)
+			} else {
+				current := privatev1.Cluster_builder{Spec: privatev1.ClusterSpec_builder{}.Build()}.Build()
+				err = server.prepareUpdatedClusterNodeSets(ctx, current, cluster,
+					cluster.GetSpec().GetNodeSets(), &fieldmaskpb.FieldMask{Paths: []string{"spec.node_sets"}}, false)
+			}
+			Expect(grpcstatus.Code(err)).To(Equal(grpccodes.InvalidArgument))
+			Expect(err).To(MatchError(ContainSubstring("node_sets.workers.baremetal_instance_type")))
+			if state == "missing" {
+				Expect(err).To(MatchError(ContainSubstring("not found")))
+			} else {
+				Expect(err).To(MatchError(ContainSubstring("deleted")))
+			}
+		},
+			Entry("deleted type on create", "create", "deleted"),
+			Entry("deleted type on update", "update", "deleted"),
+			Entry("missing type on create", "create", "missing"),
+			Entry("missing type on update", "update", "missing"),
+		)
 
-			// Verify that the host type identifier is preserved and name is resolved:
-			nodeSets := object.GetSpec().GetNodeSets()
-			Expect(nodeSets).To(HaveKey("compute"))
-			nodeSet := nodeSets["compute"]
-			Expect(nodeSet.GetHostType().GetId()).To(Equal("acme-1ti-id"))
-			Expect(nodeSet.GetHostType().GetName()).To(Equal("acme-1ti-name"))
+		It("validates the fabric port using the exact shared BMIT resolved for the NodeSet", func() {
+			seedCaaSTestBareMetalInstanceType(ctx, "shared-fabric-worker-id", "fabric-worker", auth.SharedTenant,
+				[]*privatev1.BareMetalNetworkPortSpec{
+					privatev1.BareMetalNetworkPortSpec_builder{Name: "data-0", Role: "fabric"}.Build(),
+				})
+			// This different tenant BMIT has a unique name, but its name equals the shared BMIT ID.
+			// A second lookup using `id == key || name == key` must not replace/ambiguate the
+			// already-resolved shared object used for fabric validation.
+			seedCaaSTestBareMetalInstanceType(ctx, "tenant-other-worker-id", "shared-fabric-worker-id", testTenant, nil)
+			response, err := server.Create(ctx, newCaaSNodeSetCreateRequest("shared-fabric", map[string]*privatev1.ClusterNodeSet{
+				"workers": privatev1.ClusterNodeSet_builder{
+					Size: proto.Int32(2),
+					BaremetalInstanceType: privatev1.BareMetalInstanceTypeReference_builder{
+						Name: "fabric-worker", Shared: true,
+					}.Build(),
+				}.Build(),
+			}, privatev1.ClusterNetworkAttachment_builder{
+				Subnet: privatev1.SubnetLocalReference_builder{Id: "subnet-1"}.Build(),
+			}.Build()))
+			Expect(err).ToNot(HaveOccurred())
+			resolved := response.GetObject().GetSpec().GetNodeSets()["workers"]
+			Expect(resolved.GetBaremetalInstanceType().GetId()).To(Equal("shared-fabric-worker-id"))
+			Expect(resolved.GetBaremetalInstanceType().GetShared()).To(BeTrue())
+			Expect(resolved.GetFabricInterface()).To(Equal("data-0"))
 		})
 
-		It("Creates object with template and host type specified by name", func() {
-			// Create a cluster specifying the template and the host type by name:
+		DescribeTable("preserves hardware immutability without validating reference selectors on update",
+			func(nodeSetName string, shared bool, project string) {
+				created, err := server.Create(ctx, newCaaSNodeSetCreateRequest("invalid-scope-update", map[string]*privatev1.ClusterNodeSet{
+					"compute": privatev1.ClusterNodeSet_builder{
+						Size:                  proto.Int32(2),
+						BaremetalInstanceType: privatev1.BareMetalInstanceTypeReference_builder{Id: "acme-bmit-id", Shared: true}.Build(),
+					}.Build(),
+				}, nil))
+				Expect(err).ToNot(HaveOccurred())
+				request := privatev1.ClustersUpdateRequest_builder{
+					Object: privatev1.Cluster_builder{
+						Id: created.GetObject().GetId(),
+						Spec: privatev1.ClusterSpec_builder{NodeSets: map[string]*privatev1.ClusterNodeSet{
+							nodeSetName: privatev1.ClusterNodeSet_builder{
+								Size: proto.Int32(1),
+								BaremetalInstanceType: privatev1.BareMetalInstanceTypeReference_builder{
+									Name: "acme-gpu-name", Shared: shared, Project: project,
+								}.Build(),
+							}.Build(),
+						}}.Build(),
+					}.Build(),
+					UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"spec.node_sets"}},
+				}.Build()
+				original := proto.Clone(request)
+				response, err := server.Update(ctx, request)
+				expectedSpec := created.GetObject().GetSpec()
+				if nodeSetName == "compute" {
+					// Existing hardware is immutable, so this fails before reference resolution.
+					Expect(grpcstatus.Code(err)).To(Equal(grpccodes.InvalidArgument))
+					Expect(err).To(MatchError(ContainSubstring("baremetal_instance_type is immutable")))
+				} else {
+					Expect(err).ToNot(HaveOccurred())
+					expectedSpec = response.GetObject().GetSpec()
+					ref := expectedSpec.GetNodeSets()[nodeSetName].GetBaremetalInstanceType()
+					Expect(ref.GetId()).To(Equal("acme-gpu-bmit-id"))
+					Expect(ref.GetName()).To(Equal("acme-gpu-name"))
+					Expect(ref.GetShared()).To(Equal(shared))
+					Expect(ref.GetProject()).To(Equal(project))
+				}
+				Expect(proto.Equal(request, original)).To(BeTrue())
+				stored, err := server.Get(ctx, privatev1.ClustersGetRequest_builder{Id: created.GetObject().GetId()}.Build())
+				Expect(err).ToNot(HaveOccurred())
+				Expect(proto.Equal(stored.GetObject().GetSpec(), expectedSpec)).To(BeTrue())
+			},
+			Entry("new NodeSet without shared=true", "gpu", false, ""),
+			Entry("changed NodeSet without shared=true", "compute", false, ""),
+			// The fixture resource lives in shared/""; after
+			// OSAC-6381 the validator scopes name lookups to the
+			// resolved project, so these entries must use the
+			// resource's actual project.
+			Entry("new NodeSet with shared=true", "gpu", true, ""),
+			Entry("changed NodeSet with shared=true", "compute", true, ""),
+		)
+
+		It("canonicalizes newly added shared NodeSets on update and preserves them on size-only updates", func() {
+			created, err := server.Create(ctx, newCaaSNodeSetCreateRequest("shared-update", map[string]*privatev1.ClusterNodeSet{
+				"compute": privatev1.ClusterNodeSet_builder{
+					Size: proto.Int32(2),
+					BaremetalInstanceType: privatev1.BareMetalInstanceTypeReference_builder{
+						Id: "acme-bmit-id", Shared: true,
+					}.Build(),
+				}.Build(),
+			}, nil))
+			Expect(err).ToNot(HaveOccurred())
+
+			updated, err := server.Update(ctx, privatev1.ClustersUpdateRequest_builder{
+				Object: privatev1.Cluster_builder{
+					Id: created.GetObject().GetId(),
+					Spec: privatev1.ClusterSpec_builder{NodeSets: map[string]*privatev1.ClusterNodeSet{
+						"compute": privatev1.ClusterNodeSet_builder{
+							Size: proto.Int32(2),
+							BaremetalInstanceType: privatev1.BareMetalInstanceTypeReference_builder{
+								Id: "acme-bmit-id", Shared: true,
+							}.Build(),
+						}.Build(),
+						"gpu": privatev1.ClusterNodeSet_builder{
+							Size: proto.Int32(1),
+							BaremetalInstanceType: privatev1.BareMetalInstanceTypeReference_builder{
+								Name: "acme-gpu-name", Shared: true,
+							}.Build(),
+						}.Build(),
+					}}.Build(),
+				}.Build(),
+				UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"spec.node_sets"}},
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+			gpu := updated.GetObject().GetSpec().GetNodeSets()["gpu"]
+			Expect(gpu.GetBaremetalInstanceType().GetId()).To(Equal("acme-gpu-bmit-id"))
+			Expect(gpu.GetBaremetalInstanceType().GetName()).To(Equal("acme-gpu-name"))
+			Expect(gpu.GetBaremetalInstanceType().GetShared()).To(BeTrue())
+
+			sized, err := server.Update(ctx, privatev1.ClustersUpdateRequest_builder{
+				Object: privatev1.Cluster_builder{
+					Id: created.GetObject().GetId(),
+					Spec: privatev1.ClusterSpec_builder{NodeSets: map[string]*privatev1.ClusterNodeSet{
+						"gpu": privatev1.ClusterNodeSet_builder{Size: proto.Int32(4)}.Build(),
+					}}.Build(),
+				}.Build(),
+				UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"spec.node_sets.gpu.size"}},
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+			gpu = sized.GetObject().GetSpec().GetNodeSets()["gpu"]
+			Expect(gpu.GetSize()).To(Equal(int32(4)))
+			Expect(gpu.GetBaremetalInstanceType().GetId()).To(Equal("acme-gpu-bmit-id"))
+			Expect(gpu.GetBaremetalInstanceType().GetShared()).To(BeTrue())
+		})
+
+		It("preserves legacy tenant BMIT and fabric interface when only scaling a NodeSet", func() {
+			seedCaaSTestBareMetalInstanceType(ctx, "legacy-tenant-bmit-id", "legacy-tenant-bmit", testTenant,
+				[]*privatev1.BareMetalNetworkPortSpec{
+					privatev1.BareMetalNetworkPortSpec_builder{Name: "legacy-fabric", Role: "fabric"}.Build(),
+				})
+			clustersDao, err := dao.NewGenericDAO[*privatev1.Cluster]().
+				SetLogger(logger).
+				SetTenancyLogic(tenancy).
+				Build()
+			Expect(err).ToNot(HaveOccurred())
+			// Simulate an existing Cluster created before CaaS enforced shared-only BMITs.
+			created, err := clustersDao.Create().SetObject(privatev1.Cluster_builder{
+				Metadata: privatev1.Metadata_builder{Name: "legacy-bmit-scale", Tenant: testTenant}.Build(),
+				Spec: privatev1.ClusterSpec_builder{
+					Template: privatev1.ClusterTemplateReference_builder{Id: "my-template-id"}.Build(),
+					NodeSets: map[string]*privatev1.ClusterNodeSet{
+						"workers": privatev1.ClusterNodeSet_builder{
+							Size:                  proto.Int32(2),
+							BaremetalInstanceType: privatev1.BareMetalInstanceTypeReference_builder{Id: "legacy-tenant-bmit-id", Name: "legacy-tenant-bmit"}.Build(),
+							FabricInterface:       "legacy-fabric",
+						}.Build(),
+					},
+					NetworkAttachment: privatev1.ClusterNetworkAttachment_builder{
+						Subnet: privatev1.SubnetLocalReference_builder{Id: "subnet-1"}.Build(),
+					}.Build(),
+				}.Build(),
+			}.Build()).Do(ctx)
+			Expect(err).ToNot(HaveOccurred())
+
+			updated, err := server.Update(ctx, privatev1.ClustersUpdateRequest_builder{
+				Object: privatev1.Cluster_builder{
+					Id: created.GetObject().GetId(),
+					Spec: privatev1.ClusterSpec_builder{NodeSets: map[string]*privatev1.ClusterNodeSet{
+						"workers": privatev1.ClusterNodeSet_builder{Size: proto.Int32(3)}.Build(),
+					}}.Build(),
+				}.Build(),
+				UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"spec.node_sets.workers.size"}},
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+			workers := updated.GetObject().GetSpec().GetNodeSets()["workers"]
+			Expect(workers.GetSize()).To(Equal(int32(3)))
+			Expect(workers.GetBaremetalInstanceType().GetId()).To(Equal("legacy-tenant-bmit-id"))
+			Expect(workers.GetBaremetalInstanceType().GetName()).To(Equal("legacy-tenant-bmit"))
+			Expect(workers.GetBaremetalInstanceType().GetShared()).To(BeFalse())
+			Expect(workers.GetFabricInterface()).To(Equal("legacy-fabric"))
+		})
+
+		It("rejects a size-only mask that adds a NodeSet without a hardware type", func() {
+			created, err := server.Create(ctx, newCaaSNodeSetCreateRequest("size-only-new-node-set", map[string]*privatev1.ClusterNodeSet{
+				"workers": privatev1.ClusterNodeSet_builder{
+					Size:                  proto.Int32(2),
+					BaremetalInstanceType: privatev1.BareMetalInstanceTypeReference_builder{Id: "acme-bmit-id", Shared: true}.Build(),
+				}.Build(),
+			}, nil))
+			Expect(err).ToNot(HaveOccurred())
+
+			_, err = server.Update(ctx, privatev1.ClustersUpdateRequest_builder{
+				Object: privatev1.Cluster_builder{
+					Id: created.GetObject().GetId(),
+					Spec: privatev1.ClusterSpec_builder{NodeSets: map[string]*privatev1.ClusterNodeSet{
+						"gpu": privatev1.ClusterNodeSet_builder{Size: proto.Int32(1)}.Build(),
+					}}.Build(),
+				}.Build(),
+				UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"spec.node_sets.gpu.size"}},
+			}.Build())
+			Expect(grpcstatus.Code(err)).To(Equal(grpccodes.InvalidArgument))
+			Expect(err).To(MatchError(ContainSubstring("node_sets")))
+		})
+
+		It("Creates object with template specified by name and bare metal instance type in node set", func() {
+			// Create a cluster specifying the template by name and the bare metal instance type by name:
 			response, err := server.Create(ctx, privatev1.ClustersCreateRequest_builder{
 				Object: privatev1.Cluster_builder{
 					Metadata: privatev1.Metadata_builder{
 						Name: fmt.Sprintf("test-%s", uuid.New()[24:32]),
 					}.Build(),
 					Spec: privatev1.ClusterSpec_builder{
-						Template: privatev1.ClusterTemplateReference_builder{Id: "my-template-name"}.Build(),
+						Template: privatev1.ClusterTemplateReference_builder{Name: "my-template-name"}.Build(),
 						NodeSets: map[string]*privatev1.ClusterNodeSet{
 							"compute": privatev1.ClusterNodeSet_builder{
-								HostType: privatev1.HostTypeReference_builder{Id: "acme-1ti-name"}.Build(),
-								Size:     proto.Int32(7),
+								BaremetalInstanceType: privatev1.BareMetalInstanceTypeReference_builder{Name: "acme-bmit-name", Shared: true}.Build(),
+								Size:                  proto.Int32(7),
 							}.Build(),
 						},
 					}.Build(),
@@ -470,18 +1938,18 @@ var _ = Describe("Private clusters server", func() {
 			Expect(object).ToNot(BeNil())
 			Expect(object.GetId()).ToNot(BeEmpty())
 
-			// Verify that the template and host type names were replaced by the identifiers
-			// and metadata names are preserved on the resolved references:
+			// Verify that the template and bare metal instance type names were replaced by the
+			// identifiers and metadata names are preserved on the resolved references:
 			Expect(object.GetSpec().GetTemplate().GetId()).To(Equal("my-template-id"))
 			Expect(object.GetSpec().GetTemplate().GetName()).To(Equal("my-template-name"))
 			nodeSets := object.GetSpec().GetNodeSets()
 			Expect(nodeSets).To(HaveKey("compute"))
 			nodeSet := nodeSets["compute"]
-			Expect(nodeSet.GetHostType().GetId()).To(Equal("acme-1ti-id"))
-			Expect(nodeSet.GetHostType().GetName()).To(Equal("acme-1ti-name"))
+			Expect(nodeSet.GetBaremetalInstanceType().GetId()).To(Equal("acme-bmit-id"))
+			Expect(nodeSet.GetBaremetalInstanceType().GetName()).To(Equal("acme-bmit-name"))
 		})
 
-		It("Fails when creating object with non-existent host type name", func() {
+		It("Fails when creating object with non-existent bare metal instance type name", func() {
 			_, err := server.Create(ctx, privatev1.ClustersCreateRequest_builder{
 				Object: privatev1.Cluster_builder{
 					Metadata: privatev1.Metadata_builder{
@@ -491,8 +1959,8 @@ var _ = Describe("Private clusters server", func() {
 						Template: privatev1.ClusterTemplateReference_builder{Id: "my-template-id"}.Build(),
 						NodeSets: map[string]*privatev1.ClusterNodeSet{
 							"compute": privatev1.ClusterNodeSet_builder{
-								HostType: privatev1.HostTypeReference_builder{Id: "does-not-exist"}.Build(),
-								Size:     proto.Int32(5),
+								BaremetalInstanceType: privatev1.BareMetalInstanceTypeReference_builder{Name: "does-not-exist", Shared: true}.Build(),
+								Size:                  proto.Int32(5),
 							}.Build(),
 						},
 					}.Build(),
@@ -504,13 +1972,38 @@ var _ = Describe("Private clusters server", func() {
 			Expect(err).To(HaveOccurred())
 			status, ok := grpcstatus.FromError(err)
 			Expect(ok).To(BeTrue())
-			Expect(status.Code()).To(Equal(grpccodes.NotFound))
-			Expect(status.Message()).To(Equal(
-				"there is no host type with identifier or name 'does-not-exist'",
-			))
+			Expect(status.Code()).To(Equal(grpccodes.InvalidArgument))
+			Expect(status.Message()).To(ContainSubstring("does-not-exist"))
 		})
 
-		It("Fails when creating object with non-existent node set", func() {
+		It("Accepts an additional node set with a valid bare metal instance type", func() {
+			response, err := server.Create(ctx, privatev1.ClustersCreateRequest_builder{
+				Object: privatev1.Cluster_builder{
+					Metadata: privatev1.Metadata_builder{
+						Name: fmt.Sprintf("test-%s", uuid.New()[24:32]),
+					}.Build(),
+					Spec: privatev1.ClusterSpec_builder{
+						Template: privatev1.ClusterTemplateReference_builder{Id: "my-template-id"}.Build(),
+						NodeSets: map[string]*privatev1.ClusterNodeSet{
+							"does-not-exist": privatev1.ClusterNodeSet_builder{
+								BaremetalInstanceType: privatev1.BareMetalInstanceTypeReference_builder{Id: "acme-bmit-id", Shared: true}.Build(),
+								Size:                  proto.Int32(5),
+							}.Build(),
+						},
+					}.Build(),
+					Status: privatev1.ClusterStatus_builder{
+						Hub: "my-hub-id",
+					}.Build(),
+				}.Build(),
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+			nodes := response.GetObject().GetSpec().GetNodeSets()
+			Expect(nodes).To(HaveLen(1))
+			Expect(nodes["does-not-exist"].GetBaremetalInstanceType().GetId()).To(Equal("acme-bmit-id"))
+			Expect(nodes["does-not-exist"].GetBaremetalInstanceType().GetName()).To(Equal("acme-bmit-name"))
+		})
+
+		It("Rejects an additional node set without bare metal instance type", func() {
 			_, err := server.Create(ctx, privatev1.ClustersCreateRequest_builder{
 				Object: privatev1.Cluster_builder{
 					Metadata: privatev1.Metadata_builder{
@@ -520,8 +2013,7 @@ var _ = Describe("Private clusters server", func() {
 						Template: privatev1.ClusterTemplateReference_builder{Id: "my-template-id"}.Build(),
 						NodeSets: map[string]*privatev1.ClusterNodeSet{
 							"does-not-exist": privatev1.ClusterNodeSet_builder{
-								HostType: privatev1.HostTypeReference_builder{Id: "acme-1ti-id"}.Build(),
-								Size:     proto.Int32(5),
+								Size: proto.Int32(5),
 							}.Build(),
 						},
 					}.Build(),
@@ -534,26 +2026,18 @@ var _ = Describe("Private clusters server", func() {
 			status, ok := grpcstatus.FromError(err)
 			Expect(ok).To(BeTrue())
 			Expect(status.Code()).To(Equal(grpccodes.InvalidArgument))
-			Expect(status.Message()).To(Equal(
-				"node set 'does-not-exist' doesn't exist, valid values for template 'my-template-id' " +
-					"are 'compute' and 'gpu'",
-			))
+			Expect(status.Message()).To(ContainSubstring("bare metal instance type for node set 'does-not-exist' is required"))
 		})
 
-		It("Fails when creating object with host type that doesn't match template", func() {
+		It("rejects a cluster without request or catalog node sets", func() {
+			// The template cannot supply node sets.
 			_, err := server.Create(ctx, privatev1.ClustersCreateRequest_builder{
 				Object: privatev1.Cluster_builder{
 					Metadata: privatev1.Metadata_builder{
 						Name: fmt.Sprintf("test-%s", uuid.New()[24:32]),
 					}.Build(),
 					Spec: privatev1.ClusterSpec_builder{
-						Template: privatev1.ClusterTemplateReference_builder{Id: "my-template-id"}.Build(),
-						NodeSets: map[string]*privatev1.ClusterNodeSet{
-							"compute": privatev1.ClusterNodeSet_builder{
-								HostType: privatev1.HostTypeReference_builder{Id: "acme-gpu-id"}.Build(),
-								Size:     proto.Int32(5),
-							}.Build(),
-						},
+						Template: privatev1.ClusterTemplateReference_builder{Id: "no-bmit-template-id"}.Build(),
 					}.Build(),
 					Status: privatev1.ClusterStatus_builder{
 						Hub: "my-hub-id",
@@ -564,10 +2048,7 @@ var _ = Describe("Private clusters server", func() {
 			status, ok := grpcstatus.FromError(err)
 			Expect(ok).To(BeTrue())
 			Expect(status.Code()).To(Equal(grpccodes.InvalidArgument))
-			Expect(status.Message()).To(Equal(
-				"host type for node set 'compute' should be empty, 'acme-1ti-name' or 'acme-1ti-id', " +
-					"like in template 'my-template-id', but it is 'acme-gpu-id'",
-			))
+			Expect(status.Message()).To(ContainSubstring("at least one node set"))
 		})
 
 		It("Returns 'already exists' when creating object with existing identifier", func() {
@@ -956,22 +2437,22 @@ var _ = Describe("Private clusters server", func() {
 			Expect(object.GetSpec().GetNodeSets()).To(HaveLen(2)) // compute and gpu
 
 			// Add a new node set
-			_, err = server.Update(ctx, privatev1.ClustersUpdateRequest_builder{
+			updated, err := server.Update(ctx, privatev1.ClustersUpdateRequest_builder{
 				Object: privatev1.Cluster_builder{
 					Id: object.GetId(),
 					Spec: privatev1.ClusterSpec_builder{
 						NodeSets: map[string]*privatev1.ClusterNodeSet{
 							"compute": privatev1.ClusterNodeSet_builder{
-								HostType: privatev1.HostTypeReference_builder{Id: "acme-1ti-id"}.Build(),
-								Size:     proto.Int32(3),
+								BaremetalInstanceType: privatev1.BareMetalInstanceTypeReference_builder{Id: "acme-bmit-id", Shared: true}.Build(),
+								Size:                  proto.Int32(3),
 							}.Build(),
 							"gpu": privatev1.ClusterNodeSet_builder{
-								HostType: privatev1.HostTypeReference_builder{Id: "acme-gpu-id"}.Build(),
-								Size:     proto.Int32(1),
+								BaremetalInstanceType: privatev1.BareMetalInstanceTypeReference_builder{Id: "acme-gpu-bmit-id", Shared: true}.Build(),
+								Size:                  proto.Int32(1),
 							}.Build(),
 							"storage": privatev1.ClusterNodeSet_builder{
-								HostType: privatev1.HostTypeReference_builder{Id: "acme-1ti-id"}.Build(),
-								Size:     proto.Int32(2),
+								BaremetalInstanceType: privatev1.BareMetalInstanceTypeReference_builder{Id: "acme-bmit-id", Shared: true}.Build(),
+								Size:                  proto.Int32(2),
 							}.Build(),
 						},
 					}.Build(),
@@ -981,6 +2462,8 @@ var _ = Describe("Private clusters server", func() {
 				},
 			}.Build())
 			Expect(err).ToNot(HaveOccurred())
+			Expect(proto.Equal(updated.GetObject().GetSpec().GetNodeSets()["storage"].GetVersion(),
+				object.GetSpec().GetVersion())).To(BeTrue())
 		})
 
 		It("Allows removing a node set when multiple exist", func() {
@@ -1004,8 +2487,8 @@ var _ = Describe("Private clusters server", func() {
 					Spec: privatev1.ClusterSpec_builder{
 						NodeSets: map[string]*privatev1.ClusterNodeSet{
 							"compute": privatev1.ClusterNodeSet_builder{
-								HostType: privatev1.HostTypeReference_builder{Id: "acme-1ti-id"}.Build(),
-								Size:     proto.Int32(3),
+								BaremetalInstanceType: privatev1.BareMetalInstanceTypeReference_builder{Id: "acme-bmit-id", Shared: true}.Build(),
+								Size:                  proto.Int32(3),
 							}.Build(),
 						},
 					}.Build(),
@@ -1050,7 +2533,7 @@ var _ = Describe("Private clusters server", func() {
 			Expect(status.Message()).To(Equal("cannot remove the last node set: clusters must have at least one node set"))
 		})
 
-		It("Rejects changing host_type of an existing node set", func() {
+		It("Rejects changing baremetal_instance_type of an existing node set", func() {
 			// Create a cluster with the default node sets from the template
 			createResponse, err := server.Create(ctx, privatev1.ClustersCreateRequest_builder{
 				Object: privatev1.Cluster_builder{
@@ -1063,19 +2546,19 @@ var _ = Describe("Private clusters server", func() {
 			Expect(err).ToNot(HaveOccurred())
 			object := createResponse.GetObject()
 
-			// Try to change the host_type of the compute node set
+			// Try to change the bare metal instance type of the compute node set
 			_, err = server.Update(ctx, privatev1.ClustersUpdateRequest_builder{
 				Object: privatev1.Cluster_builder{
 					Id: object.GetId(),
 					Spec: privatev1.ClusterSpec_builder{
 						NodeSets: map[string]*privatev1.ClusterNodeSet{
 							"compute": privatev1.ClusterNodeSet_builder{
-								HostType: privatev1.HostTypeReference_builder{Id: "acme-gpu-id"}.Build(), // Changed from acme-1ti-id
-								Size:     proto.Int32(3),
+								BaremetalInstanceType: privatev1.BareMetalInstanceTypeReference_builder{Id: "acme-gpu-bmit-id", Shared: true}.Build(), // Changed from acme-bmit-id
+								Size:                  proto.Int32(3),
 							}.Build(),
 							"gpu": privatev1.ClusterNodeSet_builder{
-								HostType: privatev1.HostTypeReference_builder{Id: "acme-gpu-id"}.Build(),
-								Size:     proto.Int32(1),
+								BaremetalInstanceType: privatev1.BareMetalInstanceTypeReference_builder{Id: "acme-gpu-bmit-id", Shared: true}.Build(),
+								Size:                  proto.Int32(1),
 							}.Build(),
 						},
 					}.Build(),
@@ -1088,7 +2571,32 @@ var _ = Describe("Private clusters server", func() {
 			status, ok := grpcstatus.FromError(err)
 			Expect(ok).To(BeTrue())
 			Expect(status.Code()).To(Equal(grpccodes.InvalidArgument))
-			Expect(status.Message()).To(Equal("cannot change host_type for node set 'compute' from 'acme-1ti-id' to 'acme-gpu-id': host_type is immutable"))
+			Expect(status.Message()).To(Equal("cannot change baremetal_instance_type for node set 'compute' from 'acme-bmit-id' to 'acme-gpu-bmit-id': baremetal_instance_type is immutable"))
+		})
+
+		It("Rejects changing baremetal_instance_type in a full-object update", func() {
+			created, err := server.Create(ctx, privatev1.ClustersCreateRequest_builder{
+				Object: privatev1.Cluster_builder{
+					Metadata: privatev1.Metadata_builder{Name: "immutable-hardware-full-update"}.Build(),
+					Spec: privatev1.ClusterSpec_builder{
+						Template: privatev1.ClusterTemplateReference_builder{Id: "my-template-id"}.Build(),
+					}.Build(),
+				}.Build(),
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+			original := created.GetObject()
+			updated := proto.Clone(original).(*privatev1.Cluster)
+			updated.GetSpec().GetNodeSets()["compute"].SetBaremetalInstanceType(
+				privatev1.BareMetalInstanceTypeReference_builder{Id: "acme-gpu-bmit-id", Shared: true}.Build())
+
+			_, err = server.Update(ctx, privatev1.ClustersUpdateRequest_builder{Object: updated}.Build())
+			Expect(grpcstatus.Code(err)).To(Equal(grpccodes.InvalidArgument))
+			Expect(grpcstatus.Convert(err).Message()).To(ContainSubstring(
+				"cannot change baremetal_instance_type for node set 'compute'"))
+
+			stored, err := server.Get(ctx, privatev1.ClustersGetRequest_builder{Id: original.GetId()}.Build())
+			Expect(err).ToNot(HaveOccurred())
+			Expect(proto.Equal(stored.GetObject().GetSpec(), original.GetSpec())).To(BeTrue())
 		})
 
 		It("Allows changing size of an existing node set", func() {
@@ -1111,12 +2619,12 @@ var _ = Describe("Private clusters server", func() {
 					Spec: privatev1.ClusterSpec_builder{
 						NodeSets: map[string]*privatev1.ClusterNodeSet{
 							"compute": privatev1.ClusterNodeSet_builder{
-								HostType: privatev1.HostTypeReference_builder{Id: "acme-1ti-id"}.Build(),
-								Size:     proto.Int32(5),
+								BaremetalInstanceType: privatev1.BareMetalInstanceTypeReference_builder{Id: "acme-bmit-id", Shared: true}.Build(),
+								Size:                  proto.Int32(5),
 							}.Build(),
 							"gpu": privatev1.ClusterNodeSet_builder{
-								HostType: privatev1.HostTypeReference_builder{Id: "acme-gpu-id"}.Build(),
-								Size:     proto.Int32(1),
+								BaremetalInstanceType: privatev1.BareMetalInstanceTypeReference_builder{Id: "acme-gpu-bmit-id", Shared: true}.Build(),
+								Size:                  proto.Int32(1),
 							}.Build(),
 						},
 					}.Build(),
@@ -1187,11 +2695,12 @@ var _ = Describe("Private clusters server", func() {
 					Object: privatev1.Cluster_builder{
 						Id: object.GetId(),
 						Status: privatev1.ClusterStatus_builder{
-							State: state,
+							State:               state,
+							StateTransitionTime: timestamppb.New(time.Now().Truncate(time.Second)),
 						}.Build(),
 					}.Build(),
 					UpdateMask: &fieldmaskpb.FieldMask{
-						Paths: []string{"status.state"},
+						Paths: []string{"status.state", "status.state_transition_time"},
 					},
 				}.Build())
 				Expect(err).ToNot(HaveOccurred())
@@ -1475,6 +2984,9 @@ var _ = Describe("Private clusters server", func() {
 				Expect(status.Message()).To(Equal(
 					"cannot change spec.network_attachment.subnet from 'subnet-1' to 'subnet-2': subnet is immutable",
 				))
+				stored, err := server.Get(ctx, privatev1.ClustersGetRequest_builder{Id: object.GetId()}.Build())
+				Expect(err).ToNot(HaveOccurred())
+				Expect(proto.Equal(stored.GetObject().GetSpec().GetNetworkAttachment(), object.GetSpec().GetNetworkAttachment())).To(BeTrue())
 			})
 
 			It("Rejects removing network_attachment when one exists", func() {
@@ -1496,9 +3008,13 @@ var _ = Describe("Private clusters server", func() {
 				Expect(status.Message()).To(Equal(
 					"cannot change spec.network_attachment.subnet from 'subnet-1' to '': subnet is immutable",
 				))
+				stored, err := server.Get(ctx, privatev1.ClustersGetRequest_builder{Id: object.GetId()}.Build())
+				Expect(err).ToNot(HaveOccurred())
+				Expect(proto.Equal(stored.GetObject().GetSpec().GetNetworkAttachment(), object.GetSpec().GetNetworkAttachment())).To(BeTrue())
 			})
 
-			It("Rejects adding network_attachment when none existed", func() {
+			It("Rejects replacing the resolved default network_attachment", func() {
+				defaults := seedReadyDefaultNetworking(testTenant, 0)
 				createResponse, err := server.Create(ctx, privatev1.ClustersCreateRequest_builder{
 					Object: privatev1.Cluster_builder{
 						Metadata: privatev1.Metadata_builder{Name: "test-cluster"}.Build(),
@@ -1528,11 +3044,17 @@ var _ = Describe("Private clusters server", func() {
 				Expect(ok).To(BeTrue())
 				Expect(status.Code()).To(Equal(grpccodes.InvalidArgument))
 				Expect(status.Message()).To(Equal(
-					"cannot change spec.network_attachment.subnet from '' to 'subnet-1': subnet is immutable",
+					fmt.Sprintf(
+						"cannot change spec.network_attachment.subnet from '%s' to 'subnet-1': subnet is immutable",
+						defaults.subnetID,
+					),
 				))
+				stored, err := server.Get(ctx, privatev1.ClustersGetRequest_builder{Id: object.GetId()}.Build())
+				Expect(err).ToNot(HaveOccurred())
+				Expect(proto.Equal(stored.GetObject().GetSpec().GetNetworkAttachment(), object.GetSpec().GetNetworkAttachment())).To(BeTrue())
 			})
 
-			It("Allows changing security_groups with same subnet", func() {
+			It("Rejects changing security_groups with same subnet", func() {
 				object := createClusterWithNetworkAttachment(privatev1.SubnetLocalReference_builder{Id: "subnet-1"}.Build(), []*privatev1.SecurityGroupLocalReference{privatev1.SecurityGroupLocalReference_builder{Id: "default-sg"}.Build()})
 
 				updateResponse, err := server.Update(ctx, privatev1.ClustersUpdateRequest_builder{
@@ -1549,15 +3071,17 @@ var _ = Describe("Private clusters server", func() {
 						Paths: []string{"spec.network_attachment"},
 					},
 				}.Build())
+				Expect(updateResponse).To(BeNil())
+				Expect(grpcstatus.Code(err)).To(Equal(grpccodes.InvalidArgument))
+				stored, err := server.Get(ctx, privatev1.ClustersGetRequest_builder{Id: object.GetId()}.Build())
 				Expect(err).ToNot(HaveOccurred())
-				updated := updateResponse.GetObject()
-				Expect(updated.GetSpec().GetNetworkAttachment().GetSubnet().GetId()).To(Equal("subnet-1"))
-				Expect(updated.GetSpec().GetNetworkAttachment().GetSecurityGroups()).To(HaveLen(2))
-				Expect(updated.GetSpec().GetNetworkAttachment().GetSecurityGroups()[0].GetId()).To(Equal("default-sg"))
-				Expect(updated.GetSpec().GetNetworkAttachment().GetSecurityGroups()[1].GetId()).To(Equal("sg-2"))
+				attachment := stored.GetObject().GetSpec().GetNetworkAttachment()
+				Expect(attachment.GetSubnet().GetId()).To(Equal("subnet-1"))
+				Expect(attachment.GetSecurityGroups()).To(HaveLen(1))
+				Expect(attachment.GetSecurityGroups()[0].GetId()).To(Equal("default-sg"))
 			})
 
-			It("Allows updating security_groups via sub-field mask", func() {
+			It("Rejects updating security_groups via sub-field mask", func() {
 				object := createClusterWithNetworkAttachment(privatev1.SubnetLocalReference_builder{Id: "subnet-1"}.Build(), []*privatev1.SecurityGroupLocalReference{privatev1.SecurityGroupLocalReference_builder{Id: "default-sg"}.Build()})
 
 				updateResponse, err := server.Update(ctx, privatev1.ClustersUpdateRequest_builder{
@@ -1573,11 +3097,39 @@ var _ = Describe("Private clusters server", func() {
 						Paths: []string{"spec.network_attachment.security_groups"},
 					},
 				}.Build())
+				Expect(updateResponse).To(BeNil())
+				Expect(grpcstatus.Code(err)).To(Equal(grpccodes.InvalidArgument))
+				stored, err := server.Get(ctx, privatev1.ClustersGetRequest_builder{Id: object.GetId()}.Build())
 				Expect(err).ToNot(HaveOccurred())
-				updated := updateResponse.GetObject()
-				Expect(updated.GetSpec().GetNetworkAttachment().GetSecurityGroups()).To(HaveLen(2))
-				Expect(updated.GetSpec().GetNetworkAttachment().GetSecurityGroups()[0].GetId()).To(Equal("sg-2"))
-				Expect(updated.GetSpec().GetNetworkAttachment().GetSecurityGroups()[1].GetId()).To(Equal("sg-3"))
+				attachment := stored.GetObject().GetSpec().GetNetworkAttachment()
+				Expect(attachment.GetSubnet().GetId()).To(Equal("subnet-1"))
+				Expect(attachment.GetSecurityGroups()).To(HaveLen(1))
+				Expect(attachment.GetSecurityGroups()[0].GetId()).To(Equal("default-sg"))
+			})
+
+			It("Accepts an identical network_attachment", func() {
+				object := createClusterWithNetworkAttachment(
+					privatev1.SubnetLocalReference_builder{Id: "subnet-1"}.Build(),
+					[]*privatev1.SecurityGroupLocalReference{privatev1.SecurityGroupLocalReference_builder{Id: "default-sg"}.Build()},
+				)
+				updated, err := server.Update(ctx, privatev1.ClustersUpdateRequest_builder{
+					Object: privatev1.Cluster_builder{
+						Id: object.GetId(),
+						Spec: privatev1.ClusterSpec_builder{
+							NetworkAttachment: privatev1.ClusterNetworkAttachment_builder{
+								Subnet: privatev1.SubnetLocalReference_builder{Id: "subnet-1"}.Build(),
+								SecurityGroups: []*privatev1.SecurityGroupLocalReference{
+									privatev1.SecurityGroupLocalReference_builder{Id: "default-sg"}.Build(),
+								},
+							}.Build(),
+						}.Build(),
+					}.Build(),
+					UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"spec.network_attachment"}},
+				}.Build())
+				Expect(err).ToNot(HaveOccurred())
+				attachment := updated.GetObject().GetSpec().GetNetworkAttachment()
+				Expect(attachment.GetSubnet().GetId()).To(Equal("subnet-1"))
+				Expect(attachment.GetSecurityGroups()[0].GetId()).To(Equal("default-sg"))
 			})
 
 			It("Passes through when mask does not include network_attachment", func() {
@@ -1587,16 +3139,320 @@ var _ = Describe("Private clusters server", func() {
 					Object: privatev1.Cluster_builder{
 						Id: object.GetId(),
 						Status: privatev1.ClusterStatus_builder{
-							State: privatev1.ClusterState_CLUSTER_STATE_READY,
+							State:               privatev1.ClusterState_CLUSTER_STATE_READY,
+							StateTransitionTime: timestamppb.New(time.Now().Truncate(time.Second)),
 						}.Build(),
 					}.Build(),
 					UpdateMask: &fieldmaskpb.FieldMask{
-						Paths: []string{"status.state"},
+						Paths: []string{"status.state", "status.state_transition_time"},
 					},
 				}.Build())
 				Expect(err).ToNot(HaveOccurred())
 				updated := updateResponse.GetObject()
 				Expect(updated.GetSpec().GetNetworkAttachment().GetSubnet().GetId()).To(Equal("subnet-1"))
+			})
+
+			It("Rejects removing security_groups with same subnet", func() {
+				object := createClusterWithNetworkAttachment(privatev1.SubnetLocalReference_builder{Id: "subnet-1"}.Build(), []*privatev1.SecurityGroupLocalReference{privatev1.SecurityGroupLocalReference_builder{Id: "default-sg"}.Build()})
+
+				_, err := server.Update(ctx, privatev1.ClustersUpdateRequest_builder{
+					Object: privatev1.Cluster_builder{
+						Id: object.GetId(),
+						Spec: privatev1.ClusterSpec_builder{
+							NetworkAttachment: privatev1.ClusterNetworkAttachment_builder{
+								Subnet:         privatev1.SubnetLocalReference_builder{Id: "subnet-1"}.Build(),
+								SecurityGroups: []*privatev1.SecurityGroupLocalReference{},
+							}.Build(),
+						}.Build(),
+					}.Build(),
+					UpdateMask: &fieldmaskpb.FieldMask{
+						Paths: []string{"spec.network_attachment"},
+					},
+				}.Build())
+				Expect(err).To(HaveOccurred())
+				status, ok := grpcstatus.FromError(err)
+				Expect(ok).To(BeTrue())
+				Expect(status.Code()).To(Equal(grpccodes.InvalidArgument))
+				Expect(status.Message()).To(ContainSubstring("security groups are immutable"))
+				stored, err := server.Get(ctx, privatev1.ClustersGetRequest_builder{Id: object.GetId()}.Build())
+				Expect(err).ToNot(HaveOccurred())
+				Expect(proto.Equal(stored.GetObject().GetSpec().GetNetworkAttachment(), object.GetSpec().GetNetworkAttachment())).To(BeTrue())
+			})
+
+			It("Rejects reordering equivalent security_groups", func() {
+				object := createClusterWithNetworkAttachment(
+					privatev1.SubnetLocalReference_builder{Id: "subnet-1"}.Build(),
+					[]*privatev1.SecurityGroupLocalReference{
+						privatev1.SecurityGroupLocalReference_builder{Id: "default-sg"}.Build(),
+						privatev1.SecurityGroupLocalReference_builder{Id: "sg-2"}.Build(),
+					},
+				)
+
+				_, err := server.Update(ctx, privatev1.ClustersUpdateRequest_builder{
+					Object: privatev1.Cluster_builder{
+						Id: object.GetId(),
+						Spec: privatev1.ClusterSpec_builder{
+							NetworkAttachment: privatev1.ClusterNetworkAttachment_builder{
+								Subnet: privatev1.SubnetLocalReference_builder{Id: "subnet-1"}.Build(),
+								SecurityGroups: []*privatev1.SecurityGroupLocalReference{
+									privatev1.SecurityGroupLocalReference_builder{Id: "sg-2"}.Build(),
+									privatev1.SecurityGroupLocalReference_builder{Id: "default-sg"}.Build(),
+								},
+							}.Build(),
+						}.Build(),
+					}.Build(),
+					UpdateMask: &fieldmaskpb.FieldMask{
+						Paths: []string{"spec.network_attachment"},
+					},
+				}.Build())
+				Expect(err).To(HaveOccurred())
+				status, ok := grpcstatus.FromError(err)
+				Expect(ok).To(BeTrue())
+				Expect(status.Code()).To(Equal(grpccodes.InvalidArgument))
+				Expect(status.Message()).To(ContainSubstring("security groups are immutable"))
+				stored, err := server.Get(ctx, privatev1.ClustersGetRequest_builder{Id: object.GetId()}.Build())
+				Expect(err).ToNot(HaveOccurred())
+				attachment := stored.GetObject().GetSpec().GetNetworkAttachment()
+				Expect(attachment.GetSecurityGroups()).To(HaveLen(2))
+				Expect(attachment.GetSecurityGroups()[0].GetId()).To(Equal("default-sg"))
+				Expect(attachment.GetSecurityGroups()[1].GetId()).To(Equal("sg-2"))
+			})
+		})
+
+		Context("Auto external IP attachment immutability", func() {
+			createClusterWithAttachment := func() *privatev1.Cluster {
+				createResponse, err := server.Create(ctx, privatev1.ClustersCreateRequest_builder{
+					Object: privatev1.Cluster_builder{
+						Metadata: privatev1.Metadata_builder{Name: "test-cluster"}.Build(),
+						Spec: privatev1.ClusterSpec_builder{
+							Template: privatev1.ClusterTemplateReference_builder{Id: "my-template-id"}.Build(),
+							NetworkAttachment: privatev1.ClusterNetworkAttachment_builder{
+								Subnet:         privatev1.SubnetLocalReference_builder{Id: "subnet-1"}.Build(),
+								SecurityGroups: []*privatev1.SecurityGroupLocalReference{privatev1.SecurityGroupLocalReference_builder{Id: "default-sg"}.Build()},
+							}.Build(),
+						}.Build(),
+					}.Build(),
+				}.Build())
+				Expect(err).ToNot(HaveOccurred())
+				return createResponse.GetObject()
+			}
+
+			It("Rejects enabling auto_external_ip_attachment and provisions nothing", func() {
+				object := createClusterWithAttachment()
+
+				_, err := server.Update(ctx, privatev1.ClustersUpdateRequest_builder{
+					Object: privatev1.Cluster_builder{
+						Id: object.GetId(),
+						Spec: privatev1.ClusterSpec_builder{
+							AutoExternalIpAttachment: proto.Bool(true),
+						}.Build(),
+					}.Build(),
+					UpdateMask: &fieldmaskpb.FieldMask{
+						Paths: []string{"spec.auto_external_ip_attachment"},
+					},
+				}.Build())
+				Expect(err).To(HaveOccurred())
+				status, ok := grpcstatus.FromError(err)
+				Expect(ok).To(BeTrue())
+				Expect(status.Code()).To(Equal(grpccodes.InvalidArgument))
+				Expect(status.Message()).To(ContainSubstring("auto_external_ip_attachment is immutable"))
+
+				eipDao, err := dao.NewGenericDAO[*privatev1.ExternalIP]().
+					SetLogger(logger).SetTenancyLogic(tenancy).Build()
+				Expect(err).ToNot(HaveOccurred())
+				eipList, err := eipDao.List().
+					SetFilter(fmt.Sprintf("this.metadata.labels['%s'] == '%s'", autoCreatedForLabel, object.GetId())).
+					Do(ctx)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(eipList.GetItems()).To(BeEmpty())
+
+				attDao, err := dao.NewGenericDAO[*privatev1.ExternalIPAttachment]().
+					SetLogger(logger).SetTenancyLogic(tenancy).Build()
+				Expect(err).ToNot(HaveOccurred())
+				attList, err := attDao.List().
+					SetFilter(fmt.Sprintf("this.metadata.labels['%s'] == '%s'", autoCreatedForLabel, object.GetId())).
+					Do(ctx)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(attList.GetItems()).To(BeEmpty())
+
+				stored, err := server.Get(ctx, privatev1.ClustersGetRequest_builder{Id: object.GetId()}.Build())
+				Expect(err).ToNot(HaveOccurred())
+				Expect(stored.GetObject().GetSpec().GetAutoExternalIpAttachment()).To(BeFalse())
+			})
+		})
+
+		Describe("Tenant-default networking", func() {
+			var defaultSubnetID, defaultGroupID string
+
+			BeforeEach(func() {
+				subnet, err := findDefaultSubnet(ctx, logger, fixtureDAO[*privatev1.Subnet](), testTenant, "")
+				Expect(err).NotTo(HaveOccurred())
+				Expect(subnet).NotTo(BeNil())
+				defaultSubnetID = subnet.GetId()
+				group, err := findDefaultSecurityGroup(ctx, logger, fixtureDAO[*privatev1.SecurityGroup](),
+					subnet.GetSpec().GetVirtualNetwork().GetId(), testTenant, "")
+				Expect(err).NotTo(HaveOccurred())
+				Expect(group).NotTo(BeNil())
+				defaultGroupID = group.GetId()
+			})
+			setSubnetDefaultState := func(state string) {
+				subnetsDao, err := dao.NewGenericDAO[*privatev1.Subnet]().
+					SetLogger(logger).
+					SetTenancyLogic(tenancy).
+					Build()
+				Expect(err).ToNot(HaveOccurred())
+				getResponse, err := subnetsDao.Get().SetId(defaultSubnetID).Do(ctx)
+				Expect(err).ToNot(HaveOccurred())
+				subnet := getResponse.GetObject()
+				switch state {
+				case "missing":
+					subnet.GetMetadata().SetLabels(map[string]string{})
+				case "pending":
+					subnet.GetStatus().SetState(privatev1.SubnetState_SUBNET_STATE_PENDING)
+				case "failed":
+					subnet.GetStatus().SetState(privatev1.SubnetState_SUBNET_STATE_FAILED)
+				case "deleting":
+					subnet.GetMetadata().SetFinalizers([]string{"test-finalizer"})
+				}
+				_, err = subnetsDao.Update().SetObject(subnet).Do(ctx)
+				Expect(err).ToNot(HaveOccurred())
+				if state == "deleting" {
+					_, err = subnetsDao.Delete().SetId(defaultSubnetID).Do(ctx)
+					Expect(err).ToNot(HaveOccurred())
+				}
+			}
+
+			setSecurityGroupDefaultState := func(state string) {
+				securityGroupsDao, err := dao.NewGenericDAO[*privatev1.SecurityGroup]().
+					SetLogger(logger).
+					SetTenancyLogic(tenancy).
+					Build()
+				Expect(err).ToNot(HaveOccurred())
+				getResponse, err := securityGroupsDao.Get().SetId(defaultGroupID).Do(ctx)
+				Expect(err).ToNot(HaveOccurred())
+				securityGroup := getResponse.GetObject()
+				switch state {
+				case "missing":
+					securityGroup.GetMetadata().SetLabels(map[string]string{})
+				case "pending":
+					securityGroup.GetStatus().SetState(privatev1.SecurityGroupState_SECURITY_GROUP_STATE_PENDING)
+				case "failed":
+					securityGroup.GetStatus().SetState(privatev1.SecurityGroupState_SECURITY_GROUP_STATE_FAILED)
+				case "deleting":
+					securityGroup.GetMetadata().SetFinalizers([]string{"test-finalizer"})
+				}
+				_, err = securityGroupsDao.Update().SetObject(securityGroup).Do(ctx)
+				Expect(err).ToNot(HaveOccurred())
+				if state == "deleting" {
+					_, err = securityGroupsDao.Delete().SetId(defaultGroupID).Do(ctx)
+					Expect(err).ToNot(HaveOccurred())
+				}
+			}
+
+			newOmittedAttachmentRequest := func() *privatev1.ClustersCreateRequest {
+				return privatev1.ClustersCreateRequest_builder{
+					Object: privatev1.Cluster_builder{
+						Id: uuid.New(),
+						Metadata: privatev1.Metadata_builder{
+							Name: fmt.Sprintf("test-%s", uuid.New()[24:32]),
+						}.Build(),
+						Spec: privatev1.ClusterSpec_builder{
+							Template: privatev1.ClusterTemplateReference_builder{Id: "my-template-id"}.Build(),
+						}.Build(),
+					}.Build(),
+				}.Build()
+			}
+
+			newExplicitAttachmentRequest := func() *privatev1.ClustersCreateRequest {
+				request := newOmittedAttachmentRequest()
+				request.GetObject().GetSpec().SetNetworkAttachment(privatev1.ClusterNetworkAttachment_builder{
+					Subnet: privatev1.SubnetLocalReference_builder{Id: "subnet-2"}.Build(),
+					SecurityGroups: []*privatev1.SecurityGroupLocalReference{
+						privatev1.SecurityGroupLocalReference_builder{Id: "sg-2"}.Build(),
+					},
+				}.Build())
+				return request
+			}
+
+			expectNoStoredCluster := func(request *privatev1.ClustersCreateRequest) {
+				_, getErr := server.Get(ctx, privatev1.ClustersGetRequest_builder{
+					Id: request.GetObject().GetId(),
+				}.Build())
+				Expect(grpcstatus.Code(getErr)).To(Equal(grpccodes.NotFound))
+			}
+
+			DescribeTable("classifies an omitted attachment with an unusable default",
+				func(configure func(), code grpccodes.Code, reason string) {
+					configure()
+					request := newOmittedAttachmentRequest()
+					response, err := server.Create(ctx, request)
+					Expect(err).To(HaveOccurred())
+					Expect(response).To(BeNil())
+					st, ok := grpcstatus.FromError(err)
+					Expect(ok).To(BeTrue())
+					Expect(st.Code()).To(Equal(code))
+					Expect(st.Message()).To(ContainSubstring(reason))
+					expectNoStoredCluster(request)
+				},
+				Entry("missing default Subnet", func() { setSubnetDefaultState("missing") },
+					grpccodes.InvalidArgument, "default subnet is required"),
+				Entry("pending default Subnet", func() { setSubnetDefaultState("pending") },
+					grpccodes.FailedPrecondition, "SUBNET_STATE_PENDING"),
+				Entry("failed default Subnet", func() { setSubnetDefaultState("failed") },
+					grpccodes.FailedPrecondition, "SUBNET_STATE_FAILED"),
+				Entry("deleting default Subnet", func() { setSubnetDefaultState("deleting") },
+					grpccodes.FailedPrecondition, "is being deleted"),
+				Entry("missing default SecurityGroup", func() { setSecurityGroupDefaultState("missing") },
+					grpccodes.InvalidArgument, "default security group is required"),
+				Entry("pending default SecurityGroup", func() { setSecurityGroupDefaultState("pending") },
+					grpccodes.FailedPrecondition, "SECURITY_GROUP_STATE_PENDING"),
+				Entry("failed default SecurityGroup", func() { setSecurityGroupDefaultState("failed") },
+					grpccodes.FailedPrecondition, "SECURITY_GROUP_STATE_FAILED"),
+				Entry("deleting default SecurityGroup", func() { setSecurityGroupDefaultState("deleting") },
+					grpccodes.FailedPrecondition, "is being deleted"),
+			)
+
+			It("resolves ready defaults and stores both references", func() {
+				response, err := server.Create(ctx, newOmittedAttachmentRequest())
+				Expect(err).ToNot(HaveOccurred())
+				Expect(response).ToNot(BeNil())
+				attachment := response.GetObject().GetSpec().GetNetworkAttachment()
+				Expect(attachment.GetSubnet().GetId()).To(Equal(defaultSubnetID))
+				Expect(attachment.GetSecurityGroups()).To(HaveLen(1))
+				Expect(attachment.GetSecurityGroups()[0].GetId()).To(Equal(defaultGroupID))
+				Expect(response.GetObject().GetSpec().GetNodeSets()["compute"].GetFabricInterface()).
+					To(Equal("data-0"))
+
+				stored, err := server.Get(ctx, privatev1.ClustersGetRequest_builder{
+					Id: response.GetObject().GetId(),
+				}.Build())
+				Expect(err).ToNot(HaveOccurred())
+				storedAttachment := stored.GetObject().GetSpec().GetNetworkAttachment()
+				Expect(storedAttachment.GetSubnet().GetId()).To(Equal(defaultSubnetID))
+				Expect(storedAttachment.GetSecurityGroups()).To(HaveLen(1))
+				Expect(storedAttachment.GetSecurityGroups()[0].GetId()).To(Equal(defaultGroupID))
+			})
+
+			It("preserves a complete explicit attachment without labelled defaults", func() {
+				setSubnetDefaultState("missing")
+				setSecurityGroupDefaultState("missing")
+				request := newExplicitAttachmentRequest()
+				response, err := server.Create(ctx, request)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(response).ToNot(BeNil())
+				attachment := response.GetObject().GetSpec().GetNetworkAttachment()
+				Expect(attachment.GetSubnet().GetId()).To(Equal("subnet-2"))
+				Expect(attachment.GetSecurityGroups()).To(HaveLen(1))
+				Expect(attachment.GetSecurityGroups()[0].GetId()).To(Equal("sg-2"))
+
+				stored, err := server.Get(ctx, privatev1.ClustersGetRequest_builder{
+					Id: request.GetObject().GetId(),
+				}.Build())
+				Expect(err).ToNot(HaveOccurred())
+				storedAttachment := stored.GetObject().GetSpec().GetNetworkAttachment()
+				Expect(storedAttachment.GetSubnet().GetId()).To(Equal("subnet-2"))
+				Expect(storedAttachment.GetSecurityGroups()).To(HaveLen(1))
+				Expect(storedAttachment.GetSecurityGroups()[0].GetId()).To(Equal("sg-2"))
 			})
 		})
 
@@ -1612,24 +3468,168 @@ var _ = Describe("Private clusters server", func() {
 				Expect(err).ToNot(HaveOccurred())
 			})
 
-			createCatalogItem := func(id string, published bool, fieldDefs []*privatev1.FieldDefinition) {
+			createCatalogItem := func(id string, published bool, fields *privatev1.ClusterCatalogItemFields) {
+				if fields == nil {
+					fields = &privatev1.ClusterCatalogItemFields{}
+				}
+				if fields.GetNodeSets() == nil {
+					fields = proto.Clone(fields).(*privatev1.ClusterCatalogItemFields)
+					fields.SetNodeSets(privatev1.ClusterNodeSetMapPolicy_builder{
+						Editable: privatev1.EditableClusterNodeSetMap_builder{
+							DefaultValue: privatev1.ClusterNodeSetMap_builder{Items: map[string]*privatev1.ClusterCatalogNodeSet{
+								"compute": privatev1.ClusterCatalogNodeSet_builder{Size: 3, BaremetalInstanceType: privatev1.BareMetalInstanceTypeReference_builder{Id: "acme-bmit-id", Name: "acme-bmit-name", Shared: true}.Build()}.Build(),
+								"gpu":     privatev1.ClusterCatalogNodeSet_builder{Size: 1, BaremetalInstanceType: privatev1.BareMetalInstanceTypeReference_builder{Id: "acme-gpu-bmit-id", Name: "acme-gpu-name", Shared: true}.Build()}.Build(),
+							}}.Build(),
+						}.Build(),
+					}.Build())
+				}
 				_, err := catalogItemsDao.Create().SetObject(
 					privatev1.ClusterCatalogItem_builder{
 						Id: id,
 						Metadata: privatev1.Metadata_builder{
 							Name:   id + "-name",
-							Tenant: "shared",
+							Tenant: testTenant,
 						}.Build(),
-						Title:            "Test Catalog Item",
-						Published:        published,
-						Template:         privatev1.ClusterTemplateReference_builder{Id: "my-template-id"}.Build(),
-						FieldDefinitions: fieldDefs,
+						Title:     "Test Catalog Item",
+						Published: published,
+						Template:  privatev1.ClusterTemplateReference_builder{Id: "my-template-id"}.Build(),
+						Fields:    fields,
 					}.Build(),
 				).Do(ctx)
 				Expect(err).ToNot(HaveOccurred())
 			}
 
-			It("Creates cluster with catalog item and populates node sets from template", func() {
+			It("Uses locked catalog add-on operator defaults and rejects caller input", func() {
+				operatorID := "locked-catalog-operator-" + uuid.New()[24:32]
+				operatorName := "locked-catalog-operator-" + uuid.New()[24:32]
+				seedAddOnOperator(ctx, operatorID, operatorName, true)
+				createCatalogItem("cat-locked-operators", true, privatev1.ClusterCatalogItemFields_builder{
+					AddOnOperators: privatev1.AddOnOperatorReferenceListFieldPolicy_builder{
+						Locked: privatev1.AddOnOperatorReferenceList_builder{
+							Items: []*privatev1.AddOnOperatorReference{
+								privatev1.AddOnOperatorReference_builder{Id: operatorID, Name: operatorName}.Build(),
+							},
+						}.Build(),
+					}.Build(),
+				}.Build())
+
+				response, err := server.Create(ctx, privatev1.ClustersCreateRequest_builder{
+					Object: privatev1.Cluster_builder{
+						Metadata: privatev1.Metadata_builder{Name: "cluster-locked-operators"}.Build(),
+						Spec: privatev1.ClusterSpec_builder{
+							CatalogItem: privatev1.ClusterCatalogItemReference_builder{Id: "cat-locked-operators"}.Build(),
+						}.Build(),
+						Status: privatev1.ClusterStatus_builder{Hub: "my-hub-id"}.Build(),
+					}.Build(),
+				}.Build())
+				Expect(err).ToNot(HaveOccurred())
+				Expect(response.GetObject().GetSpec().GetAddOnOperators()).To(HaveLen(1))
+				Expect(response.GetObject().GetSpec().GetAddOnOperators()[0].GetId()).To(Equal(operatorID))
+
+				_, err = server.Create(ctx, privatev1.ClustersCreateRequest_builder{
+					Object: privatev1.Cluster_builder{
+						Metadata: privatev1.Metadata_builder{Name: "cluster-locked-operators-input"}.Build(),
+						Spec: privatev1.ClusterSpec_builder{
+							CatalogItem: privatev1.ClusterCatalogItemReference_builder{Id: "cat-locked-operators"}.Build(),
+							AddOnOperators: []*privatev1.AddOnOperatorReference{
+								privatev1.AddOnOperatorReference_builder{Id: operatorID, Name: operatorName}.Build(),
+							},
+						}.Build(),
+						Status: privatev1.ClusterStatus_builder{Hub: "my-hub-id"}.Build(),
+					}.Build(),
+				}.Build())
+				Expect(grpcstatus.Code(err)).To(Equal(grpccodes.InvalidArgument))
+			})
+
+			It("Uses non-empty caller operators for an editable catalog policy", func() {
+				defaultID := "default-catalog-operator-" + uuid.New()[24:32]
+				defaultName := "default-catalog-operator-" + uuid.New()[24:32]
+				callerID := "caller-catalog-operator-" + uuid.New()[24:32]
+				callerName := "caller-catalog-operator-" + uuid.New()[24:32]
+				seedAddOnOperator(ctx, defaultID, defaultName, true)
+				seedAddOnOperator(ctx, callerID, callerName, true)
+				createCatalogItem("cat-editable-operators", true, privatev1.ClusterCatalogItemFields_builder{
+					AddOnOperators: privatev1.AddOnOperatorReferenceListFieldPolicy_builder{
+						Editable: privatev1.EditableAddOnOperatorReferenceList_builder{
+							DefaultValue: privatev1.AddOnOperatorReferenceList_builder{
+								Items: []*privatev1.AddOnOperatorReference{
+									privatev1.AddOnOperatorReference_builder{Id: defaultID, Name: defaultName}.Build(),
+								},
+							}.Build(),
+						}.Build(),
+					}.Build(),
+				}.Build())
+
+				response, err := server.Create(ctx, privatev1.ClustersCreateRequest_builder{
+					Object: privatev1.Cluster_builder{
+						Metadata: privatev1.Metadata_builder{Name: "cluster-editable-operators"}.Build(),
+						Spec: privatev1.ClusterSpec_builder{
+							CatalogItem: privatev1.ClusterCatalogItemReference_builder{Id: "cat-editable-operators"}.Build(),
+						}.Build(),
+						Status: privatev1.ClusterStatus_builder{Hub: "my-hub-id"}.Build(),
+					}.Build(),
+				}.Build())
+				Expect(err).ToNot(HaveOccurred())
+				Expect(response.GetObject().GetSpec().GetAddOnOperators()[0].GetId()).To(Equal(defaultID))
+
+				response, err = server.Create(ctx, privatev1.ClustersCreateRequest_builder{
+					Object: privatev1.Cluster_builder{
+						Metadata: privatev1.Metadata_builder{Name: "cluster-editable-operators-input"}.Build(),
+						Spec: privatev1.ClusterSpec_builder{
+							CatalogItem: privatev1.ClusterCatalogItemReference_builder{Id: "cat-editable-operators"}.Build(),
+							AddOnOperators: []*privatev1.AddOnOperatorReference{
+								privatev1.AddOnOperatorReference_builder{Id: callerID, Name: callerName}.Build(),
+							},
+						}.Build(),
+						Status: privatev1.ClusterStatus_builder{Hub: "my-hub-id"}.Build(),
+					}.Build(),
+				}.Build())
+				Expect(err).ToNot(HaveOccurred())
+				Expect(response.GetObject().GetSpec().GetAddOnOperators()[0].GetId()).To(Equal(callerID))
+			})
+
+			It("Expands catalog operator dependencies during cluster creation", func() {
+				dependencyID := "catalog-graph-dependency-" + uuid.New()[24:32]
+				dependencyName := "catalog-graph-dependency-" + uuid.New()[24:32]
+				rootID := "catalog-graph-root-" + uuid.New()[24:32]
+				rootName := "catalog-graph-root-" + uuid.New()[24:32]
+
+				dependency := newTestAddOnOperator(dependencyID, dependencyName, true)
+				seedAddOnOperatorObject(ctx, dependency)
+				root := newTestAddOnOperator(rootID, rootName, true)
+				root.SetDependencies([]*privatev1.AddOnOperatorLocalReference{
+					privatev1.AddOnOperatorLocalReference_builder{Id: dependencyID}.Build(),
+				})
+				seedAddOnOperatorObject(ctx, root)
+				createCatalogItem("cat-graph-operators", true, privatev1.ClusterCatalogItemFields_builder{
+					AddOnOperators: privatev1.AddOnOperatorReferenceListFieldPolicy_builder{
+						Locked: privatev1.AddOnOperatorReferenceList_builder{
+							Items: []*privatev1.AddOnOperatorReference{
+								privatev1.AddOnOperatorReference_builder{Id: rootID, Name: rootName}.Build(),
+							},
+						}.Build(),
+					}.Build(),
+				}.Build())
+
+				response, err := server.Create(ctx, privatev1.ClustersCreateRequest_builder{
+					Object: privatev1.Cluster_builder{
+						Metadata: privatev1.Metadata_builder{Name: "cluster-graph-operators"}.Build(),
+						Spec: privatev1.ClusterSpec_builder{
+							CatalogItem: privatev1.ClusterCatalogItemReference_builder{Id: "cat-graph-operators"}.Build(),
+						}.Build(),
+						Status: privatev1.ClusterStatus_builder{Hub: "my-hub-id"}.Build(),
+					}.Build(),
+				}.Build())
+				Expect(err).ToNot(HaveOccurred())
+
+				resolvedIDs := make([]string, 0, len(response.GetObject().GetSpec().GetAddOnOperators()))
+				for _, operator := range response.GetObject().GetSpec().GetAddOnOperators() {
+					resolvedIDs = append(resolvedIDs, operator.GetId())
+				}
+				Expect(resolvedIDs).To(ConsistOf(rootID, dependencyID))
+			})
+
+			It("Creates cluster with catalog item and populates node sets from its policy", func() {
 				createCatalogItem("cat-happy", true, nil)
 
 				response, err := server.Create(ctx, privatev1.ClustersCreateRequest_builder{
@@ -1654,16 +3654,16 @@ var _ = Describe("Private clusters server", func() {
 				Expect(object.GetSpec().GetTemplate().GetName()).To(Equal("my-template-name"))
 				Expect(object.GetSpec().GetCatalogItem().GetId()).To(Equal("cat-happy"))
 
-				// Verify node sets are populated from the template:
+				// Verify node sets are populated from the catalog policy:
 				nodeSets := object.GetSpec().GetNodeSets()
 				Expect(nodeSets).To(HaveLen(2))
 				Expect(nodeSets).To(HaveKey("compute"))
-				Expect(nodeSets["compute"].GetHostType().GetId()).To(Equal("acme-1ti-id"))
-				Expect(nodeSets["compute"].GetHostType().GetName()).To(Equal("acme-1ti-name"))
+				Expect(nodeSets["compute"].GetBaremetalInstanceType().GetId()).To(Equal("acme-bmit-id"))
+				Expect(nodeSets["compute"].GetBaremetalInstanceType().GetName()).To(Equal("acme-bmit-name"))
 				Expect(nodeSets["compute"].GetSize()).To(Equal(int32(3)))
 				Expect(nodeSets).To(HaveKey("gpu"))
-				Expect(nodeSets["gpu"].GetHostType().GetId()).To(Equal("acme-gpu-id"))
-				Expect(nodeSets["gpu"].GetHostType().GetName()).To(Equal("acme-gpu-name"))
+				Expect(nodeSets["gpu"].GetBaremetalInstanceType().GetId()).To(Equal("acme-gpu-bmit-id"))
+				Expect(nodeSets["gpu"].GetBaremetalInstanceType().GetName()).To(Equal("acme-gpu-name"))
 				Expect(nodeSets["gpu"].GetSize()).To(Equal(int32(1)))
 			})
 
@@ -1676,7 +3676,7 @@ var _ = Describe("Private clusters server", func() {
 							Name: fmt.Sprintf("test-%s", uuid.New()[24:32]),
 						}.Build(),
 						Spec: privatev1.ClusterSpec_builder{
-							CatalogItem: privatev1.ClusterCatalogItemReference_builder{Id: "cat-by-name-name"}.Build(),
+							CatalogItem: privatev1.ClusterCatalogItemReference_builder{Name: "cat-by-name-name"}.Build(),
 						}.Build(),
 						Status: privatev1.ClusterStatus_builder{
 							Hub: "my-hub-id",
@@ -1709,7 +3709,7 @@ var _ = Describe("Private clusters server", func() {
 				Expect(ok).To(BeTrue())
 				Expect(status.Code()).To(Equal(grpccodes.NotFound))
 				Expect(status.Message()).To(Equal(
-					"there is no catalog item with identifier or name 'nonexistent'",
+					"catalog item 'nonexistent' not found",
 				))
 			})
 
@@ -1761,13 +3761,7 @@ var _ = Describe("Private clusters server", func() {
 			})
 
 			It("Rejects user value for non-editable field", func() {
-				createCatalogItem("cat-noneditable", true, []*privatev1.FieldDefinition{
-					privatev1.FieldDefinition_builder{
-						Path:     "ssh_public_key",
-						Editable: false,
-						Default:  structpb.NewStringValue("forced-key"),
-					}.Build(),
-				})
+				createCatalogItem("cat-noneditable", true, privatev1.ClusterCatalogItemFields_builder{Network: privatev1.ClusterNetworkFieldPolicies_builder{PodCidr: privatev1.StringFieldPolicy_builder{Locked: proto.String("10.132.0.0/14")}.Build()}.Build()}.Build())
 
 				_, err := server.Create(ctx, privatev1.ClustersCreateRequest_builder{
 					Object: privatev1.Cluster_builder{
@@ -1775,8 +3769,8 @@ var _ = Describe("Private clusters server", func() {
 							Name: fmt.Sprintf("test-%s", uuid.New()[24:32]),
 						}.Build(),
 						Spec: privatev1.ClusterSpec_builder{
-							CatalogItem:  privatev1.ClusterCatalogItemReference_builder{Id: "cat-noneditable"}.Build(),
-							SshPublicKey: new("user-key"),
+							CatalogItem: privatev1.ClusterCatalogItemReference_builder{Id: "cat-noneditable"}.Build(),
+							Network:     privatev1.ClusterNetwork_builder{PodCidr: new("10.200.0.0/14")}.Build(),
 						}.Build(),
 						Status: privatev1.ClusterStatus_builder{
 							Hub: "my-hub-id",
@@ -1790,15 +3784,9 @@ var _ = Describe("Private clusters server", func() {
 				Expect(status.Message()).To(ContainSubstring("not editable"))
 			})
 
-			DescribeTable("validates editable field against JSON Schema",
+			DescribeTable("validates editable pod CIDRs",
 				func(catID string, value string, expectError bool) {
-					createCatalogItem(catID, true, []*privatev1.FieldDefinition{
-						privatev1.FieldDefinition_builder{
-							Path:             "ssh_public_key",
-							Editable:         true,
-							ValidationSchema: `{"type":"string","minLength":10}`,
-						}.Build(),
-					})
+					createCatalogItem(catID, true, privatev1.ClusterCatalogItemFields_builder{Network: privatev1.ClusterNetworkFieldPolicies_builder{PodCidr: privatev1.StringFieldPolicy_builder{Editable: privatev1.EditableStringField_builder{}.Build()}.Build()}.Build()}.Build())
 
 					response, err := server.Create(ctx, privatev1.ClustersCreateRequest_builder{
 						Object: privatev1.Cluster_builder{
@@ -1806,8 +3794,8 @@ var _ = Describe("Private clusters server", func() {
 								Name: fmt.Sprintf("test-%s", uuid.New()[24:32]),
 							}.Build(),
 							Spec: privatev1.ClusterSpec_builder{
-								CatalogItem:  privatev1.ClusterCatalogItemReference_builder{Id: catID}.Build(),
-								SshPublicKey: new(value),
+								CatalogItem: privatev1.ClusterCatalogItemReference_builder{Id: catID}.Build(),
+								Network:     privatev1.ClusterNetwork_builder{PodCidr: new(value)}.Build(),
 							}.Build(),
 							Status: privatev1.ClusterStatus_builder{
 								Hub: "my-hub-id",
@@ -1819,24 +3807,18 @@ var _ = Describe("Private clusters server", func() {
 						status, ok := grpcstatus.FromError(err)
 						Expect(ok).To(BeTrue())
 						Expect(status.Code()).To(Equal(grpccodes.InvalidArgument))
-						Expect(status.Message()).To(ContainSubstring("validation failed for field 'ssh_public_key'"))
+						Expect(status.Message()).To(ContainSubstring("pod_cidr"))
 					} else {
 						Expect(err).ToNot(HaveOccurred())
-						Expect(response.GetObject().GetSpec().GetSshPublicKey()).To(Equal(value))
+						Expect(response.GetObject().GetSpec().GetNetwork().GetPodCidr()).To(Equal(value))
 					}
 				},
-				Entry("rejects value below minLength", "cat-schema-reject", "short-val", true),
-				Entry("accepts value meeting minLength", "cat-schema-accept", "long-enough-value", false),
+				Entry("rejects malformed value", "cat-cidr-invalid", "300.0.0.0/8", true),
+				Entry("accepts a valid CIDR", "cat-cidr-valid", "10.128.0.0/14", false),
 			)
 
 			It("Applies default for editable field when not provided", func() {
-				createCatalogItem("cat-default", true, []*privatev1.FieldDefinition{
-					privatev1.FieldDefinition_builder{
-						Path:     "ssh_public_key",
-						Editable: true,
-						Default:  structpb.NewStringValue("default-key"),
-					}.Build(),
-				})
+				createCatalogItem("cat-default", true, privatev1.ClusterCatalogItemFields_builder{Network: privatev1.ClusterNetworkFieldPolicies_builder{PodCidr: privatev1.StringFieldPolicy_builder{Editable: privatev1.EditableStringField_builder{DefaultValue: proto.String("10.132.0.0/14")}.Build()}.Build()}.Build()}.Build())
 
 				response, err := server.Create(ctx, privatev1.ClustersCreateRequest_builder{
 					Object: privatev1.Cluster_builder{
@@ -1853,7 +3835,7 @@ var _ = Describe("Private clusters server", func() {
 				}.Build())
 				Expect(err).ToNot(HaveOccurred())
 				object := response.GetObject()
-				Expect(object.GetSpec().GetSshPublicKey()).To(Equal("default-key"))
+				Expect(object.GetSpec().GetNetwork().GetPodCidr()).To(Equal("10.132.0.0/14"))
 			})
 
 			It("Applies spec defaults from template when created via catalog item", func() {
@@ -1873,14 +3855,8 @@ var _ = Describe("Private clusters server", func() {
 							}.Build(),
 							Title:       "Template with defaults",
 							Description: "Template with spec defaults",
-							NodeSets: map[string]*privatev1.ClusterTemplateNodeSet{
-								"worker": privatev1.ClusterTemplateNodeSet_builder{
-									HostType: privatev1.HostTypeReference_builder{Id: "acme-1ti-id"}.Build(),
-									Size:     2,
-								}.Build(),
-							},
 							SpecDefaults: privatev1.ClusterTemplateSpecDefaults_builder{
-								SshPublicKey: proto.String("ssh-rsa TEMPLATE_DEFAULT_KEY"),
+								Network: privatev1.ClusterNetwork_builder{PodCidr: proto.String("10.132.0.0/14")}.Build(),
 							}.Build(),
 						}.Build(),
 					).
@@ -1893,7 +3869,7 @@ var _ = Describe("Private clusters server", func() {
 						Id: "cat-with-defaults",
 						Metadata: privatev1.Metadata_builder{
 							Name:   "cat-with-defaults-name",
-							Tenant: "shared",
+							Tenant: testTenant,
 						}.Build(),
 						Title:     "Catalog Item with Template Defaults",
 						Published: true,
@@ -1902,7 +3878,7 @@ var _ = Describe("Private clusters server", func() {
 				).Do(ctx)
 				Expect(err).ToNot(HaveOccurred())
 
-				// Create a cluster via catalog item without specifying ssh_public_key:
+				// Create a cluster via catalog item without specifying a pod CIDR:
 				response, err := server.Create(ctx, privatev1.ClustersCreateRequest_builder{
 					Object: privatev1.Cluster_builder{
 						Metadata: privatev1.Metadata_builder{
@@ -1910,6 +3886,9 @@ var _ = Describe("Private clusters server", func() {
 						}.Build(),
 						Spec: privatev1.ClusterSpec_builder{
 							CatalogItem: privatev1.ClusterCatalogItemReference_builder{Id: "cat-with-defaults"}.Build(),
+							NodeSets: map[string]*privatev1.ClusterNodeSet{
+								"worker": privatev1.ClusterNodeSet_builder{Size: proto.Int32(2), BaremetalInstanceType: privatev1.BareMetalInstanceTypeReference_builder{Id: "acme-bmit-id", Shared: true}.Build()}.Build(),
+							},
 						}.Build(),
 						Status: privatev1.ClusterStatus_builder{
 							Hub: "my-hub-id",
@@ -1920,13 +3899,13 @@ var _ = Describe("Private clusters server", func() {
 				object := response.GetObject()
 
 				// Verify spec defaults from template are applied:
-				Expect(object.GetSpec().GetSshPublicKey()).To(Equal("ssh-rsa TEMPLATE_DEFAULT_KEY"))
+				Expect(object.GetSpec().GetNetwork().GetPodCidr()).To(Equal("10.132.0.0/14"))
 
-				// Verify node sets are also populated:
+				// Verify the explicit Cluster node sets remain populated:
 				nodeSets := object.GetSpec().GetNodeSets()
 				Expect(nodeSets).To(HaveLen(1))
 				Expect(nodeSets).To(HaveKey("worker"))
-				Expect(nodeSets["worker"].GetHostType().GetId()).To(Equal("acme-1ti-id"))
+				Expect(nodeSets["worker"].GetBaremetalInstanceType().GetId()).To(Equal("acme-bmit-id"))
 				Expect(nodeSets["worker"].GetSize()).To(Equal(int32(2)))
 			})
 
@@ -1961,12 +3940,6 @@ var _ = Describe("Private clusters server", func() {
 							}.Build(),
 							Title:       "Version-pinned template",
 							Description: "Template that pins version via spec_defaults",
-							NodeSets: map[string]*privatev1.ClusterTemplateNodeSet{
-								"worker": privatev1.ClusterTemplateNodeSet_builder{
-									HostType: &privatev1.HostTypeReference{Id: "acme-1ti-id"},
-									Size:     2,
-								}.Build(),
-							},
 							SpecDefaults: privatev1.ClusterTemplateSpecDefaults_builder{
 								Version: &privatev1.ClusterVersionReference{Name: "4-18-0"},
 							}.Build(),
@@ -1982,7 +3955,7 @@ var _ = Describe("Private clusters server", func() {
 						Id: "cat-version-pinned",
 						Metadata: privatev1.Metadata_builder{
 							Name:   "cat-version-pinned-name",
-							Tenant: "shared",
+							Tenant: testTenant,
 						}.Build(),
 						Title:     "Catalog Item with Version-Pinned Template",
 						Published: true,
@@ -1999,6 +3972,7 @@ var _ = Describe("Private clusters server", func() {
 						}.Build(),
 						Spec: privatev1.ClusterSpec_builder{
 							CatalogItem: &privatev1.ClusterCatalogItemReference{Id: "cat-version-pinned"},
+							NodeSets:    map[string]*privatev1.ClusterNodeSet{"worker": privatev1.ClusterNodeSet_builder{Size: proto.Int32(2), BaremetalInstanceType: privatev1.BareMetalInstanceTypeReference_builder{Id: "acme-bmit-id", Shared: true}.Build()}.Build()},
 						}.Build(),
 						Status: privatev1.ClusterStatus_builder{
 							Hub: "my-hub-id",
@@ -2042,13 +4016,7 @@ var _ = Describe("Private clusters server", func() {
 								Tenant: testTenant,
 							}.Build(),
 							Title:       "Template for FD override test",
-							Description: "Template whose spec_defaults are overridden by field_definitions",
-							NodeSets: map[string]*privatev1.ClusterTemplateNodeSet{
-								"worker": privatev1.ClusterTemplateNodeSet_builder{
-									HostType: &privatev1.HostTypeReference{Id: "acme-1ti-id"},
-									Size:     2,
-								}.Build(),
-							},
+							Description: "Template whose spec_defaults are overridden by fields",
 							SpecDefaults: privatev1.ClusterTemplateSpecDefaults_builder{
 								Version: &privatev1.ClusterVersionReference{Name: "4-17-0"},
 							}.Build(),
@@ -2063,18 +4031,12 @@ var _ = Describe("Private clusters server", func() {
 						Id: "cat-fd-override",
 						Metadata: privatev1.Metadata_builder{
 							Name:   "cat-fd-override-name",
-							Tenant: "shared",
+							Tenant: testTenant,
 						}.Build(),
 						Title:     "Catalog Item with FD version override",
 						Published: true,
 						Template:  &privatev1.ClusterTemplateReference{Id: "template-fd-override"},
-						FieldDefinitions: []*privatev1.FieldDefinition{
-							privatev1.FieldDefinition_builder{
-								Path:     "version",
-								Editable: false,
-								Default:  structpb.NewStructValue(&structpb.Struct{Fields: map[string]*structpb.Value{"name": structpb.NewStringValue("4-19-0")}}),
-							}.Build(),
-						},
+						Fields:    privatev1.ClusterCatalogItemFields_builder{Version: privatev1.ClusterVersionReferenceFieldPolicy_builder{Locked: privatev1.ClusterVersionReference_builder{Name: "4-19-0"}.Build()}.Build()}.Build(),
 					}.Build(),
 				).Do(ctx)
 				Expect(err).ToNot(HaveOccurred())
@@ -2087,6 +4049,7 @@ var _ = Describe("Private clusters server", func() {
 						}.Build(),
 						Spec: privatev1.ClusterSpec_builder{
 							CatalogItem: &privatev1.ClusterCatalogItemReference{Id: "cat-fd-override"},
+							NodeSets:    map[string]*privatev1.ClusterNodeSet{"worker": privatev1.ClusterNodeSet_builder{Size: proto.Int32(2), BaremetalInstanceType: privatev1.BareMetalInstanceTypeReference_builder{Id: "acme-bmit-id", Shared: true}.Build()}.Build()},
 						}.Build(),
 						Status: privatev1.ClusterStatus_builder{
 							Hub: "my-hub-id",
@@ -2116,12 +4079,6 @@ var _ = Describe("Private clusters server", func() {
 							}.Build(),
 							Title:       "Template without version default",
 							Description: "Template with no spec_defaults.version",
-							NodeSets: map[string]*privatev1.ClusterTemplateNodeSet{
-								"worker": privatev1.ClusterTemplateNodeSet_builder{
-									HostType: &privatev1.HostTypeReference{Id: "acme-1ti-id"},
-									Size:     2,
-								}.Build(),
-							},
 						}.Build(),
 					).
 					Do(ctx)
@@ -2133,7 +4090,7 @@ var _ = Describe("Private clusters server", func() {
 						Id: "cat-no-version",
 						Metadata: privatev1.Metadata_builder{
 							Name:   "cat-no-version-name",
-							Tenant: "shared",
+							Tenant: testTenant,
 						}.Build(),
 						Title:     "Catalog Item without version",
 						Published: true,
@@ -2150,6 +4107,7 @@ var _ = Describe("Private clusters server", func() {
 						}.Build(),
 						Spec: privatev1.ClusterSpec_builder{
 							CatalogItem: &privatev1.ClusterCatalogItemReference{Id: "cat-no-version"},
+							NodeSets:    map[string]*privatev1.ClusterNodeSet{"worker": privatev1.ClusterNodeSet_builder{Size: proto.Int32(2), BaremetalInstanceType: privatev1.BareMetalInstanceTypeReference_builder{Id: "acme-bmit-id", Shared: true}.Build()}.Build()},
 						}.Build(),
 						Status: privatev1.ClusterStatus_builder{
 							Hub: "my-hub-id",
@@ -2168,7 +4126,7 @@ var _ = Describe("Private clusters server", func() {
 						Id: "cat-no-template",
 						Metadata: privatev1.Metadata_builder{
 							Name:   "cat-no-template-name",
-							Tenant: "shared",
+							Tenant: testTenant,
 						}.Build(),
 						Title:     "Catalog Item Without Template",
 						Published: true,
@@ -2284,6 +4242,553 @@ var _ = Describe("Private clusters server", func() {
 			}.Build())
 			Expect(err).ToNot(HaveOccurred())
 			Expect(updateResponse.GetObject().GetSpec().GetVersion().GetName()).To(Equal("4-18-0"))
+			for _, nodeSet := range updateResponse.GetObject().GetSpec().GetNodeSets() {
+				Expect(nodeSet.GetVersion().GetName()).To(Equal("4-17-0"))
+			}
+
+			nodeSets := map[string]*privatev1.ClusterNodeSet{}
+			for name, nodeSet := range updateResponse.GetObject().GetSpec().GetNodeSets() {
+				nodeSets[name] = proto.Clone(nodeSet).(*privatev1.ClusterNodeSet)
+				nodeSets[name].SetVersion(nil)
+			}
+			nodeSets["compute"].SetSize(nodeSets["compute"].GetSize() + 1)
+			nodeSets["storage"] = privatev1.ClusterNodeSet_builder{
+				Size: proto.Int32(2),
+				BaremetalInstanceType: privatev1.BareMetalInstanceTypeReference_builder{
+					Id: "acme-bmit-id", Shared: true,
+				}.Build(),
+			}.Build()
+			updated, err := server.Update(ctx, privatev1.ClustersUpdateRequest_builder{
+				Object: privatev1.Cluster_builder{
+					Id:   object.GetId(),
+					Spec: privatev1.ClusterSpec_builder{NodeSets: nodeSets}.Build(),
+				}.Build(),
+				UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"spec.node_sets"}},
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+			Expect(updated.GetObject().GetSpec().GetVersion().GetName()).To(Equal("4-18-0"))
+			for _, name := range []string{"compute", "gpu"} {
+				Expect(proto.Equal(updated.GetObject().GetSpec().GetNodeSets()[name].GetVersion(),
+					object.GetSpec().GetVersion())).To(BeTrue())
+			}
+			Expect(proto.Equal(updated.GetObject().GetSpec().GetNodeSets()["storage"].GetVersion(),
+				updated.GetObject().GetSpec().GetVersion())).To(BeTrue())
+		})
+
+		Describe("exclusive component version updates", func() {
+			var cluster *privatev1.Cluster
+
+			BeforeEach(func() {
+				for _, target := range []struct{ id, name, version string }{
+					{"cv-next", "4-18-0", "4.18.0"},
+					{"cv-later", "4-19-0", "4.19.0"},
+				} {
+					seedClusterVersion(ctx, privatev1.ClusterVersion_builder{
+						Id: target.id,
+						Metadata: privatev1.Metadata_builder{
+							Name: target.name, Tenant: testTenant,
+						}.Build(),
+						Spec: privatev1.ClusterVersionSpec_builder{
+							Image:   "quay.io/openshift-release-dev/ocp-release:" + target.version + "-multi",
+							Enabled: proto.Bool(true), Version: target.version,
+						}.Build(),
+					}.Build())
+				}
+				created, err := server.Create(ctx, privatev1.ClustersCreateRequest_builder{
+					Object: privatev1.Cluster_builder{
+						Metadata: privatev1.Metadata_builder{Name: "exclusive-versions"}.Build(),
+						Spec: privatev1.ClusterSpec_builder{
+							Template: privatev1.ClusterTemplateReference_builder{Id: "my-template-id"}.Build(),
+						}.Build(),
+					}.Build(),
+				}.Build())
+				Expect(err).ToNot(HaveOccurred())
+				cluster = created.GetObject()
+			})
+
+			updateVersions := func(controlPlane string, nodeVersions map[string]string) (*privatev1.Cluster, error) {
+				nodeSets := make(map[string]*privatev1.ClusterNodeSet, len(cluster.GetSpec().GetNodeSets()))
+				for name, nodeSet := range cluster.GetSpec().GetNodeSets() {
+					nodeSets[name] = proto.Clone(nodeSet).(*privatev1.ClusterNodeSet)
+				}
+				for name, version := range nodeVersions {
+					nodeSets[name].SetVersion(privatev1.ClusterVersionReference_builder{Name: version}.Build())
+				}
+				spec := privatev1.ClusterSpec_builder{NodeSets: nodeSets}.Build()
+				paths := []string{"spec.node_sets"}
+				if controlPlane != "" {
+					spec.SetVersion(privatev1.ClusterVersionReference_builder{Name: controlPlane}.Build())
+					paths = append(paths, "spec.version")
+				}
+				updated, err := server.Update(ctx, privatev1.ClustersUpdateRequest_builder{
+					Object:     privatev1.Cluster_builder{Id: cluster.GetId(), Spec: spec}.Build(),
+					UpdateMask: &fieldmaskpb.FieldMask{Paths: paths},
+				}.Build())
+				if err != nil {
+					return nil, err
+				}
+				return updated.GetObject(), nil
+			}
+
+			addStorageNodeSet := func(version *privatev1.ClusterVersionReference) map[string]*privatev1.ClusterNodeSet {
+				nodeSets := make(map[string]*privatev1.ClusterNodeSet, len(cluster.GetSpec().GetNodeSets())+1)
+				for name, nodeSet := range cluster.GetSpec().GetNodeSets() {
+					nodeSets[name] = proto.Clone(nodeSet).(*privatev1.ClusterNodeSet)
+				}
+				nodeSets["storage"] = privatev1.ClusterNodeSet_builder{
+					Size: proto.Int32(2),
+					BaremetalInstanceType: privatev1.BareMetalInstanceTypeReference_builder{
+						Id: "acme-bmit-id", Shared: true,
+					}.Build(),
+					Version: version,
+				}.Build()
+				return nodeSets
+			}
+
+			It("rejects changing the control plane and a node set together", func() {
+				_, err := updateVersions("4-18-0", map[string]string{"compute": "4-19-0"})
+				Expect(grpcstatus.Code(err)).To(Equal(grpccodes.InvalidArgument))
+				Expect(err).To(MatchError(ContainSubstring("only one component version")))
+				stored, err := server.Get(ctx, privatev1.ClustersGetRequest_builder{Id: cluster.GetId()}.Build())
+				Expect(err).ToNot(HaveOccurred())
+				Expect(proto.Equal(stored.GetObject().GetSpec(), cluster.GetSpec())).To(BeTrue())
+			})
+
+			It("rejects changing two node sets together", func() {
+				_, err := updateVersions("", map[string]string{"compute": "4-18-0", "gpu": "4-19-0"})
+				Expect(grpcstatus.Code(err)).To(Equal(grpccodes.InvalidArgument))
+				Expect(err).To(MatchError(ContainSubstring("only one component version")))
+			})
+
+			It("accepts one node-set version change", func() {
+				response, err := server.Update(ctx, privatev1.ClustersUpdateRequest_builder{
+					Object: privatev1.Cluster_builder{
+						Id: cluster.GetId(),
+						Spec: privatev1.ClusterSpec_builder{NodeSets: map[string]*privatev1.ClusterNodeSet{
+							"compute": privatev1.ClusterNodeSet_builder{
+								Version: privatev1.ClusterVersionReference_builder{Name: "4-18-0"}.Build(),
+							}.Build(),
+						}}.Build(),
+					}.Build(),
+					UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"spec.node_sets.compute.version"}},
+				}.Build())
+				Expect(err).ToNot(HaveOccurred())
+				updated := response.GetObject()
+				Expect(updated.GetSpec().GetNodeSets()["compute"].GetVersion().GetId()).To(Equal("cv-next"))
+				Expect(updated.GetSpec().GetNodeSets()["gpu"].GetVersion().GetId()).To(Equal("cv-default"))
+				Expect(updated.GetStatus().GetUpgradeHistory()).To(HaveLen(1))
+				attempt := updated.GetStatus().GetUpgradeHistory()[0]
+				Expect(attempt.GetAttemptId()).NotTo(BeEmpty())
+				Expect(attempt.GetComponent().GetNodeSetId()).To(Equal("compute"))
+				Expect(attempt.GetSourceVersion()).To(Equal("4.17.0"))
+				Expect(attempt.GetTargetVersion()).To(Equal("4.18.0"))
+				Expect(attempt.GetState()).To(Equal(privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_PENDING))
+				Expect(updated.GetSpec().GetNodeSetAttemptIds()["compute"]).To(Equal(attempt.GetAttemptId()))
+				Expect(updated.GetSpec().GetNodeSetAttemptIds()["gpu"]).To(BeEmpty())
+				scaled, err := server.Update(ctx, privatev1.ClustersUpdateRequest_builder{
+					Object: privatev1.Cluster_builder{
+						Id: cluster.GetId(),
+						Spec: privatev1.ClusterSpec_builder{NodeSets: map[string]*privatev1.ClusterNodeSet{
+							"compute": privatev1.ClusterNodeSet_builder{Size: proto.Int32(4)}.Build(),
+						}}.Build(),
+					}.Build(),
+					UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"spec.node_sets.compute.size"}},
+				}.Build())
+				Expect(err).ToNot(HaveOccurred())
+				Expect(scaled.GetObject().GetSpec().GetNodeSets()["compute"].GetVersion().GetId()).To(Equal("cv-next"))
+				Expect(scaled.GetObject().GetSpec().GetNodeSetAttemptIds()["compute"]).To(Equal(attempt.GetAttemptId()))
+			})
+
+			It("rejects a node-set version change through a node-sets replacement", func() {
+				_, err := updateVersions("", map[string]string{"compute": "4-18-0"})
+				Expect(grpcstatus.Code(err)).To(Equal(grpccodes.InvalidArgument))
+				Expect(err).To(MatchError(ContainSubstring("require a mask containing only")))
+			})
+
+			It("rejects changing a node-set size and version in the same masked request", func() {
+				original := cluster.GetSpec().GetNodeSets()["compute"]
+				newSize := original.GetSize() + 1
+				_, err := server.Update(ctx, privatev1.ClustersUpdateRequest_builder{
+					Object: privatev1.Cluster_builder{
+						Id: cluster.GetId(),
+						Spec: privatev1.ClusterSpec_builder{NodeSets: map[string]*privatev1.ClusterNodeSet{
+							"compute": privatev1.ClusterNodeSet_builder{
+								Size:    proto.Int32(newSize),
+								Version: privatev1.ClusterVersionReference_builder{Name: "4-18-0"}.Build(),
+							}.Build(),
+						}}.Build(),
+					}.Build(),
+					UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{
+						"spec.node_sets.compute.size", "spec.node_sets.compute.version",
+					}},
+				}.Build())
+				Expect(grpcstatus.Code(err)).To(Equal(grpccodes.InvalidArgument))
+				Expect(err).To(MatchError(ContainSubstring("a node-set version update cannot include other fields")))
+				stored, err := server.Get(ctx, privatev1.ClustersGetRequest_builder{Id: cluster.GetId()}.Build())
+				Expect(err).ToNot(HaveOccurred())
+				Expect(proto.Equal(stored.GetObject().GetSpec(), cluster.GetSpec())).To(BeTrue())
+			})
+
+			It("rejects changing a node-set size and version in a full-object update", func() {
+				full := proto.Clone(cluster).(*privatev1.Cluster)
+				compute := full.GetSpec().GetNodeSets()["compute"]
+				compute.SetSize(compute.GetSize() + 1)
+				compute.SetVersion(privatev1.ClusterVersionReference_builder{Name: "4-18-0"}.Build())
+				_, err := server.Update(ctx, privatev1.ClustersUpdateRequest_builder{Object: full}.Build())
+				Expect(grpcstatus.Code(err)).To(Equal(grpccodes.InvalidArgument))
+				Expect(err).To(MatchError(ContainSubstring("node-set size and node-set version")))
+			})
+
+			DescribeTable("allows scaling a node set with a control-plane version change",
+				func(mask *fieldmaskpb.FieldMask) {
+					full := proto.Clone(cluster).(*privatev1.Cluster)
+					compute := full.GetSpec().GetNodeSets()["compute"]
+					compute.SetSize(compute.GetSize() + 1)
+					full.GetSpec().SetVersion(privatev1.ClusterVersionReference_builder{Name: "4-18-0"}.Build())
+					updated, err := server.Update(ctx, privatev1.ClustersUpdateRequest_builder{
+						Object: full, UpdateMask: mask,
+					}.Build())
+					Expect(err).ToNot(HaveOccurred())
+					Expect(updated.GetObject().GetSpec().GetVersion().GetId()).To(Equal("cv-next"))
+					Expect(updated.GetObject().GetSpec().GetNodeSets()["compute"].GetSize()).To(Equal(compute.GetSize()))
+					Expect(updated.GetObject().GetSpec().GetNodeSets()["compute"].GetVersion().GetId()).To(Equal("cv-default"))
+				},
+				Entry("full object", (*fieldmaskpb.FieldMask)(nil)),
+				Entry("full spec", &fieldmaskpb.FieldMask{Paths: []string{"spec"}}),
+				Entry("control-plane version and node-set size", &fieldmaskpb.FieldMask{Paths: []string{
+					"spec.version", "spec.node_sets.compute.size",
+				}}),
+			)
+
+			DescribeTable("pins a legacy node set to the established control-plane version when scaling during its upgrade",
+				func(mask *fieldmaskpb.FieldMask) {
+					clustersDao, err := dao.NewGenericDAO[*privatev1.Cluster]().
+						SetLogger(logger).
+						SetTenancyLogic(tenancy).
+						Build()
+					Expect(err).ToNot(HaveOccurred())
+					created, err := clustersDao.Create().SetObject(privatev1.Cluster_builder{
+						Metadata: privatev1.Metadata_builder{Name: "legacy-scale-with-control-plane", Tenant: testTenant}.Build(),
+						Spec: privatev1.ClusterSpec_builder{
+							Template: cloneMessage(cluster.GetSpec().GetTemplate()),
+							Version:  cloneMessage(cluster.GetSpec().GetVersion()),
+							NodeSets: map[string]*privatev1.ClusterNodeSet{
+								"compute": privatev1.ClusterNodeSet_builder{
+									Size:                  proto.Int32(3),
+									BaremetalInstanceType: cloneMessage(cluster.GetSpec().GetNodeSets()["compute"].GetBaremetalInstanceType()),
+								}.Build(),
+							},
+						}.Build(),
+						Status: privatev1.ClusterStatus_builder{Hub: "my-hub-id"}.Build(),
+					}.Build()).Do(ctx)
+					Expect(err).ToNot(HaveOccurred())
+					full := proto.Clone(created.GetObject()).(*privatev1.Cluster)
+					full.GetSpec().SetVersion(privatev1.ClusterVersionReference_builder{Name: "4-18-0"}.Build())
+					full.GetSpec().GetNodeSets()["compute"].SetSize(4)
+					_, err = server.Update(ctx, privatev1.ClustersUpdateRequest_builder{
+						Object: full, UpdateMask: mask,
+					}.Build())
+					Expect(err).ToNot(HaveOccurred())
+					stored, err := server.Get(ctx, privatev1.ClustersGetRequest_builder{Id: full.GetId()}.Build())
+					Expect(err).ToNot(HaveOccurred())
+					Expect(stored.GetObject().GetSpec().GetVersion().GetId()).To(Equal("cv-next"))
+					Expect(stored.GetObject().GetSpec().GetNodeSets()["compute"].GetSize()).To(Equal(int32(4)))
+					Expect(stored.GetObject().GetSpec().GetNodeSets()["compute"].GetVersion().GetId()).To(Equal("cv-default"))
+				},
+				Entry("full object", (*fieldmaskpb.FieldMask)(nil)),
+				Entry("control-plane version and node-set size", &fieldmaskpb.FieldMask{Paths: []string{
+					"spec.version", "spec.node_sets.compute.size",
+				}}),
+			)
+
+			It("accepts a control-plane change with unchanged node-set versions", func() {
+				updated, err := updateVersions("4-18-0", nil)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(updated.GetSpec().GetVersion().GetId()).To(Equal("cv-next"))
+				for _, nodeSet := range updated.GetSpec().GetNodeSets() {
+					Expect(nodeSet.GetVersion().GetId()).To(Equal("cv-default"))
+				}
+			})
+
+			It("rejects a node-set version change in a full-object update", func() {
+				full := proto.Clone(cluster).(*privatev1.Cluster)
+				full.GetSpec().GetNodeSets()["compute"].SetVersion(privatev1.ClusterVersionReference_builder{Name: "4-18-0"}.Build())
+				_, err := server.Update(ctx, privatev1.ClustersUpdateRequest_builder{Object: full}.Build())
+				Expect(grpcstatus.Code(err)).To(Equal(grpccodes.InvalidArgument))
+				Expect(err).To(MatchError(ContainSubstring("require a mask containing only")))
+			})
+
+			DescribeTable("adding a node set through a node-sets replacement",
+				func(version string) {
+					var selected *privatev1.ClusterVersionReference
+					if version != "" {
+						selected = privatev1.ClusterVersionReference_builder{Name: version}.Build()
+					}
+					updated, err := server.Update(ctx, privatev1.ClustersUpdateRequest_builder{
+						Object: privatev1.Cluster_builder{
+							Id:   cluster.GetId(),
+							Spec: privatev1.ClusterSpec_builder{NodeSets: addStorageNodeSet(selected)}.Build(),
+						}.Build(),
+						UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"spec.node_sets"}},
+					}.Build())
+					Expect(err).ToNot(HaveOccurred())
+					Expect(updated.GetObject().GetSpec().GetNodeSets()["storage"].GetVersion().GetId()).To(Equal("cv-default"))
+					Expect(updated.GetObject().GetSpec().GetNodeSets()["compute"].GetVersion().GetId()).To(Equal("cv-default"))
+					Expect(updated.GetObject().GetStatus().GetNodeSets()["storage"].GetObservedVersion()).To(Equal("4.17.0"))
+				},
+				Entry("fills an omitted version", ""),
+				Entry("preserves the explicit control-plane version", "4-17-0"),
+			)
+
+			It("rejects another catalog version when adding a node set", func() {
+				_, err := server.Update(ctx, privatev1.ClustersUpdateRequest_builder{
+					Object: privatev1.Cluster_builder{
+						Id: cluster.GetId(),
+						Spec: privatev1.ClusterSpec_builder{NodeSets: addStorageNodeSet(
+							privatev1.ClusterVersionReference_builder{Name: "4-18-0"}.Build())}.Build(),
+					}.Build(),
+					UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"spec.node_sets"}},
+				}.Build())
+				Expect(grpcstatus.Code(err)).To(Equal(grpccodes.InvalidArgument))
+				Expect(err).To(MatchError(ContainSubstring("must match the control-plane version")))
+				stored, err := server.Get(ctx, privatev1.ClustersGetRequest_builder{Id: cluster.GetId()}.Build())
+				Expect(err).ToNot(HaveOccurred())
+				Expect(stored.GetObject().GetSpec().GetNodeSets()).ToNot(HaveKey("storage"))
+			})
+
+			DescribeTable("adding a node set while changing the control plane in a full-spec edit",
+				func(version string) {
+					full := proto.Clone(cluster).(*privatev1.Cluster)
+					full.GetSpec().SetVersion(privatev1.ClusterVersionReference_builder{Name: "4-18-0"}.Build())
+					var selected *privatev1.ClusterVersionReference
+					if version != "" {
+						selected = privatev1.ClusterVersionReference_builder{Name: version}.Build()
+					}
+					full.GetSpec().SetNodeSets(addStorageNodeSet(selected))
+					updated, err := server.Update(ctx, privatev1.ClustersUpdateRequest_builder{
+						Object: full, UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"spec"}},
+					}.Build())
+					Expect(err).ToNot(HaveOccurred())
+					Expect(updated.GetObject().GetSpec().GetVersion().GetId()).To(Equal("cv-next"))
+					Expect(updated.GetObject().GetSpec().GetNodeSets()["storage"].GetVersion().GetId()).To(Equal("cv-default"))
+					Expect(updated.GetObject().GetSpec().GetNodeSets()["compute"].GetVersion().GetId()).To(Equal("cv-default"))
+				},
+				Entry("fills an omitted version from the stored control plane", ""),
+				Entry("accepts an explicit version matching the stored control plane", "4-17-0"),
+			)
+
+			It("rejects the new control-plane version when adding a node set during its upgrade", func() {
+				full := proto.Clone(cluster).(*privatev1.Cluster)
+				full.GetSpec().SetVersion(privatev1.ClusterVersionReference_builder{Name: "4-18-0"}.Build())
+				full.GetSpec().SetNodeSets(addStorageNodeSet(privatev1.ClusterVersionReference_builder{Name: "4-18-0"}.Build()))
+				_, err := server.Update(ctx, privatev1.ClustersUpdateRequest_builder{
+					Object: full, UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"spec"}},
+				}.Build())
+				Expect(grpcstatus.Code(err)).To(Equal(grpccodes.InvalidArgument))
+				Expect(err).To(MatchError(ContainSubstring("must match the control-plane version")))
+			})
+
+			It("accepts the control-plane version on cluster creation", func() {
+				created, err := server.Create(ctx, privatev1.ClustersCreateRequest_builder{
+					Object: privatev1.Cluster_builder{
+						Metadata: privatev1.Metadata_builder{Name: "matching-new-node-version"}.Build(),
+						Spec: privatev1.ClusterSpec_builder{
+							Template: privatev1.ClusterTemplateReference_builder{Id: "my-template-id"}.Build(),
+							Version:  privatev1.ClusterVersionReference_builder{Name: "4-17-0"}.Build(),
+							NodeSets: addStorageNodeSet(privatev1.ClusterVersionReference_builder{Name: "4-17-0"}.Build()),
+						}.Build(),
+					}.Build(),
+				}.Build())
+				Expect(err).ToNot(HaveOccurred())
+				Expect(created.GetObject().GetSpec().GetNodeSets()["storage"].GetVersion().GetId()).To(Equal("cv-default"))
+			})
+
+			It("rejects another catalog version on cluster creation", func() {
+				_, err := server.Create(ctx, privatev1.ClustersCreateRequest_builder{
+					Object: privatev1.Cluster_builder{
+						Metadata: privatev1.Metadata_builder{Name: "mismatched-new-node-version"}.Build(),
+						Spec: privatev1.ClusterSpec_builder{
+							Template: privatev1.ClusterTemplateReference_builder{Id: "my-template-id"}.Build(),
+							Version:  privatev1.ClusterVersionReference_builder{Name: "4-17-0"}.Build(),
+							NodeSets: addStorageNodeSet(privatev1.ClusterVersionReference_builder{Name: "4-18-0"}.Build()),
+						}.Build(),
+					}.Build(),
+				}.Build())
+				Expect(grpcstatus.Code(err)).To(Equal(grpccodes.InvalidArgument))
+				Expect(err).To(MatchError(ContainSubstring("must match the control-plane version")))
+			})
+
+			It("rejects an uncataloged version on a new node set", func() {
+				full := proto.Clone(cluster).(*privatev1.Cluster)
+				full.GetSpec().SetNodeSets(addStorageNodeSet(privatev1.ClusterVersionReference_builder{
+					Name: "missing-version"}.Build()))
+				_, err := server.Update(ctx, privatev1.ClustersUpdateRequest_builder{Object: full}.Build())
+				Expect(grpcstatus.Code(err)).To(Equal(grpccodes.InvalidArgument))
+				stored, err := server.Get(ctx, privatev1.ClustersGetRequest_builder{Id: cluster.GetId()}.Build())
+				Expect(err).ToNot(HaveOccurred())
+				Expect(stored.GetObject().GetSpec().GetNodeSets()).ToNot(HaveKey("storage"))
+			})
+
+			It("rejects a version selection for an unknown node set", func() {
+				_, err := server.Update(ctx, privatev1.ClustersUpdateRequest_builder{
+					Object: privatev1.Cluster_builder{
+						Id: cluster.GetId(),
+						Spec: privatev1.ClusterSpec_builder{NodeSets: map[string]*privatev1.ClusterNodeSet{
+							"missing": privatev1.ClusterNodeSet_builder{
+								Version: privatev1.ClusterVersionReference_builder{Name: "4-18-0"}.Build(),
+							}.Build(),
+						}}.Build(),
+					}.Build(),
+					UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"spec.node_sets.missing.version"}},
+				}.Build())
+				Expect(grpcstatus.Code(err)).To(Equal(grpccodes.InvalidArgument))
+			})
+		})
+
+		It("pins new node sets to the resolved cluster version", func() {
+			response, err := server.Create(ctx, privatev1.ClustersCreateRequest_builder{
+				Object: privatev1.Cluster_builder{
+					Metadata: privatev1.Metadata_builder{Name: "new-versioned-node-sets"}.Build(),
+					Spec: privatev1.ClusterSpec_builder{
+						Template: privatev1.ClusterTemplateReference_builder{Id: "my-template-id"}.Build(),
+					}.Build(),
+					Status: privatev1.ClusterStatus_builder{Hub: "my-hub-id"}.Build(),
+				}.Build(),
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+			cluster := response.GetObject()
+			Expect(cluster.GetSpec().GetVersion().GetId()).To(Equal("cv-default"))
+			Expect(cluster.GetSpec().GetNodeSets()).To(HaveLen(2))
+			for _, nodeSet := range cluster.GetSpec().GetNodeSets() {
+				Expect(nodeSet.GetVersion()).To(Equal(cluster.GetSpec().GetVersion()))
+			}
+		})
+
+		It("rejects mixed upgrades and pins legacy node sets on the first control-plane upgrade", func() {
+			clustersDao, err := dao.NewGenericDAO[*privatev1.Cluster]().
+				SetLogger(logger).
+				SetTenancyLogic(tenancy).
+				Build()
+			Expect(err).ToNot(HaveOccurred())
+			oldVersion := privatev1.ClusterVersionReference_builder{Id: "cv-default", Name: "4-17-0"}.Build()
+			created, err := clustersDao.Create().SetObject(privatev1.Cluster_builder{
+				Metadata: privatev1.Metadata_builder{Name: "legacy-node-versions", Tenant: testTenant}.Build(),
+				Spec: privatev1.ClusterSpec_builder{
+					Template: privatev1.ClusterTemplateReference_builder{Id: "my-template-id"}.Build(),
+					Version:  oldVersion,
+					NodeSets: map[string]*privatev1.ClusterNodeSet{
+						"compute": privatev1.ClusterNodeSet_builder{
+							Size: proto.Int32(3), BaremetalInstanceType: privatev1.BareMetalInstanceTypeReference_builder{Id: "acme-bmit-id", Shared: true}.Build(),
+						}.Build(),
+						"gpu": privatev1.ClusterNodeSet_builder{
+							Size: proto.Int32(1), BaremetalInstanceType: privatev1.BareMetalInstanceTypeReference_builder{Id: "acme-gpu-bmit-id", Shared: true}.Build(),
+						}.Build(),
+					},
+				}.Build(),
+				Status: privatev1.ClusterStatus_builder{Hub: "my-hub-id"}.Build(),
+			}.Build()).Do(ctx)
+			Expect(err).ToNot(HaveOccurred())
+			clusterID := created.GetObject().GetId()
+
+			seedClusterVersion(ctx, privatev1.ClusterVersion_builder{
+				Id:       "cv-next",
+				Metadata: privatev1.Metadata_builder{Name: "4-18-0", Tenant: testTenant}.Build(),
+				Spec: privatev1.ClusterVersionSpec_builder{
+					Image: "quay.io/openshift-release-dev/ocp-release:4.18.0-multi", Enabled: proto.Bool(true), Version: "4.18.0",
+				}.Build(),
+			}.Build())
+
+			// Both stored NodeSets predate independent versions. An explicit target on
+			// compute still counts as a second change alongside the control plane.
+			mixedNodeSets := make(map[string]*privatev1.ClusterNodeSet)
+			for name, nodeSet := range created.GetObject().GetSpec().GetNodeSets() {
+				Expect(nodeSet.GetVersion()).To(BeNil())
+				mixedNodeSets[name] = proto.Clone(nodeSet).(*privatev1.ClusterNodeSet)
+			}
+			mixedNodeSets["compute"].SetVersion(privatev1.ClusterVersionReference_builder{Name: "4-18-0"}.Build())
+			_, err = server.Update(ctx, privatev1.ClustersUpdateRequest_builder{
+				Object: privatev1.Cluster_builder{
+					Id: clusterID,
+					Spec: privatev1.ClusterSpec_builder{
+						Version:  privatev1.ClusterVersionReference_builder{Name: "4-18-0"}.Build(),
+						NodeSets: mixedNodeSets,
+					}.Build(),
+				}.Build(),
+				UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"spec.version", "spec.node_sets"}},
+			}.Build())
+			Expect(grpcstatus.Code(err)).To(Equal(grpccodes.InvalidArgument))
+			Expect(err).To(MatchError(ContainSubstring("only one component version")))
+
+			metadataOnly, err := server.Update(ctx, privatev1.ClustersUpdateRequest_builder{
+				Object: privatev1.Cluster_builder{
+					Id:       clusterID,
+					Metadata: privatev1.Metadata_builder{Labels: map[string]string{"env": "test"}}.Build(),
+				}.Build(),
+				UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"metadata.labels"}},
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+			Expect(proto.Equal(metadataOnly.GetObject().GetSpec(), created.GetObject().GetSpec())).To(BeTrue())
+			sizeOnly, err := server.Update(ctx, privatev1.ClustersUpdateRequest_builder{
+				Object: privatev1.Cluster_builder{
+					Id: clusterID,
+					Spec: privatev1.ClusterSpec_builder{NodeSets: map[string]*privatev1.ClusterNodeSet{
+						"compute": privatev1.ClusterNodeSet_builder{Size: proto.Int32(4)}.Build(),
+					}}.Build(),
+				}.Build(),
+				UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"spec.node_sets.compute.size"}},
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+			for _, nodeSet := range sizeOnly.GetObject().GetSpec().GetNodeSets() {
+				Expect(nodeSet.GetVersion().GetId()).To(Equal(oldVersion.GetId()))
+			}
+
+			updateVersion := func(version string) *privatev1.Cluster {
+				response, err := server.Update(ctx, privatev1.ClustersUpdateRequest_builder{
+					Object: privatev1.Cluster_builder{
+						Id: clusterID,
+						Spec: privatev1.ClusterSpec_builder{
+							Version: privatev1.ClusterVersionReference_builder{Name: version}.Build(),
+						}.Build(),
+					}.Build(),
+					UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"spec.version"}},
+				}.Build())
+				Expect(err).ToNot(HaveOccurred())
+				return response.GetObject()
+			}
+
+			unchanged := updateVersion("4-17-0")
+			Expect(unchanged.GetSpec().GetVersion().GetId()).To(Equal(oldVersion.GetId()))
+			for _, nodeSet := range unchanged.GetSpec().GetNodeSets() {
+				Expect(nodeSet.GetVersion().GetId()).To(Equal(oldVersion.GetId()))
+			}
+			updateNodeSetVersion := func(version string) *privatev1.Cluster {
+				response, err := server.Update(ctx, privatev1.ClustersUpdateRequest_builder{
+					Object: privatev1.Cluster_builder{
+						Id: clusterID,
+						Spec: privatev1.ClusterSpec_builder{NodeSets: map[string]*privatev1.ClusterNodeSet{
+							"compute": privatev1.ClusterNodeSet_builder{
+								Version: privatev1.ClusterVersionReference_builder{Name: version}.Build(),
+							}.Build(),
+						}}.Build(),
+					}.Build(),
+					UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"spec.node_sets.compute.version"}},
+				}.Build())
+				Expect(err).ToNot(HaveOccurred())
+				return response.GetObject()
+			}
+			unchangedNodeSet := updateNodeSetVersion("4-17-0")
+			Expect(unchangedNodeSet.GetSpec().GetNodeSets()["compute"].GetVersion().GetId()).To(Equal(oldVersion.GetId()))
+			workerUpdated := updateNodeSetVersion("4-18-0")
+			Expect(workerUpdated.GetSpec().GetNodeSets()["compute"].GetVersion().GetId()).To(Equal("cv-next"))
+			Expect(workerUpdated.GetSpec().GetNodeSets()["gpu"].GetVersion().GetId()).To(Equal(oldVersion.GetId()))
+
+			updated := updateVersion("4-18-0")
+			Expect(updated.GetSpec().GetVersion().GetName()).To(Equal("4-18-0"))
+			Expect(updated.GetSpec().GetNodeSets()["compute"].GetVersion().GetId()).To(Equal("cv-next"))
+			Expect(updated.GetSpec().GetNodeSets()["gpu"].GetVersion().GetId()).To(Equal(oldVersion.GetId()))
+			updated = updateVersion("4-17-0")
+			Expect(updated.GetSpec().GetNodeSets()["compute"].GetVersion().GetId()).To(Equal("cv-next"))
+			Expect(updated.GetSpec().GetNodeSets()["gpu"].GetVersion().GetId()).To(Equal(oldVersion.GetId()))
 		})
 
 		It("Preserves existing version when update sends empty name", func() {
@@ -2505,16 +5010,155 @@ var _ = Describe("Private clusters server", func() {
 		})
 
 		Describe("ClusterVersion validation", func() {
-			var validatedServer *PrivateClustersServer
+			var validatedServer *clusterCreationFixture
 
 			BeforeEach(func() {
-				var err error
-				validatedServer, err = NewPrivateClustersServer().
+				privateServer, buildErr := NewPrivateClustersServer().
 					SetLogger(logger).
 					SetAttributionLogic(attribution).
 					SetTenancyLogic(tenancy).
 					Build()
+				Expect(buildErr).ToNot(HaveOccurred())
+				validatedServer = &clusterCreationFixture{PrivateClustersServer: privateServer}
+			})
+
+			It("Rejects updating a cluster to a ClusterVersion without a disk image", func() {
+				seedClusterVersionWithoutDiskImage(ctx, privatev1.ClusterVersion_builder{
+					Metadata: privatev1.Metadata_builder{Name: "version-without-disk-image", Tenant: testTenant}.Build(),
+					Spec:     privatev1.ClusterVersionSpec_builder{Version: "4.20.0", Image: "quay.io/ocp:4.20.0", Enabled: proto.Bool(true)}.Build(),
+				}.Build())
+				created, err := validatedServer.Create(ctx, privatev1.ClustersCreateRequest_builder{
+					Object: privatev1.Cluster_builder{
+						Metadata: privatev1.Metadata_builder{Name: "cluster-version-update"}.Build(),
+						Spec:     privatev1.ClusterSpec_builder{Template: &privatev1.ClusterTemplateReference{Id: "my-template-id"}}.Build(),
+						Status:   privatev1.ClusterStatus_builder{Hub: "my-hub-id"}.Build(),
+					}.Build(),
+				}.Build())
 				Expect(err).ToNot(HaveOccurred())
+				_, err = validatedServer.Update(ctx, privatev1.ClustersUpdateRequest_builder{
+					Object: privatev1.Cluster_builder{
+						Id:   created.GetObject().GetId(),
+						Spec: privatev1.ClusterSpec_builder{Version: &privatev1.ClusterVersionReference{Name: "version-without-disk-image"}}.Build(),
+					}.Build(),
+					UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"spec.version"}},
+				}.Build())
+				Expect(grpcstatus.Code(err)).To(Equal(grpccodes.FailedPrecondition))
+				Expect(grpcstatus.Convert(err).Message()).To(ContainSubstring("disk image"))
+			})
+
+			It("Rejects a BM cluster when the explicitly selected ClusterVersion has no DiskImage", func() {
+				seedClusterVersionWithoutDiskImage(ctx, privatev1.ClusterVersion_builder{
+					Id: uuid.New(),
+					Metadata: privatev1.Metadata_builder{
+						Name:   "4-19-0-no-disk-image",
+						Tenant: testTenant,
+					}.Build(),
+					Spec: privatev1.ClusterVersionSpec_builder{
+						Image:   "quay.io/openshift-release-dev/ocp-release:4.19.0-multi",
+						Enabled: proto.Bool(true),
+						Version: "4.19.0",
+					}.Build(),
+				}.Build())
+
+				_, err := validatedServer.Create(ctx, privatev1.ClustersCreateRequest_builder{
+					Object: privatev1.Cluster_builder{
+						Metadata: privatev1.Metadata_builder{Name: fmt.Sprintf("test-%s", uuid.New()[24:32])}.Build(),
+						Spec: privatev1.ClusterSpec_builder{
+							Template: &privatev1.ClusterTemplateReference{Id: "my-template-id"},
+							Version:  &privatev1.ClusterVersionReference{Name: "4-19-0-no-disk-image"},
+						}.Build(),
+						Status: privatev1.ClusterStatus_builder{Hub: "my-hub-id"}.Build(),
+					}.Build(),
+				}.Build())
+				Expect(grpcstatus.Code(err)).To(Equal(grpccodes.FailedPrecondition))
+				Expect(grpcstatus.Convert(err).Message()).To(ContainSubstring("disk image"))
+			})
+
+			It("Does not auto-resolve a BM cluster to a default ClusterVersion without a DiskImage", func() {
+				clusterVersionsDao, err := dao.NewGenericDAO[*privatev1.ClusterVersion]().
+					SetLogger(logger).
+					SetTenancyLogic(tenancy).
+					Build()
+				Expect(err).ToNot(HaveOccurred())
+				_, err = clusterVersionsDao.Delete().SetId("cv-default").Do(ctx)
+				Expect(err).ToNot(HaveOccurred())
+
+				seedClusterVersionWithoutDiskImage(ctx, privatev1.ClusterVersion_builder{
+					Id:       "cv-default",
+					Metadata: privatev1.Metadata_builder{Name: "4-17-0", Tenant: testTenant}.Build(),
+					Spec: privatev1.ClusterVersionSpec_builder{
+						Image:     "quay.io/openshift-release-dev/ocp-release:4.17.0-multi",
+						Enabled:   proto.Bool(true),
+						IsDefault: proto.Bool(true),
+						Version:   "4.17.0",
+						State:     privatev1.ClusterVersionState_CLUSTER_VERSION_STATE_ACTIVE,
+					}.Build(),
+				}.Build())
+				seedClusterVersion(ctx, privatev1.ClusterVersion_builder{
+					Id:       "cv-non-default-with-disk-image",
+					Metadata: privatev1.Metadata_builder{Name: "4-18-0", Tenant: testTenant}.Build(),
+					Spec: privatev1.ClusterVersionSpec_builder{
+						Image:     "quay.io/openshift-release-dev/ocp-release:4.18.0-multi",
+						DiskImage: privatev1.DiskImageReference_builder{Id: "test-disk-image"}.Build(),
+						Enabled:   proto.Bool(true),
+						Version:   "4.18.0",
+						State:     privatev1.ClusterVersionState_CLUSTER_VERSION_STATE_ACTIVE,
+					}.Build(),
+				}.Build())
+
+				_, err = validatedServer.Create(ctx, privatev1.ClustersCreateRequest_builder{
+					Object: privatev1.Cluster_builder{
+						Metadata: privatev1.Metadata_builder{Name: fmt.Sprintf("test-%s", uuid.New()[24:32])}.Build(),
+						Spec: privatev1.ClusterSpec_builder{
+							Template: &privatev1.ClusterTemplateReference{Id: "my-template-id"},
+						}.Build(),
+						Status: privatev1.ClusterStatus_builder{Hub: "my-hub-id"}.Build(),
+					}.Build(),
+				}.Build())
+				Expect(grpcstatus.Code(err)).To(Equal(grpccodes.FailedPrecondition))
+				Expect(grpcstatus.Convert(err).Message()).To(ContainSubstring("disk image"))
+			})
+
+			It("Rejects a ClusterTemplate-pinned BM ClusterVersion without a DiskImage", func() {
+				seedClusterVersionWithoutDiskImage(ctx, privatev1.ClusterVersion_builder{
+					Id: uuid.New(),
+					Metadata: privatev1.Metadata_builder{
+						Name:   "4-19-0-template-no-disk-image",
+						Tenant: testTenant,
+					}.Build(),
+					Spec: privatev1.ClusterVersionSpec_builder{
+						Image:   "quay.io/openshift-release-dev/ocp-release:4.19.0-multi",
+						Enabled: proto.Bool(true),
+						Version: "4.19.0",
+					}.Build(),
+				}.Build())
+
+				templatesDao, err := dao.NewGenericDAO[*privatev1.ClusterTemplate]().
+					SetLogger(logger).
+					SetTenancyLogic(tenancy).
+					Build()
+				Expect(err).ToNot(HaveOccurred())
+				_, err = templatesDao.Create().SetObject(privatev1.ClusterTemplate_builder{
+					Id:       "template-pinned-no-disk-image",
+					Metadata: privatev1.Metadata_builder{Name: "template-pinned-no-disk-image", Tenant: testTenant}.Build(),
+					Title:    "Template with incompatible version",
+					SpecDefaults: privatev1.ClusterTemplateSpecDefaults_builder{
+						Version: &privatev1.ClusterVersionReference{Name: "4-19-0-template-no-disk-image"},
+					}.Build(),
+				}.Build()).Do(ctx)
+				Expect(err).ToNot(HaveOccurred())
+
+				_, err = validatedServer.Create(ctx, privatev1.ClustersCreateRequest_builder{
+					Object: privatev1.Cluster_builder{
+						Metadata: privatev1.Metadata_builder{Name: fmt.Sprintf("test-%s", uuid.New()[24:32])}.Build(),
+						Spec: privatev1.ClusterSpec_builder{
+							Template: &privatev1.ClusterTemplateReference{Id: "template-pinned-no-disk-image"},
+						}.Build(),
+						Status: privatev1.ClusterStatus_builder{Hub: "my-hub-id"}.Build(),
+					}.Build(),
+				}.Build())
+				Expect(grpcstatus.Code(err)).To(Equal(grpccodes.FailedPrecondition))
+				Expect(grpcstatus.Convert(err).Message()).To(ContainSubstring("disk image"))
 			})
 
 			It("Rejects create with non-existent version", func() {
@@ -2536,7 +5180,7 @@ var _ = Describe("Private clusters server", func() {
 				status, ok := grpcstatus.FromError(err)
 				Expect(ok).To(BeTrue())
 				Expect(status.Code()).To(Equal(grpccodes.InvalidArgument))
-				Expect(status.Message()).To(ContainSubstring("cluster version 'does-not-exist' not found"))
+				Expect(status.Message()).To(ContainSubstring("version 'does-not-exist' not found"))
 			})
 
 			It("Rejects create with disabled version", func() {
@@ -2662,7 +5306,7 @@ var _ = Describe("Private clusters server", func() {
 				Expect(err).To(HaveOccurred())
 				status, ok := grpcstatus.FromError(err)
 				Expect(ok).To(BeTrue())
-				Expect(status.Code()).To(Equal(grpccodes.InvalidArgument))
+				Expect(status.Code()).To(Equal(grpccodes.FailedPrecondition))
 				Expect(status.Message()).To(ContainSubstring("no version specified and no system default"))
 			})
 
@@ -2687,6 +5331,7 @@ var _ = Describe("Private clusters server", func() {
 							}.Build(),
 							Spec: privatev1.ClusterVersionSpec_builder{
 								Image:     "quay.io/openshift-release-dev/ocp-release:4.18.0-multi",
+								DiskImage: privatev1.DiskImageReference_builder{Id: "test-disk-image-id"}.Build(),
 								Enabled:   proto.Bool(false),
 								IsDefault: proto.Bool(true),
 								Version:   "4.18.0",
@@ -2738,6 +5383,7 @@ var _ = Describe("Private clusters server", func() {
 							}.Build(),
 							Spec: privatev1.ClusterVersionSpec_builder{
 								Image:     "quay.io/openshift-release-dev/ocp-release:4.16.0-multi",
+								DiskImage: privatev1.DiskImageReference_builder{Id: "test-disk-image-id"}.Build(),
 								Enabled:   proto.Bool(true),
 								IsDefault: proto.Bool(true),
 								Version:   "4.16.0",
@@ -2907,6 +5553,600 @@ var _ = Describe("Private clusters server", func() {
 			})
 		})
 
+		Describe("Version transition time", func() {
+			createCluster := func() *privatev1.Cluster {
+				response, err := server.Create(ctx, privatev1.ClustersCreateRequest_builder{
+					Object: privatev1.Cluster_builder{
+						Metadata: privatev1.Metadata_builder{Name: "test-cluster"}.Build(),
+						Spec: privatev1.ClusterSpec_builder{
+							Template: privatev1.ClusterTemplateReference_builder{Id: "my-template-id"}.Build(),
+						}.Build(),
+						Status: privatev1.ClusterStatus_builder{
+							Hub: "my-hub-id",
+						}.Build(),
+					}.Build(),
+				}.Build())
+				Expect(err).ToNot(HaveOccurred())
+				return response.GetObject()
+			}
+
+			seedSharedProject := func(name string) {
+				projectsDao, err := dao.NewGenericDAO[*privatev1.Project]().
+					SetLogger(logger).
+					SetTenancyLogic(tenancy).
+					Build()
+				Expect(err).ToNot(HaveOccurred())
+				_, err = projectsDao.Create().SetObject(privatev1.Project_builder{
+					Metadata: privatev1.Metadata_builder{
+						Name:   name,
+						Tenant: auth.SharedTenant,
+					}.Build(),
+				}.Build()).Do(ctx)
+				Expect(err).ToNot(HaveOccurred())
+			}
+
+			seedNextVersion := func() {
+				seedSharedProject("cluster-version-next")
+				seedClusterVersion(ctx, privatev1.ClusterVersion_builder{
+					Id: "cv-next",
+					Metadata: privatev1.Metadata_builder{
+						Name:    "4-18-0",
+						Tenant:  auth.SharedTenant,
+						Project: "cluster-version-next",
+					}.Build(),
+					Spec: privatev1.ClusterVersionSpec_builder{
+						Image:   "quay.io/openshift-release-dev/ocp-release:4.18.0-multi",
+						Enabled: proto.Bool(true),
+						Version: "4.18.0",
+					}.Build(),
+				}.Build())
+			}
+			// seedSharedNextVersion creates a shared catalog entry for the same
+			// semantic version, referenced by digest rather than by tag.
+			seedSharedNextVersion := func() {
+				seedSharedProject("cluster-version-shared-next")
+				seedClusterVersion(ctx, privatev1.ClusterVersion_builder{
+					Id: "cv-next-shared",
+					Metadata: privatev1.Metadata_builder{
+						Name:    "4-18-0-shared",
+						Tenant:  auth.SharedTenant,
+						Project: "cluster-version-shared-next",
+					}.Build(),
+					Spec: privatev1.ClusterVersionSpec_builder{
+						Image:   "quay.io/openshift-release-dev/ocp-release@sha256:2d4f2f7e5d4ce3e9525a4610e04bb2c8ea80ff8f4cc21e9781cbbde2ba1c9dc",
+						Enabled: proto.Bool(true),
+						Version: "4.18.0",
+					}.Build(),
+				}.Build())
+			}
+			// seedSharedDifferentSemverSameImage creates a shared entry whose image
+			// string matches the next entry but whose semantic version differs.
+			seedSharedDifferentSemverSameImage := func() {
+				seedSharedProject("cluster-version-shared-different")
+				seedClusterVersion(ctx, privatev1.ClusterVersion_builder{
+					Id: "cv-next-shared-different-semver",
+					Metadata: privatev1.Metadata_builder{
+						Name:    "4-19-0-shared",
+						Tenant:  auth.SharedTenant,
+						Project: "cluster-version-shared-different",
+					}.Build(),
+					Spec: privatev1.ClusterVersionSpec_builder{
+						Image:   "quay.io/openshift-release-dev/ocp-release:4.18.0-multi",
+						Enabled: proto.Bool(true),
+						Version: "4.19.0",
+					}.Build(),
+				}.Build())
+			}
+
+			updateVersion := func(id, name string) *privatev1.Cluster {
+				response, err := server.Update(ctx, privatev1.ClustersUpdateRequest_builder{
+					Object: privatev1.Cluster_builder{
+						Id: id,
+						Spec: privatev1.ClusterSpec_builder{
+							Version: privatev1.ClusterVersionReference_builder{Name: name}.Build(),
+						}.Build(),
+					}.Build(),
+					UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"spec.version"}},
+				}.Build())
+				Expect(err).ToNot(HaveOccurred())
+				return response.GetObject()
+			}
+			// updateSharedVersion replaces the control-plane reference with a
+			// shared ClusterVersion entry.
+			updateSharedVersion := func(id, name, project string) *privatev1.Cluster {
+				response, err := server.Update(ctx, privatev1.ClustersUpdateRequest_builder{
+					Object: privatev1.Cluster_builder{
+						Id: id,
+						Spec: privatev1.ClusterSpec_builder{
+							Version: privatev1.ClusterVersionReference_builder{
+								Name: name, Shared: true, Project: project,
+							}.Build(),
+						}.Build(),
+					}.Build(),
+					UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"spec.version"}},
+				}.Build())
+				Expect(err).ToNot(HaveOccurred())
+				return response.GetObject()
+			}
+			// updateSharedNodeSetVersion replaces one node set's version with a
+			// shared ClusterVersion entry.
+			updateSharedNodeSetVersion := func(id, name, version, project string) *privatev1.Cluster {
+				response, err := server.Update(ctx, privatev1.ClustersUpdateRequest_builder{
+					Object: privatev1.Cluster_builder{Id: id,
+						Spec: privatev1.ClusterSpec_builder{NodeSets: map[string]*privatev1.ClusterNodeSet{
+							name: privatev1.ClusterNodeSet_builder{Version: privatev1.ClusterVersionReference_builder{
+								Name: version, Shared: true, Project: project,
+							}.Build()}.Build(),
+						}}.Build()}.Build(),
+					UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"spec.node_sets." + name + ".version"}},
+				}.Build())
+				Expect(err).NotTo(HaveOccurred())
+				return response.GetObject()
+			}
+			updateNextVersion := func(id string) *privatev1.Cluster {
+				return updateSharedVersion(id, "4-18-0", "cluster-version-next")
+			}
+			updateNextNodeSetVersion := func(id, name string) *privatev1.Cluster {
+				return updateSharedNodeSetVersion(id, name, "4-18-0", "cluster-version-next")
+			}
+			captureReplacementLog := func(update func()) map[string]any {
+				var logs bytes.Buffer
+				originalLogger := server.logger
+				server.logger = slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{
+					Level: slog.LevelInfo,
+				}))
+				DeferCleanup(func() {
+					server.logger = originalLogger
+				})
+				update()
+
+				var replacement map[string]any
+				for _, line := range strings.Split(logs.String(), "\n") {
+					if line == "" {
+						continue
+					}
+					var record map[string]any
+					Expect(json.Unmarshal([]byte(line), &record)).To(Succeed())
+					if record["msg"] == "Replaced ClusterVersion reference with the same semantic version; no upgrade attempt created" {
+						replacement = record
+						break
+					}
+				}
+				Expect(replacement).NotTo(BeNil())
+				return replacement
+			}
+			historyEntries := func(count int) []*privatev1.ClusterUpgradeHistoryEntry {
+				states := []privatev1.ClusterUpgradeState{
+					privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_PENDING,
+					privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_PROGRESSING,
+					privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_TIMED_OUT,
+					privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_SUCCEEDED,
+					privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_FAILED,
+					privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_NODE_SET_REMOVED,
+				}
+				entries := make([]*privatev1.ClusterUpgradeHistoryEntry, count)
+				for i := range entries {
+					component := &privatev1.ClusterUpgradeComponent{}
+					if i%2 == 0 {
+						component.SetControlPlane(&emptypb.Empty{})
+					} else {
+						component.SetNodeSetId("compute")
+					}
+					entry := &privatev1.ClusterUpgradeHistoryEntry{}
+					entry.SetAttemptId(fmt.Sprintf("history-%03d", i))
+					entry.SetComponent(component)
+					entry.SetSourceVersion("4.17.0")
+					entry.SetTargetVersion("4.18.0")
+					timestamp := timestamppb.New(time.Unix(int64(1000-i), 0))
+					entry.SetAcceptedTime(timestamp)
+					entry.SetStateTransitionTime(timestamp)
+					entry.SetState(states[i%len(states)])
+					entries[i] = entry
+				}
+				return entries
+			}
+			seedHistory := func(cluster *privatev1.Cluster, history []*privatev1.ClusterUpgradeHistoryEntry) {
+				clustersDao, err := dao.NewGenericDAO[*privatev1.Cluster]().
+					SetLogger(logger).
+					SetTenancyLogic(tenancy).
+					Build()
+				Expect(err).ToNot(HaveOccurred())
+				stored := proto.Clone(cluster).(*privatev1.Cluster)
+				stored.GetStatus().SetUpgradeHistory(history)
+				_, err = clustersDao.Update().SetObject(stored).Do(ctx)
+				Expect(err).ToNot(HaveOccurred())
+			}
+
+			It("Is unset until the version changes", func() {
+				object := createCluster()
+				Expect(object.GetStatus().GetVersionTransitionTime()).To(BeNil())
+			})
+
+			It("Is stamped when a version change is accepted", func() {
+				object := createCluster()
+				seedNextVersion()
+
+				updated := updateNextVersion(object.GetId())
+
+				Expect(updated.GetSpec().GetVersion().GetName()).To(Equal("4-18-0"))
+				Expect(updated.GetStatus().GetVersionTransitionTime()).ToNot(BeNil())
+				Expect(updated.GetStatus().GetUpgradeHistory()).To(HaveLen(1))
+				attempt := updated.GetStatus().GetUpgradeHistory()[0]
+				Expect(attempt.GetAttemptId()).NotTo(BeEmpty())
+				Expect(attempt.GetComponent().GetControlPlane()).NotTo(BeNil())
+				Expect(attempt.GetSourceVersion()).To(Equal("4.17.0"))
+				Expect(attempt.GetTargetVersion()).To(Equal("4.18.0"))
+				Expect(attempt.GetState()).To(Equal(privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_PENDING))
+				Expect(attempt.GetAcceptedTime()).To(Equal(attempt.GetStateTransitionTime()))
+				Expect(updated.GetSpec().GetControlPlaneAttemptId()).To(Equal(attempt.GetAttemptId()))
+			})
+
+			It("Is not re-stamped when the same version is set again", func() {
+				object := createCluster()
+				seedNextVersion()
+
+				updated := updateNextVersion(object.GetId())
+				stamp := updated.GetStatus().GetVersionTransitionTime()
+				Expect(stamp).ToNot(BeNil())
+
+				again := updateNextVersion(updated.GetId())
+
+				Expect(again.GetStatus().GetVersionTransitionTime().AsTime()).To(Equal(stamp.AsTime()))
+				Expect(again.GetStatus().GetUpgradeHistory()).To(HaveLen(1))
+				Expect(again.GetSpec().GetControlPlaneAttemptId()).To(Equal(updated.GetSpec().GetControlPlaneAttemptId()))
+			})
+
+			It("stores a same-semver control-plane reference without creating another attempt", func() {
+				object := createCluster()
+				seedNextVersion()
+				updated := updateNextVersion(object.GetId())
+				Expect(updated.GetSpec().GetControlPlaneAttemptId()).ToNot(BeEmpty())
+				Expect(updated.GetStatus().GetVersionTransitionTime()).ToNot(BeNil())
+				seedSharedNextVersion()
+
+				var again *privatev1.Cluster
+				replacement := captureReplacementLog(func() {
+					again = updateSharedVersion(object.GetId(), "4-18-0-shared", "cluster-version-shared-next")
+				})
+
+				Expect(again.GetSpec().GetVersion().GetId()).To(Equal("cv-next-shared"))
+				Expect(again.GetSpec().GetVersion().GetShared()).To(BeTrue())
+				Expect(again.GetStatus().GetUpgradeHistory()).To(HaveLen(1))
+				Expect(again.GetSpec().GetControlPlaneAttemptId()).To(Equal(updated.GetSpec().GetControlPlaneAttemptId()))
+				Expect(again.GetStatus().GetVersionTransitionTime().AsTime()).To(Equal(updated.GetStatus().GetVersionTransitionTime().AsTime()))
+
+				Expect(replacement).To(HaveKeyWithValue("cluster_id", object.GetId()))
+				Expect(replacement).NotTo(HaveKey("release_image"))
+				Expect(replacement).To(HaveKeyWithValue("component", "control_plane"))
+				Expect(replacement).To(HaveKeyWithValue("previous_cluster_version_id", "cv-next"))
+				Expect(replacement).To(HaveKeyWithValue("new_cluster_version_id", "cv-next-shared"))
+				Expect(replacement).NotTo(HaveKey("previous_cluster_version_name"))
+				Expect(replacement).NotTo(HaveKey("new_cluster_version_name"))
+			})
+
+			It("creates an attempt when the semantic version differs even if the image matches", func() {
+				object := createCluster()
+				seedNextVersion()
+				updated := updateNextVersion(object.GetId())
+				seedSharedDifferentSemverSameImage()
+
+				again := updateSharedVersion(object.GetId(), "4-19-0-shared", "cluster-version-shared-different")
+
+				Expect(again.GetSpec().GetVersion().GetId()).To(Equal("cv-next-shared-different-semver"))
+				Expect(again.GetStatus().GetUpgradeHistory()).To(HaveLen(2))
+				Expect(again.GetSpec().GetControlPlaneAttemptId()).NotTo(Equal(updated.GetSpec().GetControlPlaneAttemptId()))
+				Expect(again.GetStatus().GetUpgradeHistory()[0].GetTargetVersion()).To(Equal("4.19.0"))
+			})
+
+			It("stores a same-semver node-set reference without creating another attempt", func() {
+				object := createCluster()
+				seedNextVersion()
+				updated := updateNextNodeSetVersion(object.GetId(), "compute")
+				Expect(updated.GetSpec().GetNodeSetAttemptIds()["compute"]).ToNot(BeEmpty())
+				seedSharedNextVersion()
+
+				var again *privatev1.Cluster
+				replacement := captureReplacementLog(func() {
+					again = updateSharedNodeSetVersion(object.GetId(), "compute", "4-18-0-shared", "cluster-version-shared-next")
+				})
+
+				Expect(replacement).To(HaveKeyWithValue("component", "node_set"))
+				Expect(replacement).NotTo(HaveKey("previous_cluster_version_name"))
+				Expect(replacement).NotTo(HaveKey("new_cluster_version_name"))
+				Expect(again.GetSpec().GetNodeSets()["compute"].GetVersion().GetId()).To(Equal("cv-next-shared"))
+				Expect(again.GetSpec().GetNodeSets()["compute"].GetVersion().GetShared()).To(BeTrue())
+				Expect(again.GetSpec().GetNodeSets()["gpu"].GetVersion().GetId()).To(Equal("cv-default"))
+				Expect(again.GetStatus().GetUpgradeHistory()).To(HaveLen(1))
+				Expect(again.GetSpec().GetNodeSetAttemptIds()["compute"]).To(Equal(updated.GetSpec().GetNodeSetAttemptIds()["compute"]))
+			})
+
+			It("retains the newest 100 entries across components and states when accepting an upgrade", func() {
+				cluster := createCluster()
+				seedNextVersion()
+				seedHistory(cluster, historyEntries(100))
+
+				updated := updateNextVersion(cluster.GetId())
+				history := updated.GetStatus().GetUpgradeHistory()
+
+				Expect(history).To(HaveLen(100))
+				Expect(history[0].GetAttemptId()).To(Equal(updated.GetSpec().GetControlPlaneAttemptId()))
+				Expect(history[1].GetAttemptId()).To(Equal("history-000"))
+				Expect(history[1].GetComponent().GetControlPlane()).NotTo(BeNil())
+				Expect(history[2].GetAttemptId()).To(Equal("history-001"))
+				Expect(history[2].GetComponent().GetNodeSetId()).To(Equal("compute"))
+				Expect(history[3].GetState()).To(Equal(privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_TIMED_OUT))
+				Expect(history[99].GetAttemptId()).To(Equal("history-098"))
+			})
+
+			It("trims an oversized history when accepting a node-set upgrade without changing cluster state", func() {
+				cluster := createCluster()
+				seedNextVersion()
+				cluster.GetSpec().SetControlPlaneAttemptId("existing-control-plane-attempt")
+				cluster.GetSpec().SetNodeSetAttemptIds(map[string]string{"compute": "existing-compute-attempt"})
+				cluster.GetStatus().SetState(privatev1.ClusterState_CLUSTER_STATE_READY)
+				cluster.GetStatus().SetStateTransitionTime(timestamppb.Now())
+				cluster.GetStatus().SetObservedVersion("4.17.0")
+				cluster.GetStatus().SetNodeSets(map[string]*privatev1.ClusterNodeSet{
+					"compute": privatev1.ClusterNodeSet_builder{ObservedVersion: "4.17.0"}.Build(),
+				})
+				seedHistory(cluster, historyEntries(102))
+
+				updated := updateNextNodeSetVersion(cluster.GetId(), "compute")
+				history := updated.GetStatus().GetUpgradeHistory()
+
+				Expect(history).To(HaveLen(100))
+				Expect(history[0].GetAttemptId()).To(Equal(updated.GetSpec().GetNodeSetAttemptIds()["compute"]))
+				Expect(history[99].GetAttemptId()).To(Equal("history-098"))
+				Expect(updated.GetSpec().GetControlPlaneAttemptId()).To(Equal("existing-control-plane-attempt"))
+				Expect(updated.GetStatus().GetObservedVersion()).To(Equal("4.17.0"))
+				Expect(updated.GetStatus().GetState()).To(Equal(privatev1.ClusterState_CLUSTER_STATE_READY))
+				Expect(updated.GetStatus().GetNodeSets()["compute"].GetObservedVersion()).To(Equal("4.17.0"))
+			})
+
+			It("persists independent observed-version feedback without changing upgrade intent or history", func() {
+				cluster := createCluster()
+				initialSpec := proto.Clone(cluster.GetSpec())
+				initialHistory := proto.Clone(cluster.GetStatus()).(*privatev1.ClusterStatus).GetUpgradeHistory()
+				incomingStatus := proto.Clone(cluster.GetStatus()).(*privatev1.ClusterStatus)
+				incomingStatus.SetObservedVersion("4.17.1")
+				for _, nodeSet := range incomingStatus.GetNodeSets() {
+					nodeSet.SetObservedVersion("4.17.1")
+				}
+				updated, err := server.Update(ctx, privatev1.ClustersUpdateRequest_builder{
+					Object: privatev1.Cluster_builder{Id: cluster.GetId(), Status: incomingStatus}.Build(),
+					UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{
+						"status.observed_version", "status.node_sets",
+					}},
+				}.Build())
+				Expect(err).ToNot(HaveOccurred())
+				Expect(updated.GetObject().GetStatus().GetObservedVersion()).To(Equal("4.17.1"))
+				for _, nodeSet := range updated.GetObject().GetStatus().GetNodeSets() {
+					Expect(nodeSet.GetObservedVersion()).To(Equal("4.17.1"))
+				}
+				stored, err := server.Get(ctx, privatev1.ClustersGetRequest_builder{Id: cluster.GetId()}.Build())
+				Expect(err).ToNot(HaveOccurred())
+				Expect(proto.Equal(stored.GetObject().GetSpec(), initialSpec)).To(BeTrue())
+				Expect(stored.GetObject().GetStatus().GetUpgradeHistory()).To(Equal(initialHistory))
+				Expect(stored.GetObject().GetStatus().GetState()).To(Equal(cluster.GetStatus().GetState()))
+			})
+
+			It("keeps independent component IDs and newest-first history", func() {
+				cluster := createCluster()
+				seedNextVersion()
+				controlPlane := updateNextVersion(cluster.GetId())
+				cpID := controlPlane.GetSpec().GetControlPlaneAttemptId()
+				compute := updateNextNodeSetVersion(cluster.GetId(), "compute")
+				computeID := compute.GetSpec().GetNodeSetAttemptIds()["compute"]
+				gpu := updateNextNodeSetVersion(cluster.GetId(), "gpu")
+				gpuID := gpu.GetSpec().GetNodeSetAttemptIds()["gpu"]
+				Expect(gpuID).NotTo(Equal(computeID))
+				Expect(gpu.GetSpec().GetNodeSetAttemptIds()["compute"]).To(Equal(computeID))
+				Expect(gpu.GetSpec().GetControlPlaneAttemptId()).To(Equal(cpID))
+				history := gpu.GetStatus().GetUpgradeHistory()
+				Expect(history).To(HaveLen(3))
+				Expect(history[0].GetAttemptId()).To(Equal(gpuID))
+				Expect(history[1].GetAttemptId()).To(Equal(computeID))
+				Expect(history[2].GetAttemptId()).To(Equal(cpID))
+			})
+
+			It("updates an earlier component's history entry without reordering it", func() {
+				cluster := createCluster()
+				seedNextVersion()
+				controlPlane := updateNextVersion(cluster.GetId())
+				cpID := controlPlane.GetSpec().GetControlPlaneAttemptId()
+				compute := updateNextNodeSetVersion(cluster.GetId(), "compute")
+				history := compute.GetStatus().GetUpgradeHistory()
+				Expect(history).To(HaveLen(2))
+				cpTransition := &privatev1.ClusterUpgradeHistoryEntry{}
+				cpTransition.SetAttemptId(cpID)
+				cpTransition.SetComponent(proto.Clone(history[1].GetComponent()).(*privatev1.ClusterUpgradeComponent))
+				cpTransition.SetState(privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_PROGRESSING)
+				cpTransition.SetStateTransitionTime(timestamppb.New(history[1].GetStateTransitionTime().AsTime().Add(time.Second)))
+				cpTransition.SetMessage("Control plane is updating")
+				response, err := server.Update(ctx, privatev1.ClustersUpdateRequest_builder{
+					Object: privatev1.Cluster_builder{Id: cluster.GetId(),
+						Status: privatev1.ClusterStatus_builder{UpgradeHistory: []*privatev1.ClusterUpgradeHistoryEntry{cpTransition}}.Build()}.Build(),
+					UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"status.upgrade_history"}},
+				}.Build())
+				Expect(err).NotTo(HaveOccurred())
+				merged := response.GetObject().GetStatus().GetUpgradeHistory()
+				Expect(merged).To(HaveLen(2))
+				Expect(merged[0].GetAttemptId()).To(Equal(compute.GetSpec().GetNodeSetAttemptIds()["compute"]))
+				Expect(merged[1].GetAttemptId()).To(Equal(cpID))
+				Expect(merged[1].GetState()).To(Equal(privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_PROGRESSING))
+				Expect(proto.Equal(merged[1].GetComponent(), history[1].GetComponent())).To(BeTrue())
+				Expect(proto.Equal(merged[1].GetAcceptedTime(), history[1].GetAcceptedTime())).To(BeTrue())
+			})
+
+			It("merges each component independently when attempt IDs are shared", func() {
+				cluster := createCluster()
+				seedNextVersion()
+				updateNextVersion(cluster.GetId())
+				withNodeSet := updateNextNodeSetVersion(cluster.GetId(), "compute")
+				stored := withNodeSet.GetStatus().GetUpgradeHistory()
+				Expect(stored).To(HaveLen(2))
+				Expect(stored[0].GetComponent().GetNodeSetId()).To(Equal("compute"))
+				Expect(stored[1].GetComponent().GetControlPlane()).NotTo(BeNil())
+				stored[1].SetAttemptId(stored[0].GetAttemptId())
+
+				nodeSetUpdate := proto.Clone(stored[0]).(*privatev1.ClusterUpgradeHistoryEntry)
+				nodeSetUpdate.SetState(privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_PROGRESSING)
+				nodeSetUpdate.SetMessage("Node pool is updating")
+				nodeSetUpdate.SetStateTransitionTime(timestamppb.New(stored[0].GetStateTransitionTime().AsTime().Add(time.Second)))
+				controlPlaneUpdate := proto.Clone(stored[1]).(*privatev1.ClusterUpgradeHistoryEntry)
+				controlPlaneUpdate.SetState(privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_FAILED)
+				controlPlaneUpdate.SetMessage("Control plane upgrade failed")
+				controlPlaneUpdate.SetStateTransitionTime(timestamppb.New(stored[1].GetStateTransitionTime().AsTime().Add(time.Second)))
+
+				merged := mergeClusterUpgradeStateChanges(stored,
+					[]*privatev1.ClusterUpgradeHistoryEntry{nodeSetUpdate, controlPlaneUpdate})
+				Expect(merged[0].GetState()).To(Equal(privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_PROGRESSING))
+				Expect(merged[0].GetMessage()).To(Equal("Node pool is updating"))
+				Expect(merged[1].GetState()).To(Equal(privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_FAILED))
+				Expect(merged[1].GetMessage()).To(Equal("Control plane upgrade failed"))
+
+				controlPlaneOnly := mergeClusterUpgradeStateChanges(stored,
+					[]*privatev1.ClusterUpgradeHistoryEntry{controlPlaneUpdate})
+				Expect(controlPlaneOnly[0].GetState()).To(Equal(privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_PENDING))
+				Expect(controlPlaneOnly[1].GetState()).To(Equal(privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_FAILED))
+
+				missingComponent := proto.Clone(controlPlaneUpdate).(*privatev1.ClusterUpgradeHistoryEntry)
+				missingComponent.SetComponent(nil)
+				unchanged := mergeClusterUpgradeStateChanges(stored,
+					[]*privatev1.ClusterUpgradeHistoryEntry{missingComponent})
+				Expect(unchanged[0].GetState()).To(Equal(privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_PENDING))
+				Expect(unchanged[1].GetState()).To(Equal(privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_PENDING))
+				unchanged = mergeClusterUpgradeStateChanges(stored[1:],
+					[]*privatev1.ClusterUpgradeHistoryEntry{missingComponent})
+				Expect(unchanged[0].GetState()).To(Equal(privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_PENDING))
+			})
+
+			It("freezes the node count at acceptance", func() {
+				cluster := createCluster()
+				seedNextVersion()
+				updated := updateNextNodeSetVersion(cluster.GetId(), "compute")
+				entry := updated.GetStatus().GetUpgradeHistory()[0]
+				acceptedCount := max(int32(1), updated.GetSpec().GetNodeSets()["compute"].GetSize())
+				Expect(entry.GetTimeoutNodeCount()).To(Equal(acceptedCount))
+				transition := &privatev1.ClusterUpgradeHistoryEntry{}
+				transition.SetAttemptId(entry.GetAttemptId())
+				transition.SetComponent(proto.Clone(entry.GetComponent()).(*privatev1.ClusterUpgradeComponent))
+				transition.SetState(privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_PROGRESSING)
+				transition.SetStateTransitionTime(timestamppb.New(entry.GetStateTransitionTime().AsTime().Add(time.Second)))
+				transition.SetTimeoutNodeCount(acceptedCount + 2)
+				update := func() *privatev1.ClusterUpgradeHistoryEntry {
+					response, err := server.Update(ctx, privatev1.ClustersUpdateRequest_builder{
+						Object: privatev1.Cluster_builder{Id: cluster.GetId(),
+							Status: privatev1.ClusterStatus_builder{UpgradeHistory: []*privatev1.ClusterUpgradeHistoryEntry{transition}}.Build()}.Build(),
+						UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"status.upgrade_history"}},
+					}.Build())
+					Expect(err).NotTo(HaveOccurred())
+					return response.GetObject().GetStatus().GetUpgradeHistory()[0]
+				}
+				progressing := update()
+				Expect(progressing.GetTimeoutNodeCount()).To(Equal(acceptedCount))
+				transition.SetState(privatev1.ClusterUpgradeState_CLUSTER_UPGRADE_STATE_TIMED_OUT)
+				transition.SetStateTransitionTime(timestamppb.New(progressing.GetStateTransitionTime().AsTime().Add(time.Second)))
+				transition.SetTimeoutNodeCount(acceptedCount + 4)
+				Expect(update().GetTimeoutNodeCount()).To(Equal(acceptedCount))
+			})
+
+			It("preserves server-owned attempt IDs on full-object and parent-spec edits", func() {
+				cluster := createCluster()
+				seedNextVersion()
+				updated := updateNextVersion(cluster.GetId())
+				id := updated.GetSpec().GetControlPlaneAttemptId()
+				full := proto.Clone(updated).(*privatev1.Cluster)
+				full.GetSpec().SetControlPlaneAttemptId("caller-value")
+				full.GetStatus().SetUpgradeHistory(nil)
+				response, err := server.Update(ctx, privatev1.ClustersUpdateRequest_builder{Object: full}.Build())
+				Expect(err).NotTo(HaveOccurred())
+				Expect(response.GetObject().GetSpec().GetControlPlaneAttemptId()).To(Equal(id))
+				Expect(response.GetObject().GetStatus().GetUpgradeHistory()).To(HaveLen(1))
+				partial := privatev1.Cluster_builder{Id: cluster.GetId(),
+					Spec: proto.Clone(updated.GetSpec()).(*privatev1.ClusterSpec)}.Build()
+				partial.GetSpec().SetControlPlaneAttemptId("other-caller-value")
+				response, err = server.Update(ctx, privatev1.ClustersUpdateRequest_builder{
+					Object: partial, UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"spec"}},
+				}.Build())
+				Expect(err).NotTo(HaveOccurred())
+				Expect(response.GetObject().GetSpec().GetControlPlaneAttemptId()).To(Equal(id))
+			})
+
+			// createClusterWithIdOnlyVersion inserts a cluster whose stored version reference
+			// carries the id but not the name, the legacy shape that predates the enrichment
+			// always writing {id, name}. Inserts bypass the metering source contract.
+			createClusterWithIdOnlyVersion := func() *privatev1.Cluster {
+				clustersDao, err := dao.NewGenericDAO[*privatev1.Cluster]().
+					SetLogger(logger).
+					SetTenancyLogic(tenancy).
+					Build()
+				Expect(err).ToNot(HaveOccurred())
+				response, err := clustersDao.Create().SetObject(privatev1.Cluster_builder{
+					Metadata: privatev1.Metadata_builder{Name: "test-cluster", Tenant: testTenant}.Build(),
+					Spec: privatev1.ClusterSpec_builder{
+						Template: privatev1.ClusterTemplateReference_builder{Id: "my-template-id"}.Build(),
+						Version:  privatev1.ClusterVersionReference_builder{Id: "cv-default"}.Build(),
+					}.Build(),
+					Status: privatev1.ClusterStatus_builder{Hub: "my-hub-id"}.Build(),
+				}.Build()).Do(ctx)
+				Expect(err).ToNot(HaveOccurred())
+				return response.GetObject()
+			}
+
+			It("Is not stamped when enrichment only fills the name into an id-only stored reference", func() {
+				object := createClusterWithIdOnlyVersion()
+
+				updated := updateVersion(object.GetId(), "4-17-0")
+
+				// The requested version resolves to the same id, so the stored reference is
+				// kept as-is, no transition is stamped, and billing is not split.
+				Expect(updated.GetSpec().GetVersion().GetId()).To(Equal("cv-default"))
+				Expect(updated.GetStatus().GetVersionTransitionTime()).To(BeNil())
+			})
+
+			It("Is stamped when the version really changes after an enrichment-only update", func() {
+				object := createClusterWithIdOnlyVersion()
+				enriched := updateVersion(object.GetId(), "4-17-0")
+				Expect(enriched.GetStatus().GetVersionTransitionTime()).To(BeNil())
+
+				seedNextVersion()
+				changed := updateNextVersion(enriched.GetId())
+
+				Expect(changed.GetSpec().GetVersion().GetName()).To(Equal("4-18-0"))
+				Expect(changed.GetSpec().GetVersion().GetId()).To(Equal("cv-next"))
+				Expect(changed.GetStatus().GetVersionTransitionTime()).ToNot(BeNil())
+			})
+
+			It("Is preserved by updates that do not change the version", func() {
+				object := createCluster()
+				seedNextVersion()
+
+				updated := updateNextVersion(object.GetId())
+				stamp := updated.GetStatus().GetVersionTransitionTime()
+				Expect(stamp).ToNot(BeNil())
+
+				response, err := server.Update(ctx, privatev1.ClustersUpdateRequest_builder{
+					Object: privatev1.Cluster_builder{
+						Id: updated.GetId(),
+						Spec: privatev1.ClusterSpec_builder{
+							Version: privatev1.ClusterVersionReference_builder{Name: "4-18-0", Shared: true, Project: "cluster-version-next"}.Build(),
+							NodeSets: map[string]*privatev1.ClusterNodeSet{
+								"compute": privatev1.ClusterNodeSet_builder{
+									Size:                  proto.Int32(3),
+									BaremetalInstanceType: privatev1.BareMetalInstanceTypeReference_builder{Id: "acme-bmit-id", Shared: true}.Build(),
+								}.Build(),
+							},
+						}.Build(),
+					}.Build(),
+					UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"spec.node_sets"}},
+				}.Build())
+				Expect(err).ToNot(HaveOccurred())
+
+				Expect(response.GetObject().GetStatus().GetVersionTransitionTime().AsTime()).To(Equal(stamp.AsTime()))
+			})
+		})
+
 		Describe("Dry run", func() {
 			It("Returns resolved cluster with template path", func() {
 				response, err := server.Create(dryRunCtx(), privatev1.ClustersCreateRequest_builder{
@@ -2915,11 +6155,11 @@ var _ = Describe("Private clusters server", func() {
 							Name: "test-cluster",
 						}.Build(),
 						Spec: privatev1.ClusterSpec_builder{
-							Template: privatev1.ClusterTemplateReference_builder{Id: "my-template-name"}.Build(),
+							Template: privatev1.ClusterTemplateReference_builder{Name: "my-template-name"}.Build(),
 							NodeSets: map[string]*privatev1.ClusterNodeSet{
 								"compute": privatev1.ClusterNodeSet_builder{
-									HostType: privatev1.HostTypeReference_builder{Id: "acme-1ti-name"}.Build(),
-									Size:     proto.Int32(7),
+									BaremetalInstanceType: privatev1.BareMetalInstanceTypeReference_builder{Name: "acme-bmit-name", Shared: true}.Build(),
+									Size:                  proto.Int32(7),
 								}.Build(),
 							},
 						}.Build(),
@@ -2934,7 +6174,7 @@ var _ = Describe("Private clusters server", func() {
 				Expect(object.GetSpec().GetTemplate().GetId()).To(Equal("my-template-id"))
 				nodeSets := object.GetSpec().GetNodeSets()
 				Expect(nodeSets).To(HaveKey("compute"))
-				Expect(nodeSets["compute"].GetHostType().GetId()).To(Equal("acme-1ti-id"))
+				Expect(nodeSets["compute"].GetBaremetalInstanceType().GetId()).To(Equal("acme-bmit-id"))
 			})
 
 			It("Returns resolved cluster with catalog item path", func() {
@@ -2948,7 +6188,7 @@ var _ = Describe("Private clusters server", func() {
 						Id: "cat-dry-run",
 						Metadata: privatev1.Metadata_builder{
 							Name:   "cat-dry-run-name",
-							Tenant: "shared",
+							Tenant: testTenant,
 						}.Build(),
 						Title:     "Dry Run Catalog Item",
 						Published: true,
@@ -2964,6 +6204,7 @@ var _ = Describe("Private clusters server", func() {
 						}.Build(),
 						Spec: privatev1.ClusterSpec_builder{
 							CatalogItem: privatev1.ClusterCatalogItemReference_builder{Id: "cat-dry-run"}.Build(),
+							NodeSets:    map[string]*privatev1.ClusterNodeSet{"compute": privatev1.ClusterNodeSet_builder{Size: proto.Int32(3), BaremetalInstanceType: privatev1.BareMetalInstanceTypeReference_builder{Id: "acme-bmit-id", Shared: true}.Build()}.Build()},
 						}.Build(),
 						Status: privatev1.ClusterStatus_builder{
 							Hub: "my-hub-id",
@@ -2984,7 +6225,7 @@ var _ = Describe("Private clusters server", func() {
 							Name: "test-cluster",
 						}.Build(),
 						Spec: privatev1.ClusterSpec_builder{
-							Template: privatev1.ClusterTemplateReference_builder{Id: "my-template-name"}.Build(),
+							Template: privatev1.ClusterTemplateReference_builder{Name: "my-template-name"}.Build(),
 						}.Build(),
 						Status: privatev1.ClusterStatus_builder{
 							Hub: "my-hub-id",
@@ -3045,7 +6286,8 @@ var _ = Describe("Private clusters server", func() {
 				Expect(err).ToNot(HaveOccurred())
 
 				_, err = secretsDao.Create().SetObject(privatev1.Secret_builder{
-					Id: "my-secret-id",
+					Id:   "my-secret-id",
+					Type: privatev1.SecretType_SECRET_TYPE_PULL_SECRET,
 					Metadata: privatev1.Metadata_builder{
 						Name:   "my-secret-name",
 						Tenant: testTenant,
@@ -3054,7 +6296,8 @@ var _ = Describe("Private clusters server", func() {
 				Expect(err).ToNot(HaveOccurred())
 
 				_, err = secretsDao.Create().SetObject(privatev1.Secret_builder{
-					Id: "override-secret-id",
+					Id:   "override-secret-id",
+					Type: privatev1.SecretType_SECRET_TYPE_PULL_SECRET,
 					Metadata: privatev1.Metadata_builder{
 						Name:   "override-secret-name",
 						Tenant: testTenant,
@@ -3072,8 +6315,8 @@ var _ = Describe("Private clusters server", func() {
 						Spec: privatev1.ClusterSpec_builder{
 							Template: privatev1.ClusterTemplateReference_builder{Id: "my-template-id"}.Build(),
 							NodeSets: map[string]*privatev1.ClusterNodeSet{
-								"compute": privatev1.ClusterNodeSet_builder{Size: proto.Int32(3)}.Build(),
-								"gpu":     privatev1.ClusterNodeSet_builder{Size: proto.Int32(1)}.Build(),
+								"compute": privatev1.ClusterNodeSet_builder{Size: proto.Int32(3), BaremetalInstanceType: privatev1.BareMetalInstanceTypeReference_builder{Id: "acme-bmit-id", Shared: true}.Build()}.Build(),
+								"gpu":     privatev1.ClusterNodeSet_builder{Size: proto.Int32(1), BaremetalInstanceType: privatev1.BareMetalInstanceTypeReference_builder{Id: "acme-gpu-bmit-id", Shared: true}.Build()}.Build(),
 							},
 							PullSecretSecret: privatev1.SecretLocalReference_builder{Id: "my-secret-id"}.Build(),
 						}.Build(),
@@ -3097,8 +6340,8 @@ var _ = Describe("Private clusters server", func() {
 						Spec: privatev1.ClusterSpec_builder{
 							Template: privatev1.ClusterTemplateReference_builder{Id: "my-template-id"}.Build(),
 							NodeSets: map[string]*privatev1.ClusterNodeSet{
-								"compute": privatev1.ClusterNodeSet_builder{Size: proto.Int32(3)}.Build(),
-								"gpu":     privatev1.ClusterNodeSet_builder{Size: proto.Int32(1)}.Build(),
+								"compute": privatev1.ClusterNodeSet_builder{Size: proto.Int32(3), BaremetalInstanceType: privatev1.BareMetalInstanceTypeReference_builder{Id: "acme-bmit-id", Shared: true}.Build()}.Build(),
+								"gpu":     privatev1.ClusterNodeSet_builder{Size: proto.Int32(1), BaremetalInstanceType: privatev1.BareMetalInstanceTypeReference_builder{Id: "acme-gpu-bmit-id", Shared: true}.Build()}.Build(),
 							},
 							PullSecretSecret: privatev1.SecretLocalReference_builder{Name: "my-secret-name"}.Build(),
 						}.Build(),
@@ -3121,8 +6364,8 @@ var _ = Describe("Private clusters server", func() {
 						Spec: privatev1.ClusterSpec_builder{
 							Template: privatev1.ClusterTemplateReference_builder{Id: "my-template-id"}.Build(),
 							NodeSets: map[string]*privatev1.ClusterNodeSet{
-								"compute": privatev1.ClusterNodeSet_builder{Size: proto.Int32(3)}.Build(),
-								"gpu":     privatev1.ClusterNodeSet_builder{Size: proto.Int32(1)}.Build(),
+								"compute": privatev1.ClusterNodeSet_builder{Size: proto.Int32(3), BaremetalInstanceType: privatev1.BareMetalInstanceTypeReference_builder{Id: "acme-bmit-id", Shared: true}.Build()}.Build(),
+								"gpu":     privatev1.ClusterNodeSet_builder{Size: proto.Int32(1), BaremetalInstanceType: privatev1.BareMetalInstanceTypeReference_builder{Id: "acme-gpu-bmit-id", Shared: true}.Build()}.Build(),
 							},
 							PullSecretSecret: privatev1.SecretLocalReference_builder{Id: "nonexistent-secret"}.Build(),
 						}.Build(),
@@ -3133,12 +6376,13 @@ var _ = Describe("Private clusters server", func() {
 				}.Build())
 				Expect(err).To(HaveOccurred())
 				Expect(grpcstatus.Code(err)).To(Equal(grpccodes.InvalidArgument))
-				Expect(grpcstatus.Convert(err).Message()).To(ContainSubstring("no secret"))
+				Expect(grpcstatus.Convert(err).Message()).To(ContainSubstring("pull_secret_secret 'nonexistent-secret' not found"))
 			})
 
 			It("Rejects a directly supplied shared pull_secret_secret reference", func() {
 				_, err := secretsDao.Create().SetObject(privatev1.Secret_builder{
-					Id: "shared-secret-direct-id",
+					Id:   "shared-secret-direct-id",
+					Type: privatev1.SecretType_SECRET_TYPE_PULL_SECRET,
 					Metadata: privatev1.Metadata_builder{
 						Name:   "shared-secret-direct",
 						Tenant: auth.SharedTenant,
@@ -3154,8 +6398,8 @@ var _ = Describe("Private clusters server", func() {
 						Spec: privatev1.ClusterSpec_builder{
 							Template: privatev1.ClusterTemplateReference_builder{Id: "my-template-id"}.Build(),
 							NodeSets: map[string]*privatev1.ClusterNodeSet{
-								"compute": privatev1.ClusterNodeSet_builder{Size: proto.Int32(3)}.Build(),
-								"gpu":     privatev1.ClusterNodeSet_builder{Size: proto.Int32(1)}.Build(),
+								"compute": privatev1.ClusterNodeSet_builder{Size: proto.Int32(3), BaremetalInstanceType: privatev1.BareMetalInstanceTypeReference_builder{Id: "acme-bmit-id", Shared: true}.Build()}.Build(),
+								"gpu":     privatev1.ClusterNodeSet_builder{Size: proto.Int32(1), BaremetalInstanceType: privatev1.BareMetalInstanceTypeReference_builder{Id: "acme-gpu-bmit-id", Shared: true}.Build()}.Build(),
 							},
 							PullSecretSecret: privatev1.SecretLocalReference_builder{Id: "shared-secret-direct-id"}.Build(),
 						}.Build(),
@@ -3163,7 +6407,7 @@ var _ = Describe("Private clusters server", func() {
 					}.Build(),
 				}.Build())
 				Expect(grpcstatus.Code(err)).To(Equal(grpccodes.InvalidArgument))
-				Expect(grpcstatus.Convert(err).Message()).To(ContainSubstring("inherited from a shared cluster template"))
+				Expect(grpcstatus.Convert(err).Message()).To(ContainSubstring("pull_secret_secret 'shared-secret-direct-id' not found"))
 			})
 
 			It("Updates a cluster with pull_secret_secret reference", func() {
@@ -3175,8 +6419,8 @@ var _ = Describe("Private clusters server", func() {
 						Spec: privatev1.ClusterSpec_builder{
 							Template: privatev1.ClusterTemplateReference_builder{Id: "my-template-id"}.Build(),
 							NodeSets: map[string]*privatev1.ClusterNodeSet{
-								"compute": privatev1.ClusterNodeSet_builder{Size: proto.Int32(3)}.Build(),
-								"gpu":     privatev1.ClusterNodeSet_builder{Size: proto.Int32(1)}.Build(),
+								"compute": privatev1.ClusterNodeSet_builder{Size: proto.Int32(3), BaremetalInstanceType: privatev1.BareMetalInstanceTypeReference_builder{Id: "acme-bmit-id", Shared: true}.Build()}.Build(),
+								"gpu":     privatev1.ClusterNodeSet_builder{Size: proto.Int32(1), BaremetalInstanceType: privatev1.BareMetalInstanceTypeReference_builder{Id: "acme-gpu-bmit-id", Shared: true}.Build()}.Build(),
 							},
 						}.Build(),
 						Status: privatev1.ClusterStatus_builder{
@@ -3219,12 +6463,6 @@ var _ = Describe("Private clusters server", func() {
 							}.Build(),
 							Title:       "Template with secret ref default",
 							Description: "Template with pull_secret_secret in spec defaults",
-							NodeSets: map[string]*privatev1.ClusterTemplateNodeSet{
-								"compute": privatev1.ClusterTemplateNodeSet_builder{
-									HostType: privatev1.HostTypeReference_builder{Id: "acme-1ti-id"}.Build(),
-									Size:     3,
-								}.Build(),
-							},
 							SpecDefaults: privatev1.ClusterTemplateSpecDefaults_builder{
 								PullSecretSecret: privatev1.SecretLocalReference_builder{Id: "my-secret-id"}.Build(),
 							}.Build(),
@@ -3241,7 +6479,7 @@ var _ = Describe("Private clusters server", func() {
 						Spec: privatev1.ClusterSpec_builder{
 							Template: privatev1.ClusterTemplateReference_builder{Id: "template-with-secret-ref"}.Build(),
 							NodeSets: map[string]*privatev1.ClusterNodeSet{
-								"compute": privatev1.ClusterNodeSet_builder{Size: proto.Int32(3)}.Build(),
+								"compute": privatev1.ClusterNodeSet_builder{Size: proto.Int32(3), BaremetalInstanceType: privatev1.BareMetalInstanceTypeReference_builder{Id: "acme-bmit-id", Shared: true}.Build()}.Build(),
 							},
 						}.Build(),
 						Status: privatev1.ClusterStatus_builder{
@@ -3256,7 +6494,8 @@ var _ = Describe("Private clusters server", func() {
 
 			It("inherits a canonical shared pull Secret when a tenant Secret has the same name", func() {
 				_, err := secretsDao.Create().SetObject(privatev1.Secret_builder{
-					Id: "shared-pull-secret-id",
+					Id:   "shared-pull-secret-id",
+					Type: privatev1.SecretType_SECRET_TYPE_PULL_SECRET,
 					Metadata: privatev1.Metadata_builder{
 						Name:   "my-secret-name",
 						Tenant: auth.SharedTenant,
@@ -3277,12 +6516,6 @@ var _ = Describe("Private clusters server", func() {
 					}.Build(),
 					Title:       "Shared template with pull Secret",
 					Description: "Shared template with a canonical pull Secret reference",
-					NodeSets: map[string]*privatev1.ClusterTemplateNodeSet{
-						"compute": privatev1.ClusterTemplateNodeSet_builder{
-							HostType: privatev1.HostTypeReference_builder{Id: "acme-1ti-id"}.Build(),
-							Size:     3,
-						}.Build(),
-					},
 					SpecDefaults: privatev1.ClusterTemplateSpecDefaults_builder{
 						PullSecretSecret: privatev1.SecretLocalReference_builder{
 							Id:   "shared-pull-secret-id",
@@ -3302,7 +6535,7 @@ var _ = Describe("Private clusters server", func() {
 								Id: "shared-template-with-secret-ref",
 							}.Build(),
 							NodeSets: map[string]*privatev1.ClusterNodeSet{
-								"compute": privatev1.ClusterNodeSet_builder{Size: proto.Int32(3)}.Build(),
+								"compute": privatev1.ClusterNodeSet_builder{Size: proto.Int32(3), BaremetalInstanceType: privatev1.BareMetalInstanceTypeReference_builder{Id: "acme-bmit-id", Shared: true}.Build()}.Build(),
 							},
 						}.Build(),
 						Status: privatev1.ClusterStatus_builder{Hub: "my-hub-id"}.Build(),
@@ -3345,12 +6578,6 @@ var _ = Describe("Private clusters server", func() {
 							}.Build(),
 							Title:       "Template override test",
 							Description: "Template with pull_secret_secret default",
-							NodeSets: map[string]*privatev1.ClusterTemplateNodeSet{
-								"compute": privatev1.ClusterTemplateNodeSet_builder{
-									HostType: privatev1.HostTypeReference_builder{Id: "acme-1ti-id"}.Build(),
-									Size:     3,
-								}.Build(),
-							},
 							SpecDefaults: privatev1.ClusterTemplateSpecDefaults_builder{
 								PullSecretSecret: privatev1.SecretLocalReference_builder{Id: "my-secret-id"}.Build(),
 							}.Build(),
@@ -3367,7 +6594,7 @@ var _ = Describe("Private clusters server", func() {
 						Spec: privatev1.ClusterSpec_builder{
 							Template: privatev1.ClusterTemplateReference_builder{Id: "template-override-secret"}.Build(),
 							NodeSets: map[string]*privatev1.ClusterNodeSet{
-								"compute": privatev1.ClusterNodeSet_builder{Size: proto.Int32(3)}.Build(),
+								"compute": privatev1.ClusterNodeSet_builder{Size: proto.Int32(3), BaremetalInstanceType: privatev1.BareMetalInstanceTypeReference_builder{Id: "acme-bmit-id", Shared: true}.Build()}.Build(),
 							},
 							PullSecretSecret: privatev1.SecretLocalReference_builder{
 								Id: "override-secret-id",
@@ -3382,6 +6609,695 @@ var _ = Describe("Private clusters server", func() {
 				Expect(response.GetObject().GetSpec().GetPullSecretSecret().GetId()).To(Equal("override-secret-id"))
 				Expect(response.GetObject().GetSpec().GetPullSecretSecret().GetName()).To(Equal("override-secret-name"))
 			})
+		})
+
+		Describe("Fabric interface resolution from BareMetalInstanceType", func() {
+			BeforeEach(func() {
+				seedCaaSTestBareMetalInstanceType(ctx, "bmit-fabric-id", "bmit-fabric-name", auth.SharedTenant,
+					[]*privatev1.BareMetalNetworkPortSpec{
+						privatev1.BareMetalNetworkPortSpec_builder{Name: "mgmt-0", Role: "management"}.Build(),
+						privatev1.BareMetalNetworkPortSpec_builder{Name: "data-0", Role: "fabric"}.Build(),
+						privatev1.BareMetalNetworkPortSpec_builder{Name: "data-1", Role: "fabric"}.Build(),
+					})
+				seedCaaSTestBareMetalInstanceType(ctx, "bmit-no-fabric-id", "bmit-no-fabric-name", auth.SharedTenant,
+					[]*privatev1.BareMetalNetworkPortSpec{
+						privatev1.BareMetalNetworkPortSpec_builder{Name: "mgmt-0", Role: "management"}.Build(),
+					})
+			})
+
+			It("Loads fabric hardware by ID without revalidating the reference name", func() {
+				ref := privatev1.BareMetalInstanceTypeReference_builder{
+					Id: "bmit-fabric-id", Name: "bmit-no-fabric-name", Shared: true,
+				}.Build()
+				cluster := newCaaSNodeSetCreateRequest("fabric-by-id", map[string]*privatev1.ClusterNodeSet{
+					"compute": privatev1.ClusterNodeSet_builder{Size: proto.Int32(3), BaremetalInstanceType: ref}.Build(),
+				}, nil).GetObject()
+
+				err := server.resolveFabricInterfaces(ctx, cluster)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(cluster.GetSpec().GetNodeSets()["compute"].GetFabricInterface()).To(Equal("data-0"))
+				Expect(ref.GetName()).To(Equal("bmit-no-fabric-name"))
+			})
+
+			It("Does not resolve a name-only fabric hardware reference", func() {
+				cluster := newCaaSNodeSetCreateRequest("fabric-name-only", map[string]*privatev1.ClusterNodeSet{
+					"compute": privatev1.ClusterNodeSet_builder{
+						Size: proto.Int32(3),
+						BaremetalInstanceType: privatev1.BareMetalInstanceTypeReference_builder{
+							Name: "bmit-fabric-name", Shared: true,
+						}.Build(),
+					}.Build(),
+				}, nil).GetObject()
+
+				err := server.resolveFabricInterfaces(ctx, cluster)
+				Expect(err).To(HaveOccurred())
+				Expect(cluster.GetSpec().GetNodeSets()["compute"].GetFabricInterface()).To(BeEmpty())
+			})
+
+			It("Populates fabric_interface from the first fabric port", func() {
+				response, err := server.Create(ctx, privatev1.ClustersCreateRequest_builder{
+					Object: privatev1.Cluster_builder{
+						Metadata: privatev1.Metadata_builder{Name: "fabric-happy"}.Build(),
+						Spec: privatev1.ClusterSpec_builder{
+							Template: privatev1.ClusterTemplateReference_builder{Id: "my-template-id"}.Build(),
+							NodeSets: map[string]*privatev1.ClusterNodeSet{
+								"compute": privatev1.ClusterNodeSet_builder{
+									BaremetalInstanceType: privatev1.BareMetalInstanceTypeReference_builder{Id: "bmit-fabric-id", Shared: true}.
+										Build(),
+									Size: proto.Int32(3),
+								}.Build(),
+							},
+							NetworkAttachment: privatev1.ClusterNetworkAttachment_builder{
+								Subnet:         privatev1.SubnetLocalReference_builder{Id: "subnet-1"}.Build(),
+								SecurityGroups: []*privatev1.SecurityGroupLocalReference{privatev1.SecurityGroupLocalReference_builder{Id: "default-sg"}.Build()},
+							}.Build(),
+						}.Build(),
+					}.Build(),
+				}.Build())
+				Expect(err).ToNot(HaveOccurred())
+				Expect(response).ToNot(BeNil())
+				nodeSet := response.GetObject().GetSpec().GetNodeSets()["compute"]
+				Expect(nodeSet).ToNot(BeNil())
+				// The first port with role=fabric is "data-0"
+				Expect(nodeSet.GetFabricInterface()).To(Equal("data-0"))
+			})
+
+			It("Keeps fabric_interface when BMIT fabric ports change after Create", func() {
+				response, err := server.Create(ctx, privatev1.ClustersCreateRequest_builder{
+					Object: privatev1.Cluster_builder{
+						Metadata: privatev1.Metadata_builder{Name: "fabric-immutable"}.Build(),
+						Spec: privatev1.ClusterSpec_builder{
+							Template: privatev1.ClusterTemplateReference_builder{Id: "my-template-id"}.Build(),
+							NodeSets: map[string]*privatev1.ClusterNodeSet{
+								"compute": privatev1.ClusterNodeSet_builder{
+									BaremetalInstanceType: privatev1.BareMetalInstanceTypeReference_builder{
+										Id: "bmit-fabric-id", Shared: true,
+									}.Build(),
+									Size: proto.Int32(3),
+								}.Build(),
+							},
+							NetworkAttachment: privatev1.ClusterNetworkAttachment_builder{
+								Subnet:         privatev1.SubnetLocalReference_builder{Id: "subnet-1"}.Build(),
+								SecurityGroups: []*privatev1.SecurityGroupLocalReference{privatev1.SecurityGroupLocalReference_builder{Id: "default-sg"}.Build()},
+							}.Build(),
+						}.Build(),
+					}.Build(),
+				}.Build())
+				Expect(err).ToNot(HaveOccurred())
+				Expect(response.GetObject().GetSpec().GetNodeSets()["compute"].GetFabricInterface()).To(Equal("data-0"))
+
+				// Reorder BMIT ports so the first fabric port would now be data-1.
+				bmitDao, err := dao.NewGenericDAO[*privatev1.BareMetalInstanceType]().
+					SetLogger(logger).
+					SetTenancyLogic(tenancy).
+					Build()
+				Expect(err).ToNot(HaveOccurred())
+				getResp, err := bmitDao.Get().SetId("bmit-fabric-id").Do(ctx)
+				Expect(err).ToNot(HaveOccurred())
+				bmit := getResp.GetObject()
+				bmit.GetSpec().GetHardware().SetNetworkPorts([]*privatev1.BareMetalNetworkPortSpec{
+					privatev1.BareMetalNetworkPortSpec_builder{
+						Name: "mgmt-0", Role: "management", Type: "Ethernet", Speed: "1Gbps",
+					}.Build(),
+					privatev1.BareMetalNetworkPortSpec_builder{
+						Name: "data-1", Role: "fabric", Type: "Ethernet", Speed: "100Gbps",
+					}.Build(),
+					privatev1.BareMetalNetworkPortSpec_builder{
+						Name: "data-0", Role: "fabric", Type: "Ethernet", Speed: "100Gbps",
+					}.Build(),
+				})
+				_, err = bmitDao.Update().SetObject(bmit).Do(ctx)
+				Expect(err).ToNot(HaveOccurred())
+
+				getCluster, err := server.Get(ctx, privatev1.ClustersGetRequest_builder{
+					Id: response.GetObject().GetId(),
+				}.Build())
+				Expect(err).ToNot(HaveOccurred())
+				Expect(getCluster.GetObject().GetSpec().GetNodeSets()["compute"].GetFabricInterface()).
+					To(Equal("data-0"), "stored fabric_interface must not track later BMIT changes")
+			})
+			It("Returns FailedPrecondition when BMIT has no fabric port", func() {
+				_, err := server.Create(ctx, privatev1.ClustersCreateRequest_builder{
+					Object: privatev1.Cluster_builder{
+						Metadata: privatev1.Metadata_builder{Name: "fabric-missing"}.Build(),
+						Spec: privatev1.ClusterSpec_builder{
+							Template: privatev1.ClusterTemplateReference_builder{Id: "my-template-id"}.Build(),
+							NodeSets: map[string]*privatev1.ClusterNodeSet{
+								"compute": privatev1.ClusterNodeSet_builder{
+									BaremetalInstanceType: privatev1.BareMetalInstanceTypeReference_builder{Id: "bmit-no-fabric-id", Shared: true}.
+										Build(),
+									Size: proto.Int32(3),
+								}.Build(),
+							},
+							NetworkAttachment: privatev1.ClusterNetworkAttachment_builder{
+								Subnet:         privatev1.SubnetLocalReference_builder{Id: "subnet-1"}.Build(),
+								SecurityGroups: []*privatev1.SecurityGroupLocalReference{privatev1.SecurityGroupLocalReference_builder{Id: "default-sg"}.Build()},
+							}.Build(),
+						}.Build(),
+					}.Build(),
+				}.Build())
+				Expect(err).To(HaveOccurred())
+				st, ok := grpcstatus.FromError(err)
+				Expect(ok).To(BeTrue())
+				Expect(st.Code()).To(Equal(grpccodes.FailedPrecondition))
+				Expect(st.Message()).To(ContainSubstring("no network port with role 'fabric'"))
+			})
+
+			It("Rejects an omitted network attachment when tenant defaults are not ready", func() {
+				seedReadyDefaultNetworking(testTenant, 0)
+				tenantDao := fixtureDAO[*privatev1.Tenant]()
+				tenantResponse, err := tenantDao.Get().SetId(testTenant).Do(ctx)
+				Expect(err).ToNot(HaveOccurred())
+				tenant := tenantResponse.GetObject()
+				tenant.GetStatus().SetConditions([]*privatev1.TenantCondition{
+					privatev1.TenantCondition_builder{
+						Type:   privatev1.TenantConditionType_TENANT_CONDITION_TYPE_DEFAULT_NETWORKING_READY,
+						Status: privatev1.ConditionStatus_CONDITION_STATUS_FALSE,
+					}.Build(),
+				})
+				_, err = tenantDao.Update().SetObject(tenant).Do(ctx)
+				Expect(err).ToNot(HaveOccurred())
+
+				By("rejecting the omitted attachment while the readiness reads False")
+				const name = "default-network-not-ready"
+				response, err := server.Create(ctx, privatev1.ClustersCreateRequest_builder{
+					Object: privatev1.Cluster_builder{
+						Metadata: privatev1.Metadata_builder{Name: name}.Build(),
+						Spec: privatev1.ClusterSpec_builder{
+							Template: privatev1.ClusterTemplateReference_builder{Id: "my-template-id"}.Build(),
+							NodeSets: map[string]*privatev1.ClusterNodeSet{
+								"compute": privatev1.ClusterNodeSet_builder{
+									BaremetalInstanceType: privatev1.BareMetalInstanceTypeReference_builder{Id: "bmit-no-fabric-id", Shared: true}.
+										Build(),
+									Size: proto.Int32(3),
+								}.Build(),
+							},
+						}.Build(),
+					}.Build(),
+				}.Build())
+				Expect(response).To(BeNil())
+				Expect(grpcstatus.Code(err)).To(Equal(grpccodes.FailedPrecondition))
+				Expect(grpcstatus.Convert(err).Message()).To(Equal("tenant default networking is not ready"))
+
+				listed, err := server.List(ctx, privatev1.ClustersListRequest_builder{
+					Filter: new(fmt.Sprintf("this.metadata.name == %q", name)),
+				}.Build())
+				Expect(err).ToNot(HaveOccurred())
+				Expect(listed.GetTotal()).To(BeZero(), "a rejected Cluster Create must not persist the Cluster")
+
+				By("storing a complete explicit attachment despite the not-ready defaults")
+				created, err := server.Create(ctx, newCaaSNodeSetCreateRequest("explicit-network-after-readiness-reset",
+					map[string]*privatev1.ClusterNodeSet{
+						"compute": privatev1.ClusterNodeSet_builder{
+							Size: proto.Int32(3),
+							BaremetalInstanceType: privatev1.BareMetalInstanceTypeReference_builder{
+								Id: "bmit-fabric-id", Shared: true,
+							}.Build(),
+						}.Build(),
+					}, privatev1.ClusterNetworkAttachment_builder{
+						Subnet:         privatev1.SubnetLocalReference_builder{Id: "subnet-1"}.Build(),
+						SecurityGroups: []*privatev1.SecurityGroupLocalReference{privatev1.SecurityGroupLocalReference_builder{Id: "default-sg"}.Build()},
+					}.Build()))
+				Expect(err).ToNot(HaveOccurred())
+				Expect(created).ToNot(BeNil())
+				Expect(created.GetObject().GetId()).ToNot(BeEmpty())
+				storedAttachment := created.GetObject().GetSpec().GetNetworkAttachment()
+				Expect(storedAttachment.GetSubnet().GetId()).To(Equal("subnet-1"))
+				Expect(storedAttachment.GetSecurityGroups()).To(HaveLen(1))
+				Expect(storedAttachment.GetSecurityGroups()[0].GetId()).To(Equal("default-sg"))
+			})
+
+			It("Resolves tenant defaults when provider networking is disabled", func() {
+				server.settings.ProvisioningEnabled = false
+				defaults := seedReadyDefaultNetworking(testTenant, 0)
+
+				response, err := server.Create(ctx, privatev1.ClustersCreateRequest_builder{
+					Object: privatev1.Cluster_builder{
+						Metadata: privatev1.Metadata_builder{Name: "networking-disabled"}.Build(),
+						Spec: privatev1.ClusterSpec_builder{
+							Template: privatev1.ClusterTemplateReference_builder{Id: "my-template-id"}.Build(),
+							NodeSets: map[string]*privatev1.ClusterNodeSet{
+								"compute": privatev1.ClusterNodeSet_builder{
+									BaremetalInstanceType: privatev1.BareMetalInstanceTypeReference_builder{
+										Id: "bmit-fabric-id", Shared: true,
+									}.Build(),
+									Size: proto.Int32(3),
+								}.Build(),
+							},
+						}.Build(),
+					}.Build(),
+				}.Build())
+
+				Expect(err).NotTo(HaveOccurred())
+				networkAttachment := response.GetObject().GetSpec().GetNetworkAttachment()
+				Expect(networkAttachment.GetSubnet().GetId()).To(Equal(defaults.subnetID))
+				Expect(networkAttachment.GetSecurityGroups()).To(HaveLen(1))
+				Expect(networkAttachment.GetSecurityGroups()[0].GetId()).To(Equal(defaults.securityGroupID))
+				Expect(response.GetObject().GetSpec().GetNodeSets()["compute"].GetFabricInterface()).To(Equal("data-0"))
+			})
+
+			It("Selects the first fabric port when multiple exist", func() {
+				response, err := server.Create(ctx, privatev1.ClustersCreateRequest_builder{
+					Object: privatev1.Cluster_builder{
+						Metadata: privatev1.Metadata_builder{Name: "fabric-multi"}.Build(),
+						Spec: privatev1.ClusterSpec_builder{
+							Template: privatev1.ClusterTemplateReference_builder{Id: "my-template-id"}.Build(),
+							NodeSets: map[string]*privatev1.ClusterNodeSet{
+								"compute": privatev1.ClusterNodeSet_builder{
+									BaremetalInstanceType: privatev1.BareMetalInstanceTypeReference_builder{Id: "bmit-fabric-id", Shared: true}.
+										Build(),
+									Size: proto.Int32(3),
+								}.Build(),
+							},
+							NetworkAttachment: privatev1.ClusterNetworkAttachment_builder{
+								Subnet:         privatev1.SubnetLocalReference_builder{Id: "subnet-1"}.Build(),
+								SecurityGroups: []*privatev1.SecurityGroupLocalReference{privatev1.SecurityGroupLocalReference_builder{Id: "default-sg"}.Build()},
+							}.Build(),
+						}.Build(),
+					}.Build(),
+				}.Build())
+				Expect(err).ToNot(HaveOccurred())
+				Expect(response).ToNot(BeNil())
+				nodeSet := response.GetObject().GetSpec().GetNodeSets()["compute"]
+				Expect(nodeSet).ToNot(BeNil())
+				// bmit-fabric-id has mgmt-0 (management), data-0 (fabric), data-1 (fabric)
+				// The first fabric port should be selected: "data-0"
+				Expect(nodeSet.GetFabricInterface()).To(Equal("data-0"))
+			})
+
+		})
+
+		Describe("controller-reported endpoint validation", func() {
+			type endpointField struct {
+				path string
+				set  func(*privatev1.ClusterStatus, string)
+				get  func(*privatev1.ClusterStatus) string
+			}
+
+			fields := []endpointField{
+				{
+					path: "status.api_endpoint",
+					set:  func(status *privatev1.ClusterStatus, value string) { status.SetApiEndpoint(value) },
+					get:  func(status *privatev1.ClusterStatus) string { return status.GetApiEndpoint() },
+				},
+				{
+					path: "status.ingress_endpoint",
+					set:  func(status *privatev1.ClusterStatus, value string) { status.SetIngressEndpoint(value) },
+					get:  func(status *privatev1.ClusterStatus) string { return status.GetIngressEndpoint() },
+				},
+			}
+
+			invalidValues := []struct {
+				name  string
+				value string
+			}{
+				{name: "IPv6", value: "2001:db8::1"},
+				{name: "IPv4-mapped IPv6", value: "::ffff:192.0.2.1"},
+				{name: "malformed address", value: "not-an-ip"},
+				{name: "non-canonical address", value: "192.000.2.1"},
+				{name: "CIDR suffix", value: "192.0.2.1/32"},
+			}
+
+			newCluster := func(name string, status *privatev1.ClusterStatus) *privatev1.Cluster {
+				return privatev1.Cluster_builder{
+					Id:       uuid.New(),
+					Metadata: privatev1.Metadata_builder{Name: name}.Build(),
+					Spec: privatev1.ClusterSpec_builder{
+						Template: privatev1.ClusterTemplateReference_builder{Id: "my-template-id"}.Build(),
+					}.Build(),
+					Status: status,
+				}.Build()
+			}
+
+			It("accepts empty and canonical IPv4 endpoints on Create and Update", func() {
+				status := privatev1.ClusterStatus_builder{
+					ApiEndpoint:     "192.0.2.10",
+					IngressEndpoint: "192.0.2.11",
+				}.Build()
+				object := newCluster("endpoint-valid-"+uuid.New()[24:32], status)
+				createResponse, err := server.Create(ctx, privatev1.ClustersCreateRequest_builder{Object: object}.Build())
+				Expect(err).ToNot(HaveOccurred())
+				id := createResponse.GetObject().GetId()
+				DeferCleanup(func() {
+					_, deleteErr := server.Delete(ctx, privatev1.ClustersDeleteRequest_builder{Id: id}.Build())
+					Expect(deleteErr).ToNot(HaveOccurred())
+				})
+
+				for _, field := range fields {
+					By("accepting canonical IPv4 for " + field.path)
+					updateStatus := privatev1.ClusterStatus_builder{}.Build()
+					field.set(updateStatus, "198.51.100.9")
+					updateResponse, updateErr := server.Update(ctx, privatev1.ClustersUpdateRequest_builder{
+						Object:     privatev1.Cluster_builder{Id: id, Status: updateStatus}.Build(),
+						UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{field.path}},
+					}.Build())
+					Expect(updateErr).ToNot(HaveOccurred())
+					Expect(field.get(updateResponse.GetObject().GetStatus())).To(Equal("198.51.100.9"))
+				}
+
+				// An empty value is valid while the provisioning controller has not discovered a VIP.
+				emptyCluster := newCluster("endpoint-empty-"+uuid.New()[24:32], privatev1.ClusterStatus_builder{}.Build())
+				emptyResponse, err := server.Create(ctx, privatev1.ClustersCreateRequest_builder{Object: emptyCluster}.Build())
+				Expect(err).ToNot(HaveOccurred())
+				DeferCleanup(func() {
+					_, deleteErr := server.Delete(ctx, privatev1.ClustersDeleteRequest_builder{Id: emptyResponse.GetObject().GetId()}.Build())
+					Expect(deleteErr).ToNot(HaveOccurred())
+				})
+			})
+
+			It("rejects invalid endpoints before Create persistence", func() {
+				for _, field := range fields {
+					for _, invalid := range invalidValues {
+						By("rejecting " + invalid.name + " for " + field.path)
+						status := privatev1.ClusterStatus_builder{}.Build()
+						field.set(status, invalid.value)
+						object := newCluster("endpoint-invalid-"+uuid.New()[24:32], status)
+						id := object.GetId()
+						_, err := server.Create(ctx, privatev1.ClustersCreateRequest_builder{Object: object}.Build())
+						if err == nil {
+							_, deleteErr := server.Delete(ctx, privatev1.ClustersDeleteRequest_builder{Id: id}.Build())
+							Expect(deleteErr).ToNot(HaveOccurred())
+							Fail("Create accepted " + invalid.name + " for " + field.path)
+						}
+
+						errStatus, ok := grpcstatus.FromError(err)
+						Expect(ok).To(BeTrue())
+						Expect(errStatus.Code()).To(Equal(grpccodes.InvalidArgument))
+						Expect(err.Error()).To(ContainSubstring(field.path))
+						Expect(err.Error()).To(ContainSubstring("canonical IPv4"))
+
+						_, getErr := server.Get(ctx, privatev1.ClustersGetRequest_builder{Id: id}.Build())
+						getStatus, getOK := grpcstatus.FromError(getErr)
+						Expect(getOK).To(BeTrue())
+						Expect(getStatus.Code()).To(Equal(grpccodes.NotFound))
+					}
+				}
+			})
+
+			It("rejects invalid endpoint updates without changing stored status", func() {
+				object := newCluster("endpoint-update-"+uuid.New()[24:32], privatev1.ClusterStatus_builder{
+					ApiEndpoint:     "192.0.2.10",
+					IngressEndpoint: "192.0.2.11",
+				}.Build())
+				createResponse, err := server.Create(ctx, privatev1.ClustersCreateRequest_builder{Object: object}.Build())
+				Expect(err).ToNot(HaveOccurred())
+				id := createResponse.GetObject().GetId()
+				DeferCleanup(func() {
+					_, deleteErr := server.Delete(ctx, privatev1.ClustersDeleteRequest_builder{Id: id}.Build())
+					Expect(deleteErr).ToNot(HaveOccurred())
+				})
+
+				By("rejecting an invalid endpoint in a full-object update")
+				fullObjectResponse, err := server.Get(ctx, privatev1.ClustersGetRequest_builder{Id: id}.Build())
+				Expect(err).ToNot(HaveOccurred())
+				fullObject := fullObjectResponse.GetObject()
+				fullObject.GetStatus().SetApiEndpoint("2001:db8::9")
+				_, err = server.Update(ctx, privatev1.ClustersUpdateRequest_builder{Object: fullObject}.Build())
+				Expect(grpcstatus.Code(err)).To(Equal(grpccodes.InvalidArgument))
+				Expect(err.Error()).To(ContainSubstring("status.api_endpoint"))
+				Expect(err.Error()).To(ContainSubstring("canonical IPv4"))
+				storedResponse, err := server.Get(ctx, privatev1.ClustersGetRequest_builder{Id: id}.Build())
+				Expect(err).ToNot(HaveOccurred())
+				Expect(storedResponse.GetObject().GetStatus().GetApiEndpoint()).To(Equal("192.0.2.10"))
+
+				for _, field := range fields {
+					for _, invalid := range invalidValues {
+						By("rejecting " + invalid.name + " for " + field.path)
+						updateStatus := privatev1.ClusterStatus_builder{}.Build()
+						field.set(updateStatus, invalid.value)
+						_, err = server.Update(ctx, privatev1.ClustersUpdateRequest_builder{
+							Object:     privatev1.Cluster_builder{Id: id, Status: updateStatus}.Build(),
+							UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{field.path}},
+						}.Build())
+						errStatus, ok := grpcstatus.FromError(err)
+						Expect(ok).To(BeTrue())
+						Expect(errStatus.Code()).To(Equal(grpccodes.InvalidArgument))
+						Expect(err.Error()).To(ContainSubstring(field.path))
+						Expect(err.Error()).To(ContainSubstring("canonical IPv4"))
+
+						getResponse, getErr := server.Get(ctx, privatev1.ClustersGetRequest_builder{Id: id}.Build())
+						Expect(getErr).ToNot(HaveOccurred())
+						Expect(field.get(getResponse.GetObject().GetStatus())).To(
+							Equal(map[string]string{
+								"status.api_endpoint":     "192.0.2.10",
+								"status.ingress_endpoint": "192.0.2.11",
+							}[field.path]))
+					}
+
+					By("accepting an empty endpoint for " + field.path)
+					updateStatus := privatev1.ClusterStatus_builder{}.Build()
+					field.set(updateStatus, "")
+					_, err = server.Update(ctx, privatev1.ClustersUpdateRequest_builder{
+						Object:     privatev1.Cluster_builder{Id: id, Status: updateStatus}.Build(),
+						UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{field.path}},
+					}.Build())
+					Expect(err).ToNot(HaveOccurred())
+				}
+
+			})
+		})
+
+		Describe("Cluster SSH key reference", func() {
+			seedSSHKeySecretInProject := func(name string, tenant string, project string, secretType privatev1.SecretType, data map[string][]byte) *privatev1.Secret {
+				GinkgoHelper()
+				secretsDao, err := dao.NewGenericDAO[*privatev1.Secret]().
+					SetLogger(logger).
+					SetTenancyLogic(tenancy).
+					Build()
+				Expect(err).ToNot(HaveOccurred())
+				created, err := secretsDao.Create().SetObject(privatev1.Secret_builder{
+					Metadata: privatev1.Metadata_builder{Name: name, Tenant: tenant, Project: project}.Build(),
+					Type:     secretType,
+					Data:     data,
+				}.Build()).Do(ctx)
+				Expect(err).ToNot(HaveOccurred())
+				return created.GetObject()
+			}
+
+			seedSSHKeySecret := func(name string, tenant string, secretType privatev1.SecretType, data map[string][]byte) *privatev1.Secret {
+				GinkgoHelper()
+				return seedSSHKeySecretInProject(name, tenant, "", secretType, data)
+			}
+
+			createCluster := func(sshKey *privatev1.SecretReference) (*privatev1.Cluster, error) {
+				GinkgoHelper()
+				response, err := server.Create(ctx, privatev1.ClustersCreateRequest_builder{
+					Object: privatev1.Cluster_builder{
+						Metadata: privatev1.Metadata_builder{
+							Name: fmt.Sprintf("test-%s", uuid.New()[24:32]),
+						}.Build(),
+						Spec: privatev1.ClusterSpec_builder{
+							Template: privatev1.ClusterTemplateReference_builder{Id: "my-template-id"}.Build(),
+							SshKey:   sshKey,
+						}.Build(),
+						Status: privatev1.ClusterStatus_builder{Hub: "my-hub-id"}.Build(),
+					}.Build(),
+				}.Build())
+				if err != nil {
+					return nil, err
+				}
+				return response.GetObject(), nil
+			}
+
+			updateClusterSSHKey := func(id string, sshKey *privatev1.SecretReference, paths ...string) (*privatev1.Cluster, error) {
+				GinkgoHelper()
+				if len(paths) == 0 {
+					paths = []string{"spec.ssh_key"}
+				}
+				response, err := server.Update(ctx, privatev1.ClustersUpdateRequest_builder{
+					Object: privatev1.Cluster_builder{
+						Id:   id,
+						Spec: privatev1.ClusterSpec_builder{SshKey: sshKey}.Build(),
+					}.Build(),
+					UpdateMask: &fieldmaskpb.FieldMask{Paths: paths},
+				}.Build())
+				if err != nil {
+					return nil, err
+				}
+				return response.GetObject(), nil
+			}
+
+			It("canonicalizes a named SSH key Secret and stores no key material", func() {
+				secret := seedSSHKeySecret(
+					fmt.Sprintf("cluster-key-%s", uuid.New()[24:32]),
+					testTenant,
+					privatev1.SecretType_SECRET_TYPE_SSH_PUBLIC_KEY,
+					map[string][]byte{"public_key": []byte(testSSHPublicKey)},
+				)
+
+				object, err := createCluster(privatev1.SecretReference_builder{Name: secret.GetMetadata().GetName()}.Build())
+				Expect(err).ToNot(HaveOccurred())
+				Expect(object.GetSpec().GetSshKey().GetId()).To(Equal(secret.GetId()))
+				Expect(object.GetSpec().GetSshKey().GetName()).To(Equal(secret.GetMetadata().GetName()))
+				Expect(object.GetSpec().GetSshKey().GetShared()).To(BeFalse())
+
+				encoded, err := protojson.Marshal(object)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(string(encoded)).NotTo(ContainSubstring(testSSHPublicKey))
+			})
+
+			It("canonicalizes an SSH key Secret selected by ID", func() {
+				secret := seedSSHKeySecret(
+					fmt.Sprintf("cluster-key-id-%s", uuid.New()[24:32]),
+					testTenant,
+					privatev1.SecretType_SECRET_TYPE_SSH_PUBLIC_KEY,
+					map[string][]byte{"public_key": []byte(testSSHPublicKey)},
+				)
+
+				object, err := createCluster(privatev1.SecretReference_builder{Id: secret.GetId()}.Build())
+				Expect(err).ToNot(HaveOccurred())
+				Expect(object.GetSpec().GetSshKey().GetId()).To(Equal(secret.GetId()))
+			})
+
+			It("resolves Cluster SSH-key references from any tenant project", func() {
+				projects, err := dao.NewGenericDAO[*privatev1.Project]().
+					SetLogger(logger).SetTenancyLogic(tenancy).Build()
+				Expect(err).ToNot(HaveOccurred())
+				for _, project := range []string{"cluster-key-project", "cluster-key-other-project"} {
+					_, err = projects.Create().SetObject(privatev1.Project_builder{
+						Id:       project,
+						Metadata: privatev1.Metadata_builder{Name: project, Tenant: testTenant}.Build(),
+					}.Build()).Do(ctx)
+					Expect(err).ToNot(HaveOccurred())
+				}
+
+				keyName := fmt.Sprintf("cluster-cross-project-key-%s", uuid.New()[24:32])
+				rootSecret := seedSSHKeySecret(keyName, testTenant,
+					privatev1.SecretType_SECRET_TYPE_SSH_PUBLIC_KEY,
+					map[string][]byte{"public_key": []byte(testSSHPublicKey)})
+				projectSecret := seedSSHKeySecretInProject(keyName, testTenant, "cluster-key-project",
+					privatev1.SecretType_SECRET_TYPE_SSH_PUBLIC_KEY,
+					map[string][]byte{"public_key": []byte(testSSHPublicKey)})
+				otherSecret := seedSSHKeySecretInProject(keyName, testTenant, "cluster-key-other-project",
+					privatev1.SecretType_SECRET_TYPE_SSH_PUBLIC_KEY,
+					map[string][]byte{"public_key": []byte(testSSHPublicKey)})
+				Expect(rootSecret.GetId()).NotTo(Equal(projectSecret.GetId()))
+				Expect(projectSecret.GetId()).NotTo(Equal(otherSecret.GetId()))
+
+				By("selecting the named key from the tenant's default project")
+				object, err := createCluster(privatev1.SecretReference_builder{Name: keyName}.Build())
+				Expect(err).ToNot(HaveOccurred())
+				Expect(object.GetSpec().GetSshKey().GetId()).To(Equal(rootSecret.GetId()))
+
+				By("selecting the named key from an explicit project of the tenant")
+				object, err = createCluster(privatev1.SecretReference_builder{
+					Name: keyName, Project: "cluster-key-other-project",
+				}.Build())
+				Expect(err).ToNot(HaveOccurred(),
+					"an explicit project may differ from the cluster's own project")
+				Expect(object.GetSpec().GetSshKey().GetId()).To(Equal(otherSecret.GetId()))
+				Expect(object.GetSpec().GetSshKey().GetProject()).To(Equal("cluster-key-other-project"))
+				Expect(projectSecret.GetId()).NotTo(Equal(otherSecret.GetId()),
+					"the explicit project selector must win over the default project's same-name key")
+			})
+
+			It("rejects an SSH key reference without id or name", func() {
+				_, err := createCluster(privatev1.SecretReference_builder{}.Build())
+				Expect(grpcstatus.Code(err)).To(Equal(grpccodes.InvalidArgument))
+				Expect(grpcstatus.Convert(err).Message()).To(ContainSubstring("must specify id or name"))
+			})
+
+			It("rejects a shared SSH key Secret reference", func() {
+				secret := seedSSHKeySecret(
+					fmt.Sprintf("cluster-shared-key-%s", uuid.New()[24:32]),
+					auth.SharedTenant,
+					privatev1.SecretType_SECRET_TYPE_SSH_PUBLIC_KEY,
+					map[string][]byte{"public_key": []byte(testSSHPublicKey)},
+				)
+
+				_, err := createCluster(privatev1.SecretReference_builder{Id: secret.GetId(), Shared: true}.Build())
+				Expect(grpcstatus.Code(err)).To(Equal(grpccodes.InvalidArgument))
+				Expect(grpcstatus.Convert(err).Message()).To(ContainSubstring("must be tenant-scoped"))
+			})
+
+			It("rejects a cross-tenant SSH key Secret reference", func() {
+				tenantsDao, err := dao.NewGenericDAO[*privatev1.Tenant]().
+					SetLogger(logger).SetTenancyLogic(tenancy).Build()
+				Expect(err).ToNot(HaveOccurred())
+				_, err = tenantsDao.Create().SetObject(privatev1.Tenant_builder{
+					Id:       "other-tenant",
+					Metadata: privatev1.Metadata_builder{Name: "other-tenant", Tenant: "other-tenant"}.Build(),
+				}.Build()).Do(ctx)
+				Expect(err).ToNot(HaveOccurred())
+
+				secret := seedSSHKeySecret(
+					fmt.Sprintf("cluster-other-key-%s", uuid.New()[24:32]),
+					"other-tenant",
+					privatev1.SecretType_SECRET_TYPE_SSH_PUBLIC_KEY,
+					map[string][]byte{"public_key": []byte(testSSHPublicKey)},
+				)
+
+				_, err = createCluster(privatev1.SecretReference_builder{Id: secret.GetId()}.Build())
+				Expect(grpcstatus.Code(err)).To(Equal(grpccodes.NotFound))
+				Expect(grpcstatus.Convert(err).Message()).To(ContainSubstring("not found or is not visible"))
+			})
+
+			It("rejects a missing SSH key Secret reference", func() {
+				_, err := createCluster(privatev1.SecretReference_builder{Name: "no-such-key"}.Build())
+				Expect(grpcstatus.Code(err)).To(Equal(grpccodes.NotFound))
+				Expect(grpcstatus.Convert(err).Message()).To(ContainSubstring("not found or is not visible"))
+			})
+
+			DescribeTable("rejects unusable SSH key Secrets without exposing material",
+				func(secretType privatev1.SecretType, data map[string][]byte, messagePart string) {
+					secret := seedSSHKeySecret(
+						fmt.Sprintf("cluster-bad-key-%s", uuid.New()[24:32]),
+						testTenant,
+						secretType,
+						data,
+					)
+
+					_, err := createCluster(privatev1.SecretReference_builder{Id: secret.GetId()}.Build())
+					Expect(grpcstatus.Code(err)).To(Equal(grpccodes.InvalidArgument))
+					Expect(grpcstatus.Convert(err).Message()).To(ContainSubstring(messagePart))
+					Expect(err.Error()).NotTo(ContainSubstring(testSSHPublicKey))
+				},
+				Entry("wrong type", privatev1.SecretType_SECRET_TYPE_USER_DATA, map[string][]byte{"userdata": []byte("#cloud-config")}, "type"),
+				Entry("missing public key entry", privatev1.SecretType_SECRET_TYPE_SSH_PUBLIC_KEY, nil, "public_key"),
+				Entry("malformed OpenSSH data", privatev1.SecretType_SECRET_TYPE_SSH_PUBLIC_KEY, map[string][]byte{"public_key": []byte("not-a-key")}, "invalid OpenSSH public key"),
+			)
+
+			It("rejects changing the SSH key reference", func() {
+				secretA := seedSSHKeySecret(
+					fmt.Sprintf("cluster-ready-a-%s", uuid.New()[24:32]),
+					testTenant, privatev1.SecretType_SECRET_TYPE_SSH_PUBLIC_KEY,
+					map[string][]byte{"public_key": []byte(testSSHPublicKey)},
+				)
+				secretB := seedSSHKeySecret(
+					fmt.Sprintf("cluster-ready-b-%s", uuid.New()[24:32]),
+					testTenant, privatev1.SecretType_SECRET_TYPE_SSH_PUBLIC_KEY,
+					map[string][]byte{"public_key": []byte(testSSHPublicKey)},
+				)
+
+				object, err := createCluster(privatev1.SecretReference_builder{Id: secretA.GetId()}.Build())
+				Expect(err).ToNot(HaveOccurred())
+
+				_, err = updateClusterSSHKey(object.GetId(), privatev1.SecretReference_builder{Id: secretB.GetId()}.Build())
+				Expect(grpcstatus.Code(err)).To(Equal(grpccodes.InvalidArgument))
+				Expect(grpcstatus.Convert(err).Message()).To(ContainSubstring("ssh_key is immutable"))
+			})
+
+			It("keeps a stale reference on unrelated updates after the Secret was deleted", func() {
+				secret := seedSSHKeySecret(
+					fmt.Sprintf("cluster-stale-%s", uuid.New()[24:32]),
+					testTenant, privatev1.SecretType_SECRET_TYPE_SSH_PUBLIC_KEY,
+					map[string][]byte{"public_key": []byte(testSSHPublicKey)})
+
+				object, err := createCluster(privatev1.SecretReference_builder{Id: secret.GetId()}.Build())
+				Expect(err).ToNot(HaveOccurred())
+
+				secretsDao, err := dao.NewGenericDAO[*privatev1.Secret]().
+					SetLogger(logger).SetTenancyLogic(tenancy).Build()
+				Expect(err).ToNot(HaveOccurred())
+				_, err = secretsDao.Delete().SetId(secret.GetId()).Do(ctx)
+				Expect(err).ToNot(HaveOccurred())
+
+				updated, err := updateClusterSSHKey(object.GetId(), nil, "spec.version")
+				Expect(err).ToNot(HaveOccurred())
+				Expect(updated.GetSpec().GetSshKey()).NotTo(BeNil())
+				Expect(updated.GetSpec().GetSshKey().GetId()).To(Equal(secret.GetId()))
+			})
+
 		})
 	})
 })

@@ -24,11 +24,12 @@ import (
 	"go.uber.org/mock/gomock"
 	"google.golang.org/grpc"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
+	"google.golang.org/protobuf/types/known/timestamppb"
+
 	"github.com/osac-project/osac/fulfillment-service/internal/controllers/finalizers"
 	"github.com/osac-project/osac/fulfillment-service/internal/idp"
 	"github.com/osac-project/osac/fulfillment-service/internal/masks"
-	"google.golang.org/protobuf/types/known/timestamppb"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
 var logger = slog.Default()
@@ -398,21 +399,12 @@ var _ = Describe("RoleBinding Reconciler", func() {
 			Expect(roles[0].ClientRole).To(BeFalse())
 		})
 
-		It("should map tenant-reader to realm-level role", func() {
-			roles, clientID := t.mapRoleToKeycloak("tenant-reader")
+		It("should map cloud-provider-admin to realm-level role", func() {
+			roles, clientID := t.mapRoleToKeycloak("cloud-provider-admin")
 
 			Expect(clientID).To(Equal(""))
 			Expect(roles).To(HaveLen(1))
-			Expect(roles[0].Name).To(Equal("tenant-reader"))
-			Expect(roles[0].ClientRole).To(BeFalse())
-		})
-
-		It("should map tenant-user to realm-level role", func() {
-			roles, clientID := t.mapRoleToKeycloak("tenant-user")
-
-			Expect(clientID).To(Equal(""))
-			Expect(roles).To(HaveLen(1))
-			Expect(roles[0].Name).To(Equal("tenant-user"))
+			Expect(roles[0].Name).To(Equal("cloud-provider-admin"))
 			Expect(roles[0].ClientRole).To(BeFalse())
 		})
 
@@ -456,7 +448,7 @@ var _ = Describe("RoleBinding Reconciler", func() {
 			role := privatev1.Role_builder{
 				Id: "role-456",
 				Metadata: privatev1.Metadata_builder{
-					Name: "tenant-reader",
+					Name: "tenant-admin",
 				}.Build(),
 			}.Build()
 
@@ -473,11 +465,11 @@ var _ = Describe("RoleBinding Reconciler", func() {
 			}
 			t := &task{r: f}
 
-			result, err := t.getRoleByNameOrID(ctx, "tenant-reader")
+			result, err := t.getRoleByNameOrID(ctx, "tenant-admin")
 
 			Expect(err).ToNot(HaveOccurred())
 			Expect(result.GetId()).To(Equal("role-456"))
-			Expect(result.GetMetadata().GetName()).To(Equal("tenant-reader"))
+			Expect(result.GetMetadata().GetName()).To(Equal("tenant-admin"))
 		})
 
 		It("should return error when role not found by ID or name", func() {
@@ -545,10 +537,16 @@ var _ = Describe("RoleBinding Reconciler", func() {
 
 			idpClient := idp.NewMockClientInterface(ctrl)
 			idpClient.EXPECT().
-				AssignTenantRolesToUser(ctx, "test-org", "keycloak-user-1", gomock.Any()).
+				AssignTenantRolesToUser(ctx, "test-org", "keycloak-user-1", gomock.Eq([]*idp.Role{{
+					Name:       "custom-role",
+					ClientRole: false,
+				}})).
 				Return(nil)
 			idpClient.EXPECT().
-				AssignTenantRolesToUser(ctx, "test-org", "keycloak-user-2", gomock.Any()).
+				AssignTenantRolesToUser(ctx, "test-org", "keycloak-user-2", gomock.Eq([]*idp.Role{{
+					Name:       "custom-role",
+					ClientRole: false,
+				}})).
 				Return(nil)
 
 			binding := privatev1.RoleBinding_builder{
@@ -596,7 +594,10 @@ var _ = Describe("RoleBinding Reconciler", func() {
 
 			idpClient := idp.NewMockClientInterface(ctrl)
 			idpClient.EXPECT().
-				AssignTenantRolesToUser(ctx, "test-org", "keycloak-user-1", gomock.Any()).
+				AssignTenantRolesToUser(ctx, "test-org", "keycloak-user-1", gomock.Eq([]*idp.Role{{
+					Name:       "tenant-admin",
+					ClientRole: false,
+				}})).
 				Return(nil)
 
 			binding := privatev1.RoleBinding_builder{
@@ -1017,10 +1018,16 @@ var _ = Describe("RoleBinding Reconciler", func() {
 
 			idpClient := idp.NewMockClientInterface(ctrl)
 			idpClient.EXPECT().
-				RemoveTenantRolesFromUser(ctx, "test-org", "keycloak-user-1", gomock.Any()).
+				RemoveTenantRolesFromUser(ctx, "test-org", "keycloak-user-1", gomock.Eq([]*idp.Role{{
+					Name:       "custom-role",
+					ClientRole: false,
+				}})).
 				Return(nil)
 			idpClient.EXPECT().
-				RemoveTenantRolesFromUser(ctx, "test-org", "keycloak-user-2", gomock.Any()).
+				RemoveTenantRolesFromUser(ctx, "test-org", "keycloak-user-2", gomock.Eq([]*idp.Role{{
+					Name:       "custom-role",
+					ClientRole: false,
+				}})).
 				Return(nil)
 
 			binding := privatev1.RoleBinding_builder{

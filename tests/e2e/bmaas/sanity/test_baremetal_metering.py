@@ -1,0 +1,174 @@
+"""Bare-metal instance metering: allocation and consumption bill side by side.
+
+The bare-metal instance is the only resource with two meters on one resource:
+``allocation`` bills the host from the moment provisioning confirms it (it
+keeps billing through STOPPED, because the host stays reserved), while
+``consumption`` bills only the spans the instance actually ran. Both carry the
+instance_type dimension, so attribution holds on each meter separately.
+"""
+
+from __future__ import annotations
+
+import contextlib
+from datetime import datetime
+from decimal import Decimal
+from typing import Any
+
+import pytest
+
+from tests.e2e.core.grpc_client import GRPCClient
+from tests.e2e.core.helpers import (
+    wait_for_bmi_cr,
+    wait_for_bmi_deletion,
+    wait_for_bmi_grpc_removal,
+    wait_for_bmi_running,
+)
+from tests.e2e.core.k8s_client import K8sClient
+from tests.e2e.core.metering import (
+    HEARTBEAT_TYPE,
+    MeteringCollector,
+    assert_contiguous_exact_seconds,
+    assert_exact_contiguous_life,
+    delete_recording_timestamp,
+    parse_time,
+)
+from tests.e2e.core.osac_cli import OsacCLI
+from tests.e2e.core.runner import poll_until
+from tests.e2e.core.wait_kinds import WaitResourceKind
+
+pytestmark = [pytest.mark.sanity, pytest.mark.metering]
+
+HEARTBEAT_TIMEOUT: int = 600
+
+
+def _wait_for_meter(metering: MeteringCollector, bmi_id: str, meter: str, instance_type: str) -> dict[str, Any]:
+    """Return the first heartbeat of the meter carrying the instance type."""
+    return poll_until(
+        fn=lambda: metering.typed_heartbeats(bmi_id, meter=meter, dimension="instance_type"),
+        until=lambda events: len(events) > 0,
+        retries=HEARTBEAT_TIMEOUT // 10,
+        delay=10,
+        description=f"first {meter} heartbeat of {bmi_id} with instance_type",
+        resource_kind=WaitResourceKind.BARE_METAL_INSTANCE,
+        resource_id=bmi_id,
+    )[0]
+
+
+def test_baremetal_instance_bills_allocation_and_consumption(
+    jwt_cli_user: OsacCLI,
+    jwt_grpc_tenant1: GRPCClient,
+    k8s_hub_client: K8sClient,
+    metering: MeteringCollector,
+    catalog_item: str,
+    bmi_instance_type: str,
+    bmi_disk_image: str,
+    ssh_key_secret: str,
+    test_run_id: str,
+) -> None:
+    """Both meters bill a running instance and stop after its deletion, each
+    ending at the recorded deletion with its final partial interval billed."""
+    name = f"e2e-bmi-metering-{test_run_id}"
+    bmi_id, _ = jwt_cli_user.create_baremetal_instance(
+        name=name, catalog_item=catalog_item, ssh_key=ssh_key_secret, disk_image=bmi_disk_image
+    )
+    bmi_cr_name: str | None = None
+
+    try:
+        bmi_cr_name = wait_for_bmi_cr(k8s=k8s_hub_client, uuid=bmi_id)
+        wait_for_bmi_running(grpc=jwt_grpc_tenant1, bmi_id=bmi_id)
+
+        allocation = _wait_for_meter(metering, bmi_id, "allocation", bmi_instance_type)
+        # The instance is created without a project, so its heartbeats must
+        # carry no project dimension: the engine emits only the facts a
+        # resource carries, and one that names a project is misattributed.
+        metering.expect_no_project()
+        metering.verify_event(allocation, resource_id=bmi_id)
+        consumption = _wait_for_meter(metering, bmi_id, "consumption", bmi_instance_type)
+        metering.verify_event(consumption, resource_id=bmi_id)
+
+        for heartbeat, meter in ((allocation, "allocation"), (consumption, "consumption")):
+            data = heartbeat["data"]
+            assert data["meter"] == meter
+            assert data["usage"]["unit"] == "second", f"{meter} unit is {data['usage']['unit']!r}"
+            assert data["billing_dimensions"]["instance_type"] == bmi_instance_type, (
+                f"{meter} instance_type is {data['billing_dimensions'].get('instance_type')!r}"
+            )
+
+        # Wait for a second heartbeat of each meter, then pin the arithmetic.
+        for meter in ("allocation", "consumption"):
+            poll_until(
+                fn=lambda meter=meter: len(metering.typed_heartbeats(bmi_id, meter=meter, dimension="instance_type")),
+                until=lambda count: count >= 2,
+                retries=HEARTBEAT_TIMEOUT // 10,
+                delay=10,
+                description=f"two typed {meter} heartbeats of {bmi_id}",
+                resource_kind=WaitResourceKind.BARE_METAL_INSTANCE,
+                resource_id=bmi_id,
+            )
+            assert_contiguous_exact_seconds(
+                metering.typed_heartbeats(bmi_id, meter=meter, dimension="instance_type"), meter
+            )
+
+        # Allocation bills from the moment the host was confirmed, which is at or
+        # before the moment the instance started running: the allocation meter's
+        # first interval cannot start after the consumption meter's.
+        allocation_start = parse_time(allocation["data"]["usage"]["from"])
+        consumption_start = parse_time(consumption["data"]["usage"]["from"])
+        assert allocation_start <= consumption_start, (
+            f"allocation starts billing at {allocation_start}, after consumption "
+            f"starts at {consumption_start}: the host reservation must bill first"
+        )
+    finally:
+        deletion_recorded = _delete_bmi(
+            jwt_cli_user, jwt_grpc_tenant1, k8s_hub_client, uuid=bmi_id, cr_name=bmi_cr_name
+        )
+
+    assert deletion_recorded is not None, "the instance's CR was never deleted, so no deletion timestamp was recorded"
+
+    # The billing end is the meter's own last interval end across both meters,
+    # anchored on the recorded deletion: a round skips its tick while the fold
+    # lags the event topic, so the final partial pieces can land several round
+    # intervals after the deletion, and reading the end before they land
+    # anchors on an intermediate round, making the pieces read as billing past
+    # the anchor.
+    billing_end = metering.wait_for_billing_end(bmi_id, deletion=deletion_recorded)
+
+    # Each meter ends at or after the recorded deletion: its final partial
+    # interval is billed, not dropped, and its typed heartbeats collapse into
+    # contiguous net intervals billing exactly one second per second.
+    for meter in ("allocation", "consumption"):
+        assert_exact_contiguous_life(
+            metering.typed_heartbeats(bmi_id, meter=meter, dimension="instance_type"),
+            multiplier=Decimal(1),
+            deletion=deletion_recorded,
+            label=f"typed {meter} heartbeats of {bmi_id}",
+        )
+
+    # Nothing bills past the end, and past the final interval nothing more
+    # arrives: both meters stopped.
+    metering.assert_no_events(HEARTBEAT_TYPE, bmi_id, since=billing_end.isoformat(), within=180)
+
+
+def _delete_bmi(cli: OsacCLI, grpc: GRPCClient, k8s: K8sClient, *, uuid: str, cr_name: str | None) -> datetime | None:
+    """Delete the instance and return the deletion time the API server recorded.
+
+    None when the instance never had a CR to watch: the cleanup path after a
+    failed setup.
+    """
+    deletion_recorded: datetime | None = None
+    if cr_name is None:
+        with contextlib.suppress(Exception):
+            cli.delete_baremetal_instance(uuid=uuid)
+    else:
+        deletion_recorded = delete_recording_timestamp(
+            k8s,
+            resource="baremetalinstance",
+            cr_name=cr_name,
+            delete=lambda: cli.delete_baremetal_instance(uuid=uuid),
+            resource_kind=WaitResourceKind.BARE_METAL_INSTANCE,
+        )
+        with contextlib.suppress(Exception):
+            wait_for_bmi_deletion(k8s=k8s, name=cr_name)
+    with contextlib.suppress(Exception):
+        wait_for_bmi_grpc_removal(grpc=grpc, uuid=uuid)
+    return deletion_recorded

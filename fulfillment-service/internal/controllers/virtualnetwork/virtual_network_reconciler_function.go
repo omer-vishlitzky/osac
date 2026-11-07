@@ -13,15 +13,15 @@ language governing permissions and limitations under the License.
 
 package virtualnetwork
 
-//go:generate mockgen -source=../../api/osac/private/v1/virtual_networks_service_grpc.pb.go -destination=virtual_networks_client_mock.go -package=virtualnetwork VirtualNetworksClient
+//go:generate mockgen -destination=virtual_networks_client_mock.go -package=virtualnetwork github.com/osac-project/osac/proto/gen/osac/private/v1 VirtualNetworksClient
 
 import (
 	"context"
 	"errors"
 	"fmt"
 	"log/slog"
-	"math/rand/v2"
 	"slices"
+	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/proto"
@@ -30,16 +30,18 @@ import (
 
 	osacv1alpha1 "github.com/osac-project/osac/osac-operator/api/v1alpha1"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/controllers"
 	"github.com/osac-project/osac/fulfillment-service/internal/controllers/finalizers"
 	"github.com/osac-project/osac/fulfillment-service/internal/kubernetes/annotations"
 	"github.com/osac-project/osac/fulfillment-service/internal/kubernetes/labels"
 	"github.com/osac-project/osac/fulfillment-service/internal/masks"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
 // objectPrefix is the prefix that will be used in the `generateName` field of the resources created in the hub.
 const objectPrefix = "virtualnetwork-"
+
+const hubResolutionRetryDelay = 2 * time.Second
 
 // FunctionBuilder contains the data and logic needed to build a function that reconciles virtual networks.
 type FunctionBuilder struct {
@@ -52,7 +54,7 @@ type function struct {
 	logger                *slog.Logger
 	hubCache              controllers.HubCache
 	virtualNetworksClient privatev1.VirtualNetworksClient
-	hubsClient            privatev1.HubsClient
+	networkingHubReader   controllers.NetworkingHubReader
 	maskCalculator        *masks.Calculator
 }
 
@@ -103,12 +105,22 @@ func (b *FunctionBuilder) Build() (result controllers.ReconcilerFunction[*privat
 		return
 	}
 
+	// Create the read-only canonical networking Hub reader. NetworkClass status is owned by the
+	// NetworkClass reconciler; VirtualNetwork reconciliation only consumes the persisted binding.
+	networkingHubReader, err := controllers.NewNetworkingHubReader().
+		SetNetworkClassesClient(privatev1.NewNetworkClassesClient(b.connection)).
+		SetHubCache(b.hubCache).
+		Build()
+	if err != nil {
+		return nil, err
+	}
+
 	// Create and populate the object:
 	object := &function{
 		logger:                b.logger,
 		virtualNetworksClient: privatev1.NewVirtualNetworksClient(b.connection),
-		hubsClient:            privatev1.NewHubsClient(b.connection),
 		hubCache:              b.hubCache,
+		networkingHubReader:   networkingHubReader,
 		maskCalculator:        masks.NewCalculator().Build(),
 	}
 	result = object.run
@@ -135,6 +147,16 @@ func (r *function) run(ctx context.Context, virtualNetwork *privatev1.VirtualNet
 	} else {
 		err = t.update(ctx)
 	}
+	var hubResolutionRetryErr error
+	if err != nil {
+		handled, retry := controllers.HandleResourceNetworkingHubResolutionError(err, t.setPending, t.setFailed)
+		if handled {
+			if retry {
+				hubResolutionRetryErr = err
+			}
+			err = nil
+		}
+	}
 	if err != nil {
 		r.logger.ErrorContext(ctx, "VN run: update/delete returned error",
 			slog.String("id", id),
@@ -150,7 +172,7 @@ func (r *function) run(ctx context.Context, virtualNetwork *privatev1.VirtualNet
 			slog.String("id", id),
 			slog.Bool("is_default", isDefault),
 		)
-		return nil
+		return hubResolutionRetryErr
 	}
 
 	r.logger.DebugContext(ctx, "VN run: calling virtualNetworksClient.Update",
@@ -174,7 +196,10 @@ func (r *function) run(ctx context.Context, virtualNetwork *privatev1.VirtualNet
 			slog.Bool("is_default", isDefault),
 		)
 	}
-	return err
+	if err != nil {
+		return err
+	}
+	return hubResolutionRetryErr
 }
 
 func (t *task) update(ctx context.Context) error {
@@ -199,21 +224,14 @@ func (t *task) update(ctx context.Context) error {
 	}
 
 	// Pass 2: select hub.
-	hubJustSelected := t.virtualNetwork.GetStatus().GetHub() == ""
 	t.r.logger.DebugContext(ctx, "VN update: pass 2 — selectHub",
-		slog.String("id", id), slog.Bool("is_default", isDefault),
-		slog.Bool("hub_just_selected", hubJustSelected))
+		slog.String("id", id), slog.Bool("is_default", isDefault))
 	if err := t.selectHub(ctx); err != nil {
 		t.r.logger.ErrorContext(ctx, "VN update: pass 2 — selectHub failed",
 			slog.String("id", id), slog.Bool("is_default", isDefault), slog.Any("error", err))
 		return err
 	}
 	t.virtualNetwork.GetStatus().SetHub(t.hubId)
-	if hubJustSelected {
-		t.r.logger.DebugContext(ctx, "VN update: pass 2 done — hub selected, returning early",
-			slog.String("id", id), slog.Bool("is_default", isDefault), slog.String("hub", t.hubId))
-		return nil
-	}
 	t.r.logger.DebugContext(ctx, "VN update: pass 2 done — hub already set",
 		slog.String("id", id), slog.Bool("is_default", isDefault), slog.String("hub", t.hubId))
 
@@ -296,11 +314,15 @@ func (t *task) delete(ctx context.Context) (err error) {
 	// Do nothing if we don't know the hub yet:
 	t.hubId = t.virtualNetwork.GetStatus().GetHub()
 	if t.hubId == "" {
-		// No hub assigned, nothing to clean up on K8s side.
-		t.removeFinalizer()
-		return nil
+		// The CR may exist without status.hub when the controller restarted between its create and the hub
+		// write, so look it up in the canonical hub.
+		if selectErr := t.selectHub(ctx); selectErr != nil {
+			t.removeFinalizer()
+			return nil
+		}
+	} else {
+		err = t.getHub(ctx)
 	}
-	err = t.getHub(ctx)
 	if err != nil {
 		// Check if the hub has been decommissioned (deleted from database)
 		if errors.Is(err, controllers.ErrHubNotFound) {
@@ -350,32 +372,26 @@ func (t *task) delete(ctx context.Context) (err error) {
 	}
 
 	// Don't remove finalizer — K8s object still exists with finalizers being processed.
-	return
+	return controllers.RequeueAfterKubernetesDeletion("virtual network")
 }
 
 func (t *task) selectHub(ctx context.Context) error {
-	t.hubId = t.virtualNetwork.GetStatus().GetHub()
-	if t.hubId == "" {
-		response, err := t.r.hubsClient.List(ctx, privatev1.HubsListRequest_builder{}.Build())
-		if err != nil {
-			return err
-		}
-		if len(response.Items) == 0 {
-			return errors.New("there are no hubs")
-		}
-		t.hubId = response.Items[rand.IntN(len(response.Items))].GetId()
+	resolution, err := controllers.ResolveResourceNetworkingHub(
+		ctx,
+		t.r.networkingHubReader,
+		t.virtualNetwork.GetStatus().GetHub(),
+	)
+	if err != nil {
+		return controllers.RequeueAfter(err, hubResolutionRetryDelay)
 	}
+	t.hubId = resolution.HubID
 	t.r.logger.DebugContext(
 		ctx,
-		"Selected hub",
+		"Resolved canonical networking hub",
 		slog.String("id", t.hubId),
 	)
-	hubEntry, err := t.r.hubCache.Get(ctx, t.hubId)
-	if err != nil {
-		return err
-	}
-	t.hubNamespace = hubEntry.Namespace
-	t.hubClient = hubEntry.Client
+	t.hubNamespace = resolution.Namespace
+	t.hubClient = resolution.Client
 	return nil
 }
 
@@ -453,22 +469,22 @@ func (t *task) setFailed(err error) {
 	t.virtualNetwork.GetStatus().SetMessage(err.Error())
 }
 
+func (t *task) setPending(err error) {
+	if !t.virtualNetwork.HasStatus() {
+		t.virtualNetwork.SetStatus(&privatev1.VirtualNetworkStatus{})
+	}
+	t.virtualNetwork.GetStatus().SetState(privatev1.VirtualNetworkState_VIRTUAL_NETWORK_STATE_PENDING)
+	t.virtualNetwork.GetStatus().SetMessage(err.Error())
+}
+
 // buildSpec constructs the spec for the Kubernetes VirtualNetwork object based on the
 // virtual network from the database.
 func (t *task) buildSpec() osacv1alpha1.VirtualNetworkSpec {
-	spec := osacv1alpha1.VirtualNetworkSpec{
-		Region:       t.virtualNetwork.GetSpec().GetRegion(),
-		NetworkClass: controllers.RefKeyStr(t.virtualNetwork.GetSpec().GetNetworkClass()),
-	}
+	spec := osacv1alpha1.VirtualNetworkSpec{}
 
 	// Add IPv4 CIDR if present:
 	if t.virtualNetwork.GetSpec().HasIpv4Cidr() {
 		spec.IPv4CIDR = t.virtualNetwork.GetSpec().GetIpv4Cidr()
-	}
-
-	// Add IPv6 CIDR if present:
-	if t.virtualNetwork.GetSpec().HasIpv6Cidr() {
-		spec.IPv6CIDR = t.virtualNetwork.GetSpec().GetIpv6Cidr()
 	}
 
 	return spec

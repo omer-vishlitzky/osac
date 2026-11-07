@@ -13,8 +13,8 @@ language governing permissions and limitations under the License.
 
 package volume
 
-//go:generate mockgen -source=../../api/osac/private/v1/volumes_service_grpc.pb.go -destination=volumes_client_mock.go -package=volume VolumesClient
-//go:generate mockgen -source=../../api/osac/private/v1/hubs_service_grpc.pb.go -destination=hubs_client_mock.go -package=volume HubsClient
+//go:generate mockgen -destination=volumes_client_mock.go -package=volume github.com/osac-project/osac/proto/gen/osac/private/v1 VolumesClient
+//go:generate mockgen -destination=hubs_client_mock.go -package=volume github.com/osac-project/osac/proto/gen/osac/private/v1 HubsClient
 
 import (
 	"context"
@@ -32,12 +32,12 @@ import (
 
 	osacv1alpha1 "github.com/osac-project/osac/osac-operator/api/v1alpha1"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/controllers"
 	"github.com/osac-project/osac/fulfillment-service/internal/controllers/finalizers"
 	"github.com/osac-project/osac/fulfillment-service/internal/kubernetes/annotations"
 	"github.com/osac-project/osac/fulfillment-service/internal/kubernetes/labels"
 	"github.com/osac-project/osac/fulfillment-service/internal/masks"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
 const objectPrefix = "vol-"
@@ -190,7 +190,8 @@ func (t *task) update(ctx context.Context) error {
 					labels.VolumeUuid: t.volume.GetId(),
 				},
 				Annotations: map[string]string{
-					annotations.Tenant: t.volume.GetMetadata().GetTenant(),
+					annotations.Tenant:  t.volume.GetMetadata().GetTenant(),
+					annotations.Project: t.volume.GetMetadata().GetProject(),
 				},
 			},
 			Spec: spec,
@@ -210,6 +211,11 @@ func (t *task) update(ctx context.Context) error {
 		)
 	} else {
 		update := object.DeepCopy()
+		if update.Annotations == nil {
+			update.Annotations = make(map[string]string)
+		}
+		update.Annotations[annotations.Tenant] = t.volume.GetMetadata().GetTenant()
+		update.Annotations[annotations.Project] = t.volume.GetMetadata().GetProject()
 		update.Spec = spec
 		err = t.hubClient.Patch(ctx, update, clnt.MergeFrom(object))
 		if err != nil {
@@ -235,6 +241,7 @@ func (t *task) setDefaults() {
 	}
 	if t.volume.GetStatus().GetState() == privatev1.VolumeState_VOLUME_STATE_UNSPECIFIED {
 		t.volume.GetStatus().SetState(privatev1.VolumeState_VOLUME_STATE_CREATING)
+		t.volume.GetStatus().SetStateTransitionTime(controllers.NowTruncated())
 	}
 }
 
@@ -297,7 +304,7 @@ func (t *task) delete(ctx context.Context) (err error) {
 		)
 	}
 
-	return
+	return controllers.RequeueAfterKubernetesDeletion("volume")
 }
 
 // selectHub assigns a hub to the volume. Unlike resources that inherit their
@@ -400,6 +407,10 @@ func (t *task) setFailed(err error) {
 	if !t.volume.HasStatus() {
 		t.volume.SetStatus(&privatev1.VolumeStatus{})
 	}
+	if t.volume.GetStatus().GetState() != privatev1.VolumeState_VOLUME_STATE_FAILED ||
+		t.volume.GetStatus().GetStateTransitionTime() == nil {
+		t.volume.GetStatus().SetStateTransitionTime(controllers.NowTruncated())
+	}
 	t.volume.GetStatus().SetState(privatev1.VolumeState_VOLUME_STATE_FAILED)
 	t.volume.GetStatus().SetMessage(err.Error())
 }
@@ -407,10 +418,20 @@ func (t *task) setFailed(err error) {
 // buildSpec maps the proto VolumeSpec to the osac-operator CRD VolumeSpec.
 // Access mode is converted from the proto enum to the CRD typed string.
 func (t *task) buildSpec() osacv1alpha1.VolumeSpec {
+	var topology *osacv1alpha1.VolumeTopology
+	if source := t.volume.GetSpec().GetTopology(); source != nil {
+		segments := make(map[string]string, len(source.GetSegments()))
+		for key, value := range source.GetSegments() {
+			segments[key] = value
+		}
+		topology = &osacv1alpha1.VolumeTopology{Segments: segments}
+	}
+
 	return osacv1alpha1.VolumeSpec{
 		StorageTier: t.volume.GetSpec().GetStorageTier(),
 		SizeGiB:     t.volume.GetSpec().GetSizeGib(),
 		AccessMode:  protoAccessModeToCRD(t.volume.GetSpec().GetAccessMode()),
+		Topology:    topology,
 	}
 }
 
@@ -436,28 +457,28 @@ func protoAccessModeToCRD(mode privatev1.VolumeAccessMode) osacv1alpha1.VolumeAc
 // controller-runtime requeue.
 const statusStampMaxAttempts = 4
 
-// stampStatus ensures status.backend and status.protocol on the hub Volume CR
-// match the values resolved by tier resolution in the private Volume proto. It
-// is called on both the create and patch-spec branches so that a stamp lost to a
-// concurrent operator write (resourceVersion conflict) is recovered on the next
-// reconcile. On conflict the method re-fetches the CR and retries, avoiding a
-// full reconcile round-trip.
+// stampStatus ensures the resolved provider and protocol on the hub
+// Volume CR match the values in the private Volume proto. It is called on both
+// the create and patch-spec branches so that a stamp lost to a concurrent
+// operator write (resourceVersion conflict) is recovered on the next reconcile.
+// On conflict the method re-fetches the CR and retries, avoiding a full
+// reconcile round-trip.
 func (t *task) stampStatus(ctx context.Context, object *osacv1alpha1.Volume) error {
-	backend := t.volume.GetStatus().GetBackend()
+	provider := t.volume.GetStatus().GetProvider()
 	protocol := protoProtocolToCRD(t.volume.GetStatus().GetProtocol())
 
-	if backend == "" || protocol == "" {
-		t.r.logger.WarnContext(ctx, "backend or protocol is empty in proto source, skipping status stamp (incomplete tier resolution)")
+	if provider == "" || protocol == "" {
+		t.r.logger.WarnContext(ctx, "provider or protocol is empty in proto source, skipping status stamp (incomplete tier resolution)")
 		return nil
 	}
 
-	if object.Status.Backend == backend && object.Status.Protocol == protocol {
+	if object.Status.Provider == provider && object.Status.Protocol == protocol {
 		return nil
 	}
 
 	var lastErr error
 	for attempt := range statusStampMaxAttempts {
-		object.Status.Backend = backend
+		object.Status.Provider = provider
 		object.Status.Protocol = protocol
 		lastErr = t.hubClient.Status().Update(ctx, object)
 		if lastErr == nil {

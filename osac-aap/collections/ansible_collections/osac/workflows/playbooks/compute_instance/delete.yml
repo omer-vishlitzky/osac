@@ -22,8 +22,10 @@
   hosts: localhost
   gather_facts: false
   environment:
-    K8S_AUTH_KUBECONFIG: "{{ lookup('env', 'K8S_AUTH_KUBECONFIG') | default(lookup('env', 'KUBECONFIG'), true) | default(lookup('env', 'HOME') + '/.kube/config', true) }}"
-
+    K8S_AUTH_KUBECONFIG: >-
+      {{ lookup('env', 'K8S_AUTH_KUBECONFIG')
+         | default(lookup('env', 'KUBECONFIG'), true)
+         | default(lookup('env', 'HOME') + '/.kube/config', true) }}
 
   vars:
     compute_instance: "{{ osac_job_vars.resource }}"
@@ -58,17 +60,11 @@
       ansible.builtin.set_fact:
         template_id: "{{ compute_instance.spec.templateID }}"
 
-    # CRITICAL: Determine namespace (NOT overrideable)
-    - name: Determine tenant target namespace
-      ansible.builtin.include_role:
-        name: osac.service.tenant_target_namespace
-
   tasks:
     - name: Display compute instance deletion information
       ansible.builtin.debug:
         msg:
           - "Deleting compute instance: {{ compute_instance_name }}"
-          - "Tenant target namespace: {{ tenant_target_namespace }}"
           - "Template ID: {{ template_id_override | default(template_id) }}"
 
     # CRITICAL: Call template (NOT overrideable, but template has internal override points)

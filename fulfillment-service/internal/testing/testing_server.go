@@ -16,6 +16,7 @@ package testing
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"net"
 	"strings"
 
@@ -23,7 +24,8 @@ import (
 	. "github.com/onsi/gomega"
 	"google.golang.org/grpc"
 
-	publicv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/public/v1"
+	"github.com/osac-project/osac/fulfillment-service/internal/tlsconfig"
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
 
 // Server is a gRPC server used only for tests.
@@ -49,11 +51,7 @@ func NewServer(opts ...grpc.ServerOption) *Server {
 func NewTLSServer() *Server {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	Expect(err).ToNot(HaveOccurred())
-	tlsListener := tls.NewListener(listener, &tls.Config{
-		Certificates: []tls.Certificate{
-			LocalhostCertificate(),
-		},
-	})
+	tlsListener := tls.NewListener(listener, tlsconfig.NewServerTLSConfig(LocalhostCertificate(), nil))
 	server := grpc.NewServer()
 	return &Server{
 		listener: tlsListener,
@@ -77,7 +75,9 @@ func (s *Server) Start() {
 	go func() {
 		defer GinkgoRecover()
 		err := s.server.Serve(s.listener)
-		Expect(err).ToNot(HaveOccurred())
+		if err != nil && !errors.Is(err, grpc.ErrServerStopped) {
+			Expect(err).ToNot(HaveOccurred())
+		}
 	}()
 }
 

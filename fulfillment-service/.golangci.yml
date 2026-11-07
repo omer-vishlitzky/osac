@@ -90,3 +90,8 @@ linters:
           - staticcheck
         path: internal/servers/
         text: FieldDefinitions.*deprecated
+      # host_type is proto-deprecated in favour of baremetal_instance_type but
+      # still resolved by the server and read by the operator as a fallback.
+      - linters:
+          - staticcheck
+        text: HostType.*deprecated

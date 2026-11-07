@@ -1,515 +1,129 @@
-# AGENTS.md
+# OSAC AAP
 
-Guide for AI agents working on osac-aap — Ansible Automation Platform roles and playbooks for OSAC infrastructure provisioning.
+Ansible roles and playbooks used by OSAC to provision infrastructure through
+Ansible Automation Platform.
 
-## Overview
+This component is part of the OSAC monorepo, not an isolated project. Its APIs,
+generated artifacts, deployment configuration, and runtime behavior may affect
+other components. Apply the repository-wide rules in
+[`../AGENTS.md`](../AGENTS.md), consider downstream consumers before changing
+behavior, and follow the instructions for every affected component.
 
-osac-aap contains Ansible collections that provision and manage OSAC infrastructure. Backends are added over time — the lists below are examples, not exhaustive:
-- **Network backends**: e.g. CUDN, Netris, OpenStack, MetalLB
-- **Compute backends**: e.g. OpenShift Virtualization (KubeVirt)
-- **Cluster provisioning**: e.g. OpenShift 4.20 templates
-- **Storage backends**: e.g. VAST
-- **Bare metal provisioning**: e.g. OpenStack Ironic (via the ESI collection), Metal3, NICo
+## Required context
 
-Integration flow: fulfillment-service (API) → osac-operator (CRs) → AAP job templates → osac-aap playbooks → template roles
+Before changing this component, identify the documents relevant to the change
+below, then read and follow them. These documents are authoritative for their
+respective areas.
 
-## Development Environment
+- Component setup and playbook entry points: [`README.md`](README.md)
+- Role and workflow examples: `collections/ansible_collections/osac/`
+- Integration fixtures and targets: `tests/integration/`
+- Deployment contracts: [`../docs/ARCHITECTURE.md`](../docs/ARCHITECTURE.md)
 
-### Setup
+## Invariants
 
-Install dependencies:
+- `pyproject.toml` and `uv.lock` own development dependencies; rerun
+  `uv sync --all-groups` after changing them.
+- Local collections live under `collections/ansible_collections/`; third-party
+  collections live under `vendor/`. `ansible.cfg` searches `vendor/` before
+  local collections, so stale vendored content can hide local changes.
+- After changing `collections/requirements.yml`, reinstall the collections and review the complete `vendor/` diff.
+- Use fully qualified Ansible module names and give every task a `name:`.
+- Role directories use underscores. A network template role must define at least one `fabric_manager` or `k8s_manager`, and manager names must match the corresponding role directory names.
+- A template role's `meta/osac.yaml` must match its actual `template_type`; verify the real template before copying fields from another type.
+- Network roles are not published as ComputeClass-family resources by `playbook_osac_config_as_code.yml`. Cluster, compute-instance, and bare-metal template metadata is published by config-as-code; do not assume that behavior applies to network roles.
+- NetworkClass resources are created by the installer from configured manager names; role capabilities are informational. Only one NetworkClass may exist per deployment, so adding a backend replaces the configured NetworkClass rather than creating another.
+- Preserve tenant and owner-reference annotations on resources created by playbooks.
+- Use the shared remote-kubeconfig service role for remote workflows and preserve the required empty primary-network label syntax.
+- Never expose credentials in tasks, logs, fixtures, examples, or generated artifacts.
+
+## Integration Testing
+
+See [suite boundaries and coverage gaps](../docs/INTEGRATION-TESTING.md#osac-aap).
+
+| Touched area | Required validation | Command / follow-up |
+|---|---|---|
+| Filters, variable transforms, and isolated plugin logic | Unit | `uv run pytest tests/unit` |
+| Netris ExternalIP session transport and redirect isolation | Unit / local HTTP transport | `uv run pytest tests/unit/test_netris_external_ip_transport.py`; real Ansible HTTP and module subprocesses against a cookie-enforcing loopback fixture, including missing/incorrect-session rejection and redirects with and without response cookies. Both supplied and response-derived cookies must stay off redirect targets. No Kind, AAP, or real provider. The loopback provider is `tests/unit/netris_session_fixture.py`; it requires the exact session cookie on every request. |
+| Keycloak token lookup, cache refresh, and error handling | Unit | `uv run pytest tests/unit/plugins/lookup/test_fulfillment_token.py` |
+| AAP publish-templates credential and Kubernetes token wiring | Unit | `uv run pytest tests/unit/test_publish_templates_auth_config.py` |
+| Template publishing certificate validation | Local protocol integration | Run the `test_cert_validation` play in `collections/ansible_collections/osac/service/roles/publish_templates/tests/test.yml` with `uv run ansible-playbook`; the mock HTTPS server tests the client transport only |
+| Config-as-code networking templates and launch policy | Component contract | `tests/integration/targets/config_as_code_job_templates/tasks/baseline.yml`; renders controller templates without contacting AAP |
+| Config-as-code container-group pod specs, including the CaaS Netris settings of cluster fulfillment | Unit plus component contract | `tests/unit/test_config_as_code_cluster_netris_settings.py`, `tests/unit/test_publish_templates_auth_config.py` and `tests/integration/targets/config_as_code_pod_specs/tasks/baseline.yml`; renders the pod specs and the AAP chart's config-as-code Secret without contacting AAP |
+| Generic networking task playbook: task allowlists, launch input validation, task-file lookup, and typed result handling | Unit plus component integration | `tests/unit/plugins/lookup/test_launch_extra_vars.py`, `tests/unit/plugins/lookup/test_network_task_file.py`, and `tests/integration/targets/network_task_playbook/tasks/baseline.yml`; child Ansible processes without Kubernetes or AAP check the fixed task sets, input rejection that runs no manager task, missing role or task file, and one real task (the Netris SecurityGroup no-op); running every task of a set is the manager target (`netris_fabric`, `cudn_evpn`) |
+| AgentlessNet API-ID state, exact SQLite schema/marker validation, tombstones, VirtualNetwork/Subnet/IPAM allocation, shared ExternalIPPool state, NetworkAttachment address and port claims, DHCP lease lookup, and parent locks | Unit | `tests/unit/test_agentless_network_state.py`, `tests/unit/test_agentless_net_network.py`, and `tests/unit/test_agentless_net_subnet.py`; run `uv run --group development pytest tests/unit` |
+| AgentlessNet ExternalIPAttachment DNAT, scoped forwarding, local route, and conntrack cleanup | Unit | `tests/unit/test_agentless_net_external_ip.py`; run `uv run pytest tests/unit` |
+| AgentlessNet VN and Cumulus Subnet inventory, host registration, trunk validation, and password rejection | Contract | `agentless_net_stub` baseline target runs `files/validate_vn_inventory.yml` in fresh Ansible processes; omitted switch platform defaults to Cumulus and explicit unsupported platforms fail; no SSH/provider commands |
+| AgentlessNet API-ID-owned ExternalIP reservations, shared pool ownership, retries, and release | Unit | `tests/unit/test_agentless_network_state.py`; run `uv run --group development pytest tests/unit`. Temporary SQLite is real. Kubernetes, AAP, SSH, switches, and Linux provider commands are omitted. |
+| AgentlessNet NATGateway v1 VN-wide SNAT, transit exemption, ExternalIP consumer exclusivity, dependency deletion guards, scoped forwarding, bypass, route and conntrack cleanup | Unit | `tests/unit/test_agentless_network_state.py` and `tests/unit/test_agentless_net_nat_gateway.py`; run `uv run --group development pytest tests/unit`. SQLite is real; Linux commands are mocked. Subnet lifecycle is independent and no active source list or revision is saved. |
+| AgentlessNet NATGateway tasks through the generic network task playbook | Component integration ([DEV] OSAC-6202) | `tests/integration/targets/agentless_net_nat_gateway/tasks/baseline.yml`; runs `playbook_osac_network_task.yml` in a child process with the stored operator input, no typed output, `osac_error` retryability, temporary schema-v1 SQLite, retry and failed-cleanup retention. Provider commands are replaced by test-only fixtures; AAP server, Kubernetes API, SSH, BGP peer convergence and external traffic are omitted. |
+| AgentlessNet Fabric tasks through the generic network task playbook | Component integration | `tests/integration/targets/agentless_net_contract/tasks/baseline.yml`; real child Ansible jobs and SQLite exercise physical NetworkAttachment reservation, partial switch-apply retry, DHCP lease result, delete-wins tombstones, port restoration, and shared ExternalIPPool/ExternalIP/ExternalIPAttachment create/delete results. A fake SSH endpoint models Cumulus VLAN state; Linux, DHCP service, AAP, Kubernetes and live switches are omitted. |
+| AgentlessNet BMI access-port inventory validation | Unit plus component contract | `tests/unit/test_agentless_network_state.py`, `tests/unit/test_agentless_net_subnet.py`, and `tests/integration/targets/agentless_net_attachment/tasks/baseline.yml`; saved-state/lease parsing uses temporary SQLite/files, and a child Ansible process exercises real host/interface inventory validation including duplicate mappings and trunk overlap. AAP, SSH, switches, and provider commands are omitted. |
+| `cudn_evpn` Kubernetes Manager input checks, CUDN/namespace/NetworkPolicy manifests, owner claim, SecurityGroup rule translation and conditional patches, and `osac_result`/`osac_error` shapes | Unit plus component integration | `tests/unit/test_cudn_evpn_role.py` and `tests/unit/test_cudn_evpn_playbook.py` (the latter runs tasks through `playbook_osac_network_task.yml` in a child Ansible process against an unreachable hub API). Hub behavior against a real Kubernetes API server is covered by `tests/integration/targets/cudn_evpn/tasks/baseline.yml` (from `tests/integration/` run `uv run ansible-playbook targets/cudn_evpn/tasks/baseline.yml -e '@common_vars.yml'`; also in `make test`). The ClusterUserDefinedNetwork and VTEP CRDs are fakes (accept-anything schema, no status subresource) and the play, not OVN-Kubernetes, sets the VTEP and CUDN conditions, including conditions that stay False. API errors and dropped connections come from `tests/integration/fixtures/kube/fault_proxy.py`, which forwards everything else to Kind unchanged. Timeouts run `targets/cudn_evpn/files/short_waits.yml`, the generic playbook with the role's waits cut to seconds. Not covered: OVN-Kubernetes behavior, real CRD validation, and the EVPN/DHCP data plane. |
+| Netris Fabric Manager through the generic networking playbook: all 21 Fabric tasks, VirtualNetwork/Subnet results and reruns, V-Net gateway and DHCP, `l3Vni` mismatch, physical attachment and DHCP lease, ExternalIP/NAT names and addresses, FabricDomain, ordered absent-tolerant deletes (VNI freed last), 5xx versus 4xx errors without response bodies, tenant isolation, drift, partial-create and lost-response recovery, and every stop of the role with its message (`cases_paths.yaml`) | Component integration | `tests/integration/targets/netris_fabric/tasks/baseline.yml` (from `tests/integration/` run `uv run ansible-playbook targets/netris_fabric/tasks/baseline.yml -e '@common_vars.yml'`; also in `make test`); child Ansible processes with an unusable kubeconfig against the stateful fake `tests/integration/fixtures/netris/fake_netris.py`; no Kubernetes objects, AAP, operator, switches or live Netris. Gap: real Netris stays the lab E2E (QE); live ExternalIP coverage is [OSAC-4843](https://redhat.atlassian.net/browse/OSAC-4843) |
+| Netris VirtualNetwork, Subnet and SecurityGroup tasks through the generic networking playbook: contract inputs, `osac_result` (`backend_id`, `l3_vni`, evpn `network_segment.l2_vni`), retryable/final errors, get-or-create reruns, V-Net gateway/DHCP plan and update, and absent-object deletes | Unit plus component contract | `tests/unit/test_netris_vn_subnet.py` and `tests/unit/test_netris_playbook.py`; child Ansible processes against a stateful in-memory Netris double (`tests/unit/netris_fake.py`); no AAP, Kubernetes, switches, or live Netris. Deployed journeys: `netris_fabric`. |
+| Netris NetworkAttachment tasks through the generic networking playbook: overlay no-op, physical port move from the provisioning V-Net to the Subnet V-Net (EVPN Subnets get DHCP over the physical range first), `query_dhcp_lease` by interface MAC, tenant/VPC ownership refusals and absent-object deletes | Unit plus component contract | `tests/unit/test_netris_attachment.py`; child Ansible processes against the in-memory Netris double (`tests/unit/netris_fake.py`, with servers, ports and IPAM hosts); no AAP, Kubernetes, switches, or live Netris. Deployed journeys: `netris_fabric`. |
+| Netris FabricDomain (Server Cluster `osac-fd-<id>` in the VirtualNetwork VPC), `reserve_cluster_ingress_ip` (final error) and `release_cluster_ingress_ip` (no-op) tasks, and `create_virtual_network` (no NAT rule, leftover Netris DNS settings ignored), through the generic networking playbook: template choice, membership, foreign-VPC refusal, absent-object deletes | Unit plus component contract | `tests/unit/test_netris_fabric_domain.py` and `tests/unit/test_server_cluster_identity.py` (controller role); child Ansible processes against the stateful Netris double (`tests/unit/netris_fake.py`); no AAP, Kubernetes, switches, or live Netris. Deployed journeys: `netris_fabric`. |
+| MetalLB ExternalIP detach annotation cleanup under concurrent stale reads | Component integration | `tests/integration/targets/metallb_l2_detach_annotation/tasks/baseline.yml`; two independent Ansible processes patch the same annotation against real Kind; no deployed AAP or MetalLB provider |
+| Task and Python coverage of `roles/netris`, `roles/cudn_evpn` and their plugins | Measured gate | `make test` measures it and fails on a gap; `make role-coverage` runs only the unit tests and the `network_task_playbook`, `cudn_evpn` and `netris_fabric` targets on a Kind cluster of its own; `make role-coverage-report` prints the report again. A new task, `when`, `rescue` or fail path needs a test or a line with its reason in `tests/coverage/exclusions.yaml`. [What is measured](../docs/INTEGRATION-TESTING.md#osac-aap). The `netris.controller` roles are reported, not gated. |
+| Operator-to-AAP task inputs and results (`l3_vni`, `l2_vni`, `network_segment`, `external_ip`, `vm_attachment`, `nat_gateway_context`) for the networking managers | Unit plus component contract against the shared wire goldens | `tests/unit/test_network_task_wire_contract.py` reads `../tests/contract/network-task`; run `uv run --all-groups python -m pytest tests/unit/test_network_task_wire_contract.py`. The operator half is `networking_wire_golden_test.go`; change both in one PR. Bound: create/apply/attach tasks of VirtualNetwork, Subnet, ExternalIPPool, ExternalIP, ExternalIPAttachment, NetworkAttachment (overlay) and NATGateway. Not bound (no ticket): delete_*/detach_* tasks, SecurityGroup tasks, query_dhcp_lease, FabricDomain, cluster ingress, physical interfaces |
+| Netris ExternalIPPool, ExternalIP, ExternalIPAttachment and NATGateway tasks on the contract (API-ID object names, `external_ip.address` result, DNAT/SNAT in the destination VPC, final versus retryable errors, tenant-isolated get-or-create and absent-tolerant deletes), and the API-ID-owned `osac.templates.netris_external_ip` module | Unit | `tests/unit/test_netris_eip_nat.py`, `tests/unit/test_netris_external_ip.py` and `tests/unit/test_netris_external_ip_module.py`; run `uv run pytest tests/unit`. The tasks run through `playbook_osac_network_task.yml` in child Ansible processes against the in-memory Netris double `tests/unit/netris_fake.py`; no live Netris controller (OSAC-4843); the deployed journey is the `netris_fabric` target. |
+| VMI stuck-finalizer recovery during ComputeInstance deletion (crashed/absent launcher, running-launcher refusal) | Component integration | `tests/integration/targets/compute_instance_delete_vmi_recovery/tasks/baseline.yml`; real Kind VMI and Pod resources with KubeVirt CRDs (operator scaled to 0); no AAP, real virt-launcher, or KubeVirt controller |
+| Ansible roles, workflow tasks, hooks, leases, finalizers, or Kubernetes resources | Component integration | `make test` or the focused target command |
+| Windows/Linux user-data routing and Windows base-spec regressions | Unit / isolated role transform | `ocp_virt_vm:test_windows_userdata_sysprep`, `ocp_virt_vm:test_windows_no_userdata`, and `ocp_virt_vm:test_linux_userdata_cloudinit` in `make test`; existing role Tests 15–17 run in separate Ansible processes without Kubernetes Secret operations |
+| Tenant StorageClass tier resolution, DataVolume `storageClassName` wiring, and ambiguity guards | Unit + Component integration ([DEV] OSAC-6596) | `collections/ansible_collections/osac/service/roles/tenant_storage_class/tests/test.yml` and `compute_instance_create:csp_storage_tiers` in `make test` |
+| Windows sysprep Secret copying and VM-spec wiring | Component integration ([DEV] OSAC-6182) | `compute_instance_create:sysprep_secret_copy` in `make test`; real Kind Secrets and `create_secrets.yaml`, including missing-tenant rejection; VM creation and readiness are overridden |
+| ComputeInstance disk Volume ID validation and DataVolume annotations | Contract plus component integration ([DEV] OSAC-6612) | `compute_instance_create:volume_id_validation` runs the real role without Kubernetes and rejects missing boot/additional IDs and an empty additional ID before resource creation; `compute_instance_create:volume_id_annotations` runs real create workflow/DataVolume tasks against Kind with out-of-order disk keys and checks each annotation and unchanged disk fields. Both run in `make test`. |
+| ComputeInstance tier-to-StorageClass selection and disk specs | Unit / isolated role plus component integration ([DEV] OSAC-6682) | `uv run pytest tests/unit/test_tenant_storage_class.py` and `compute_instance_create:storage_tier_mapping` in `make test`; [focused setup and boundaries](tests/integration/targets/compute_instance_create/README.md). Real top-level playbook, Kind DataVolume specs, unchanged shared classes, rejected missing/ambiguous mappings, retries, and LVMS JIT class creation; no VM controllers or storage data plane. Fixed synthetic Volume IDs are fixture inputs only. Volume-ID coverage under [OSAC-6682](https://redhat.atlassian.net/browse/OSAC-6682) is deferred to the post-preview Volume API workflow. Operator CSP filtering remains [OSAC-6596](https://redhat.atlassian.net/browse/OSAC-6596). |
+| Execution-environment definition or dependency inputs | Build/package validation plus applicable integration tests | `make execution-environment-build`, then `make test` |
+| AAP, OpenStack, KubeVirt/RHACM, or provider provisioning | Contract or real-provider integration | Use the qualifying [OSAC-4843](https://redhat.atlassian.net/browse/OSAC-4843) suite |
+| Storage-provider behavior | Component integration (focused) plus real-provider coverage when required | Tenant and compute-instance JIT target-routing run in `make test`; provider tests require `STORAGE_TESTS_ENABLED=true make test` (or the relevant storage target and provider suite) |
+
+Storage integration requires `STORAGE_TESTS_ENABLED=true`; image builds are separate build/package validation.
+
+AgentlessNet unit tests use real allocation/locked state and Linux helpers with
+mocked `ip`/`iptables`, systemd/Supervisor, dnsmasq, and switch command output,
+including allocation exclusions, retries, service selection, reconciliation,
+and verification. Pool-state unit tests use SQLite directly to prove the
+current v1 schema, identity preservation, and idempotent deletion. Inventory
+contract tests run real Ansible parsing and
+`add_host` without contacting AAP or the selected node. Service readiness does
+not establish client DHCP leases or traffic delivery. Deployed VN retry/delete
+and packet isolation coverage remains a QE gap under
+[OSAC-4843](https://redhat.atlassian.net/browse/OSAC-4843) /
+[OSAC-4850](https://redhat.atlassian.net/browse/OSAC-4850); no qualifying VN
+runner is tracked here.
+
+The isolated HostedCluster role regression runs with
+`uv run --group development ansible-playbook collections/ansible_collections/osac/service/roles/hosted_cluster/tests/test.yml`.
+It executes NodePool definition transforms for distinct NodeSets sharing an
+instance type and independent scaling. It does not create Kubernetes resources
+or exercise AAP/provider endpoints; the applicable component-integration and
+provider-boundary validations remain required.
+
+## Generated and vendored files
+
+- There is no source-code generator for roles. Do not hand-edit third-party content under `vendor/`.
+- Reinstall vendored collections after dependency changes. Confirm Automation Hub credentials and required environment variables first, then run:
+  `rm -rf vendor && ansible-galaxy collection install -r collections/requirements.yml`.
+- Review the vendor diff and commit it with the requirements change when vendoring is required.
+
+## Validation
+
+From `osac-aap/`:
+
 ```bash
 uv sync --all-groups
-source .venv/bin/activate  # or prefix commands with `uv run`
+uv run pytest tests/unit      # Unit tests
+make lint                     # uv run ansible-lint
+make test                     # Kind setup, integration tests, teardown
+helm lint charts/aap
 ```
 
-`uv sync` creates or updates `.venv` in place to match `pyproject.toml`/`uv.lock` — re-run it after dependency changes instead of recreating the venv manually.
-
-### Key Configuration Files
-
-- `pyproject.toml` — Python dependencies (Ansible 11.4.0+, kubernetes 32.0.1+)
-- `uv.lock` — Locked dependency versions
-- `ansible.cfg` — Jinja2 native mode, `collections_path=./vendor:./collections` (vendored collections are searched before local `collections/`)
-- `ansible-navigator.yml` — Logging and playbook artifact configuration
-- `.python-version` — Python 3.13+ for local development (container runtime uses Python 3.12 as specified in `execution-environment.yaml`)
-- `devfile.yaml` — Dev Containers configuration (ansible-workspace-env-reference image)
-
-### Collections Management
-
-Collections live in two directories:
-- `collections/ansible_collections/` — Local collections across multiple namespaces: `osac.*` (service, templates, workflows, config_as_code, esi, steps, test_overrides), `agentless_net.*`, `ci.*`, `dns.*`, `netris.*`, `nico.*`
-- `vendor/` — Vendored upstream collections
-
-Re-vendor after updating `collections/requirements.yml`:
-```bash
-rm -rf vendor && ansible-galaxy collection install -r collections/requirements.yml
-git add vendor/  # commit vendored collections
-```
-
-Note: Requires Red Hat Automation Hub token for proprietary collections.
-
-## Repository Structure
-
-```
-osac-aap/
-├── playbook_osac_*.yml              # AAP job templates (entry points)
-├── collections/ansible_collections/
-│   ├── osac/service/                # Utilities (common, finalizer, lease, wait_for)
-│   ├── osac/templates/              # Infrastructure provisioning roles
-│   ├── osac/workflows/              # Multi-step orchestration
-│   ├── osac/config_as_code/        # AAP configuration as code
-│   ├── osac/esi/                   # Elastic Secure Infrastructure
-│   ├── osac/steps/                 # Workflow step definitions
-│   ├── osac/test_overrides/        # Test template overrides
-│   ├── ci/                         # CI workflow steps
-│   ├── netris/                     # Netris network backend
-│   ├── nico/                       # NVIDIA NICo bare metal backend
-│   ├── dns/                        # DNS management
-│   └── agentless_net/              # CaaS networking
-├── vendor/                         # Vendored collections
-├── tests/integration/              # Integration test suites
-│   ├── targets/                    # Test scenarios
-│   ├── fixtures/                   # Sample CRs
-│   └── common_vars.yml             # Shared test variables
-├── execution-environment/          # Container build definitions
-├── charts/aap/                     # Helm charts for AAP deployment
-└── samples/                        # Example payloads
-```
-
-## Template Role Pattern
-
-Each template role in `osac.templates` declares its metadata in `meta/osac.yaml`. The fields present depend on `template_type` (`network`, `compute_instance`, `bare_metal_instance`, `storage_provider`, or `cluster`) — see the exact structure for each type below.
-
-Running `playbook_osac_config_as_code.yml` publishes cluster/compute-instance/bare-metal-instance
-templates as ComputeClass-family resources in Kubernetes. Network templates are not published this
-way — NetworkClass creation happens at install time via the osac-installer Helm chart instead.
-
-### Template Type-Specific `meta/osac.yaml` Structures
-
-**Network templates** (e.g., `cudn_net`, `metallb_l2`):
-```yaml
-template_type: network
-fabric_manager: <name>       # at least one of fabric_manager/k8s_manager is required
-k8s_manager: <name>          # optional
-is_default: true/false       # optional
-capabilities:
-  supports_ipv4: true
-  supports_ipv6: true
-  supports_dual_stack: true
-```
-These fields are informational for the role's own provisioning logic, not published anywhere —
-registering `fabric_manager`/`k8s_manager` as a selectable NetworkClass manager happens in
-osac-operator's `networkManagers` chart values, and the deployment's actual NetworkClass is
-created at install time by osac-installer, keyed off the same manager name.
-`implementation_strategy` is no longer read here — it was reserved on the NetworkClass/
-VirtualNetwork protos once the fabric_manager/k8s_manager dispatcher became the sole
-routing mechanism (see `playbook_osac_create_virtual_network.yml`, which now reads the
-`osac.openshift.io/implementation-strategy` annotation set by osac-operator instead).
-
-**Compute instance templates** (e.g., `ocp_virt_vm`):
-```yaml
-template_type: compute_instance
-spec_defaults:
-  # cores/memory_gib/image are reserved (removed) on ComputeInstanceTemplateSpecDefaults —
-  # instance_type is now the sole, mandatory way to size a ComputeInstance.
-  # Use disk_image for image source and ref
-  boot_disk:
-    size_gib: 10
-parameters:
-  - name: exposed_ports
-    title: Exposed Ports
-    description: Port configuration
-    type: string
-    required: false
-    default: "22/tcp"
-    validation:
-      pattern: '^([0-9]+/(tcp|udp))(,[0-9]+/(tcp|udp))*$'
-```
-
-**Bare metal instance templates** (e.g., `bm_host_agent_provisioning`):
-```yaml
-template_type: bare_metal_instance
-# No standard fields beyond template_type
-```
-
-**Storage provider templates** (e.g., `vast_storage`):
-```yaml
-template_type: storage_provider
-implementation_strategy: <name>
-capabilities:
-  supported_protocols:
-    - nfs
-    - block
-  provisioning_targets:
-    - vmaas
-    - hcp_control_plane
-```
-
-**Cluster templates** (e.g., `ocp_small`):
-```yaml
-title: Display name
-description: Cluster template description
-default_node_request:
-  - resourceClass: fc430
-    numberOfNodes: 2
-allowed_resource_classes: []
-# Note: Typically no template_type, implementation_strategy, or capabilities
-# fields. Exception: ocp_4_20_ai_maas has both template_type: cluster and
-# implementation_strategy — verify the actual file rather than assuming.
-```
-
-### Template Roles by Type
-
-**Networking:**
-- `cudn_net` — ClusterUserDefinedNetwork (CUDN) with OVN-Kubernetes
-- `netris` — Netris Controller API backend
-- `openstack` — OpenStack Neutron
-- `network_policy` — Kubernetes NetworkPolicy (SecurityGroups)
-- `metallb_l2` — MetalLB-based ExternalIPPool/ExternalIP
-
-**Compute:**
-- `ocp_virt_vm` — KubeVirt VMs on OpenShift Virtualization
-
-**Clusters:**
-- `ocp_small` — Standard OpenShift cluster template
-- `ocp_4_20_ai_maas` — OpenShift 4.20 with AI/MaaS
-- `ocp_4_20_small_nico` — OpenShift 4.20 with NICo networking
-- `ocp_ci_small` — CI cluster template
-
-**Storage:**
-- `vast_storage` — VAST storage backend
-
-**Bare Metal:**
-- `bm_host_agent_provisioning` / `bm_host_agent_deprovisioning`
-- `bm_host_provisioning` — Dispatches to Metal3 or OpenStack Ironic
-- `bm_private_network` / `bm_host_private_network`
-
-### Service Roles (osac.service)
-
-Shared utilities imported by template roles:
-- `cleanup_stale_network_resources` — Cleanup for stale network resources
-- `cluster_infra` — Cluster infrastructure utilities
-- `cluster_settings` — Cluster configuration management
-- `cluster_working_namespace` — Cluster namespace utilities
-- `common` — Kubeconfig and credential management (`get_remote_cluster_kubeconfig`)
-- `enumerate_templates` — Template enumeration
-- `external_access` — External access configuration
-- `extract_template_info` — Template metadata extraction
-- `finalizer` — Kubernetes finalizer lifecycle (`add_finalizer`, `remove_finalizer`)
-- `hosted_cluster` — Hosted cluster management
-- `lease` — Bare metal lease management
-- `manage_agents` — Agent management utilities
-- `metallb_ingress` — MetalLB ingress setup
-- `nmstate_config` — Network configuration with nmstate
-- `openstack_bm_node` — OpenStack bare metal node preflight and preparation
-- `publish_templates` — Registers template metadata as ComputeClass-family resources
-- `retrieve_kubeconfig` — Kubeconfig retrieval
-- `storage_provider` — Storage provider utilities
-- `tenant_storage_class` — StorageClass discovery for tenants
-- `tenant_target_namespace` — Tenant namespace utilities
-- `wait_for` — Polling utilities for pods, deployments, CRs
-- `write_ssh_keys` — SSH key management
-
-## Testing
-
-### Running Tests
-
-```bash
-make test   # Full integration suite (setup → run → teardown)
-make lint   # ansible-lint validation
-```
-
-### Integration Test Structure
-
-Location: `tests/integration/`
-
-Test orchestration:
-- `setup_test_env.sh` — Provisions kind cluster and test fixtures
-- `run_tests.sh` — Executes test playbooks
-- `teardown_test_env.sh` — Cleanup
-
-Test targets in `tests/integration/targets/`:
-- `cluster_*` — ClusterOrder lifecycle (create, delete, post_install, status_reporting)
-- `compute_instance_*` — ComputeInstance lifecycle (create, delete, with_gpu)
-- `storage_provider_*` — Storage onboarding, setup, teardown, rollback
-- `finalizer`, `lease`, `tenant_target_namespace` — Service role tests
-- `config_as_code_pod_specs` — AAP configuration validation
-
-Test fixtures: `tests/integration/fixtures/` contains sample CRs (ClusterOrder, ComputeInstance with/without GPU).
-
-### CI Workflows
-
-**`.github/workflows/ansible-lint.yml`:**
-- Dedicated ansible-lint validation on PRs
-
-**`.github/workflows/integration-tests.yml`:**
-- Full test suite with kind cluster (storage tests conditionally enabled via `STORAGE_TESTS_ENABLED=true` environment variable in CI)
-
-**`.github/workflows/e2e-vmaas-full-install.yml`:**
-- End-to-end VMaaS installation testing
-- Triggers: `pull_request`, scheduled (every 12h), `workflow_dispatch`
-
-**`.github/workflows/e2e-bmaas-full-install.yml`:**
-- End-to-end BM-as-a-Service installation testing
-
-**`.github/workflows/pre-commit.yaml`:**
-- Runs all pre-commit hooks on PRs, plus gitleaks PR-diff secret scan
-
-**`.github/workflows/helm-lint.yaml`:**
-- Validates Helm chart syntax
-
-**`.github/workflows/execution-environment.yml`:**
-- Container images built from `execution-environment/execution-environment.yaml`
-- Validates the build definition and produces images for AAP deployment
-
-**`.github/workflows/publish-charts.yaml`:**
-- Publishes Helm charts on release tags
-
-**`.github/workflows/ok-to-test-label-cleanup.yml`:**
-- Removes `ok-to-test` label on new pushes to PRs
-
-**`.github/workflows/slash-command.yml`:**
-- Handles slash commands in PR comments
-
-## Building
-
-### Execution Environment (Container)
-
-Build definition: `execution-environment/execution-environment.yaml`
-
-- **Base image**: UBI 10.2 (Red Hat Universal Base Image)
-- **Python**: 3.12 in container runtime
-- **System packages**: systemd-libs, systemd-devel, gcc, python3.12-devel, git-core, bind-utils, krb5-devel
-- **CLI tools**: oc and kubectl copied from `quay.io/openshift/origin-cli:4.19`
-- **Build files**: Copies local `collections/` and `vendor/` into container
-
-No compilation step — Ansible playbooks are interpreted at runtime.
-
-### Helm Charts
-
-Location: `charts/aap/`
-Purpose: AAP deployment configuration
-Validation: CI runs `helm lint` on all PRs
-
-## Code Standards
-
-### Naming Conventions
-
-- **Playbooks**: `playbook_osac_{action}_{resource}.yml`
-- **Roles**: Use underscores, not hyphens (e.g., `cudn_net`, not `cudn-net`)
-- **fabric_manager/k8s_manager**: Should match the role directory name exactly (underscores)
-  for new network roles — this is the value the dispatcher resolves and osac-operator writes
-  into the `osac.openshift.io/implementation-strategy` annotation, which playbooks then use
-  to select `osac.templates.{{ implementation_strategy }}` via `include_role`.
-- **Collections**: Namespace `osac.*` (service, templates, workflows, config_as_code, esi, steps, test_overrides)
-
-### Ansible-lint Rules
-
-Configuration: `.ansible-lint.yml`
-
-Enforced:
-- FQCN for all modules (e.g., `ansible.builtin.debug`, not `debug`)
-- All tasks must have `name:` attribute
-
-Skipped:
-- `role-name[path]` — Role names use underscores (OSAC convention)
-- `parser-error` — False positive on multi-play test playbooks
-- `fqcn[keyword]` — Workflows use `collections:` keyword
-
-Warnings:
-- `risky-file-permissions` — Test code uses `lineinfile` without mode
-
-Excluded:
-- `vendor/`, `.github/`, `execution-environment/`
-
-### YAML Linting
-
-Configuration: `.yamllint.yaml`
-
-Disabled:
-- line-length
-- document-start
-
-Customized:
-- `indent-sequences: whatever` — Flexible list indentation
-- `hyphens.max-spaces-after: 4`
-- `truthy.check-keys: false`
-- `comments.min-spaces-from-content: 1`
-- Octal values forbidden (both implicit and explicit)
-
-### Pre-commit Hooks
-
-Configuration: `.pre-commit-config.yaml`
-
-Hooks:
-- Standard checks: trailing-whitespace, check-merge-conflict, end-of-file-fixer, check-added-large-files
-- Security: detect-private-key
-- Format: check-json, check-symlinks, check-case-conflict
-- YAML: yamllint with `--strict`
-
-Excluded: `vendor/`, `charts/`
-
-## PR Workflow
-
-### Commit Messages
-
-Format:
-- `OSAC-XXXX: description` (with Jira ticket)
-- `NO-ISSUE: description` when no Jira ticket applies
-- Or conventional commits: `feat:`, `fix:`, `test:`, `docs:`, `chore:`, `refactor:`
-
-DCO: Sign-off required (`git commit -s`)
-
-AI attribution: Add trailer when AI-assisted:
-```
-Assisted-by: Claude Code <noreply@anthropic.com>
-```
-
-Note: Use `Assisted-by`, not `Co-Authored-By` (Red Hat attribution standard).
-
-### Fork-Based Workflow
-
-- Push to `fork` remote, not `origin`
-- PRs go from `fork/<branch>` to `origin/main`
-- Include the Jira ticket key in the PR title when one applies (e.g., "OSAC-12345: add VAST storage backend"); use `NO-ISSUE` otherwise, matching the commit message format above
-
-### CI Checks
-
-All PRs must pass (docs-only PRs — `*.md`, `docs/` — skip checks 1-3 via `paths-ignore`):
-1. `pre-commit` — All pre-commit hooks (`pre-commit.yaml`)
-2. `ansible-lint` — Playbook and role linting (`ansible-lint.yml`)
-3. `integration-tests` — Full test suite with kind cluster (`integration-tests.yml`)
-4. `helm-lint` — Helm chart validation (`helm-lint.yaml`)
-5. `execution-environment` — Container image build validation (`execution-environment.yml`)
-
-### Review Process
-
-- Cross-repo changes documented in PR description (link related PRs)
-- `meta/osac.yaml` updated for template role changes
-- Collections re-vendored after `collections/requirements.yml` updates
-- E2E tests require `/ok-to-test` comment for fork PRs (org membership check)
-
-## Common Fix Locations
-
-Use this table to go directly to the right file for common patterns:
-
-| Pattern | Location |
-|---------|----------|
-| Add new network backend | `collections/ansible_collections/osac/templates/roles/<backend>/` + `meta/osac.yaml` |
-| Add new compute backend | `collections/ansible_collections/osac/templates/roles/<backend>/` + `meta/osac.yaml` |
-| Add new cluster template | `collections/ansible_collections/osac/templates/roles/<template>/` + `meta/osac.yaml` |
-| Add new bare metal template | `collections/ansible_collections/osac/templates/roles/<backend>/` + `meta/osac.yaml` |
-| Add AAP job template | `playbook_osac_<action>_<resource>.yml` (top-level) |
-| Add shared utility | `collections/ansible_collections/osac/service/roles/<utility>/` |
-| Add integration test | `tests/integration/targets/<test_name>/` |
-| Fix CR status updates | Template role's main task file (look for `kubernetes.core.k8s` with `status:` key) |
-| Add new capability | `meta/osac.yaml` in template role, then run `playbook_osac_config_as_code.yml` (does not apply to `template_type: network` -- its `capabilities` are informational only, never published) |
-
-## Security Guidelines
-
-### Tenant Isolation
-
-All resources must include tenant metadata:
-- `osac.openshift.io/tenant` annotation
-- `osac.openshift.io/owner-reference` annotation for resource hierarchy
-
-OPA policies enforce isolation at runtime (handled by fulfillment-service).
-
-### Secrets Management
-
-- Pre-commit hook `detect-private-key` scans for leaked secrets
-- Example files use `.example` suffix (e.g., `tests/golden-image-vars.yml.example`)
-- Environment variables: `OSAC_AAP_TOKEN` for AAP authentication (set by osac-operator)
-
-### Container Security
-
-- Base image: Red Hat UBI 10.2 (official, maintained)
-- System updates: glibc updated before package installation
-- Minimal packages: Only required system dependencies installed
-
-### Network Security
-
-- SecurityGroup CR translates to Kubernetes NetworkPolicy
-- Supports TCP, UDP, ICMP with port ranges and CIDR sources
-- Implementation in `osac.templates.network_policy` and `osac.templates.cudn_net`
-
-## Common Workflows
-
-### Adding a New Network Backend
-
-1. Create role directory: `collections/ansible_collections/osac/templates/roles/<backend>/`
-2. Add `meta/osac.yaml`:
-   ```yaml
-   template_type: network
-   fabric_manager: <backend>       # at least one of fabric_manager/k8s_manager is required
-   k8s_manager: <k8s_component>    # optional
-   is_default: false               # optional
-   capabilities:
-     supports_ipv4: true
-     supports_ipv6: true           # optional
-     supports_dual_stack: true     # optional
-   ```
-   Only one NetworkClass may exist per deployment (OSAC-4073) — config-as-code publishing this role's NetworkClass
-   requires the existing one to be removed first, regardless of `is_default`. Adding a new network backend means
-   replacing the existing NetworkClass, not adding a second one.
-3. Implement tasks in `tasks/main.yml` (provision and deprovision logic)
-4. Add integration test in `tests/integration/targets/<backend>_test/`
-5. Update `playbook_osac_config_as_code.yml` if needed
-6. Run `make test` and `make lint`
-
-### Adding a New Compute Backend
-
-1. Create role directory: `collections/ansible_collections/osac/templates/roles/<backend>/`
-2. Add `meta/osac.yaml`:
-   ```yaml
-   template_type: compute_instance
-   implementation_strategy: <backend>
-   spec_defaults:
-     # cores/memory_gib are reserved (removed); instance_type is mandatory.
-     boot_disk:
-       size_gib: 10
-   parameters:
-     - name: param_name
-       title: Display Name
-       description: Parameter description
-       type: string
-       required: false
-       default: "value"
-   ```
-3. Implement tasks in `tasks/main.yml` (provision and deprovision logic)
-4. Add integration test in `tests/integration/targets/<backend>_test/`
-5. Run `make test` and `make lint`
-
-### Debugging Integration Tests
-
-Inspect test environment after running tests:
-```bash
-make test
-# Cluster name is determined by setup scripts, check with:
-kind get clusters
-# Inspect the cluster:
-kubectl --context kind-<cluster-name> get pods -A
-# Cleanup when done:
-kind delete cluster --name <cluster-name>
-```
-
-Note: The test scripts manage cluster lifecycle automatically. To preserve clusters for debugging, modify `tests/integration/teardown_test_env.sh` directly.
-
-## Cross-Component Dependencies
-
-When making changes that affect other OSAC components:
-
-1. **New CR fields in osac-operator** → Update playbooks to consume new fields
-2. **New cluster, compute-instance, or bare-metal-instance template capabilities** → Run `playbook_osac_config_as_code.yml` to publish ComputeClass-family resources
-3. **New AAP job templates** → Update osac-operator to trigger new jobs
-4. **Collection updates** → Update `collections/requirements.yml` and re-vendor
-
-Link related PRs in description (e.g., "Depends on osac-operator#123").
-
-## References
-
-- `docs/` — Integration guides (Netris, NICo, BCM, agents)
-- `samples/` — Example payloads and configurations
-- `meta/osac.yaml` — Template role metadata format
-- `ansible.cfg` — Jinja2 native mode and collections path
-- `ansible-navigator.yml` — Logging and artifact configuration
+`make test` creates and removes a Kind test environment; run it for
+integration-affecting changes.
+
+For a focused workflow, run the relevant playbook from `tests/integration/`,
+for example `ansible-playbook targets/<workflow>/tasks/baseline.yml -e "@common_vars.yml" -v`.
+Build the execution environment with `make execution-environment-build` when
+its definition or dependency inputs change.

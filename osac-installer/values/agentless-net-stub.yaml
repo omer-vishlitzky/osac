@@ -1,0 +1,12 @@
+# AgentlessNet overlay: select the fabric-only BMaaS profile and suppress the
+# operator chart's legacy AgentlessNet stub registration. The umbrella chart
+# renders the contract-format immutable Fabric Manager registration.
+global:
+  networking:
+    provisioningEnabled: true
+    fabricManager: agentless_net
+    k8sManager: ""
+aap:
+  instanceGroups:
+    networkFulfillment:
+      enabled: true

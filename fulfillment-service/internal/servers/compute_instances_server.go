@@ -17,23 +17,28 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"slices"
+	"strings"
 
 	"github.com/prometheus/client_golang/prometheus"
 	grpccodes "google.golang.org/grpc/codes"
 	grpcstatus "google.golang.org/grpc/status"
+	"google.golang.org/protobuf/reflect/protoreflect"
+	"google.golang.org/protobuf/types/known/fieldmaskpb"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
-	publicv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/public/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
-	"github.com/osac-project/osac/fulfillment-service/internal/events"
+	"github.com/osac-project/osac/fulfillment-service/internal/vault"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
 
 type ComputeInstancesServerBuilder struct {
-	logger            *slog.Logger
-	notifier          events.Notifier
-	attributionLogic  auth.AttributionLogic
-	tenancyLogic      auth.TenancyLogic
-	metricsRegisterer prometheus.Registerer
+	logger             *slog.Logger
+	attributionLogic   auth.AttributionLogic
+	tenancyLogic       auth.TenancyLogic
+	metricsRegisterer  prometheus.Registerer
+	secretStore        vault.SecretStore
+	networkingSettings *NetworkingSettings
 }
 
 var _ publicv1.ComputeInstancesServer = (*ComputeInstancesServer)(nil)
@@ -57,12 +62,6 @@ func (b *ComputeInstancesServerBuilder) SetLogger(value *slog.Logger) *ComputeIn
 	return b
 }
 
-// SetNotifier sets the notifier to use. This is optional.
-func (b *ComputeInstancesServerBuilder) SetNotifier(value events.Notifier) *ComputeInstancesServerBuilder {
-	b.notifier = value
-	return b
-}
-
 // SetAttributionLogic sets the attribution logic to use. This is optional.
 func (b *ComputeInstancesServerBuilder) SetAttributionLogic(value auth.AttributionLogic) *ComputeInstancesServerBuilder {
 	b.attributionLogic = value
@@ -82,6 +81,18 @@ func (b *ComputeInstancesServerBuilder) SetMetricsRegisterer(value prometheus.Re
 	return b
 }
 
+func (b *ComputeInstancesServerBuilder) SetSecretStore(value vault.SecretStore) *ComputeInstancesServerBuilder {
+	b.secretStore = value
+	return b
+}
+
+// SetNetworkingSettings sets the networking installation settings. This is optional; the default is
+// DefaultNetworkingSettings.
+func (b *ComputeInstancesServerBuilder) SetNetworkingSettings(value NetworkingSettings) *ComputeInstancesServerBuilder {
+	b.networkingSettings = &value
+	return b
+}
+
 func (b *ComputeInstancesServerBuilder) Build() (result *ComputeInstancesServer, err error) {
 	// Check parameters:
 	if b.logger == nil {
@@ -97,6 +108,9 @@ func (b *ComputeInstancesServerBuilder) Build() (result *ComputeInstancesServer,
 	inMapper, err := NewGenericMapper[*publicv1.ComputeInstance, *privatev1.ComputeInstance]().
 		SetLogger(b.logger).
 		SetStrict(true).
+		// The status is output-only: only the system writes it. Users can read it
+		// but never supply it.
+		AddIgnoredFields("status").
 		Build()
 	if err != nil {
 		return
@@ -112,11 +126,12 @@ func (b *ComputeInstancesServerBuilder) Build() (result *ComputeInstancesServer,
 	// Create the private server to delegate to:
 	delegate, err := NewPrivateComputeInstancesServer().
 		SetLogger(b.logger).
-		SetNotifier(b.notifier).
 		SetAttributionLogic(b.attributionLogic).
 		SetTenancyLogic(b.tenancyLogic).
 		SetMetricsRegisterer(b.metricsRegisterer).
+		SetSecretStore(b.secretStore).
 		SetFilterDesc((*publicv1.ComputeInstance)(nil).ProtoReflect().Descriptor()).
+		SetNetworkingSettings(resolveNetworkingSettings(b.networkingSettings)).
 		Build()
 	if err != nil {
 		return
@@ -220,9 +235,13 @@ func (s *ComputeInstancesServer) Create(ctx context.Context,
 			"Failed to map public compute instance to private",
 			slog.Any("error", err),
 		)
-		err = grpcstatus.Errorf(grpccodes.Internal, "failed to process compute instance")
+		err = publicInputMappingError(err, "failed to process compute instance")
 		return
 	}
+	// The status is output-only: only the system writes it. The metering source contract
+	// is not enforced on inserts, so a caller-supplied status must never reach the
+	// database as a fabricated fact.
+	privateComputeInstance.ClearStatus()
 
 	// Delegate to the private server:
 	privateRequest := &privatev1.ComputeInstancesCreateRequest{}
@@ -255,8 +274,18 @@ func (s *ComputeInstancesServer) Create(ctx context.Context,
 	return
 }
 
+// Update applies permitted public changes to a compute instance while
+// preserving system-owned fields. The status is read-only: an omitted mask
+// infers the supplied writable fields, an explicit mask selects only
+// permitted roots, and the changes apply under the generic updater's row
+// lock.
 func (s *ComputeInstancesServer) Update(ctx context.Context,
 	request *publicv1.ComputeInstancesUpdateRequest) (response *publicv1.ComputeInstancesUpdateResponse, err error) {
+	ctx = withPublicAPIView(ctx)
+	if err := validatePublicObjectMetadata(request.GetObject()); err != nil {
+		return nil, err
+	}
+
 	// Validate the request:
 	publicComputeInstance := request.GetObject()
 	if publicComputeInstance == nil {
@@ -269,23 +298,18 @@ func (s *ComputeInstancesServer) Update(ctx context.Context,
 		return
 	}
 
-	// Determine how to prepare the private compute instance based on whether there's a field mask.
-	// When there's a field mask, copy to a new object and let the generic server handle the merge
-	// with the database object, which correctly applies field mask semantics.
-	var privateComputeInstance *privatev1.ComputeInstance
-	updateMask := request.GetUpdateMask()
-	if len(updateMask.GetPaths()) > 0 {
-		privateComputeInstance = &privatev1.ComputeInstance{}
-		privateComputeInstance.SetId(id)
-	} else {
-		getRequest := &privatev1.ComputeInstancesGetRequest{}
-		getRequest.SetId(id)
-		getResponse, err := s.delegate.Get(ctx, getRequest)
-		if err != nil {
-			return nil, err
-		}
-		privateComputeInstance = getResponse.GetObject()
+	// The public API has no writable status: build a mask that selects only the
+	// permitted public fields, inferring them from the supplied input when the
+	// caller omits the mask.
+	updateMask, err := computeInstancePublicUpdateMask(publicComputeInstance, request.GetUpdateMask())
+	if err != nil {
+		return nil, err
 	}
+
+	// Map the public compute instance to a new private object and delegate to the
+	// private server, which applies the permitted changes to the locked current
+	// database object:
+	privateComputeInstance := &privatev1.ComputeInstance{}
 	err = s.inMapper.Copy(ctx, publicComputeInstance, privateComputeInstance)
 	if err != nil {
 		s.logger.ErrorContext(
@@ -293,7 +317,7 @@ func (s *ComputeInstancesServer) Update(ctx context.Context,
 			"Failed to map public compute instance to private",
 			slog.Any("error", err),
 		)
-		err = grpcstatus.Errorf(grpccodes.Internal, "failed to process compute instance")
+		err = publicInputMappingError(err, "failed to process compute instance")
 		return
 	}
 
@@ -324,7 +348,99 @@ func (s *ComputeInstancesServer) Update(ctx context.Context,
 	// Create the public response:
 	response = &publicv1.ComputeInstancesUpdateResponse{}
 	response.SetObject(updatedPublicComputeInstance)
+	response.SetWarnings(privateResponse.GetWarnings())
 	return
+}
+
+// computeInstancePublicUpdateMask selects only public writable fields. When the
+// caller supplies an update mask it is validated and whole-metadata masks are
+// expanded to the permitted child paths; status and any other non-writable
+// field is rejected. When the caller omits the mask, paths are inferred from
+// the populated writable fields of the object, so omitted fields stay
+// unchanged. The returned mask is fresh and never nil.
+func computeInstancePublicUpdateMask(
+	object *publicv1.ComputeInstance,
+	mask *fieldmaskpb.FieldMask,
+) (*fieldmaskpb.FieldMask, error) {
+	permittedMetadata := []string{
+		"metadata.labels",
+		"metadata.annotations",
+	}
+	paths := []string{}
+	if mask != nil {
+		for _, path := range mask.GetPaths() {
+			path = normalizeFieldMaskPath(path)
+			// The status is output-only: only the system writes it. The whole
+			// status and every descendant are rejected.
+			if path == "status" || strings.HasPrefix(path, "status.") {
+				return nil, grpcstatus.Errorf(grpccodes.InvalidArgument, "%s is output-only", path)
+			}
+			if path == "spec" || strings.HasPrefix(path, "spec.") {
+				// Spec path validity is checked by the private server's field-path
+				// compiler, which owns schema knowledge for accepted subpaths.
+				paths = append(paths, path)
+				continue
+			}
+			if path == "metadata" {
+				paths = append(paths, permittedMetadata...)
+				continue
+			}
+			if slices.Contains(permittedMetadata, path) {
+				paths = append(paths, path)
+				continue
+			}
+			return nil, grpcstatus.Errorf(grpccodes.InvalidArgument, "%s is not writable", path)
+		}
+	} else if object != nil {
+		// Infer paths from the populated writable fields of the object:
+		message := object.ProtoReflect()
+		if spec := populatedChild(message, "spec"); spec != nil {
+			fields := spec.Descriptor().Fields()
+			for i := range fields.Len() {
+				field := fields.Get(i)
+				if spec.Has(field) {
+					paths = append(paths, "spec."+string(field.Name()))
+				}
+			}
+		}
+		if metadata := populatedChild(message, "metadata"); metadata != nil {
+			for _, name := range permittedMetadata {
+				child := strings.TrimPrefix(name, "metadata.")
+				field := metadata.Descriptor().Fields().ByName(protoreflect.Name(child))
+				if field != nil && metadata.Has(field) {
+					paths = append(paths, name)
+				}
+			}
+		}
+	}
+	slices.Sort(paths)
+	paths = slices.Compact(paths)
+	return &fieldmaskpb.FieldMask{Paths: paths}, nil
+}
+
+// populatedChild returns the named submessage of a message when it is set,
+// or nil when the field is absent. The result is not recursive: only the
+// direct child message is returned.
+func populatedChild(message protoreflect.Message, name string) protoreflect.Message {
+	field := message.Descriptor().Fields().ByName(protoreflect.Name(name))
+	if field == nil || !message.Has(field) {
+		return nil
+	}
+	return message.Get(field).Message()
+}
+
+// normalizeFieldMaskPath trims whitespace from each dot-separated part of a
+// field-mask path and removes empty parts, so spellings like "status. state"
+// and "status..state" normalize to "status.state".
+func normalizeFieldMaskPath(path string) string {
+	parts := strings.Split(path, ".")
+	normalizedParts := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if part = strings.TrimSpace(part); part != "" {
+			normalizedParts = append(normalizedParts, part)
+		}
+	}
+	return strings.Join(normalizedParts, ".")
 }
 
 func (s *ComputeInstancesServer) Delete(ctx context.Context,

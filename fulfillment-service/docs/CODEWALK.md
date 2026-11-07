@@ -14,9 +14,9 @@ line numbers in the linked files may have moved.
 Most services keep three separate representations of an entity: a wire DTO, an in-memory domain
 object, and a persistence model, with mapping code between them. This codebase does not do that.
 
-[`internal/api/osac/private/v1.BareMetalInstance`](https://github.com/osac-project/osac/blob/main/fulfillment-service/internal/api/osac/private/v1/baremetal_instance_type.pb.go)
+[`proto/gen/osac/private/v1.BareMetalInstance`](https://github.com/osac-project/osac/blob/main/proto/gen/osac/private/v1/baremetal_instance_type.pb.go)
 (generated from
-[`proto/private/osac/private/v1/baremetal_instance_type.proto`](https://github.com/osac-project/osac/blob/main/fulfillment-service/proto/private/osac/private/v1/baremetal_instance_type.proto))
+[`proto/private/osac/private/v1/baremetal_instance_type.proto`](https://github.com/osac-project/osac/blob/main/proto/private/osac/private/v1/baremetal_instance_type.proto))
 is simultaneously:
 
 - the **wire format** for the private gRPC API (`BareMetalInstancesCreateRequest.object`),
@@ -25,9 +25,11 @@ is simultaneously:
   [`internal/servers/private_baremetal_instances_server.go`](https://github.com/osac-project/osac/blob/main/fulfillment-service/internal/servers/private_baremetal_instances_server.go)
   call `bmi.GetSpec()` / `bmi.SetNetworkAttachments(...)` on the proto type itself, no separate
   domain struct exists, and
-- the **persistence model** — `dao.GenericDAO[O]` serializes the object (minus `id` and `metadata`,
-  which get their own columns) as JSON into the `data` column of a hand-written Postgres table (see
+- the **persistence model** — `dao.GenericDAO[O]` stores the object body as JSON in the `data`
+  column of a hand-written Postgres table (see
   [`internal/database/migrations/54_create_baremetal_tables.up.sql`](https://github.com/osac-project/osac/blob/main/fulfillment-service/internal/database/migrations/54_create_baremetal_tables.up.sql)).
+  Metadata fields represented by dedicated columns are stored in those columns; a resource DAO can
+  opt in to storing the remaining metadata fields in `data`.
 
 This mirrors Kubernetes itself: a CRD Go type is simultaneously the API type, the etcd storage
 format, and the object controllers reconcile against — no intermediate entity layer either. It is a
@@ -49,6 +51,12 @@ delegates to the private server and converts between the two representations usi
 which copies matching fields by protobuf reflection. Fields that don't exist on one side are simply
 skipped (or ignored explicitly via `AddIgnoredFields`).
 
+Networking follows the same split with a deliberately narrower public contract. Public
+`VirtualNetworks`, `Subnets`, `SecurityGroups`, `ExternalIPs`, `ExternalIPAttachments`, and
+`NATGateways` expose Create/List/Get/Delete only. Their private services retain Update so
+controllers can persist status and provider feedback; that private mutation path is not reachable
+through the public gRPC or REST descriptors.
+
 **Table naming and JSON encoding are derived by reflection, not hardcoded.**
 `GenericDAOBuilder[O].tableName()`
 ([`internal/database/dao/generic_dao.go`](https://github.com/osac-project/osac/blob/main/fulfillment-service/internal/database/dao/generic_dao.go))
@@ -64,7 +72,7 @@ per resource purely through Go generics plus protobuf reflection over the resour
 ([`internal/database/database_tx_interceptor.go`](https://github.com/osac-project/osac/blob/main/fulfillment-service/internal/database/database_tx_interceptor.go))
 wraps every unary gRPC call: it begins a transaction before the handler runs, injects it into the
 context (`TxIntoContext`), and commits or rolls back in a deferred block after the handler returns.
-Any code downstream — DAOs, the `Notifier` — retrieves the current transaction with
+Any code downstream retrieves the current transaction with
 `database.TxFromContext(ctx)` instead of receiving it as a parameter.
 
 This is a known pattern (**transaction-per-request**, e.g. Django's `ATOMIC_REQUESTS`), with the
@@ -78,16 +86,11 @@ mitigate this here:
   (`managedTx.ensureReal`). A request that never touches the database never opens a real Postgres
   transaction, so the cost isn't "every request pays for a transaction" — only requests that do DB
   work do.
-- **It enables a transactional outbox for events.** `Notifier.Notify`
-  ([`internal/database/database_notifier.go`](https://github.com/osac-project/osac/blob/main/fulfillment-service/internal/database/database_notifier.go))
-  inserts the event payload into a `notifications` table and calls `pg_notify` **using the same
-  transaction as the business-logic change** (it reads the transaction from context, same as
-  everything else). Because both writes are in the one transaction the interceptor already opened,
-  event emission is atomic with the change that caused it — an event is never sent for a change
-  that then rolls back, and a committed change never fails to notify because of an unrelated later
-  error in the same request. Doing this without the interceptor-managed transaction would mean
-  every handler manually opening a transaction and remembering to include the notification insert
-  in it — easy to forget in one of the many `*_server.go` files.
+- **It enables a transactional outbox for events.** Database triggers insert object-table mutations
+  into `changes` in the same transaction as the business-logic change. `Signal` RPCs use the generic
+  DAO's `Signal` operation to perform a flagged no-op update that the trigger records as `SIGNAL`.
+  Event emission is therefore atomic with the request: an event is never published for a change
+  that rolls back.
 
 Known footgun: rollback is driven by `Tx.ReportError(&err)`
 ([`internal/database/database_tx.go`](https://github.com/osac-project/osac/blob/main/fulfillment-service/internal/database/database_tx.go)),
@@ -95,18 +98,22 @@ which must be called (typically via `defer`) by any code path that can produce a
 transaction. If a handler forgets it, its error will not trigger a rollback — this is not enforced
 by the type system.
 
-### `pg_notify` is a hint, not a guarantee — and that's by design
+### Event delivery and reconciliation recovery
 
-It's tempting to read the outbox pattern above as "the event delivery mechanism" and worry about
-what happens if a `NOTIFY` is missed — Postgres does not persist `NOTIFY` payloads for clients that
-aren't listening at the time, and a dropped gRPC `Watch` stream loses whatever was sent while it was
-disconnected. In this system that's fine, because `pg_notify` is only ever used as a **low-latency
-hint that something changed**, never as the source of truth for *what* changed:
+Watch events notify controllers that an object may need reconciliation. Controllers read the
+current state from the database, which remains the source of truth:
 
-- The actual event payload lives in the `notifications` table, written in the same transaction
-  (see above) — `pg_notify` only carries the row's `id` ([`internal/database/database_notifier.go`](https://github.com/osac-project/osac/blob/main/fulfillment-service/internal/database/database_notifier.go)).
-  A subscriber that receives the notification still re-reads the row to get the payload, so a
-  notification is never "the data" — just a poke to go look.
+- Public and private Watch events are captured in the transactional `changes` table, published by
+  the separate event-publisher process to tenant topics named `osac.events.<tenant>`, and consumed
+  from Kafka. Each public Watch request consumes only `osac.events.<user-tenant>` and
+  `osac.events.shared`; each private Watch request discovers all event topics. `dao.GenericDAO.Signal`
+  marks its no-op update with a transaction-local PostgreSQL setting, so the same row trigger adds an
+  `OBJECT_SIGNALED` change in the request transaction. Public Watch filters those private-only
+  signal events.
+- Private Watch requests can specify a consumer group. Reconcilers use stable groups named
+  `<controller-name>-reconciler`, allowing them to resume from committed Kafka offsets after
+  disconnecting. Requests without a group watch new events independently. Grouped delivery can
+  repeat events, and delivery to the gRPC stream does not acknowledge successful reconciliation.
 - Every `controllers.Reconciler[O]`
   ([`internal/controllers/reconciler.go`](https://github.com/osac-project/osac/blob/main/fulfillment-service/internal/controllers/reconciler.go))
   also runs a periodic full `List()` (`syncObjects`, `syncInterval`, default one hour) independently
@@ -115,11 +122,22 @@ hint that something changed**, never as the source of truth for *what* changed:
   it, just later. The `Watch` stream is the fast path; the periodic sync is the correctness
   fallback that makes the fast path safe to lose.
 
+Full synchronization is enabled by default. Configuring the reconciler builder with
+`SetSync(false)` disables startup, periodic, and watch-restart full syncs.
+Object events still trigger reconciliation. Events for related resources still trigger a full scan
+so dependent objects can make progress, but missed events no longer have the background sync fallback.
+The `fulfillment-service start controller --sync=false` command applies this setting to all
+reconcilers. The `--sync` flag defaults to `true`.
+The service Helm chart sets `controller.sync: true` by default and passes that value through
+`--sync`. The installer's fulfillment integration test target explicitly sets
+`service.controller.sync=false` for all test phases so they rely on event-driven reconciliation.
+This includes the controller downtime recovery test, which exercises grouped event delivery.
+
 This is the same design principle Kubernetes controllers use: informer watches are an optimization
 for latency, but every controller is written to tolerate a missed or replayed watch event because a
 relist will eventually re-deliver the same state. Here it means the interesting failure mode isn't
 "lost update" (the periodic sync heals that) but "stale until the next sync", bounded by
-`syncInterval`.
+`syncInterval` when synchronization is enabled.
 
 ## End-to-end flow: `Create` for a `BareMetalInstance`
 
@@ -127,7 +145,7 @@ relist will eventually re-deliver the same state. Here it means the interesting 
 grpc client
   │  Create(BareMetalInstancesCreateRequest)
   ▼
-publicv1.RegisterBareMetalInstancesServer (generated ServiceDesc, internal/api/osac/public/v1)
+publicv1.RegisterBareMetalInstancesServer (generated ServiceDesc, proto/gen/osac/public/v1)
   │  routes "/osac.public.v1.BareMetalInstances/Create" to the registered BareMetalInstancesServer
   ▼
 servers.BareMetalInstancesServer.Create (internal/servers/baremetal_instances_server.go)
@@ -145,16 +163,20 @@ dao.GenericDAO[O].Create (internal/database/dao/generic_dao_create.go)
   │  + JSON-serialized remainder in the `data` column
   │  (runs inside the transaction opened by TxInterceptor for this request)
   ▼
-events.Notifier.Notify (internal/database/database_notifier.go)
-  │  INSERT into `notifications`, then `pg_notify('events', id)` — same transaction, so this
-  │  is atomic with the row insert above
+database trigger
+  │  INSERTs the object change into `changes` and notifies the event publisher
   ▼
   (transaction commits when TxInterceptor's deferred End() runs)
   │
   ▼
-servers.EventsServer (Watch RPC, internal/servers/events_server.go)
-  │  LISTENs on the `events` channel, re-reads the full payload from `notifications` by id,
-  │  streams it to any Watch subscriber
+servers.EventPublisher (separate `event-publisher` process)
+  │  drains `changes` and publishes protobuf events to `osac.events.<tenant>` Kafka topics
+  ├─ servers.EventsServer (public Watch RPC, internal/servers/events_server.go)
+  │    consumes only the authenticated user's tenant topic plus `osac.events.shared`, maps events
+  │    to their public representation, enforces project visibility, applies CEL, and streams matches
+  ▼
+servers.PrivateEventsServer (private Watch RPC, internal/servers/private_events_server.go)
+  │  creates one Kafka consumer per Watch, applies the unchanged CEL filter, and streams matches
   ▼
 controller process (separate binary: internal/cmd/service/start/controller/start_controller_cmd.go)
   │  controllers.Reconciler[*privatev1.BareMetalInstance] (internal/controllers/reconciler.go)
@@ -180,25 +202,24 @@ BareMetalInstancesClient.Update (another gRPC round-trip) to persist the synced 
 
 File references for the diagram above:
 
-- [`internal/api/osac/public/v1`](https://github.com/osac-project/osac/blob/main/fulfillment-service/internal/api/osac/public/v1) (generated `ServiceDesc`)
+- [`proto/gen/osac/public/v1`](https://github.com/osac-project/osac/blob/main/proto/gen/osac/public/v1) (generated `ServiceDesc`)
 - [`internal/servers/baremetal_instances_server.go`](https://github.com/osac-project/osac/blob/main/fulfillment-service/internal/servers/baremetal_instances_server.go)
 - [`internal/servers/private_baremetal_instances_server.go`](https://github.com/osac-project/osac/blob/main/fulfillment-service/internal/servers/private_baremetal_instances_server.go)
 - [`internal/servers/generic_server.go`](https://github.com/osac-project/osac/blob/main/fulfillment-service/internal/servers/generic_server.go)
 - [`internal/database/dao/generic_dao_create.go`](https://github.com/osac-project/osac/blob/main/fulfillment-service/internal/database/dao/generic_dao_create.go)
-- [`internal/database/database_notifier.go`](https://github.com/osac-project/osac/blob/main/fulfillment-service/internal/database/database_notifier.go)
+- [`internal/database/dao/generic_dao_signal.go`](https://github.com/osac-project/osac/blob/main/fulfillment-service/internal/database/dao/generic_dao_signal.go)
 - [`internal/servers/events_server.go`](https://github.com/osac-project/osac/blob/main/fulfillment-service/internal/servers/events_server.go)
 - [`internal/cmd/service/start/controller/start_controller_cmd.go`](https://github.com/osac-project/osac/blob/main/fulfillment-service/internal/cmd/service/start/controller/start_controller_cmd.go)
 - [`internal/controllers/reconciler.go`](https://github.com/osac-project/osac/blob/main/fulfillment-service/internal/controllers/reconciler.go)
 - [`internal/controllers/baremetalinstance/baremetalinstance_reconciler_function.go`](https://github.com/osac-project/osac/blob/main/fulfillment-service/internal/controllers/baremetalinstance/baremetalinstance_reconciler_function.go)
 
 Key point: the `controller` binary is not a code path inside `grpc-server` — it is a **separate
-process acting as a gRPC client** of the private API, decoupled from the write path purely through
-the Postgres `LISTEN`/`NOTIFY` mechanism described above. This is why `Notifier`/`EventsServer`
-exist at all: without them, nothing outside the `grpc-server` process would know that a row changed
-except by polling (which `syncObjects`, `Reconciler`'s periodic full `List()`, still does as a
-fallback safety net — see `syncInterval` in
+process acting as a gRPC client** of the private API, decoupled from the write path through the
+changes outbox, event publisher, Kafka, and Watch paths described above. Without that path,
+nothing outside the `grpc-server` process would know that a row changed except by polling (which
+`syncObjects`, `Reconciler`'s periodic full `List()`, still does as a fallback safety net — see `syncInterval` in
 [`internal/controllers/reconciler.go`](https://github.com/osac-project/osac/blob/main/fulfillment-service/internal/controllers/reconciler.go),
-and the "`pg_notify` is a hint" note above).
+and the "Event delivery is a hint" note above).
 
 **The controller never touches Postgres directly.** `internal/controllers/` has no dependency on
 `internal/database`. Every interaction with fulfillment-service state — reading the object fresh
@@ -237,7 +258,7 @@ set hub/create CR → status catches up to the CR → no more diff).
 ### Hub selection
 
 A "hub" is a target Kubernetes cluster the CR gets created on (see `Hub`/`HubSpec` in
-[`proto/private/osac/private/v1/hub_type.proto`](https://github.com/osac-project/osac/blob/main/fulfillment-service/proto/private/osac/private/v1/hub_type.proto));
+[`proto/private/osac/private/v1/hub_type.proto`](https://github.com/osac-project/osac/blob/main/proto/private/osac/private/v1/hub_type.proto));
 OSAC supports multiple hubs for workload placement. `task.selectHub`
 ([`internal/controllers/baremetalinstance/baremetalinstance_reconciler_function.go`](https://github.com/osac-project/osac/blob/main/fulfillment-service/internal/controllers/baremetalinstance/baremetalinstance_reconciler_function.go))
 implements the selection:

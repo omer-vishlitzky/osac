@@ -1,5 +1,24 @@
 # OpenShift dev environment -- instance values for osac chart.
 
+# --- Service Enablement ---
+global:
+  osacDeploymentId: "ci/osac"
+  fulfillmentTrust:
+    enabled: false
+  # Provider networking disabled: networking resources become READY without
+  # provider work. The osac chart renders the Netris Fabric Manager and
+  # cudn_evpn Kubernetes Manager registrations from fabricManager and
+  # k8sManager; no Netris connection settings are needed.
+  networking:
+    provisioningEnabled: false
+    fabricManager: netris
+    k8sManager: cudn_evpn
+  services:
+    caas:
+      enabled: true
+    vmaas:
+      enabled: true
+
 # --- Operator ---
 operator:
   image:
@@ -15,10 +34,11 @@ operator:
     templatePrefix: "osac"
   fulfillment:
     serverAddress: "fulfillment-internal-api:8001"
-    tokenFile: "/var/run/secrets/kubernetes.io/serviceaccount/token"
+    credentials:
+      secretName: fulfillment-controller-credentials
+      clientIdKey: client-id
+      clientSecretKey: client-secret
   controllers:
-    clusterOrder: true
-    computeInstance: true
     tenant: true
     networking: true
 
@@ -28,8 +48,14 @@ service:
   externalHostname: ""  # Set dynamically by make install-osac
   internalHostname: ""  # Set dynamically by make install-osac
   images:
-    service: ghcr.io/osac-project/fulfillment-service:latest
-    envoy: ghcr.io/osac-project/envoy:v1.33.0
+    service:
+      repository: ghcr.io/osac-project/fulfillment-service
+      tag: latest
+      pullPolicy: Always
+    envoy:
+      repository: ghcr.io/osac-project/envoy
+      tag: v1.33.0
+      pullPolicy: IfNotPresent
   certs:
     issuerRef:
       kind: ClusterIssuer
@@ -37,11 +63,10 @@ service:
     caBundle:
       configMap: ca-bundle
   auth:
-    issuerUrl: https://keycloak.keycloak.svc.cluster.local/realms/osac
+    issuerUrl: "https://keycloak-keycloak.{{ .Values.global.clusterDomain }}/realms/osac"
+
     emergencyServiceAccounts:
     - admin
-    - osac-operator
-    - osac-operator-controller-manager
     - template-publisher
     - osac-metering
     controllerCredentials:
@@ -81,6 +106,27 @@ service:
           param: sslrootcert
   log:
     level: info
+  vault:
+    namespace: osac
+    kvMountPath: secret
+    lifecycleRole: lifecycle
+    lifecycleMountPath: jwt
+    keycloakClientId: osac-controller
+    keycloakIssuerUrl: https://keycloak.keycloak.svc.cluster.local/realms/osac
+    keycloakAudience: osac-api
+    caBundle:
+      configMap: ca-bundle
+    credentials:
+    - secret:
+        name: fulfillment-controller-credentials
+        items:
+        - key: client-secret
+          param: client-secret
+
+# --- BMF installation API issuer (matches service.auth.issuerUrl) ---
+bmf:
+  secretAPI:
+    issuerUrl: "https://keycloak-keycloak.{{ .Values.global.clusterDomain }}/realms/osac"
 
 # --- UI ---
 ui:
@@ -93,6 +139,7 @@ ui:
         caBundle:
           configMap: ca-bundle
   auth:
+    oidcIssuerURL: https://keycloak.keycloak.svc.cluster.local/realms/osac
     certs:
       caBundle:
         configMap: ca-bundle
@@ -111,8 +158,6 @@ aap:
     clusterFulfillment:
       enabled: true
       config:
-        NETWORK_CLASS: "esi"
-        NETWORK_STEPS_COLLECTION: "osac.steps"
         EXTERNAL_ACCESS_BASE_DOMAIN: "box.massopen.cloud"
         EXTERNAL_ACCESS_SUPPORTED_BASE_DOMAINS: "box.massopen.cloud"
         EXTERNAL_ACCESS_API_INTERNAL_NETWORK: "hypershift"
@@ -121,12 +166,7 @@ aap:
         HOSTED_CLUSTER_INFRASTRUCTURE_AVAILABILITY_POLICY: "HighlyAvailable"
     networkFulfillment:
       enabled: true
-      config:
-        NETRIS_CONTROLLER_URL: "https://redhat-ctl.netris.io"
-        NETRIS_USERNAME: "netris"
-        NETRIS_SITE_ID: "5"
-        NETRIS_TENANT_ID: "1"
-        NETRIS_TENANT_NAME: "Admin"
+      config: {}
 
 # --- Validation ---
 validation:
@@ -141,3 +181,6 @@ clusterVersions:
   - version: "4.22.0"
     image: "quay.io/openshift-release-dev/ocp-release:4.22.0-multi"
     default: true
+    diskImage:
+      name: rhcos-4-22
+      sourceRef: oci://quay.io/osac-project/rhcos:4.22.0

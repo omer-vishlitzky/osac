@@ -1,0 +1,112 @@
+//
+// Copyright (c) 2025 Red Hat, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with
+// the License. You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on
+// an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the
+// specific language governing permissions and limitations under the License.
+//
+
+syntax = "proto3";
+
+package osac.public.v1;
+
+import "buf/validate/validate.proto";
+
+// Defines a single firewall rule for network traffic filtering.
+//
+// SecurityRule specifies which traffic to allow based on protocol, port ranges (for TCP/UDP), and source/
+// destination CIDR blocks. Rules are stateful - return traffic for established connections is automatically
+// allowed.
+//
+// TCP and UDP rules require a port range; ICMP and ALL rules must not set ports. Rules support canonical IPv4 CIDRs
+// only.
+message SecurityRule {
+  option (buf.validate.message).cel = {
+    id: "protocol_required"
+    message: "protocol is required"
+    expression: "this.protocol != 0"
+  };
+  option (buf.validate.message).cel = {
+    id: "ports_tcp_udp"
+    message: "tcp and udp rules require port_from and port_to from 1 to 65535 with port_from <= port_to; icmp and all rules must not set ports"
+    expression: "(this.protocol == 1 || this.protocol == 2) ? (has(this.port_from) && has(this.port_to) && this.port_from >= 1 && this.port_to <= 65535 && this.port_from <= this.port_to) : (!has(this.port_from) && !has(this.port_to))"
+  };
+
+  // Protocol to match for this rule.
+  //
+  // Use PROTOCOL_ALL to match all protocols (wildcard). Use PROTOCOL_TCP or PROTOCOL_UDP when port ranges
+  // are needed. Use PROTOCOL_ICMP for ping and other ICMP traffic where the deployment's network managers
+  // support it; otherwise it is rejected and PROTOCOL_ALL, which includes ICMP, is the alternative.
+  Protocol protocol = 1;
+
+  // Starting port number for the rule (1-65535).
+  //
+  // Required for tcp/udp protocols and not allowed for icmp/all. For a single port, set port_from = port_to.
+  // Must be <= port_to.
+  //
+  // Example: 22 (SSH), 80 (HTTP), 443 (HTTPS), 3306 (MySQL)
+  optional int32 port_from = 2;
+
+  // Ending port number for the rule (1-65535).
+  //
+  // Required for tcp/udp protocols and not allowed for icmp/all. Must be >= port_from. For a single port, set
+  // port_from = port_to.
+  //
+  // Example: 22 (single port), 8000 (range 8000-9000)
+  optional int32 port_to = 3;
+
+  // IPv4 CIDR block for source (ingress) or destination (egress) addresses.
+  //
+  // Must be a canonical IPv4 CIDR with no host bits set. Use '0.0.0.0/0' to match all IPv4 addresses.
+  //
+  // Example: '192.168.1.0/24', '10.0.0.0/8', '0.0.0.0/0' (all IPv4)
+  optional string ipv4_cidr = 4 [
+    (buf.validate.field).required = true,
+    (buf.validate.field).string.min_len = 1,
+    (buf.validate.field).cel = {
+      id: "canonical_ipv4_cidr"
+      message: "must be a canonical IPv4 CIDR"
+      expression: "this.isIpPrefix(4, true)"
+    }
+  ];
+
+  // Reserved field numbers for removed fields (do not reuse).
+  reserved 5;
+  reserved "ipv6_cidr";
+}
+
+// Network protocol types for SecurityRule matching.
+//
+// Determines which layer 4 protocol the rule applies to. Protocol affects whether port range fields are
+// required (TCP/UDP) or not allowed (ICMP/ALL).
+enum Protocol {
+  // Unknown protocol (invalid). This should never be used in actual rules.
+  PROTOCOL_UNSPECIFIED = 0;
+
+  // TCP protocol. Port ranges (port_from, port_to) are required for TCP rules.
+  //
+  // Used for connection-oriented protocols like HTTP, HTTPS, SSH, database connections, etc.
+  PROTOCOL_TCP = 1;
+
+  // UDP protocol. Port ranges (port_from, port_to) are required for UDP rules.
+  //
+  // Used for connectionless protocols like DNS, NTP, DHCP, VoIP, etc.
+  PROTOCOL_UDP = 2;
+
+  // ICMP protocol (ping and other control messages). Port ranges are not allowed.
+  //
+  // Used for network diagnostics (ping), error reporting, and control messages.
+  // Rejected on deployments whose network managers do not support it; PROTOCOL_ALL includes ICMP.
+  PROTOCOL_ICMP = 3;
+
+  // All protocols (wildcard). Port ranges are not allowed.
+  //
+  // Matches any protocol. Useful for allowing all traffic from a trusted CIDR block or for egress rules
+  // that permit all outbound traffic.
+  PROTOCOL_ALL = 4;
+}

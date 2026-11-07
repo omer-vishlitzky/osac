@@ -14,11 +14,9 @@
 
 name: Unit Tests
 
-on:
-  pull_request:
-    branches:
-    - main
-  merge_group:
+# The pull request and merge queue runs of the unit tests are legs of the matrix in ci.yml (see .github/ci-tests.yml and
+# tests.yml). This workflow runs EVERY unit leg on a schedule, by hand and from the nightly build.
+on:  # yamllint disable-line rule:truthy
   workflow_dispatch:
   # 2x/day (every 12h). Offset 13 minutes past the hour, not on the hour --
   # GitHub Actions' shared cron scheduler queues everyone's on-the-hour
@@ -30,109 +28,56 @@ on:
     - cron: '13 */12 * * *'
   # Invoked as a parallel "box" by nightly-build.yaml.
   workflow_call:
+    # Flake detection passes a fixed commit and a label appended to saved log names.
+    # Empty defaults keep other callers' checkout and log names unchanged.
+    inputs:
+      commit:
+        description: Commit to check out; empty uses the triggering commit
+        type: string
+        default: ""
+      artifact_suffix:
+        description: Suffix for diagnostic artifacts when repeating tests
+        type: string
+        default: ""
 
 permissions:
   contents: read
 
 jobs:
-
-  changes:
+  plan:
+    name: Plan
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      pull-requests: read
     outputs:
-      # Same ignore list for pull_request and merge_group. schedule /
-      # workflow_dispatch always run. Job-level `if:` skip reports success
-      # so docs-only PRs (and merge groups) are not blocked.
-      should-run: ${{ (github.event_name != 'pull_request' && github.event_name != 'merge_group') || steps.filter.outputs.code == 'true' }}
+      tests: ${{ steps.legs.outputs.tests }}
     steps:
-      # dorny/paths-filter uses git diff on merge_group (not the PR Files API),
-      # so the repo must be checked out with enough history for base..head.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-        if: github.event_name == 'merge_group'
         with:
-          fetch-depth: 0
+          ref: ${{ inputs.commit }}
+          sparse-checkout: .github/ci-tests.yml
           persist-credentials: false
-      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d  # v4.0.3
-        if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
-        id: filter
-        with:
-          predicate-quantifier: 'every'
-          filters: |
-            code:
-              - '**'
-              - '!**/OWNERS'
-              - '!**/LICENSE'
-              - '!**/*.md'
-              - '!**/docs/**'
-              - '!**/.claude/**'
-              - '!**/.cursor/**'
-              - '!**/.gemini/**'
-              - '!.design/**'
-              - '!.skillsaw.yaml'
-              - '!.pre-commit-config.yaml'
+      - name: Every unit leg
+        id: legs
+        run: |
+          set -euo pipefail
+          tests=$(yq -o=json -I=0 '.' .github/ci-tests.yml | jq -c '[ .[] | select(.group == "unit") ]')
+          echo "tests=${tests}" >> "$GITHUB_OUTPUT"
 
-  run-unit-tests:
-    name: Run unit tests
-    needs: changes
-    if: needs.changes.outputs.should-run == 'true'
-    runs-on: ubuntu-latest
-    steps:
-    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-      with:
-        persist-credentials: false
-    - uses: ./.github/actions/setup-go
-      with:
-        working-directory: fulfillment-service
-    - working-directory: fulfillment-service
-      run: |
-        ginkgo run --timeout 1h -r internal
-
-  run-osac-metering-tests:
-    name: Run unit tests (osac-metering)
-    needs: changes
-    if: needs.changes.outputs.should-run == 'true'
-    runs-on: ubuntu-latest
-    steps:
-    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-      with:
-        persist-credentials: false
-    - uses: ./.github/actions/setup-go
-      with:
-        working-directory: osac-metering/metering-service
-    - working-directory: osac-metering/metering-service
-      run: |
-        ginkgo run -r internal
-
-  run-osac-metering-adapters-tests:
-    name: Run unit tests (osac-metering/adapters)
-    needs: changes
-    if: needs.changes.outputs.should-run == 'true'
-    runs-on: ubuntu-latest
-    steps:
-    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-      with:
-        persist-credentials: false
-    - uses: ./.github/actions/setup-go
-      with:
-        working-directory: osac-metering/adapters
-    - working-directory: osac-metering/adapters
-      run: |
-        ginkgo run -r .
-
-  run-osac-metering-schema-tests:
-    name: Run unit tests (osac-metering/schema)
-    needs: changes
-    if: needs.changes.outputs.should-run == 'true'
-    runs-on: ubuntu-latest
-    steps:
-    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-      with:
-        persist-credentials: false
-    - uses: ./.github/actions/setup-go
-      with:
-        working-directory: osac-metering/schema
-    - working-directory: osac-metering/schema
-      run: |
-        ginkgo run -r .
+  tests:
+    name: ${{ matrix.id }}
+    needs: plan
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.tests) }}
+    permissions:
+      contents: read
+    uses: ./.github/workflows/tests.yml
+    with:
+      commit: ${{ inputs.commit || '' }}
+      kind: ${{ matrix.kind }}
+      dir: ${{ matrix.dir || '' }}
+      cmd: ${{ matrix.cmd || '' }}
+      timeout: ${{ matrix.timeout || 360 }}
+      artifact_suffix: ${{ inputs.artifact_suffix || '' }}

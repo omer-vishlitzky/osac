@@ -22,15 +22,13 @@ import (
 	grpccodes "google.golang.org/grpc/codes"
 	grpcstatus "google.golang.org/grpc/status"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
-	publicv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/public/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
-	"github.com/osac-project/osac/fulfillment-service/internal/events"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
 
 type ComputeInstanceTemplatesServerBuilder struct {
 	logger            *slog.Logger
-	notifier          events.Notifier
 	attributionLogic  auth.AttributionLogic
 	tenancyLogic      auth.TenancyLogic
 	metricsRegisterer prometheus.Registerer
@@ -54,12 +52,6 @@ func NewComputeInstanceTemplatesServer() *ComputeInstanceTemplatesServerBuilder 
 // SetLogger sets the logger to use. This is mandatory.
 func (b *ComputeInstanceTemplatesServerBuilder) SetLogger(value *slog.Logger) *ComputeInstanceTemplatesServerBuilder {
 	b.logger = value
-	return b
-}
-
-// SetNotifier sets the notifier to use. This is optional.
-func (b *ComputeInstanceTemplatesServerBuilder) SetNotifier(value events.Notifier) *ComputeInstanceTemplatesServerBuilder {
-	b.notifier = value
 	return b
 }
 
@@ -112,7 +104,6 @@ func (b *ComputeInstanceTemplatesServerBuilder) Build() (result *ComputeInstance
 	// Create the private server to delegate to:
 	delegate, err := NewPrivateComputeInstanceTemplatesServer().
 		SetLogger(b.logger).
-		SetNotifier(b.notifier).
 		SetAttributionLogic(b.attributionLogic).
 		SetTenancyLogic(b.tenancyLogic).
 		SetMetricsRegisterer(b.metricsRegisterer).
@@ -220,7 +211,7 @@ func (s *ComputeInstanceTemplatesServer) Create(ctx context.Context,
 			"Failed to map public compute instance template to private",
 			slog.Any("error", err),
 		)
-		err = grpcstatus.Errorf(grpccodes.Internal, "failed to process compute instance template")
+		err = publicInputMappingError(err, "failed to process compute instance template")
 		return
 	}
 
@@ -255,6 +246,11 @@ func (s *ComputeInstanceTemplatesServer) Create(ctx context.Context,
 
 func (s *ComputeInstanceTemplatesServer) Update(ctx context.Context,
 	request *publicv1.ComputeInstanceTemplatesUpdateRequest) (response *publicv1.ComputeInstanceTemplatesUpdateResponse, err error) {
+	ctx = withPublicAPIView(ctx)
+	if err := validatePublicObjectMetadata(request.GetObject()); err != nil {
+		return nil, err
+	}
+
 	// Validate the request:
 	publicComputeInstanceTemplate := request.GetObject()
 	if publicComputeInstanceTemplate == nil {
@@ -284,7 +280,7 @@ func (s *ComputeInstanceTemplatesServer) Update(ctx context.Context,
 			"Failed to map public compute instance template to private",
 			slog.Any("error", err),
 		)
-		err = grpcstatus.Errorf(grpccodes.Internal, "failed to process compute instance template")
+		err = publicInputMappingError(err, "failed to process compute instance template")
 		return
 	}
 

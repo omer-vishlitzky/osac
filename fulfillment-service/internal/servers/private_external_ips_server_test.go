@@ -16,17 +16,21 @@ package servers
 import (
 	"context"
 	"fmt"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"google.golang.org/grpc"
 	grpccodes "google.golang.org/grpc/codes"
 	grpcstatus "google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
 	"github.com/osac-project/osac/fulfillment-service/internal/database/dao"
+	"github.com/osac-project/osac/fulfillment-service/internal/references"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
 var _ = Describe("Private external IPs server", func() {
@@ -93,7 +97,8 @@ var _ = Describe("Private external IPs server", func() {
 		object := resp.GetObject()
 
 		object.SetStatus(privatev1.ExternalIPStatus_builder{
-			State: state,
+			State:               state,
+			StateTransitionTime: timestamppb.Now(),
 		}.Build())
 		daoResp, err := externalIPDao.Update().SetObject(object).Do(ctx)
 		Expect(err).ToNot(HaveOccurred())
@@ -168,6 +173,47 @@ var _ = Describe("Private external IPs server", func() {
 				Equal(privatev1.ExternalIPState_EXTERNAL_IP_STATE_PENDING))
 		})
 
+		It("creates ExternalIP from a pool referenced by name through the reference interceptor", func() {
+			validator, err := references.NewReferenceValidator().SetLogger(logger).Build()
+			Expect(err).ToNot(HaveOccurred())
+			references.RegisterDAOLookup(validator, "osac.private.v1.ExternalIPPoolReference", externalIPPoolDao)
+			request := privatev1.ExternalIPsCreateRequest_builder{
+				Object: privatev1.ExternalIP_builder{
+					Metadata: privatev1.Metadata_builder{Name: "by-name-eip"}.Build(),
+					Spec:     privatev1.ExternalIPSpec_builder{Pool: privatev1.ExternalIPPoolReference_builder{Name: "test-pool"}.Build()}.Build(),
+				}.Build(),
+			}.Build()
+
+			response, err := validator.UnaryServer(ctx, request, &grpc.UnaryServerInfo{FullMethod: privatev1.ExternalIPs_Create_FullMethodName}, func(callCtx context.Context, message any) (any, error) {
+				return externalIPsServer.Create(callCtx, message.(*privatev1.ExternalIPsCreateRequest))
+			})
+			Expect(err).ToNot(HaveOccurred())
+
+			pool := response.(*privatev1.ExternalIPsCreateResponse).GetObject().GetSpec().GetPool()
+			Expect(pool.GetName()).To(Equal("test-pool"))
+			Expect(pool.GetId()).To(Equal(poolID))
+			poolResponse, err := externalIPPoolDao.Get().SetId(poolID).Do(ctx)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(poolResponse.GetObject().GetStatus().GetAllocated()).To(Equal(int64(1)))
+			Expect(poolResponse.GetObject().GetStatus().GetAvailable()).To(Equal(int64(99)))
+		})
+
+		It("rejects caller-supplied output status on Create", func() {
+			_, err := externalIPsServer.Create(ctx, privatev1.ExternalIPsCreateRequest_builder{
+				Object: privatev1.ExternalIP_builder{
+					Metadata: privatev1.Metadata_builder{Name: "output-on-create", Tenant: testTenant}.Build(),
+					Spec:     privatev1.ExternalIPSpec_builder{Pool: privatev1.ExternalIPPoolReference_builder{Id: poolID}.Build()}.Build(),
+					Status: privatev1.ExternalIPStatus_builder{
+						Attached: true,
+						Address:  "198.51.100.10",
+						Pool:     poolID,
+						Hub:      "hub-1",
+					}.Build(),
+				}.Build(),
+			}.Build())
+			Expect(grpcstatus.Code(err)).To(Equal(grpccodes.InvalidArgument))
+		})
+
 		It("retrieves ExternalIP by ID", func() {
 			createResponse, err := externalIPsServer.Create(ctx, privatev1.ExternalIPsCreateRequest_builder{
 				Object: privatev1.ExternalIP_builder{
@@ -216,8 +262,10 @@ var _ = Describe("Private external IPs server", func() {
 			object := createResponse.GetObject()
 
 			object.GetStatus().SetState(privatev1.ExternalIPState_EXTERNAL_IP_STATE_ALLOCATED)
+			object.GetStatus().SetStateTransitionTime(timestamppb.Now())
 			updateResponse, err := externalIPsServer.Update(ctx, privatev1.ExternalIPsUpdateRequest_builder{
-				Object: object,
+				Object:     object,
+				UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"status.state", "status.state_transition_time"}},
 			}.Build())
 			Expect(err).ToNot(HaveOccurred())
 			object = updateResponse.GetObject()
@@ -366,8 +414,10 @@ var _ = Describe("Private external IPs server", func() {
 			object := createResponse.GetObject()
 
 			object.GetStatus().SetState(privatev1.ExternalIPState_EXTERNAL_IP_STATE_ALLOCATED)
+			object.GetStatus().SetStateTransitionTime(timestamppb.Now())
 			_, err = externalIPsServer.Update(ctx, privatev1.ExternalIPsUpdateRequest_builder{
-				Object: object,
+				Object:     object,
+				UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"status.state", "status.state_transition_time"}},
 			}.Build())
 			Expect(err).ToNot(HaveOccurred())
 
@@ -397,18 +447,33 @@ var _ = Describe("Private external IPs server", func() {
 			Expect(err).ToNot(HaveOccurred())
 		})
 
+		It("rejects an update without an explicit mask", func() {
+			object := createExternalIPInState(externalIPsServer, privatev1.ExternalIPState_EXTERNAL_IP_STATE_ALLOCATED)
+			_, err := externalIPsServer.Update(ctx, privatev1.ExternalIPsUpdateRequest_builder{
+				Object: object,
+			}.Build())
+			Expect(grpcstatus.Code(err)).To(Equal(grpccodes.InvalidArgument))
+		})
+
 		setStateOnObject := func(object *privatev1.ExternalIP, state privatev1.ExternalIPState) {
 			if object.GetStatus() == nil {
-				object.SetStatus(privatev1.ExternalIPStatus_builder{State: state}.Build())
-			} else {
-				object.GetStatus().SetState(state)
+				object.SetStatus(privatev1.ExternalIPStatus_builder{
+					State:               state,
+					StateTransitionTime: timestamppb.Now(),
+				}.Build())
+				return
 			}
+			if object.GetStatus().GetState() != state || object.GetStatus().GetStateTransitionTime() == nil {
+				object.GetStatus().SetStateTransitionTime(timestamppb.Now())
+			}
+			object.GetStatus().SetState(state)
 		}
 
 		transitionTo := func(object *privatev1.ExternalIP, state privatev1.ExternalIPState) *privatev1.ExternalIP {
 			setStateOnObject(object, state)
 			resp, err := externalIPsServer.Update(ctx, privatev1.ExternalIPsUpdateRequest_builder{
-				Object: object,
+				Object:     object,
+				UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"status.state", "status.state_transition_time"}},
 			}.Build())
 			Expect(err).ToNot(HaveOccurred())
 			return resp.GetObject()
@@ -448,7 +513,8 @@ var _ = Describe("Private external IPs server", func() {
 			object := createExternalIPInState(externalIPsServer, privatev1.ExternalIPState_EXTERNAL_IP_STATE_FAILED)
 			setStateOnObject(object, privatev1.ExternalIPState_EXTERNAL_IP_STATE_PENDING)
 			_, err := externalIPsServer.Update(ctx, privatev1.ExternalIPsUpdateRequest_builder{
-				Object: object,
+				Object:     object,
+				UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"status.state", "status.state_transition_time"}},
 			}.Build())
 			Expect(err).To(HaveOccurred())
 			status, ok := grpcstatus.FromError(err)
@@ -457,16 +523,24 @@ var _ = Describe("Private external IPs server", func() {
 			Expect(err.Error()).To(ContainSubstring("invalid state transition"))
 		})
 
-		It("rejects PENDING to DELETING transition", func() {
+		It("accepts PENDING to DELETING transition", func() {
 			object := createExternalIPInState(externalIPsServer, privatev1.ExternalIPState_EXTERNAL_IP_STATE_PENDING)
 			setStateOnObject(object, privatev1.ExternalIPState_EXTERNAL_IP_STATE_DELETING)
 			_, err := externalIPsServer.Update(ctx, privatev1.ExternalIPsUpdateRequest_builder{
-				Object: object,
+				Object:     object,
+				UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"status.state", "status.state_transition_time"}},
 			}.Build())
-			Expect(err).To(HaveOccurred())
-			status, ok := grpcstatus.FromError(err)
-			Expect(ok).To(BeTrue())
-			Expect(status.Code()).To(Equal(grpccodes.FailedPrecondition))
+			Expect(err).ToNot(HaveOccurred())
+		})
+
+		It("accepts FAILED to DELETING transition", func() {
+			object := createExternalIPInState(externalIPsServer, privatev1.ExternalIPState_EXTERNAL_IP_STATE_FAILED)
+			setStateOnObject(object, privatev1.ExternalIPState_EXTERNAL_IP_STATE_DELETING)
+			_, err := externalIPsServer.Update(ctx, privatev1.ExternalIPsUpdateRequest_builder{
+				Object:     object,
+				UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"status.state", "status.state_transition_time"}},
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
 		})
 
 		It("skips state validation when UpdateMask excludes status.state", func() {
@@ -481,6 +555,49 @@ var _ = Describe("Private external IPs server", func() {
 			}.Build())
 			Expect(err).To(HaveOccurred())
 			Expect(err.Error()).To(ContainSubstring("immutable"))
+		})
+
+		It("allows trusted lifecycle updates to status.hub", func() {
+			object := createExternalIPInState(externalIPsServer, privatev1.ExternalIPState_EXTERNAL_IP_STATE_ALLOCATED)
+			object.GetStatus().SetHub("hub-1")
+			response, err := externalIPsServer.Update(ctx, privatev1.ExternalIPsUpdateRequest_builder{
+				Object: object,
+				UpdateMask: &fieldmaskpb.FieldMask{
+					Paths: []string{"status.hub"},
+				},
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+			Expect(response.GetObject().GetStatus().GetHub()).To(Equal("hub-1"))
+		})
+
+		DescribeTable("rejects output-only status fields in an update mask",
+			func(path string) {
+				object := createExternalIPInState(externalIPsServer, privatev1.ExternalIPState_EXTERNAL_IP_STATE_ALLOCATED)
+				_, err := externalIPsServer.Update(ctx, privatev1.ExternalIPsUpdateRequest_builder{
+					Object: object,
+					UpdateMask: &fieldmaskpb.FieldMask{
+						Paths: []string{path},
+					},
+				}.Build())
+				Expect(err).To(HaveOccurred())
+				status, ok := grpcstatus.FromError(err)
+				Expect(ok).To(BeTrue())
+				Expect(status.Code()).To(Equal(grpccodes.InvalidArgument))
+			},
+			Entry("attribution", "status.attribution"),
+			Entry("attached", "status.attached"),
+			Entry("pool", "status.pool"),
+			Entry("attachment transition time", "status.attachment_transition_time"),
+		)
+
+		It("allows an explicit authoritative state transition time", func() {
+			object := createExternalIPInState(externalIPsServer, privatev1.ExternalIPState_EXTERNAL_IP_STATE_ALLOCATED)
+			object.GetStatus().SetStateTransitionTime(timestamppb.Now())
+			_, err := externalIPsServer.Update(ctx, privatev1.ExternalIPsUpdateRequest_builder{
+				Object:     object,
+				UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"status.state_transition_time"}},
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
 		})
 	})
 
@@ -505,16 +622,228 @@ var _ = Describe("Private external IPs server", func() {
 			Expect(err).ToNot(HaveOccurred())
 		})
 
-		It("rejects Delete when state is PENDING", func() {
+		It("allows Delete when state is PENDING", func() {
 			object := createExternalIPInState(externalIPsServer, privatev1.ExternalIPState_EXTERNAL_IP_STATE_PENDING)
 			_, err := externalIPsServer.Delete(ctx, privatev1.ExternalIPsDeleteRequest_builder{
 				Id: object.GetId(),
 			}.Build())
-			Expect(err).To(HaveOccurred())
-			status, ok := grpcstatus.FromError(err)
-			Expect(ok).To(BeTrue())
-			Expect(status.Code()).To(Equal(grpccodes.FailedPrecondition))
-			Expect(err.Error()).To(ContainSubstring("must be in ALLOCATED state"))
+			Expect(err).ToNot(HaveOccurred())
+		})
+
+		It("allows Delete when state is FAILED", func() {
+			object := createExternalIPInState(externalIPsServer, privatev1.ExternalIPState_EXTERNAL_IP_STATE_FAILED)
+			_, err := externalIPsServer.Delete(ctx, privatev1.ExternalIPsDeleteRequest_builder{
+				Id: object.GetId(),
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+		})
+
+		It("blocks deletion while a deleting NATGateway still references the ExternalIP", func() {
+			object := createExternalIPInState(externalIPsServer, privatev1.ExternalIPState_EXTERNAL_IP_STATE_ALLOCATED)
+			natGateway, err := externalIPsServer.lifecycle.natGatewayDao.Create().SetObject(privatev1.NATGateway_builder{
+				Metadata: privatev1.Metadata_builder{
+					Tenant: testTenant, Name: "nat-with-deleting-eip-ref", Finalizers: []string{"test-cleanup"},
+				}.Build(),
+				Spec: privatev1.NATGatewaySpec_builder{
+					VirtualNetwork: privatev1.VirtualNetworkLocalReference_builder{Id: "virtual-network-id"}.Build(),
+					ExternalIp:     privatev1.ExternalIPLocalReference_builder{Id: object.GetId()}.Build(),
+				}.Build(),
+			}.Build()).Do(ctx)
+			Expect(err).ToNot(HaveOccurred())
+			_, err = externalIPsServer.lifecycle.natGatewayDao.Delete().SetId(natGateway.GetObject().GetId()).Do(ctx)
+			Expect(err).ToNot(HaveOccurred())
+
+			_, err = externalIPsServer.Delete(ctx, privatev1.ExternalIPsDeleteRequest_builder{Id: object.GetId()}.Build())
+			Expect(grpcstatus.Code(err)).To(Equal(grpccodes.FailedPrecondition))
+			Expect(err.Error()).To(ContainSubstring("NATGateway"))
+		})
+
+		It("blocks deletion while a deleting ExternalIPAttachment still references the ExternalIP", func() {
+			object := createExternalIPInState(externalIPsServer, privatev1.ExternalIPState_EXTERNAL_IP_STATE_ALLOCATED)
+			computeInstanceDao, err := dao.NewGenericDAO[*privatev1.ComputeInstance]().
+				SetLogger(logger).SetTenancyLogic(tenancy).Build()
+			Expect(err).ToNot(HaveOccurred())
+			computeInstance := createComputeInstanceInState(ctx, computeInstanceDao,
+				privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_STARTING)
+			attachment, err := externalIPsServer.lifecycle.externalIPAttachmentDao.Create().SetObject(
+				privatev1.ExternalIPAttachment_builder{
+					Metadata: privatev1.Metadata_builder{
+						Tenant: testTenant, Name: "attachment-with-deleting-eip-ref", Finalizers: []string{"test-cleanup"},
+					}.Build(),
+					Spec: privatev1.ExternalIPAttachmentSpec_builder{
+						ExternalIp:      privatev1.ExternalIPLocalReference_builder{Id: object.GetId()}.Build(),
+						ComputeInstance: privatev1.ComputeInstanceLocalReference_builder{Id: computeInstance.GetId()}.Build(),
+					}.Build(),
+				}.Build()).Do(ctx)
+			Expect(err).ToNot(HaveOccurred())
+			_, err = externalIPsServer.lifecycle.externalIPAttachmentDao.Delete().SetId(attachment.GetObject().GetId()).Do(ctx)
+			Expect(err).ToNot(HaveOccurred())
+
+			_, err = externalIPsServer.Delete(ctx, privatev1.ExternalIPsDeleteRequest_builder{Id: object.GetId()}.Build())
+			Expect(grpcstatus.Code(err)).To(Equal(grpccodes.FailedPrecondition))
+			Expect(err.Error()).To(ContainSubstring("ExternalIPAttachment"))
+		})
+
+		It("preserves the deletion boundary and releases capacity once", func() {
+			object := createExternalIPInState(externalIPsServer, privatev1.ExternalIPState_EXTERNAL_IP_STATE_PENDING)
+			poolID := object.GetSpec().GetPool().GetId()
+			object.GetMetadata().SetFinalizers([]string{"cleanup"})
+			_, err := externalIPDao.Update().SetObject(object).Do(ctx)
+			Expect(err).ToNot(HaveOccurred())
+
+			_, err = externalIPsServer.Delete(ctx, privatev1.ExternalIPsDeleteRequest_builder{Id: object.GetId()}.Build())
+			Expect(err).ToNot(HaveOccurred())
+			first, err := externalIPDao.Get().SetId(object.GetId()).Do(ctx)
+			Expect(err).ToNot(HaveOccurred())
+			firstDeletion := first.GetObject().GetMetadata().GetDeletionTimestamp()
+			Expect(firstDeletion).ToNot(BeNil())
+
+			_, err = externalIPsServer.Delete(ctx, privatev1.ExternalIPsDeleteRequest_builder{Id: object.GetId()}.Build())
+			Expect(err).ToNot(HaveOccurred())
+			second, err := externalIPDao.Get().SetId(object.GetId()).Do(ctx)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(proto.Equal(firstDeletion, second.GetObject().GetMetadata().GetDeletionTimestamp())).To(BeTrue())
+			pool, err := externalIPPoolDao.Get().SetId(poolID).Do(ctx)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(pool.GetObject().GetStatus().GetAllocated()).To(Equal(int64(1)))
+			Expect(pool.GetObject().GetStatus().GetAvailable()).To(Equal(int64(99)))
+
+			second.GetObject().GetMetadata().SetFinalizers(nil)
+			_, err = externalIPDao.Update().SetObject(second.GetObject()).Do(ctx)
+			Expect(err).ToNot(HaveOccurred())
+			pool, err = externalIPPoolDao.Get().SetId(poolID).Do(ctx)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(pool.GetObject().GetStatus().GetAllocated()).To(Equal(int64(0)))
+			Expect(pool.GetObject().GetStatus().GetAvailable()).To(Equal(int64(100)))
+		})
+
+		It("marks the ExternalIP DELETING at the accept time and keeps that time", func() {
+			object := createExternalIPInState(externalIPsServer, privatev1.ExternalIPState_EXTERNAL_IP_STATE_ALLOCATED)
+			object.GetMetadata().SetFinalizers([]string{"cleanup"})
+			object.GetStatus().SetMessage("allocated")
+			_, err := externalIPDao.Update().SetObject(object).Do(ctx)
+			Expect(err).ToNot(HaveOccurred())
+			stored, err := externalIPDao.Get().SetId(object.GetId()).Do(ctx)
+			Expect(err).ToNot(HaveOccurred())
+			allocatedAt := stored.GetObject().GetStatus().GetStateTransitionTime().AsTime()
+
+			before := time.Now()
+			_, err = externalIPsServer.Delete(ctx, privatev1.ExternalIPsDeleteRequest_builder{Id: object.GetId()}.Build())
+			Expect(err).ToNot(HaveOccurred())
+			after := time.Now()
+
+			first, err := externalIPDao.Get().SetId(object.GetId()).Do(ctx)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(first.GetObject().GetMetadata().GetDeletionTimestamp()).ToNot(BeNil())
+			Expect(first.GetObject().GetStatus().GetState()).To(Equal(privatev1.ExternalIPState_EXTERNAL_IP_STATE_DELETING))
+			Expect(first.GetObject().GetStatus().GetMessage()).To(BeEmpty())
+			// DELETING is dated at the accept time: not the allocation time and not a later feedback time. The
+			// meter bills through DELETING until the physical deletion. The stored time has second precision.
+			deletingAt := first.GetObject().GetStatus().GetStateTransitionTime().AsTime()
+			Expect(deletingAt).To(BeTemporally(">=", allocatedAt))
+			Expect(deletingAt).To(BeTemporally(">=", before.Truncate(time.Second)))
+			Expect(deletingAt).To(BeTemporally("<=", after))
+
+			By("a repeated delete changes nothing")
+			_, err = externalIPsServer.Delete(ctx, privatev1.ExternalIPsDeleteRequest_builder{Id: object.GetId()}.Build())
+			Expect(err).ToNot(HaveOccurred())
+			second, err := externalIPDao.Get().SetId(object.GetId()).Do(ctx)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(proto.Equal(first.GetObject().GetStatus(), second.GetObject().GetStatus())).To(BeTrue())
+
+			By("later DELETING feedback does not move the time")
+			feedback := second.GetObject()
+			feedback.GetStatus().SetStateTransitionTime(timestamppb.New(deletingAt.Add(time.Hour)))
+			feedback.GetStatus().SetMessage("deleting in the provider")
+			_, err = externalIPDao.Update().SetObject(feedback).Do(ctx)
+			Expect(err).ToNot(HaveOccurred())
+			third, err := externalIPDao.Get().SetId(object.GetId()).Do(ctx)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(third.GetObject().GetStatus().GetState()).To(Equal(privatev1.ExternalIPState_EXTERNAL_IP_STATE_DELETING))
+			Expect(third.GetObject().GetStatus().GetStateTransitionTime().AsTime()).To(Equal(deletingAt))
+		})
+
+		It("leaves the state alone when a guard rejects the delete", func() {
+			object := createExternalIPInState(externalIPsServer, privatev1.ExternalIPState_EXTERNAL_IP_STATE_ALLOCATED)
+			natGateway, err := externalIPsServer.lifecycle.natGatewayDao.Create().SetObject(privatev1.NATGateway_builder{
+				Metadata: privatev1.Metadata_builder{Tenant: testTenant, Name: "nat-using-eip"}.Build(),
+				Spec: privatev1.NATGatewaySpec_builder{
+					VirtualNetwork: privatev1.VirtualNetworkLocalReference_builder{Id: "virtual-network-id"}.Build(),
+					ExternalIp:     privatev1.ExternalIPLocalReference_builder{Id: object.GetId()}.Build(),
+				}.Build(),
+			}.Build()).Do(ctx)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(natGateway.GetObject().GetId()).ToNot(BeEmpty())
+
+			_, err = externalIPsServer.Delete(ctx, privatev1.ExternalIPsDeleteRequest_builder{Id: object.GetId()}.Build())
+			Expect(grpcstatus.Code(err)).To(Equal(grpccodes.FailedPrecondition))
+			got, err := externalIPDao.Get().SetId(object.GetId()).Do(ctx)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(got.GetObject().GetMetadata().GetDeletionTimestamp()).To(BeNil())
+			Expect(got.GetObject().GetStatus().GetState()).To(Equal(privatev1.ExternalIPState_EXTERNAL_IP_STATE_ALLOCATED))
+			Expect(got.GetObject().GetStatus().GetStateTransitionTime().AsTime()).To(
+				BeTemporally("~", object.GetStatus().GetStateTransitionTime().AsTime(), time.Second))
+		})
+
+		Describe("the attachment cascade", func() {
+			// attachedExternalIP returns an ALLOCATED ExternalIP with a READY attachment to a ComputeInstance.
+			attachedExternalIP := func(finalizers []string) (*privatev1.ExternalIP, string) {
+				object := createExternalIPInState(externalIPsServer, privatev1.ExternalIPState_EXTERNAL_IP_STATE_ALLOCATED)
+				computeInstanceDao, err := dao.NewGenericDAO[*privatev1.ComputeInstance]().
+					SetLogger(logger).SetTenancyLogic(tenancy).Build()
+				Expect(err).ToNot(HaveOccurred())
+				computeInstance := createComputeInstanceInState(ctx, computeInstanceDao,
+					privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_STARTING)
+				attachment, err := externalIPsServer.lifecycle.externalIPAttachmentDao.Create().SetObject(
+					privatev1.ExternalIPAttachment_builder{
+						Metadata: privatev1.Metadata_builder{
+							Tenant: testTenant, Name: "cascade-attachment", Finalizers: finalizers,
+						}.Build(),
+						Spec: privatev1.ExternalIPAttachmentSpec_builder{
+							ExternalIp:      privatev1.ExternalIPLocalReference_builder{Id: object.GetId()}.Build(),
+							ComputeInstance: privatev1.ComputeInstanceLocalReference_builder{Id: computeInstance.GetId()}.Build(),
+						}.Build(),
+						Status: privatev1.ExternalIPAttachmentStatus_builder{
+							State:               privatev1.ExternalIPAttachmentState_EXTERNAL_IP_ATTACHMENT_STATE_READY,
+							StateTransitionTime: timestamppb.Now(),
+						}.Build(),
+					}.Build()).Do(ctx)
+				Expect(err).ToNot(HaveOccurred())
+				// A finalizer keeps the deleted ExternalIP readable.
+				object.GetMetadata().SetFinalizers([]string{"cleanup"})
+				object.GetStatus().SetAttached(true)
+				object.GetStatus().SetAttachmentTransitionTime(timestamppb.Now())
+				object.GetStatus().SetAttribution(privatev1.ExternalIPAttribution_builder{
+					ComputeInstance: privatev1.ComputeInstanceLocalReference_builder{Id: computeInstance.GetId()}.Build(),
+				}.Build())
+				_, err = externalIPDao.Update().SetObject(object).Do(ctx)
+				Expect(err).ToNot(HaveOccurred())
+				return object, attachment.GetObject().GetId()
+			}
+
+			It("marks the ExternalIP DELETING when the detached attachment leaves nothing to wait for", func() {
+				object, attachmentID := attachedExternalIP(nil)
+
+				Expect(externalIPsServer.lifecycle.deleteAttachmentAndExternalIP(ctx, attachmentID, object.GetId())).To(Succeed())
+
+				got, err := externalIPDao.Get().SetId(object.GetId()).Do(ctx)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(got.GetObject().GetMetadata().GetDeletionTimestamp()).ToNot(BeNil())
+				Expect(got.GetObject().GetStatus().GetState()).To(Equal(privatev1.ExternalIPState_EXTERNAL_IP_STATE_DELETING))
+				Expect(got.GetObject().GetStatus().GetAttached()).To(BeFalse())
+			})
+
+			It("leaves the ExternalIP ALLOCATED while the attachment still has a finalizer", func() {
+				object, attachmentID := attachedExternalIP([]string{"test-cleanup"})
+
+				Expect(externalIPsServer.lifecycle.deleteAttachmentAndExternalIP(ctx, attachmentID, object.GetId())).To(Succeed())
+
+				got, err := externalIPDao.Get().SetId(object.GetId()).Do(ctx)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(got.GetObject().GetMetadata().GetDeletionTimestamp()).To(BeNil())
+				Expect(got.GetObject().GetStatus().GetState()).To(Equal(privatev1.ExternalIPState_EXTERNAL_IP_STATE_ALLOCATED))
+				Expect(got.GetObject().GetStatus().GetAttached()).To(BeFalse())
+			})
 		})
 
 		It("blocks deletion of default-labeled ExternalIP", func() {
@@ -570,13 +899,128 @@ var _ = Describe("Private external IPs server", func() {
 
 			object.GetSpec().SetPool(privatev1.ExternalIPPoolReference_builder{Id: poolB}.Build())
 			_, err = externalIPsServer.Update(ctx, privatev1.ExternalIPsUpdateRequest_builder{
-				Object: object,
+				Object:     object,
+				UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"spec.pool"}},
 			}.Build())
 			Expect(err).To(HaveOccurred())
 			status, ok := grpcstatus.FromError(err)
 			Expect(ok).To(BeTrue())
 			Expect(status.Code()).To(Equal(grpccodes.InvalidArgument))
-			Expect(err.Error()).To(ContainSubstring("spec.pool' is immutable"))
+			Expect(err.Error()).To(ContainSubstring("spec is immutable"))
+		})
+
+		It("rejects moving a stored ExternalIP into a reserved tenant and preserves the stored object", func() {
+			pool := createReadyExternalIPPool(ctx, "tenant-immutable-pool", 100, 0)
+			createResponse, err := externalIPsServer.Create(ctx, privatev1.ExternalIPsCreateRequest_builder{
+				Object: privatev1.ExternalIP_builder{
+					Metadata: privatev1.Metadata_builder{Name: "tenant-immutable-eip", Tenant: testTenant}.Build(),
+					Spec:     privatev1.ExternalIPSpec_builder{Pool: privatev1.ExternalIPPoolReference_builder{Id: pool}.Build()}.Build(),
+				}.Build(),
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+			id := createResponse.GetObject().GetId()
+
+			_, err = externalIPsServer.Update(ctx, privatev1.ExternalIPsUpdateRequest_builder{
+				Object: privatev1.ExternalIP_builder{
+					Id:       id,
+					Metadata: privatev1.Metadata_builder{Tenant: auth.SharedTenant}.Build(),
+				}.Build(),
+				UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"metadata.tenant"}},
+			}.Build())
+			Expect(grpcstatus.Code(err)).To(Equal(grpccodes.PermissionDenied))
+			Expect(err.Error()).To(ContainSubstring("objects cannot be placed in the 'shared' tenant"))
+
+			stored, getErr := externalIPsServer.Get(ctx, privatev1.ExternalIPsGetRequest_builder{Id: id}.Build())
+			Expect(getErr).ToNot(HaveOccurred())
+			Expect(stored.GetObject().GetMetadata().GetTenant()).To(Equal(testTenant))
+			Expect(stored.GetObject().GetSpec().GetPool().GetId()).To(Equal(pool))
+		})
+	})
+
+	Describe("Tenant isolation", func() {
+		var externalIPsServer *PrivateExternalIPsServer
+
+		createPoolWithTenant := func(tenant string) string {
+			resp, err := externalIPPoolDao.Create().SetObject(
+				privatev1.ExternalIPPool_builder{
+					Metadata: privatev1.Metadata_builder{
+						Name:   fmt.Sprintf("pool-%s", tenant),
+						Tenant: tenant,
+					}.Build(),
+					Spec: privatev1.ExternalIPPoolSpec_builder{
+						Cidrs: []string{"10.0.0.0/24"},
+					}.Build(),
+					Status: privatev1.ExternalIPPoolStatus_builder{
+						State:     privatev1.ExternalIPPoolState_EXTERNAL_IP_POOL_STATE_READY,
+						Total:     100,
+						Allocated: 0,
+						Available: 100,
+					}.Build(),
+				}.Build(),
+			).Do(ctx)
+			Expect(err).ToNot(HaveOccurred())
+			return resp.GetObject().GetId()
+		}
+
+		BeforeEach(func() {
+			var err error
+			tenantsDao, err := dao.NewGenericDAO[*privatev1.Tenant]().
+				SetLogger(logger).
+				SetTableName("tenants").
+				SetTenancyLogic(tenancy).
+				Build()
+			Expect(err).ToNot(HaveOccurred())
+			_, err = tenantsDao.Create().
+				SetObject(privatev1.Tenant_builder{
+					Id: "tenant-b",
+					Metadata: privatev1.Metadata_builder{
+						Name:   "tenant-b",
+						Tenant: "tenant-b",
+					}.Build(),
+				}.Build()).
+				Do(ctx)
+			Expect(err).ToNot(HaveOccurred())
+
+			externalIPsServer, err = NewPrivateExternalIPsServer().
+				SetLogger(logger).
+				SetAttributionLogic(attribution).
+				SetTenancyLogic(tenancy).
+				Build()
+			Expect(err).ToNot(HaveOccurred())
+		})
+
+		It("accepts ExternalIP referencing a shared ExternalIPPool", func() {
+			poolID := createReadyExternalIPPool(ctx, "shared-pool", 100, 0)
+			_, err := externalIPsServer.Create(ctx, privatev1.ExternalIPsCreateRequest_builder{
+				Object: privatev1.ExternalIP_builder{
+					Metadata: privatev1.Metadata_builder{Name: "shared-pool-eip", Tenant: testTenant}.Build(),
+					Spec:     privatev1.ExternalIPSpec_builder{Pool: privatev1.ExternalIPPoolReference_builder{Id: poolID}.Build()}.Build(),
+				}.Build(),
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+		})
+
+		It("accepts ExternalIP referencing a same-tenant ExternalIPPool", func() {
+			poolID := createPoolWithTenant(testTenant)
+			_, err := externalIPsServer.Create(ctx, privatev1.ExternalIPsCreateRequest_builder{
+				Object: privatev1.ExternalIP_builder{
+					Metadata: privatev1.Metadata_builder{Name: "same-tenant-pool-eip", Tenant: testTenant}.Build(),
+					Spec:     privatev1.ExternalIPSpec_builder{Pool: privatev1.ExternalIPPoolReference_builder{Id: poolID}.Build()}.Build(),
+				}.Build(),
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+		})
+
+		It("rejects ExternalIP referencing an unrelated-tenant ExternalIPPool", func() {
+			poolID := createPoolWithTenant("tenant-b")
+			_, err := externalIPsServer.Create(ctx, privatev1.ExternalIPsCreateRequest_builder{
+				Object: privatev1.ExternalIP_builder{
+					Metadata: privatev1.Metadata_builder{Name: "cross-tenant-pool-eip", Tenant: testTenant}.Build(),
+					Spec:     privatev1.ExternalIPSpec_builder{Pool: privatev1.ExternalIPPoolReference_builder{Id: poolID}.Build()}.Build(),
+				}.Build(),
+			}.Build())
+			Expect(grpcstatus.Code(err)).To(Equal(grpccodes.InvalidArgument))
+			Expect(err).To(MatchError(ContainSubstring("belongs to tenant")))
 		})
 	})
 })

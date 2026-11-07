@@ -1,27 +1,41 @@
 ---
-# ExternalIPAttachment deletion — removes the DNAT rule from Netris
+# Delete the DNAT rule osac-eipa-<attachment id>. A rule that is already gone is
+# a success. When the destination is in the input, the rule must be in its VPC;
+# a rule of another VPC is a final error and is not deleted. The same holds for
+# a rule whose dnatToIP or destinationAddress differs from the input.
+- name: Detach the ExternalIP on Netris
+  block:
+    - name: Check the settings
+      ansible.builtin.include_tasks: _settings.yaml
+      vars:
+        netris_require: [controller, credentials, site, tenant]
 
-- name: Extract ExternalIPAttachment name
-  ansible.builtin.set_fact:
-    attachment_name: "{{ external_ip_attachment.metadata.name }}"
+    - name: Check the task input
+      ansible.builtin.include_tasks: _input.yaml
 
-- name: Display ExternalIPAttachment deletion info
-  ansible.builtin.debug:
-    msg: "Deleting Netris DNAT rule for ExternalIPAttachment '{{ attachment_name }}'"
+    - name: Build the object names
+      ansible.builtin.include_tasks: _names.yaml
 
-- name: Ensure Netris auth
-  ansible.builtin.include_role:
-    name: netris.controller.auth
-  when: netris_session_cookie is not defined
+    - name: Find the VPC of the destination
+      ansible.builtin.include_tasks: _nat_vpc.yaml
+      vars:
+        netris_nat_domain: "{{ ((osac_job_vars.destination | default({}, true)).routing_domain | default({}, true)).type | default('', true) }}"
+        netris_nat_vpc_required: false
 
-- name: Delete DNAT rule for ExternalIPAttachment
-  ansible.builtin.include_role:
-    name: netris.controller.nat
-    tasks_from: delete
-  vars:
-    nat_name: "{{ attachment_name }}-dnat"
-    nat_site_id: "{{ netris_site_id }}"
-
-- name: Display deletion result
-  ansible.builtin.debug:
-    msg: "DNAT rule '{{ attachment_name }}-dnat' deletion completed"
+    - name: Delete the DNAT rule
+      ansible.builtin.include_role:
+        name: netris.controller.nat
+        tasks_from: delete
+      vars:
+        nat_name: "{{ netris_names.eipa_dnat }}"
+        nat_site_id: "{{ netris_site_id | int }}"
+        nat_expected_fields: >-
+          {{ {'action': 'DNAT', 'site.id': netris_site_id | int}
+             | combine({'vpc.id': netris_nat_vpc.id} if netris_nat_vpc.id | string | length > 0 else {})
+             | combine({'dnatToIP': osac_job_vars.destination.address ~ '/32'}
+                       if (osac_job_vars.destination | default({}, true)).address | default('', true) | length > 0 else {})
+             | combine({'destinationAddress': osac_job_vars.external_ip.address ~ '/32'}
+                       if (osac_job_vars.external_ip | default({}, true)).address | default('', true) | length > 0 else {}) }}
+  rescue:
+    - name: Report the error
+      ansible.builtin.include_tasks: _rescue.yaml

@@ -92,23 +92,22 @@ const (
 	RunStrategyHalted RunStrategyType = "Halted"
 )
 
-// ComputeNetworkAttachment defines one NIC: a Subnet CR on the hub plus optional SecurityGroup CR names.
+// ComputeNetworkAttachment defines one NIC: a Subnet plus its SecurityGroups, by API ID.
 type ComputeNetworkAttachment struct {
-	// SubnetRef is the name of the Subnet CR in the same namespace as the ComputeInstance.
+	// SubnetRef is the API ID of the Subnet.
 	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=253
-	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="subnetRef is immutable"
 	SubnetRef string `json:"subnetRef"`
 
-	// SecurityGroupRefs lists SecurityGroup CR names in the same namespace as the ComputeInstance.
-	// Mutable - can be changed to add/remove security groups without recreating the VM.
+	// SecurityGroupRefs lists the SecurityGroup API IDs.
 	// +kubebuilder:validation:Optional
 	SecurityGroupRefs []string `json:"securityGroupRefs,omitempty"`
 }
 
 // ComputeInstanceSpec defines the desired state of ComputeInstance
 // +kubebuilder:validation:XValidation:rule="has(self.gpu) == has(oldSelf.gpu) && (!has(self.gpu) || self.gpu == oldSelf.gpu)",message="gpu is immutable"
+// +kubebuilder:validation:XValidation:rule="has(self.networkAttachments) == has(oldSelf.networkAttachments) && (!has(self.networkAttachments) || self.networkAttachments == oldSelf.networkAttachments)",message="networkAttachments are immutable after creation"
 type ComputeInstanceSpec struct {
 	// TemplateID is the unique identifier of the compute instance template to use when creating this compute instance
 	// +kubebuilder:validation:Required
@@ -116,7 +115,7 @@ type ComputeInstanceSpec struct {
 	TemplateID string `json:"templateID"`
 
 	// TemplateParameters allows passing additional template-specific parameters as JSON-encoded key-value pairs.
-	// This complements the explicit fields (cores, memoryGiB, etc.) and is used for:
+	// This complements the explicit fields (vCPUs, memoryGiB, etc.) and is used for:
 	// - Template-specific parameters not covered by explicit fields (e.g., exposed_ports)
 	// - Custom parameters defined by specific templates
 	// +kubebuilder:validation:Optional
@@ -135,17 +134,15 @@ type ComputeInstanceSpec struct {
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="guestOSFamily is immutable"
 	GuestOSFamily string `json:"guestOSFamily,omitempty"`
 
-	// Cores is the number of CPU cores
+	// VCPUs is the number of virtual CPUs
 	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:validation:Maximum=128
-	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="cores is immutable"
-	Cores int32 `json:"cores"`
+	VCPUs int32 `json:"vcpus"`
 
 	// MemoryGiB is the memory in gibibytes
 	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:Minimum=1
-	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="memoryGiB is immutable"
 	MemoryGiB int32 `json:"memoryGiB"`
 
 	// BootDisk is the primary boot disk
@@ -157,6 +154,11 @@ type ComputeInstanceSpec struct {
 	// +kubebuilder:validation:Optional
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="additionalDisks is immutable"
 	AdditionalDisks []DiskSpec `json:"additionalDisks,omitempty"`
+
+	// DiskVolumeIDs maps stable disk keys to their returned Fulfillment Volume IDs.
+	// Keys are boot and disk-N.
+	// +kubebuilder:validation:Optional
+	DiskVolumeIDs map[string]string `json:"diskVolumeIDs,omitempty"`
 
 	// Gpu defines GPU passthrough configuration resolved from the InstanceType.
 	// +kubebuilder:validation:Optional
@@ -176,29 +178,11 @@ type ComputeInstanceSpec struct {
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="sshKey is immutable"
 	SSHKey string `json:"sshKey,omitempty"`
 
-	// NetworkAttachments defines multiple NICs when more than one subnet (and optional security groups per NIC) is required.
-	// The first entry is the primary subnet for VM placement (subnet-namespace annotation).
-	// Subnet references (per ComputeNetworkAttachment) are immutable but security groups can be changed.
-	//
-	// Why immutability is required:
-	// Currently, ComputeInstances are created with a single NIC. The VM instance must be created in the namespace
-	// of the subnet it uses (the subnet-namespace annotation determines VM placement). This architectural constraint
-	// means that changing the subnet would require recreating the VM in a different namespace, which is not supported.
-	// Similarly, the array size cannot change because adding/removing NICs would require changing the primary subnet
-	// or the VM's namespace, both of which are immutable after VM creation.
-	//
-	// Immutability enforcement:
-	// - The +listType=map with +listMapKey=subnetRef markers correlate entries by subnetRef for updates
-	// - The size check below prevents adding or removing entries
-	// - The per-item subnetRef validation (self == oldSelf) prevents changing keys of existing entries
-	// Combined, these ensure only securityGroupRefs can be modified.
-	//
-	// MaxItems is required for CEL cost budget calculation: ComputeNetworkAttachment.SubnetRef has a CEL validation
-	// rule (self == oldSelf for immutability). Without maxItems, Kubernetes cannot bound the cost of iterating
-	// over array items to validate this rule, causing CRD installation to fail with "estimated rule cost exceeds budget".
+	// NetworkAttachments optionally connects the instance to a Subnet and SecurityGroups.
+	// At most one attachment is supported, and the complete value is immutable after creation.
 	// +kubebuilder:validation:Optional
 	// +kubebuilder:validation:MaxItems=8
-	// +kubebuilder:validation:XValidation:rule="size(oldSelf) == 0 || (size(self) == size(oldSelf) && self.all(na, oldSelf.exists(old, old.subnetRef == na.subnetRef)))",message="cannot change or add/remove network attachments after initial assignment"
+	// +kubebuilder:validation:XValidation:rule="size(self) <= 1",message="at most one network attachment is supported"
 	// +listType=map
 	// +listMapKey=subnetRef
 	NetworkAttachments []ComputeNetworkAttachment `json:"networkAttachments,omitempty"`
@@ -270,6 +254,21 @@ const (
 	// ComputeInstanceConditionRestartRequired means the compute instance requires a restart for
 	// configuration changes to take effect. Synced from KubeVirt VM.Status.Conditions[RestartRequired].
 	ComputeInstanceConditionRestartRequired ComputeInstanceConditionType = "RestartRequired"
+
+	// ComputeInstanceConditionNetworkReady means the VM's NetworkAttachment is Ready and
+	// its address is known (VMaaS networking design).
+	ComputeInstanceConditionNetworkReady ComputeInstanceConditionType = "NetworkReady"
+)
+
+// NetworkReady condition reasons of a ComputeInstance (VMaaS networking design).
+const (
+	ComputeInstanceReasonNetworkAttachmentProgressing = "NetworkAttachmentProgressing"
+	ComputeInstanceReasonNetworkAttachmentFailed      = "NetworkAttachmentFailed"
+	ComputeInstanceReasonVMNotRunning                 = "VMNotRunning"
+	ComputeInstanceReasonWaitingForIPAddress          = "WaitingForIPAddress"
+	ComputeInstanceReasonWaitingForFabricBinding      = "WaitingForFabricBinding"
+	ComputeInstanceReasonIPDiscovered                 = "IPDiscovered"
+	// ReasonProvisioningDisabled (networking_common_types.go) is also a NetworkReady reason.
 )
 
 // VirtualMachineReferenceType contains a reference to the KubeVirt VirtualMachine CR created by this ComputeInstance
@@ -294,6 +293,16 @@ type ComputeInstanceStatus struct {
 	// +kubebuilder:validation:Type=string
 	// +kubebuilder:validation:Enum=Starting;Running;Failed;Deleting;Stopping;Stopped;Paused
 	Phase ComputeInstancePhaseType `json:"phase,omitempty"`
+
+	// PhaseTransitionTime records when the controller last changed Phase. It moves only
+	// when Phase changes, so metering can bill state changes from the moment they happened
+	// rather than from when feedback noticed them: during a fulfillment outage every
+	// transition would otherwise be dated at recovery. It follows the RunningConfigSince
+	// pattern: stamped once per phase change, kept when unchanged.
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Type=string
+	// +kubebuilder:validation:Format=date-time
+	PhaseTransitionTime *metav1.Time `json:"phaseTransitionTime,omitempty"`
 
 	// Conditions holds an array of metav1.Condition that describe the state of the ComputeInstance
 	// +kubebuilder:validation:Optional
@@ -321,11 +330,54 @@ type ComputeInstanceStatus struct {
 	// +kubebuilder:validation:Format=date-time
 	LastRestartedAt *metav1.Time `json:"lastRestartedAt,omitempty"`
 
+	// RunningConfigVersion is the desired config version that the controller observed
+	// actually running: the instance is Running, that configuration is applied, and no
+	// restart required to realize it is pending.
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Type=string
+	RunningConfigVersion string `json:"runningConfigVersion,omitempty"`
+
+	// RunningInstanceTypeName is the instance type name that was current when
+	// RunningConfigVersion was recorded. It is part of the running-config identity:
+	// the config version hashes the resolved resources, so two types with identical
+	// cores and memory hash to the same version, and a resize between them must still
+	// move RunningConfigSince.
+	// +kubebuilder:validation:Optional
+	RunningInstanceTypeName string `json:"runningInstanceTypeName,omitempty"`
+
+	// RunningConfigSince records when the controller observed the configuration named
+	// by RunningConfigVersion running. It moves only when RunningConfigVersion changes,
+	// so metering can bill the running instance type from the time it actually started
+	// running rather than from when the change was reported downstream.
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Type=string
+	// +kubebuilder:validation:Format=date-time
+	RunningConfigSince *metav1.Time `json:"runningConfigSince,omitempty"`
+
+	// ProvisionConfigVersion is the desiredConfigVersion the latest provision
+	// attempt ran with. The configuration is applied when the provision entry
+	// succeeded with the current desiredConfigVersion; a later spec change
+	// (for example a restart request) runs the provision job again as a new attempt.
+	// +kubebuilder:validation:Optional
+	ProvisionConfigVersion string `json:"provisionConfigVersion,omitempty"`
+
 	// ProvisioningJobs tracks the history of provision and deprovision operations
 	// Ordered chronologically, with latest operations at the end
 	// Limited to the last N jobs (configurable via OSAC_MAX_JOB_HISTORY, default 10)
 	// +kubebuilder:validation:Optional
 	ProvisioningJobs []JobStatus `json:"provisioningJobs,omitempty"`
+
+	// Jobs tracks the provision and deprovision jobs (manager none), one entry
+	// per task (network manager contract §4.7 Job tracking).
+	// +kubebuilder:validation:Optional
+	// +listType=map
+	// +listMapKey=task
+	// +listMapKey=manager
+	Jobs []NetworkJobStatus `json:"jobs,omitempty"`
+
+	// ComputeNetworkAttachmentStatuses reports the Subnet ID and IPv4 address for each configured network attachment.
+	// +kubebuilder:validation:Optional
+	ComputeNetworkAttachmentStatuses []ComputeNetworkAttachmentStatus `json:"computeNetworkAttachmentStatuses,omitempty"`
 
 	// IPAddress is the primary IP address of the running instance, taken from the KubeVirt VirtualMachineInstance.
 	// Populated when the instance is ready (phase Running).
@@ -338,11 +390,21 @@ type ComputeInstanceStatus struct {
 	ExternalIPAddress string `json:"externalIPAddress,omitempty"`
 }
 
+// ComputeNetworkAttachmentStatus contains the discovered Subnet ID and IP address for one network attachment.
+type ComputeNetworkAttachmentStatus struct {
+	// SubnetRef is the ID of the Subnet assigned to the attachment.
+	SubnetRef string `json:"subnetRef"`
+
+	// IPAddress is the IPv4 address reported by the VMI interface.
+	// +kubebuilder:validation:Optional
+	IPAddress string `json:"ipAddress,omitempty"`
+}
+
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:shortName=ci
 // +kubebuilder:printcolumn:name="Template",type=string,JSONPath=`.spec.templateID`
-// +kubebuilder:printcolumn:name="Cores",type=integer,JSONPath=`.spec.cores`
+// +kubebuilder:printcolumn:name="vCPUs",type=integer,JSONPath=`.spec.vcpus`
 // +kubebuilder:printcolumn:name="Memory",type=integer,JSONPath=`.spec.memoryGiB`
 // +kubebuilder:printcolumn:name="OS",type=string,JSONPath=`.spec.guestOSFamily`
 // +kubebuilder:printcolumn:name="RunStrategy",type=string,JSONPath=`.spec.runStrategy`

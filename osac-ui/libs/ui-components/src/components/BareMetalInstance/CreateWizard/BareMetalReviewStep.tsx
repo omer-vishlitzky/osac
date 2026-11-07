@@ -1,0 +1,101 @@
+import {
+  DescriptionList,
+  DescriptionListDescription,
+  DescriptionListGroup,
+  DescriptionListTerm,
+  Stack,
+  StackItem,
+} from '@patternfly/react-core';
+import { useFormikContext } from 'formik';
+
+import type { BareMetalInstanceWizardValues } from './fields';
+import { useTranslation } from '../../../hooks/useTranslation';
+import { displayValue } from '../../../utils/detailFormatters';
+import { NetworkAttachmentReviewFields } from '../../ProvisioningWizard/NetworkAttachmentReviewFields';
+
+export const BareMetalReviewStep = () => {
+  const { t } = useTranslation();
+  const { values } = useFormikContext<BareMetalInstanceWizardValues>();
+  const userData = values.spec.userData.value;
+  const isSecretSource = userData.source === 'secret';
+  const selectedUserData = isSecretSource ? userData.secret : userData.inline;
+  const userDataReview = selectedUserData.trim() ? t('Configured') : displayValue();
+
+  const networkAttachment = values.spec.networkAttachment.value;
+  const isCustomNetwork = !networkAttachment.useDefaultNetwork;
+
+  return (
+    <Stack hasGutter>
+      <StackItem>
+        <DescriptionList
+          isHorizontal
+          isCompact
+          aria-label={t('catalogProvision.steps.review.title')}
+        >
+          <DescriptionListGroup>
+            <DescriptionListTerm>{t('Catalog item')}</DescriptionListTerm>
+            <DescriptionListDescription>
+              {values.catalogItemReference.name || '—'}
+            </DescriptionListDescription>
+          </DescriptionListGroup>
+
+          <DescriptionListGroup>
+            <DescriptionListTerm>{t('Project')}</DescriptionListTerm>
+            <DescriptionListDescription>
+              {values.metadata.project || t('Default')}
+            </DescriptionListDescription>
+          </DescriptionListGroup>
+          <DescriptionListGroup>
+            <DescriptionListTerm>{t('Name')}</DescriptionListTerm>
+            <DescriptionListDescription>
+              {displayValue(values.metadata.name)}
+            </DescriptionListDescription>
+          </DescriptionListGroup>
+          <DescriptionListGroup>
+            <DescriptionListTerm>{t('SSH public key')}</DescriptionListTerm>
+            <DescriptionListDescription>
+              {displayValue(values.spec.sshKey.value)}
+            </DescriptionListDescription>
+          </DescriptionListGroup>
+          <DescriptionListGroup>
+            <DescriptionListTerm>{t('Disk image')}</DescriptionListTerm>
+            <DescriptionListDescription>
+              {values.spec.diskImage.value.name || ''}
+            </DescriptionListDescription>
+          </DescriptionListGroup>
+          <DescriptionListGroup>
+            <DescriptionListTerm>{t('Instance type')}</DescriptionListTerm>
+            <DescriptionListDescription>
+              {values.spec.instanceType.value || '—'}
+            </DescriptionListDescription>
+          </DescriptionListGroup>
+          <DescriptionListGroup>
+            <DescriptionListTerm>{t('Cloud-init')}</DescriptionListTerm>
+            <DescriptionListDescription>{userDataReview}</DescriptionListDescription>
+          </DescriptionListGroup>
+          <DescriptionListGroup>
+            <DescriptionListTerm>{t('Network')}</DescriptionListTerm>
+            <DescriptionListDescription>
+              {isCustomNetwork ? t('Custom') : t('Tenant default')}
+            </DescriptionListDescription>
+          </DescriptionListGroup>
+
+          {isCustomNetwork && (
+            <NetworkAttachmentReviewFields
+              virtualNetwork={networkAttachment.virtualNetwork}
+              subnet={networkAttachment.subnet}
+              securityGroups={networkAttachment.securityGroups}
+            />
+          )}
+
+          <DescriptionListGroup>
+            <DescriptionListTerm>{t('External access')}</DescriptionListTerm>
+            <DescriptionListDescription>
+              {values.spec.autoExternalIpAttachment.value ? t('Enabled') : t('Disabled')}
+            </DescriptionListDescription>
+          </DescriptionListGroup>
+        </DescriptionList>
+      </StackItem>
+    </Stack>
+  );
+};

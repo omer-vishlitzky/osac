@@ -19,16 +19,17 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	. "github.com/onsi/ginkgo/v2/dsl/core"
 	. "github.com/onsi/gomega"
 	"go.uber.org/mock/gomock"
 	grpcmetadata "google.golang.org/grpc/metadata"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
 	"github.com/osac-project/osac/fulfillment-service/internal/database"
 	"github.com/osac-project/osac/fulfillment-service/internal/database/dao"
 	"github.com/osac-project/osac/fulfillment-service/internal/logging"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
 func TestServers(t *testing.T) {
@@ -43,7 +44,9 @@ var (
 	ctrl        *gomock.Controller
 	logger      *slog.Logger
 	server      *database.Container
+	testPool    *pgxpool.Pool
 	tm          database.TxManager
+	suiteTx     database.Tx
 	attribution *auth.MockAttributionLogic
 	tenancy     *auth.MockTenancyLogic
 )
@@ -87,14 +90,14 @@ var _ = BeforeSuite(func() {
 		SetLogger(logger).
 		Build()
 	Expect(err).ToNot(HaveOccurred())
-	err = server.Start(ctx)
-	Expect(err).ToNot(HaveOccurred())
 	DeferCleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 		defer cancel()
 		err = server.Stop(ctx)
 		Expect(err).ToNot(HaveOccurred())
 	})
+	err = server.Start(ctx)
+	Expect(err).ToNot(HaveOccurred())
 })
 
 var _ = BeforeEach(func() {
@@ -107,25 +110,32 @@ var _ = BeforeEach(func() {
 	db, err := server.NewInstance().Build()
 	Expect(err).ToNot(HaveOccurred())
 	DeferCleanup(db.Close)
-	pool, err := db.Pool(ctx)
+	testPool, err = db.Pool(ctx)
 	Expect(err).ToNot(HaveOccurred())
-	DeferCleanup(pool.Close)
+	DeferCleanup(func() {
+		testPool.Close()
+		testPool = nil
+	})
 
 	// Create the transaction manager:
 	tm, err = database.NewTxManager().
 		SetLogger(logger).
-		SetPool(pool).
+		SetPool(testPool).
 		Build()
 	Expect(err).ToNot(HaveOccurred())
 
 	// Start a transaction and add it to the context:
-	tx, err := tm.Begin(ctx)
+	suiteTx, err = tm.Begin(ctx)
 	Expect(err).ToNot(HaveOccurred())
 	DeferCleanup(func() {
-		err := tx.End(ctx)
+		if suiteTx == nil {
+			return
+		}
+		err := suiteTx.End(ctx)
 		Expect(err).ToNot(HaveOccurred())
+		suiteTx = nil
 	})
-	ctx = database.TxIntoContext(ctx, tx)
+	ctx = database.TxIntoContext(ctx, suiteTx)
 
 	// Create the testTenant in the database so foreign key constraints are satisfied
 	// when resources are created with the default tenant mock.

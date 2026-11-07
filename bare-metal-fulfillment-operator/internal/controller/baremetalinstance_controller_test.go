@@ -40,11 +40,12 @@ import (
 
 // mockInventoryClient implements inventory.Client for testing
 type mockInventoryClient struct {
-	findFreeHostFunc  func(ctx context.Context, matchExpressions map[string]string) (*inventory.Host, error)
-	assignHostFunc    func(ctx context.Context, inventoryHostID string, bareMetalInstanceID string, labels map[string]string) (*inventory.Host, error)
-	unassignHostFunc  func(ctx context.Context, inventoryHostID string, labels []string) error
-	getHostNICsFunc   func(ctx context.Context, inventoryHostID string) ([]inventory.HostNIC, error)
-	getHostNICsCalled int
+	findFreeHostFunc           func(ctx context.Context, matchExpressions map[string]string) (*inventory.Host, error)
+	assignHostFunc             func(ctx context.Context, inventoryHostID string, bareMetalInstanceID string, labels map[string]string) (*inventory.Host, error)
+	unassignHostFunc           func(ctx context.Context, inventoryHostID, bareMetalInstanceID string, labels []string) error
+	getHostNICsFunc            func(ctx context.Context, inventoryHostID string) ([]inventory.HostNIC, error)
+	getHostNICsCalled          int
+	getHostLogicalPortMACsFunc func(ctx context.Context, inventoryHostID string) (map[string]string, error)
 }
 
 func (m *mockInventoryClient) FindFreeHost(ctx context.Context, matchExpressions map[string]string) (*inventory.Host, error) {
@@ -61,9 +62,9 @@ func (m *mockInventoryClient) AssignHost(ctx context.Context, inventoryHostID st
 	return nil, nil
 }
 
-func (m *mockInventoryClient) UnassignHost(ctx context.Context, inventoryHostID string, labels []string) error {
+func (m *mockInventoryClient) UnassignHost(ctx context.Context, inventoryHostID, bareMetalInstanceID string, labels []string) error {
 	if m.unassignHostFunc != nil {
-		return m.unassignHostFunc(ctx, inventoryHostID, labels)
+		return m.unassignHostFunc(ctx, inventoryHostID, bareMetalInstanceID, labels)
 	}
 	return nil
 }
@@ -76,13 +77,19 @@ func (m *mockInventoryClient) GetHostNICs(ctx context.Context, inventoryHostID s
 	return nil, nil
 }
 
+func (m *mockInventoryClient) GetHostLogicalPortMACs(ctx context.Context, inventoryHostID string) (map[string]string, error) {
+	if m.getHostLogicalPortMACsFunc != nil {
+		return m.getHostLogicalPortMACsFunc(ctx, inventoryHostID)
+	}
+	return map[string]string{}, nil
+}
+
 // mockManagementClient implements management.Client for testing
 type mockManagementClient struct {
-	getPowerStateFunc        func(ctx context.Context, hostID string) (*management.PowerStatus, error)
-	setPowerStateFunc        func(ctx context.Context, hostID string, target management.PowerState) error
-	triggerRestartFunc       func(ctx context.Context, hostID string) error
-	isRestartCompleteFunc    func(ctx context.Context, hostID string) (bool, error)
-	getHostInterfaceMACsFunc func(ctx context.Context, hostID string) (map[string]string, error)
+	getPowerStateFunc     func(ctx context.Context, hostID string) (*management.PowerStatus, error)
+	setPowerStateFunc     func(ctx context.Context, hostID string, target management.PowerState) error
+	triggerRestartFunc    func(ctx context.Context, hostID string) error
+	isRestartCompleteFunc func(ctx context.Context, hostID string) (bool, error)
 }
 
 func (m *mockManagementClient) GetPowerState(ctx context.Context, hostID string) (*management.PowerStatus, error) {
@@ -111,13 +118,6 @@ func (m *mockManagementClient) IsRestartComplete(ctx context.Context, hostID str
 		return m.isRestartCompleteFunc(ctx, hostID)
 	}
 	return true, nil
-}
-
-func (m *mockManagementClient) GetHostInterfaceMACs(ctx context.Context, hostID string) (map[string]string, error) {
-	if m.getHostInterfaceMACsFunc != nil {
-		return m.getHostInterfaceMACsFunc(ctx, hostID)
-	}
-	return map[string]string{}, nil
 }
 
 // mockProvisioningProvider implements provisioning.ProvisioningProvider for testing
@@ -248,7 +248,7 @@ var _ = Describe("BareMetalInstance Controller", func() {
 				Expect(reconciler.TryLockFailPollIntervalDuration).To(Equal(DefaultTryLockFailPollIntervalDuration))
 				Expect(reconciler.ManagementRecheckIntervalDuration).To(Equal(DefaultManagementRecheckIntervalDuration))
 				Expect(reconciler.ProvisionPollIntervalDuration).To(Equal(DefaultProvisionPollIntervalDuration))
-				Expect(reconciler.HostReadinessPollIntervalDuration).To(Equal(DefaultHostReadinessPollIntervalDuration))
+				Expect(reconciler.HostAvailabilityPollIntervalDuration).To(Equal(DefaultHostAvailabilityPollIntervalDuration))
 			})
 		})
 
@@ -274,8 +274,54 @@ var _ = Describe("BareMetalInstance Controller", func() {
 				Expect(customReconciler.TryLockFailPollIntervalDuration).To(Equal(2 * time.Second))
 				Expect(customReconciler.ManagementRecheckIntervalDuration).To(Equal(15 * time.Second))
 				Expect(customReconciler.ProvisionPollIntervalDuration).To(Equal(60 * time.Second))
-				Expect(customReconciler.HostReadinessPollIntervalDuration).To(Equal(90 * time.Second))
+				Expect(customReconciler.HostAvailabilityPollIntervalDuration).To(Equal(90 * time.Second))
 			})
+		})
+	})
+
+	Describe("updateStatusWithRetry", func() {
+		It("does not publish Ready when a provision update races with deletion", func() {
+			instance := &v1alpha1.BareMetalInstance{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:       "late-provision-delete-race",
+					Namespace:  namespace,
+					Finalizers: []string{"test/hold-deletion"},
+				},
+				Spec: v1alpha1.BareMetalInstanceSpec{
+					Selector:   v1alpha1.HostSelectorSpec{HostSelector: map[string]string{"type": hostType}},
+					TemplateID: "test_template",
+				},
+			}
+			Expect(k8sClient.Create(ctx, instance)).To(Succeed())
+			DeferCleanup(func(cleanupCtx context.Context) {
+				latest := &v1alpha1.BareMetalInstance{}
+				if err := k8sClient.Get(cleanupCtx, client.ObjectKeyFromObject(instance), latest); err == nil {
+					latest.Finalizers = nil
+					Expect(k8sClient.Update(cleanupCtx, latest)).To(Succeed())
+				}
+			})
+
+			Expect(k8sClient.Delete(ctx, instance)).To(Succeed())
+			latest := &v1alpha1.BareMetalInstance{}
+			Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(instance), latest)).To(Succeed())
+			Expect(latest.DeletionTimestamp.IsZero()).To(BeFalse())
+
+			// A reconcile that started before Delete can finish provisioning later.
+			// Preserve the provider job history for cleanup, but suppress its stale Ready phase.
+			lateStatus := v1alpha1.BareMetalInstanceStatus{
+				Phase: v1alpha1.BareMetalInstancePhaseReady,
+				ProvisioningJobs: []opv1alpha1.JobStatus{{
+					JobID: "provision-in-flight", Type: opv1alpha1.JobTypeProvision,
+					State: opv1alpha1.JobStateSucceeded, Timestamp: metav1.Now(),
+				}},
+			}
+			reconciler.Client = k8sClient
+			Expect(reconciler.updateStatusWithRetry(ctx, client.ObjectKeyFromObject(instance), lateStatus)).To(Succeed())
+
+			Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(instance), latest)).To(Succeed())
+			Expect(latest.Status.Phase).To(Equal(v1alpha1.BareMetalInstancePhaseDeleting))
+			Expect(latest.Status.ProvisioningJobs).To(HaveLen(1))
+			Expect(latest.Status.ProvisioningJobs[0].JobID).To(Equal("provision-in-flight"))
 		})
 	})
 
@@ -430,7 +476,7 @@ var _ = Describe("BareMetalInstance Controller", func() {
 					return &inventory.Host{
 						InventoryHostID: inventoryHostID,
 						HostClass:       hostClass,
-						Ready:           true,
+						Available:       true,
 					}, nil
 				}
 			})
@@ -454,7 +500,7 @@ var _ = Describe("BareMetalInstance Controller", func() {
 					return &inventory.Host{
 						InventoryHostID: inventoryHostID,
 						HostClass:       hostClass,
-						Ready:           false,
+						Available:       false,
 					}, nil
 				}
 				// When the host is not ready the controller must requeue *before*
@@ -467,7 +513,7 @@ var _ = Describe("BareMetalInstance Controller", func() {
 				result, err := reconciler.reconcileInventory(ctx, bareMetalInstance)
 
 				Expect(err).NotTo(HaveOccurred())
-				Expect(result.RequeueAfter).To(Equal(reconciler.HostReadinessPollIntervalDuration))
+				Expect(result.RequeueAfter).To(Equal(reconciler.HostAvailabilityPollIntervalDuration))
 			})
 		})
 
@@ -608,7 +654,7 @@ var _ = Describe("BareMetalInstance Controller", func() {
 					return &inventory.Host{
 						InventoryHostID: "existing-host-123",
 						HostClass:       hostClass,
-						Ready:           true,
+						Available:       true,
 					}, nil
 				}
 			})
@@ -1075,6 +1121,72 @@ var _ = Describe("BareMetalInstance Controller", func() {
 				Expect(bareMetalInstance.Status.ProvisioningJobs).To(HaveLen(1))
 			})
 		})
+
+		It("keeps a failed provisioning attempt active while retrying", func() {
+			const providerError = "AAP workflow failed: inventory service unavailable"
+			mockProvProvider.getProvisionStatusFunc = func(
+				_ context.Context, _ client.Object, jobID string,
+			) (provisioning.ProvisionStatus, error) {
+				return provisioning.ProvisionStatus{
+					JobID:   jobID,
+					State:   opv1alpha1.JobStateFailed,
+					Message: providerError,
+				}, nil
+			}
+
+			// Trigger the first attempt, then poll it to observe the provider failure.
+			result, err := reconciler.reconcileNetworkProvisionAndDiscovery(ctx, bareMetalInstance)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.IsZero()).To(BeFalse())
+
+			result, err = reconciler.reconcileNetworkProvisionAndDiscovery(ctx, bareMetalInstance)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.IsZero()).To(BeTrue(), "the failed attempt status update triggers the next reconcile")
+			Expect(bareMetalInstance.Status.Phase).To(Equal(v1alpha1.BareMetalInstancePhaseProgressing))
+
+			condition := bareMetalInstance.GetStatusCondition(v1alpha1.HostConditionProvisionTemplateComplete)
+			Expect(condition).NotTo(BeNil())
+			Expect(condition.Status).To(Equal(metav1.ConditionFalse))
+			Expect(condition.Reason).To(Equal(v1alpha1.HostConditionReasonRetrying))
+			Expect(condition.Message).To(Equal(
+				"Provisioning retry scheduled after failed attempt: " + providerError))
+
+			// The scheduled reconcile must enter the lifecycle's exponential backoff.
+			result, err = reconciler.reconcileNetworkProvisionAndDiscovery(ctx, bareMetalInstance)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(BeNumerically(">", 0))
+			Expect(bareMetalInstance.Status.Phase).To(Equal(v1alpha1.BareMetalInstancePhaseProgressing))
+		})
+
+		It("migrates a retained template failure to retrying during backoff", func() {
+			const providerError = "legacy AAP workflow failure"
+
+			// Trigger once to record a job with the current desired config version.
+			result, err := reconciler.reconcileProvisioning(ctx, bareMetalInstance)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.IsZero()).To(BeFalse())
+			Expect(bareMetalInstance.Status.ProvisioningJobs).To(HaveLen(1))
+
+			bareMetalInstance.Status.ProvisioningJobs[0].State = opv1alpha1.JobStateFailed
+			bareMetalInstance.Status.ProvisioningJobs[0].Message = providerError
+			bareMetalInstance.SetStatusCondition(
+				v1alpha1.HostConditionProvisionTemplateComplete,
+				metav1.ConditionFalse,
+				v1alpha1.HostConditionReasonTemplateFailed,
+				providerError,
+			)
+
+			result, err = reconciler.reconcileProvisioning(ctx, bareMetalInstance)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(BeNumerically(">", 0))
+
+			condition := bareMetalInstance.GetStatusCondition(v1alpha1.HostConditionProvisionTemplateComplete)
+			Expect(condition).NotTo(BeNil())
+			Expect(condition.Status).To(Equal(metav1.ConditionFalse))
+			Expect(condition.Reason).To(Equal(v1alpha1.HostConditionReasonRetrying))
+			Expect(condition.Message).To(Equal(
+				"Provisioning retry scheduled after failed attempt: " + providerError))
+		})
 	})
 
 	Describe("syncBareMetalInstanceStatus", func() {
@@ -1350,6 +1462,7 @@ var _ = Describe("BareMetalInstance Controller", func() {
 				ObjectMeta: metav1.ObjectMeta{
 					Name:              "handleDeletion-bareMetalInstance",
 					Namespace:         namespace,
+					UID:               "bmi-123",
 					DeletionTimestamp: &metav1.Time{Time: time.Now()},
 				},
 				Spec: v1alpha1.BareMetalInstanceSpec{
@@ -1365,9 +1478,10 @@ var _ = Describe("BareMetalInstance Controller", func() {
 
 			It("should unassign the host and remove finalizer", func() {
 				unassignCalled := false
-				mockInvClient.unassignHostFunc = func(ctx context.Context, inventoryHostID string, labels []string) error {
+				mockInvClient.unassignHostFunc = func(ctx context.Context, inventoryHostID, bareMetalInstanceID string, labels []string) error {
 					unassignCalled = true
 					Expect(inventoryHostID).To(Equal("host-to-delete"))
+					Expect(bareMetalInstanceID).To(Equal("bmi-123"))
 					return nil
 				}
 
@@ -1384,6 +1498,19 @@ var _ = Describe("BareMetalInstance Controller", func() {
 				Expect(unassignCalled).To(BeTrue())
 			})
 
+			It("keeps the inventory finalizer while unassign is pending", func() {
+				cleanupErr := errors.New("cleanup pending")
+				mockInvClient.unassignHostFunc = func(_ context.Context, _, _ string, _ []string) error {
+					return cleanupErr
+				}
+
+				result, err := reconciler.handleDeletion(ctx, bareMetalInstance)
+
+				Expect(err).To(MatchError(cleanupErr))
+				Expect(result).To(Equal(ctrl.Result{}))
+				Expect(controllerutil.ContainsFinalizer(bareMetalInstance, BareMetalInstanceInventoryFinalizer)).To(BeTrue())
+			})
+
 			Context("when ExternalHostID is empty", func() {
 				BeforeEach(func() {
 					bareMetalInstance.Spec.ExternalHostID = ""
@@ -1391,7 +1518,7 @@ var _ = Describe("BareMetalInstance Controller", func() {
 
 				It("should remove finalizer without unassigning", func() {
 					unassignCalled := false
-					mockInvClient.unassignHostFunc = func(ctx context.Context, inventoryHostID string, labels []string) error {
+					mockInvClient.unassignHostFunc = func(ctx context.Context, inventoryHostID, bareMetalInstanceID string, labels []string) error {
 						unassignCalled = true
 						return nil
 					}
@@ -1464,6 +1591,44 @@ var _ = Describe("BareMetalInstance Controller", func() {
 
 					Expect(err).NotTo(HaveOccurred())
 					Expect(result.RequeueAfter).To(Equal(DefaultProvisionPollIntervalDuration))
+				})
+
+				It("waits for an in-flight provision job to be cancelled before releasing finalizers", func() {
+					bareMetalInstance.Spec.TemplateID = "os-provision"
+					bareMetalInstance.Status.ProvisioningJobs = []opv1alpha1.JobStatus{{
+						JobID: "provision-in-flight", Type: opv1alpha1.JobTypeProvision,
+						State: opv1alpha1.JobStateRunning, Timestamp: metav1.Now(),
+					}}
+					var observedProvisionJobs []opv1alpha1.JobStatus
+					mockProvProvider.triggerDeprovisionFunc = func(_ context.Context, _ client.Object,
+						jobs []opv1alpha1.JobStatus) (*provisioning.DeprovisionResult, error) {
+						observedProvisionJobs = append([]opv1alpha1.JobStatus(nil), jobs...)
+						return &provisioning.DeprovisionResult{
+							Action: provisioning.DeprovisionWaiting,
+							ProvisionJobStatus: &provisioning.ProvisionStatus{
+								State: opv1alpha1.JobStateFailed, Message: "cancelled by delete",
+							},
+						}, nil
+					}
+					unassignCalled := false
+					mockInvClient.unassignHostFunc = func(_ context.Context, _, _ string, _ []string) error {
+						unassignCalled = true
+						return nil
+					}
+
+					result, err := reconciler.handleDeletion(ctx, bareMetalInstance)
+
+					Expect(err).NotTo(HaveOccurred())
+					Expect(result.RequeueAfter).To(Equal(DefaultProvisionPollIntervalDuration))
+					Expect(observedProvisionJobs).To(HaveLen(1))
+					Expect(observedProvisionJobs[0].JobID).To(Equal("provision-in-flight"))
+					Expect(bareMetalInstance.Status.ProvisioningJobs[0].State).To(Equal(opv1alpha1.JobStateFailed))
+					Expect(controllerutil.ContainsFinalizer(bareMetalInstance, BareMetalInstanceManagementFinalizer)).To(BeTrue())
+					Expect(controllerutil.ContainsFinalizer(bareMetalInstance, BareMetalInstanceInventoryFinalizer)).To(BeTrue())
+					Expect(unassignCalled).To(BeFalse(), "host cleanup must wait for provider create cancellation")
+					Expect(bareMetalInstance.Status.Phase).To(Equal(v1alpha1.BareMetalInstancePhaseDeleting))
+					Expect(bareMetalInstance.Status.Phase).NotTo(Equal(v1alpha1.BareMetalInstancePhaseReady))
+					Expect(bareMetalInstance.Status.ProvisioningJobs).To(HaveLen(1), "deletion must retain the create job ID so a later reconcile can clean it up")
 				})
 
 				Context("when ProvisioningProvider is nil for a non-noop template", func() {
@@ -1631,10 +1796,54 @@ var _ = Describe("BareMetalInstance Controller", func() {
 					Expect(err).NotTo(HaveOccurred())
 					Expect(result.RequeueAfter).To(Equal(reconciler.ManagementRecheckIntervalDuration))
 
+					// Benign backpressure (host busy, nothing triggered yet): the condition
+					// reports PowerSyncRequired — a benign in-progress reason that is NOT a
+					// failure and, unlike Progressing, does not mark a restart as already in
+					// flight (so the next reconcile re-triggers rather than polling).
 					condition := bareMetalInstance.GetStatusCondition(v1alpha1.HostConditionPowerSynced)
 					Expect(condition).NotTo(BeNil())
 					Expect(condition.Status).To(Equal(metav1.ConditionFalse))
-					Expect(condition.Reason).To(Equal(v1alpha1.HostConditionReasonPowerSyncFailed))
+					Expect(condition.Reason).To(Equal(v1alpha1.HostConditionReasonPowerSyncRequired))
+				})
+
+				It("should re-trigger (not poll) on the reconcile after transitioning backpressure", func() {
+					// Regression guard for the benign-backpressure state machine: after a
+					// transitioning error stamps PowerSyncRequired, the *next* reconcile must
+					// re-enter the trigger path (guard keys on Progressing, not
+					// PowerSyncRequired) rather than adopting a possibly-unrelated transition
+					// via IsRestartComplete. A mistaken switch back to Progressing here would
+					// route reconcile #2 into the poll branch and silently skip the restart.
+					triggerCalls := 0
+					mockMgmtClient.triggerRestartFunc = func(ctx context.Context, hostID string) error {
+						triggerCalls++
+						if triggerCalls == 1 {
+							return management.ErrTransitioning // host busy, nothing triggered
+						}
+						return nil // host idle now, restart actually initiated
+					}
+					pollCalled := false
+					mockMgmtClient.isRestartCompleteFunc = func(ctx context.Context, hostID string) (bool, error) {
+						pollCalled = true
+						return true, nil
+					}
+
+					// Reconcile #1: transitioning backpressure.
+					_, err := reconciler.reconcileRestartTrigger(ctx, bareMetalInstance)
+					Expect(err).NotTo(HaveOccurred())
+					Expect(bareMetalInstance.GetStatusCondition(v1alpha1.HostConditionPowerSynced).Reason).
+						To(Equal(v1alpha1.HostConditionReasonPowerSyncRequired))
+
+					// Reconcile #2: must re-trigger (not poll for completion).
+					result, err := reconciler.reconcileRestartTrigger(ctx, bareMetalInstance)
+					Expect(err).NotTo(HaveOccurred())
+					Expect(result.RequeueAfter).To(Equal(reconciler.ManagementRecheckIntervalDuration))
+					Expect(triggerCalls).To(Equal(2), "reconcile #2 should re-trigger the restart")
+					Expect(pollCalled).To(BeFalse(), "reconcile #2 must not poll IsRestartComplete")
+
+					// The restart is now genuinely in flight → Progressing.
+					condition := bareMetalInstance.GetStatusCondition(v1alpha1.HostConditionPowerSynced)
+					Expect(condition.Status).To(Equal(metav1.ConditionFalse))
+					Expect(condition.Reason).To(Equal(v1alpha1.HostConditionReasonProgressing))
 				})
 			})
 
@@ -1801,15 +2010,25 @@ var _ = Describe("BareMetalInstance Controller", func() {
 			})
 		})
 
-		Context("when GetHostNICs succeeds after a prior transient failure", func() {
-			It("populates NICs and does not return an error", func() {
+		Context("when NIC data becomes available after a transient failure", func() {
+			It("leaves Hardware unset, then populates it on retry", func() {
+				attempts := 0
+				unavailableErr := errors.New("BMH is not ready")
 				invClient.getHostNICsFunc = func(_ context.Context, _ string) ([]inventory.HostNIC, error) {
+					attempts++
+					if attempts == 1 {
+						return nil, unavailableErr
+					}
 					return []inventory.HostNIC{{MAC: "aa:bb:cc:dd:ee:01"}}, nil
 				}
 
 				err := reconcilerForNICs.reconcileNICMetadata(ctx, bmi)
+				Expect(err).To(MatchError(unavailableErr))
+				Expect(bmi.Status.Hardware).To(BeNil())
 
+				err = reconcilerForNICs.reconcileNICMetadata(ctx, bmi)
 				Expect(err).NotTo(HaveOccurred())
+				Expect(attempts).To(Equal(2))
 				Expect(bmi.Status.Hardware).NotTo(BeNil())
 				Expect(bmi.Status.Hardware.NICs).To(HaveLen(1))
 			})

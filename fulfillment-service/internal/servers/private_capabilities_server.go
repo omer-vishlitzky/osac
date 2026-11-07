@@ -19,13 +19,16 @@ import (
 	"log/slog"
 	"slices"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
+	"github.com/osac-project/osac/fulfillment-service/internal/services"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
 // PrivateCapabilitiesServerBuilder contains the data and logic needed to create a new private capabilities server.
 type PrivateCapabilitiesServerBuilder struct {
 	logger                   *slog.Logger
 	authnTrustedTokenIssuers []string
+	serviceFlags             *services.Flags
+	provisioningEnabled      bool
 }
 
 var _ privatev1.CapabilitiesServer = (*PrivateCapabilitiesServer)(nil)
@@ -36,6 +39,8 @@ type PrivateCapabilitiesServer struct {
 
 	logger                   *slog.Logger
 	authnTrustedTokenIssuers []string
+	serviceFlags             *services.Flags
+	provisioningEnabled      bool
 }
 
 // NewPrivateCapabilitiesServer creates a builder that can then be used to configure and create a new private
@@ -47,6 +52,19 @@ func NewPrivateCapabilitiesServer() *PrivateCapabilitiesServerBuilder {
 // SetLogger sets the logger to use. This is mandatory.
 func (b *PrivateCapabilitiesServerBuilder) SetLogger(value *slog.Logger) *PrivateCapabilitiesServerBuilder {
 	b.logger = value
+	return b
+}
+
+// SetServiceFlags sets the services advertised by the server.
+func (b *PrivateCapabilitiesServerBuilder) SetServiceFlags(value *services.Flags) *PrivateCapabilitiesServerBuilder {
+	b.serviceFlags = value
+	return b
+}
+
+// SetNetworkingProvisioningEnabled sets the value of global.networking.provisioningEnabled that the startup checks
+// compared with the value stored at the first start. The operator and the bare metal fulfillment operator read it.
+func (b *PrivateCapabilitiesServerBuilder) SetNetworkingProvisioningEnabled(value bool) *PrivateCapabilitiesServerBuilder {
+	b.provisioningEnabled = value
 	return b
 }
 
@@ -72,6 +90,8 @@ func (b *PrivateCapabilitiesServerBuilder) Build() (result *PrivateCapabilitiesS
 	result = &PrivateCapabilitiesServer{
 		logger:                   b.logger,
 		authnTrustedTokenIssuers: authnTrustedTokenIssuers,
+		serviceFlags:             b.serviceFlags,
+		provisioningEnabled:      b.provisioningEnabled,
 	}
 	return
 }
@@ -83,6 +103,30 @@ func (s *PrivateCapabilitiesServer) Get(ctx context.Context,
 		Authn: &privatev1.AuthnCapabilities{
 			TrustedTokenIssuers: s.authnTrustedTokenIssuers,
 		},
+		EnabledServices:               enabledPrivateServiceTiers(s.serviceFlags),
+		NetworkingProvisioningEnabled: s.provisioningEnabled,
 	}.Build()
 	return response, nil
+}
+
+func enabledPrivateServiceTiers(flags *services.Flags) []privatev1.ServiceTier {
+	if flags == nil {
+		return nil
+	}
+
+	serviceNames := flags.EnabledServices()
+	result := make([]privatev1.ServiceTier, 0, len(serviceNames))
+	for _, serviceName := range serviceNames {
+		switch serviceName {
+		case "caas":
+			result = append(result, privatev1.ServiceTier_SERVICE_TIER_CAAS)
+		case "vmaas":
+			result = append(result, privatev1.ServiceTier_SERVICE_TIER_VMAAS)
+		case "bmaas":
+			result = append(result, privatev1.ServiceTier_SERVICE_TIER_BMAAS)
+		case "maas":
+			result = append(result, privatev1.ServiceTier_SERVICE_TIER_MAAS)
+		}
+	}
+	return result
 }

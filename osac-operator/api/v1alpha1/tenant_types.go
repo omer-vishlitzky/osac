@@ -49,10 +49,16 @@ const (
 	// Owned by the OSAC Storage Controller.
 	TenantConditionStorageBackendReady TenantConditionType = "StorageBackendReady"
 
-	// TenantConditionClusterStorageReady indicates whether StorageClasses and CSI
-	// drivers are installed on the target cluster for this tenant.
+	// TenantConditionClusterStorageReady indicates whether StorageClasses
+	// are installed on the target cluster for this tenant.
 	// Owned by the OSAC Storage Controller.
 	TenantConditionClusterStorageReady TenantConditionType = "ClusterStorageReady"
+
+	// TenantConditionStorageReady indicates whether all expected
+	// CSP-managed StorageClasses (osac.openshift.io/tenant=csp-managed) exist
+	// on the target cluster for all configured CSP-managed StorageTiers.
+	// Owned by the OSAC Storage Controller.
+	TenantConditionStorageReady TenantConditionType = "StorageReady"
 )
 
 // Reason constants for Tenant conditions

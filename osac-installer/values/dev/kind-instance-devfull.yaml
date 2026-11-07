@@ -1,35 +1,25 @@
+global:
+  networking:
+    # The Kind-only CUDN CRD accepts AAP-created objects without an OVN dataplane.
+    # Keep Subnet provisioning on so AAP creates each tenant's target namespace.
+    provisioningEnabled: true
+
 # Kind dev-full overlay -- layered on top of kind-instance.yaml (PROFILE=dev-full).
 #
-# The plain `dev` (integration-test) profile uses kind-instance.yaml as-is and
-# never onboards a real tenant network, so it leaves networking provisioning at
-# its chart default. dev-full seeds a VirtualNetwork/Subnet/SecurityGroup and
-# waits for them to reach READY, but Kind has no CUDN/OVN fabric for the AAP
-# playbooks to act on. Disabling networkingProvisioning makes the networking
-# controllers reconcile those resources to READY immediately (no AAP dispatch),
-# which is exactly the local-dev "noop networking" behavior. The networking
-# controller itself stays enabled (kind-instance.yaml: operator.controllers.networking=true)
-# so it still runs and marks resources Ready.
+# kind-instance-devfull.yaml enables Subnet provisioning so AAP creates each
+# tenant's target namespace. The Kind-only CUDN API accepts the resulting
+# networking objects without providing an OVN dataplane.
 operator:
+  image:
+    pullPolicy: IfNotPresent
   controllers:
-    networkingProvisioning: false
     storage: true
     volume: true
 
-# --- CSI Driver & Backends ---
-# Enable the OSAC CSI driver for persistent volume provisioning via storage tiers.
-# For dev-full, we leave fulfillment.endpoint empty so it uses in-memory stubs
-# (no real vendor backend integration needed for local dev).
-#
-# CSI backends (VAST, Pure, NetApp) are available but not enabled for local dev.
-# The driver uses vendorControllers="local=none" for node-local storage (hostPath,
-# local PVs) which doesn't require external storage array controllers.
-csiDriver:
+# Reuse the local storage registration hook so tenant onboarding provisions a
+# tenant-labeled TopoLVM StorageClass for the existing "local" storage tier.
+lvms:
   enabled: true
-
-# csiBackends chart is deployed (same condition as csiDriver), but all vendor
-# backends are disabled. To enable a backend for testing, set csiBackends.<vendor>.enabled: true
-# and provide the required credentials/configuration. Available backends: vast, pure, trident.
-csiBackends: {}
 
 # --- Browser-reachable endpoints (dev-full only) ---
 # dev-full drives the full "create a VM from the UI" flow in a real browser, so
@@ -40,14 +30,25 @@ csiBackends: {}
 # (→ the real service). The plain `dev`/IT profile keeps the *.svc.cluster.local
 # names (kind-instance.yaml) because its test client uses /etc/hosts.
 #
-# Only the browser-facing names change: externalHostname (UI → API) and the
-# Keycloak issuer/idp URLs (browser login + in-cluster JWKS). internalHostname is
-# left as-is — only in-cluster controllers use it, never the browser.
+# The public and internal API hostnames both use localhost so their TLSRoutes
+# can be reached through the host port mapping. CoreDNS rewrites these names
+# back to the in-cluster Services for controller traffic.
 service:
   externalHostname: fulfillment-api.osac.localhost
+  internalHostname: fulfillment-internal-api.osac.localhost
+  images:
+    service:
+      pullPolicy: IfNotPresent
+    envoy:
+      pullPolicy: IfNotPresent
   auth:
     issuerUrl: https://keycloak.osac.localhost:8443/realms/osac
+
   idp:
     url: https://keycloak.osac.localhost:8443
   vault:
     keycloakIssuerUrl: "https://keycloak.osac.localhost:8443/realms/osac"
+
+bmf:
+  secretAPI:
+    issuerUrl: https://keycloak.osac.localhost:8443/realms/osac

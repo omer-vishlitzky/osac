@@ -23,11 +23,11 @@ import (
 	"github.com/spf13/cobra"
 	"google.golang.org/protobuf/proto"
 
-	publicv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/public/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/cmd/cli/lookup"
 	"github.com/osac-project/osac/fulfillment-service/internal/config"
 	"github.com/osac-project/osac/fulfillment-service/internal/logging"
 	"github.com/osac-project/osac/fulfillment-service/internal/terminal"
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
 
 // Cmd creates the command to describe a virtual network.
@@ -104,11 +104,6 @@ func RenderVirtualNetwork(w io.Writer, vn *publicv1.VirtualNetwork) {
 		ipv4Cidr = v
 	}
 
-	ipv6Cidr := "-"
-	if v := vn.GetSpec().GetIpv6Cidr(); v != "" {
-		ipv6Cidr = v
-	}
-
 	state := "-"
 	message := "-"
 	if vn.GetStatus() != nil {
@@ -121,7 +116,6 @@ func RenderVirtualNetwork(w io.Writer, vn *publicv1.VirtualNetwork) {
 	fmt.Fprintf(writer, "ID:\t%s\n", vn.GetId())
 	fmt.Fprintf(writer, "Name:\t%s\n", name)
 	fmt.Fprintf(writer, "IPv4 CIDR:\t%s\n", ipv4Cidr)
-	fmt.Fprintf(writer, "IPv6 CIDR:\t%s\n", ipv6Cidr)
 	fmt.Fprintf(writer, "State:\t%s\n", state)
 	fmt.Fprintf(writer, "Message:\t%s\n", message)
 	writer.Flush()

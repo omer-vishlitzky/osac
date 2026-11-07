@@ -14,17 +14,22 @@ language governing permissions and limitations under the License.
 package baremetalinstance
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"slices"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-	bmfov1alpha1 "github.com/osac-project/osac/bare-metal-fulfillment-operator/api/v1alpha1"
 	"go.uber.org/mock/gomock"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/anypb"
+	"google.golang.org/protobuf/types/known/timestamppb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -37,13 +42,197 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
+	bmfov1alpha1 "github.com/osac-project/osac/bare-metal-fulfillment-operator/api/v1alpha1"
+
 	"github.com/osac-project/osac/fulfillment-service/internal/controllers"
 	"github.com/osac-project/osac/fulfillment-service/internal/controllers/finalizers"
 	"github.com/osac-project/osac/fulfillment-service/internal/kubernetes/gvks"
 	"github.com/osac-project/osac/fulfillment-service/internal/kubernetes/labels"
 	"github.com/osac-project/osac/fulfillment-service/internal/masks"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
+
+// testSSHPublicKeyMaterial is a valid OpenSSH public key; registered-key
+// resolution validates the fetched material's format.
+const testSSHPublicKeyMaterial = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIG8K1ZuSC7tmzxD5LJJXwkCfStVEjzXWYCFhJaLBxWAn test@example.com"
+
+var _ = Describe("BMaaS registered SSH-key resolution", func() {
+	It("loads the current public key by canonical Secret ID", func() {
+		ctrl := gomock.NewController(GinkgoT())
+		secrets := NewMockSecretsClient(ctrl)
+		secrets.EXPECT().Get(gomock.Any(), privatev1.SecretsGetRequest_builder{Id: "secret-id"}.Build()).
+			Return(privatev1.SecretsGetResponse_builder{Object: privatev1.Secret_builder{
+				Id:   "secret-id",
+				Type: privatev1.SecretType_SECRET_TYPE_SSH_PUBLIC_KEY,
+				Data: map[string][]byte{"public_key": []byte(testSSHPublicKeyMaterial)},
+			}.Build()}.Build(), nil)
+
+		key, err := controllers.ResolveSSHKey(context.Background(), secrets,
+			privatev1.SecretReference_builder{Id: "secret-id", Name: "login"}.Build())
+		Expect(err).ToNot(HaveOccurred())
+		Expect(key).To(Equal(testSSHPublicKeyMaterial))
+	})
+
+	DescribeTable("rejects unusable registered Secrets", func(secret *privatev1.Secret, expected string) {
+		ctrl := gomock.NewController(GinkgoT())
+		secrets := NewMockSecretsClient(ctrl)
+		secrets.EXPECT().Get(gomock.Any(), privatev1.SecretsGetRequest_builder{Id: "secret-id"}.Build()).
+			Return(privatev1.SecretsGetResponse_builder{Object: secret}.Build(), nil)
+
+		_, err := controllers.ResolveSSHKey(context.Background(), secrets,
+			privatev1.SecretReference_builder{Id: "secret-id", Name: "login"}.Build())
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring(expected))
+	},
+		Entry("wrong type", privatev1.Secret_builder{
+			Type: privatev1.SecretType_SECRET_TYPE_USER_DATA,
+			Data: map[string][]byte{"public_key": []byte("ssh-ed25519 AAAA")},
+		}.Build(), "expected"),
+		Entry("empty public key", privatev1.Secret_builder{
+			Type: privatev1.SecretType_SECRET_TYPE_SSH_PUBLIC_KEY,
+		}.Build(), "non-empty 'public_key'"),
+		Entry("malformed public key", privatev1.Secret_builder{
+			Type: privatev1.SecretType_SECRET_TYPE_SSH_PUBLIC_KEY,
+			Data: map[string][]byte{"public_key": []byte("not-an-ssh-key")},
+		}.Build(), "invalid OpenSSH public key"),
+	)
+
+	It("preserves materialized key material without re-reading a deleted Secret", func() {
+		ctrl := gomock.NewController(GinkgoT())
+		secrets := NewMockSecretsClient(ctrl)
+		t := &task{
+			r: &function{secretsClient: secrets},
+			bareMetalInstance: privatev1.BareMetalInstance_builder{
+				Spec: privatev1.BareMetalInstanceSpec_builder{
+					SshKey: privatev1.SecretReference_builder{Id: "deleted-secret"}.Build(),
+				}.Build(),
+			}.Build(),
+		}
+		existing := &bmfov1alpha1.BareMetalInstance{}
+		existing.Spec.TemplateParameters = `{"sshPublicKey":"ssh-ed25519 OLD"}`
+
+		Expect(t.resolveSSHKey(context.Background(), existing)).To(Succeed())
+		Expect(t.sshPublicKey).To(Equal("ssh-ed25519 OLD"))
+	})
+
+	It("classifies a reference without a canonical ID as permanently invalid", func() {
+		_, err := controllers.ResolveSSHKey(context.Background(), nil,
+			privatev1.SecretReference_builder{Name: "login"}.Build())
+		var resolutionErr *controllers.SSHKeyResolutionError
+		Expect(errors.As(err, &resolutionErr)).To(BeTrue())
+		Expect(resolutionErr.Permanent).To(BeTrue())
+		Expect(resolutionErr.Reason).To(Equal("SecretInvalid"))
+	})
+
+	DescribeTable("classifies registered SSH-key lookup failures", func(code codes.Code, permanent bool, reason string) {
+		ctrl := gomock.NewController(GinkgoT())
+		DeferCleanup(ctrl.Finish)
+		secrets := NewMockSecretsClient(ctrl)
+		secrets.EXPECT().Get(gomock.Any(), gomock.Any()).
+			Return(nil, status.Error(code, "lookup failed"))
+		t := &task{
+			r: &function{secretsClient: secrets},
+			bareMetalInstance: privatev1.BareMetalInstance_builder{
+				Spec: privatev1.BareMetalInstanceSpec_builder{
+					SshKey: privatev1.SecretReference_builder{Id: "secret-id"}.Build(),
+				}.Build(),
+			}.Build(),
+		}
+
+		err := t.resolveSSHKey(context.Background(), nil)
+		var resolutionErr *controllers.SSHKeyResolutionError
+		Expect(errors.As(err, &resolutionErr)).To(BeTrue())
+		Expect(resolutionErr.Permanent).To(Equal(permanent))
+		Expect(resolutionErr.Reason).To(Equal(reason))
+	},
+		Entry("not found", codes.NotFound, true, "SecretNotFound"),
+		Entry("invalid", codes.InvalidArgument, true, "SecretInvalid"),
+		Entry("unavailable", codes.Unavailable, false, ""),
+		Entry("deadline exceeded", codes.DeadlineExceeded, false, ""),
+		Entry("canceled", codes.Canceled, false, ""),
+	)
+})
+
+var _ = Describe("run SSH-key failure handling", func() {
+	newRunner := func(ctrl *gomock.Controller, secretsErr error) (*function, *privatev1.BareMetalInstance, *MockBareMetalInstancesClient) {
+		secrets := NewMockSecretsClient(ctrl)
+		secrets.EXPECT().Get(gomock.Any(), gomock.Any()).Return(nil, secretsErr)
+		hubCache := controllers.NewMockHubCache(ctrl)
+		hubCache.EXPECT().Get(gomock.Any(), "hub-1").Return(&controllers.HubEntry{
+			Namespace: "hub-ns",
+			Client:    fake.NewClientBuilder().WithScheme(newFakeScheme()).Build(),
+		}, nil)
+		instances := NewMockBareMetalInstancesClient(ctrl)
+		f := &function{
+			logger:                   logger,
+			hubCache:                 hubCache,
+			secretsClient:            secrets,
+			bareMetalInstancesClient: instances,
+			maskCalculator:           masks.NewCalculator().Build(),
+		}
+		bmi := privatev1.BareMetalInstance_builder{
+			Id: "bmi-run-test",
+			Metadata: privatev1.Metadata_builder{
+				Tenant:     "tenant-a",
+				Finalizers: []string{finalizers.Controller},
+			}.Build(),
+			Status: privatev1.BareMetalInstanceStatus_builder{Hub: "hub-1"}.Build(),
+			Spec: privatev1.BareMetalInstanceSpec_builder{
+				SshKey: privatev1.SecretReference_builder{Id: "secret-id"}.Build(),
+			}.Build(),
+		}.Build()
+		return f, bmi, instances
+	}
+
+	It("persists only the failure status for a permanent SSH-key resolution failure", func() {
+		ctrl := gomock.NewController(GinkgoT())
+		DeferCleanup(ctrl.Finish)
+		f, bmi, instances := newRunner(ctrl, status.Error(codes.InvalidArgument, "secret invalid"))
+
+		var updated *privatev1.BareMetalInstancesUpdateRequest
+		instances.EXPECT().Update(gomock.Any(), gomock.Any()).DoAndReturn(
+			func(_ context.Context, request *privatev1.BareMetalInstancesUpdateRequest, _ ...grpc.CallOption) (
+				*privatev1.BareMetalInstancesUpdateResponse, error) {
+				updated = request
+				return privatev1.BareMetalInstancesUpdateResponse_builder{}.Build(), nil
+			})
+
+		Expect(f.run(context.Background(), bmi)).To(Succeed())
+
+		Expect(updated).ToNot(BeNil())
+		object := updated.GetObject()
+		Expect(object.GetStatus().GetState()).To(
+			Equal(privatev1.BareMetalInstanceState_BARE_METAL_INSTANCE_STATE_FAILED))
+		provisioned := findProtoCondition(object,
+			privatev1.BareMetalInstanceConditionType_BARE_METAL_INSTANCE_CONDITION_TYPE_PROVISIONED)
+		Expect(provisioned).ToNot(BeNil())
+		Expect(provisioned.GetStatus()).To(Equal(privatev1.ConditionStatus_CONDITION_STATUS_FALSE))
+		Expect(provisioned.GetReason()).To(Equal("SecretInvalid"))
+		Expect(provisioned.GetMessage()).To(Equal(messageFailureSSHKey))
+		ready := findProtoCondition(object,
+			privatev1.BareMetalInstanceConditionType_BARE_METAL_INSTANCE_CONDITION_TYPE_READY)
+		Expect(ready).ToNot(BeNil())
+		Expect(ready.GetStatus()).To(Equal(privatev1.ConditionStatus_CONDITION_STATUS_FALSE))
+		// The failed reconcile's partial changes are discarded: only the failure
+		// status is set, and the reset input keeps its finalizer and hub.
+		Expect(object.GetStatus().GetConditions()).To(HaveLen(2))
+		Expect(hasFinalizer(object)).To(BeTrue())
+		Expect(object.GetStatus().GetHub()).To(Equal("hub-1"))
+	})
+
+	It("returns transient SSH-key resolution failures without persisting status", func() {
+		ctrl := gomock.NewController(GinkgoT())
+		DeferCleanup(ctrl.Finish)
+		f, bmi, instances := newRunner(ctrl, status.Error(codes.Unavailable, "api unavailable"))
+		instances.EXPECT().Update(gomock.Any(), gomock.Any()).Times(0)
+
+		err := f.run(context.Background(), bmi)
+		Expect(err).To(HaveOccurred())
+		var resolutionErr *controllers.SSHKeyResolutionError
+		Expect(errors.As(err, &resolutionErr)).To(BeTrue())
+		Expect(resolutionErr.Permanent).To(BeFalse())
+	})
+})
 
 func newBareMetalInstanceCR(id, namespace, name string, deletionTimestamp *metav1.Time) *bmfov1alpha1.BareMetalInstance {
 	obj := &bmfov1alpha1.BareMetalInstance{
@@ -78,14 +267,28 @@ func newTaskForDelete(bmiID, hubID string, hubCache controllers.HubCache) *task 
 	}.Build()
 
 	f := &function{
-		logger:   logger,
-		hubCache: hubCache,
+		logger:            logger,
+		hubCache:          hubCache,
+		networkingCleanup: &fakeWorkloadNetworkingCleanup{complete: true},
 	}
 
 	return &task{
 		r:                 f,
 		bareMetalInstance: bmi,
 	}
+}
+
+type fakeWorkloadNetworkingCleanup struct {
+	complete   bool
+	calls      int
+	workloadID string
+	err        error
+}
+
+func (f *fakeWorkloadNetworkingCleanup) Cleanup(_ context.Context, workloadID string) (bool, error) {
+	f.calls++
+	f.workloadID = workloadID
+	return f.complete, f.err
 }
 
 func newFakeScheme() *runtime.Scheme {
@@ -102,26 +305,14 @@ var _ = Describe("mutateBMI", func() {
 		ctx = context.Background()
 	})
 
-	It("should set TemplateID from catalog item template reference", func() {
+	It("should use the materialized Template without fetching catalog provenance", func() {
 		catalogItemID := "catalog-item-1"
 		templateID := "osac.templates.gpu_host"
 
-		catalogItemsClient := &fakeCatalogItemsClient{
-			getResponse: privatev1.BareMetalInstanceCatalogItemsGetResponse_builder{
-				Object: privatev1.BareMetalInstanceCatalogItem_builder{
-					Id: catalogItemID,
-					Template: privatev1.BareMetalInstanceTemplateReference_builder{
-						Id: templateID,
-					}.Build(),
-				}.Build(),
-			}.Build(),
-		}
-
 		t := &task{
 			r: &function{
-				logger:                              logger,
-				bareMetalInstanceCatalogItemsClient: catalogItemsClient,
-				bareMetalInstanceTypesClient:        defaultFakeBareMetalInstanceTypesClient(),
+				logger:                       logger,
+				bareMetalInstanceTypesClient: defaultFakeBareMetalInstanceTypesClient(),
 			},
 			bareMetalInstance: privatev1.BareMetalInstance_builder{
 				Id: "bmi-test",
@@ -129,7 +320,8 @@ var _ = Describe("mutateBMI", func() {
 					CatalogItem: privatev1.BareMetalInstanceCatalogItemReference_builder{
 						Id: catalogItemID,
 					}.Build(),
-					InstanceType: privatev1.BareMetalInstanceTypeLocalReference_builder{Id: "default-type"}.Build(),
+					Template:     privatev1.BareMetalInstanceTemplateReference_builder{Id: templateID}.Build(),
+					InstanceType: privatev1.BareMetalInstanceTypeReference_builder{Id: "default-type", Shared: true}.Build(),
 				}.Build(),
 			}.Build(),
 		}
@@ -141,13 +333,11 @@ var _ = Describe("mutateBMI", func() {
 	})
 
 	It("should map run_strategy ALWAYS to RunStrategy Always", func() {
-		catalogItemsClient := defaultFakeCatalogItemsClient()
 
 		t := &task{
 			r: &function{
-				logger:                              logger,
-				bareMetalInstanceCatalogItemsClient: catalogItemsClient,
-				bareMetalInstanceTypesClient:        defaultFakeBareMetalInstanceTypesClient(),
+				logger:                       logger,
+				bareMetalInstanceTypesClient: defaultFakeBareMetalInstanceTypesClient(),
 			},
 			bareMetalInstance: privatev1.BareMetalInstance_builder{
 				Id: "bmi-test",
@@ -155,8 +345,9 @@ var _ = Describe("mutateBMI", func() {
 					CatalogItem: privatev1.BareMetalInstanceCatalogItemReference_builder{
 						Id: "catalog-1",
 					}.Build(),
+					Template:     privatev1.BareMetalInstanceTemplateReference_builder{Id: "osac.templates.default"}.Build(),
 					RunStrategy:  new(privatev1.BareMetalInstanceRunStrategy_BARE_METAL_INSTANCE_RUN_STRATEGY_ALWAYS),
-					InstanceType: privatev1.BareMetalInstanceTypeLocalReference_builder{Id: "default-type"}.Build(),
+					InstanceType: privatev1.BareMetalInstanceTypeReference_builder{Id: "default-type", Shared: true}.Build(),
 				}.Build(),
 			}.Build(),
 		}
@@ -167,14 +358,21 @@ var _ = Describe("mutateBMI", func() {
 		Expect(obj.Spec.RunStrategy).To(Equal(bmfov1alpha1.RunStrategyAlways))
 	})
 
-	It("should map run_strategy HALTED to RunStrategy Halted", func() {
-		catalogItemsClient := defaultFakeCatalogItemsClient()
-
+	It("should materialize a resolved registered SSH key into the BMFO template parameters", func() {
+		ctrl := gomock.NewController(GinkgoT())
+		DeferCleanup(ctrl.Finish)
+		secrets := NewMockSecretsClient(ctrl)
+		secrets.EXPECT().Get(gomock.Any(), gomock.Any()).
+			Return(privatev1.SecretsGetResponse_builder{Object: privatev1.Secret_builder{
+				Metadata: privatev1.Metadata_builder{Name: "registered-key"}.Build(),
+				Type:     privatev1.SecretType_SECRET_TYPE_SSH_PUBLIC_KEY,
+				Data:     map[string][]byte{"public_key": []byte(testSSHPublicKeyMaterial)},
+			}.Build()}.Build(), nil)
 		t := &task{
 			r: &function{
-				logger:                              logger,
-				bareMetalInstanceCatalogItemsClient: catalogItemsClient,
-				bareMetalInstanceTypesClient:        defaultFakeBareMetalInstanceTypesClient(),
+				logger:                       logger,
+				secretsClient:                secrets,
+				bareMetalInstanceTypesClient: defaultFakeBareMetalInstanceTypesClient(),
 			},
 			bareMetalInstance: privatev1.BareMetalInstance_builder{
 				Id: "bmi-test",
@@ -182,8 +380,40 @@ var _ = Describe("mutateBMI", func() {
 					CatalogItem: privatev1.BareMetalInstanceCatalogItemReference_builder{
 						Id: "catalog-1",
 					}.Build(),
+					Template:     privatev1.BareMetalInstanceTemplateReference_builder{Id: "osac.templates.default"}.Build(),
+					InstanceType: privatev1.BareMetalInstanceTypeReference_builder{Id: "default-type", Shared: true}.Build(),
+					SshKey:       privatev1.SecretReference_builder{Id: "registered-key"}.Build(),
+				}.Build(),
+			}.Build(),
+		}
+
+		Expect(t.resolveSSHKey(ctx, nil)).To(Succeed())
+
+		var obj bmfov1alpha1.BareMetalInstance
+		err := t.mutateBMI(ctx, &obj)
+		Expect(err).ToNot(HaveOccurred())
+		var params map[string]string
+		Expect(json.Unmarshal([]byte(obj.Spec.TemplateParameters), &params)).To(Succeed())
+		Expect(params).To(HaveKeyWithValue("sshPublicKey", testSSHPublicKeyMaterial),
+			"the resolved registered key must reach the BMFO CR template parameters")
+	})
+
+	It("should map run_strategy HALTED to RunStrategy Halted", func() {
+
+		t := &task{
+			r: &function{
+				logger:                       logger,
+				bareMetalInstanceTypesClient: defaultFakeBareMetalInstanceTypesClient(),
+			},
+			bareMetalInstance: privatev1.BareMetalInstance_builder{
+				Id: "bmi-test",
+				Spec: privatev1.BareMetalInstanceSpec_builder{
+					CatalogItem: privatev1.BareMetalInstanceCatalogItemReference_builder{
+						Id: "catalog-1",
+					}.Build(),
+					Template:     privatev1.BareMetalInstanceTemplateReference_builder{Id: "osac.templates.default"}.Build(),
 					RunStrategy:  new(privatev1.BareMetalInstanceRunStrategy_BARE_METAL_INSTANCE_RUN_STRATEGY_HALTED),
-					InstanceType: privatev1.BareMetalInstanceTypeLocalReference_builder{Id: "default-type"}.Build(),
+					InstanceType: privatev1.BareMetalInstanceTypeReference_builder{Id: "default-type", Shared: true}.Build(),
 				}.Build(),
 			}.Build(),
 		}
@@ -195,19 +425,18 @@ var _ = Describe("mutateBMI", func() {
 	})
 
 	It("should leave RunStrategy empty when run_strategy is not set", func() {
-		catalogItemsClient := defaultFakeCatalogItemsClient()
 
 		t := &task{
 			r: &function{
-				logger:                              logger,
-				bareMetalInstanceCatalogItemsClient: catalogItemsClient,
-				bareMetalInstanceTypesClient:        defaultFakeBareMetalInstanceTypesClient(),
+				logger:                       logger,
+				bareMetalInstanceTypesClient: defaultFakeBareMetalInstanceTypesClient(),
 			},
 			bareMetalInstance: privatev1.BareMetalInstance_builder{
 				Id: "bmi-test",
 				Spec: privatev1.BareMetalInstanceSpec_builder{
 					CatalogItem:  privatev1.BareMetalInstanceCatalogItemReference_builder{Id: "catalog-1"}.Build(),
-					InstanceType: privatev1.BareMetalInstanceTypeLocalReference_builder{Id: "default-type"}.Build(),
+					Template:     privatev1.BareMetalInstanceTemplateReference_builder{Id: "osac.templates.default"}.Build(),
+					InstanceType: privatev1.BareMetalInstanceTypeReference_builder{Id: "default-type", Shared: true}.Build(),
 				}.Build(),
 			}.Build(),
 		}
@@ -219,20 +448,19 @@ var _ = Describe("mutateBMI", func() {
 	})
 
 	It("should propagate restart_trigger to CR spec", func() {
-		catalogItemsClient := defaultFakeCatalogItemsClient()
 
 		t := &task{
 			r: &function{
-				logger:                              logger,
-				bareMetalInstanceCatalogItemsClient: catalogItemsClient,
-				bareMetalInstanceTypesClient:        defaultFakeBareMetalInstanceTypesClient(),
+				logger:                       logger,
+				bareMetalInstanceTypesClient: defaultFakeBareMetalInstanceTypesClient(),
 			},
 			bareMetalInstance: privatev1.BareMetalInstance_builder{
 				Id: "bmi-test",
 				Spec: privatev1.BareMetalInstanceSpec_builder{
 					CatalogItem:    privatev1.BareMetalInstanceCatalogItemReference_builder{Id: "catalog-1"}.Build(),
+					Template:       privatev1.BareMetalInstanceTemplateReference_builder{Id: "osac.templates.default"}.Build(),
 					RestartTrigger: 42,
-					InstanceType:   privatev1.BareMetalInstanceTypeLocalReference_builder{Id: "default-type"}.Build(),
+					InstanceType:   privatev1.BareMetalInstanceTypeReference_builder{Id: "default-type", Shared: true}.Build(),
 				}.Build(),
 			}.Build(),
 		}
@@ -244,19 +472,18 @@ var _ = Describe("mutateBMI", func() {
 	})
 
 	It("should leave restart_trigger as zero when not set", func() {
-		catalogItemsClient := defaultFakeCatalogItemsClient()
 
 		t := &task{
 			r: &function{
-				logger:                              logger,
-				bareMetalInstanceCatalogItemsClient: catalogItemsClient,
-				bareMetalInstanceTypesClient:        defaultFakeBareMetalInstanceTypesClient(),
+				logger:                       logger,
+				bareMetalInstanceTypesClient: defaultFakeBareMetalInstanceTypesClient(),
 			},
 			bareMetalInstance: privatev1.BareMetalInstance_builder{
 				Id: "bmi-test",
 				Spec: privatev1.BareMetalInstanceSpec_builder{
 					CatalogItem:  privatev1.BareMetalInstanceCatalogItemReference_builder{Id: "catalog-1"}.Build(),
-					InstanceType: privatev1.BareMetalInstanceTypeLocalReference_builder{Id: "default-type"}.Build(),
+					Template:     privatev1.BareMetalInstanceTemplateReference_builder{Id: "osac.templates.default"}.Build(),
+					InstanceType: privatev1.BareMetalInstanceTypeReference_builder{Id: "default-type", Shared: true}.Build(),
 				}.Build(),
 			}.Build(),
 		}
@@ -268,22 +495,21 @@ var _ = Describe("mutateBMI", func() {
 	})
 
 	It("should include sshPublicKey and userDataSecret in templateParameters", func() {
-		catalogItemsClient := defaultFakeCatalogItemsClient()
 
 		t := &task{
 			r: &function{
-				logger:                              logger,
-				bareMetalInstanceCatalogItemsClient: catalogItemsClient,
-				bareMetalInstanceTypesClient:        defaultFakeBareMetalInstanceTypesClient(),
+				logger:                       logger,
+				bareMetalInstanceTypesClient: defaultFakeBareMetalInstanceTypesClient(),
 			},
 			bareMetalInstance: privatev1.BareMetalInstance_builder{
 				Id: "bmi-test",
 				Spec: privatev1.BareMetalInstanceSpec_builder{
 					CatalogItem:  privatev1.BareMetalInstanceCatalogItemReference_builder{Id: "catalog-1"}.Build(),
-					SshPublicKey: new("ssh-ed25519 AAAA... test@example.com"),
-					InstanceType: privatev1.BareMetalInstanceTypeLocalReference_builder{Id: "default-type"}.Build(),
+					Template:     privatev1.BareMetalInstanceTemplateReference_builder{Id: "osac.templates.default"}.Build(),
+					InstanceType: privatev1.BareMetalInstanceTypeReference_builder{Id: "default-type", Shared: true}.Build(),
 				}.Build(),
 			}.Build(),
+			sshPublicKey:       "ssh-ed25519 AAAA... test@example.com",
 			userDataSecretName: "bmi-test-user-data",
 		}
 
@@ -298,23 +524,22 @@ var _ = Describe("mutateBMI", func() {
 	})
 
 	It("should include only sshPublicKey when no user data", func() {
-		catalogItemsClient := defaultFakeCatalogItemsClient()
 		sshPublicKey := "ssh-ed25519 AAAA... test@example.com"
 
 		t := &task{
 			r: &function{
-				logger:                              logger,
-				bareMetalInstanceCatalogItemsClient: catalogItemsClient,
-				bareMetalInstanceTypesClient:        defaultFakeBareMetalInstanceTypesClient(),
+				logger:                       logger,
+				bareMetalInstanceTypesClient: defaultFakeBareMetalInstanceTypesClient(),
 			},
 			bareMetalInstance: privatev1.BareMetalInstance_builder{
 				Id: "bmi-test",
 				Spec: privatev1.BareMetalInstanceSpec_builder{
 					CatalogItem:  privatev1.BareMetalInstanceCatalogItemReference_builder{Id: "catalog-1"}.Build(),
-					SshPublicKey: new(sshPublicKey),
-					InstanceType: privatev1.BareMetalInstanceTypeLocalReference_builder{Id: "default-type"}.Build(),
+					Template:     privatev1.BareMetalInstanceTemplateReference_builder{Id: "osac.templates.default"}.Build(),
+					InstanceType: privatev1.BareMetalInstanceTypeReference_builder{Id: "default-type", Shared: true}.Build(),
 				}.Build(),
 			}.Build(),
+			sshPublicKey: sshPublicKey,
 		}
 
 		var obj bmfov1alpha1.BareMetalInstance
@@ -328,20 +553,19 @@ var _ = Describe("mutateBMI", func() {
 		Expect(params).ToNot(HaveKey("userDataSecret"))
 	})
 
-	It("should leave templateParameters empty when no ssh_public_key or user_data", func() {
-		catalogItemsClient := defaultFakeCatalogItemsClient()
+	It("should leave templateParameters empty when no ssh_public_key or user_data_source.inline", func() {
 
 		t := &task{
 			r: &function{
-				logger:                              logger,
-				bareMetalInstanceCatalogItemsClient: catalogItemsClient,
-				bareMetalInstanceTypesClient:        defaultFakeBareMetalInstanceTypesClient(),
+				logger:                       logger,
+				bareMetalInstanceTypesClient: defaultFakeBareMetalInstanceTypesClient(),
 			},
 			bareMetalInstance: privatev1.BareMetalInstance_builder{
 				Id: "bmi-test",
 				Spec: privatev1.BareMetalInstanceSpec_builder{
 					CatalogItem:  privatev1.BareMetalInstanceCatalogItemReference_builder{Id: "catalog-1"}.Build(),
-					InstanceType: privatev1.BareMetalInstanceTypeLocalReference_builder{Id: "default-type"}.Build(),
+					Template:     privatev1.BareMetalInstanceTemplateReference_builder{Id: "osac.templates.default"}.Build(),
+					InstanceType: privatev1.BareMetalInstanceTypeReference_builder{Id: "default-type", Shared: true}.Build(),
 				}.Build(),
 			}.Build(),
 		}
@@ -353,22 +577,21 @@ var _ = Describe("mutateBMI", func() {
 	})
 
 	It("should include user-provided template_parameters in CR templateParameters", func() {
-		catalogItemsClient := defaultFakeCatalogItemsClient()
 
 		osParam, err := anypb.New(wrapperspb.String("rhel9.4"))
 		Expect(err).ToNot(HaveOccurred())
 
 		t := &task{
 			r: &function{
-				logger:                              logger,
-				bareMetalInstanceCatalogItemsClient: catalogItemsClient,
-				bareMetalInstanceTypesClient:        defaultFakeBareMetalInstanceTypesClient(),
+				logger:                       logger,
+				bareMetalInstanceTypesClient: defaultFakeBareMetalInstanceTypesClient(),
 			},
 			bareMetalInstance: privatev1.BareMetalInstance_builder{
 				Id: "bmi-test",
 				Spec: privatev1.BareMetalInstanceSpec_builder{
 					CatalogItem:        privatev1.BareMetalInstanceCatalogItemReference_builder{Id: "catalog-1"}.Build(),
-					InstanceType:       privatev1.BareMetalInstanceTypeLocalReference_builder{Id: "default-type"}.Build(),
+					Template:           privatev1.BareMetalInstanceTemplateReference_builder{Id: "osac.templates.default"}.Build(),
+					InstanceType:       privatev1.BareMetalInstanceTypeReference_builder{Id: "default-type", Shared: true}.Build(),
 					TemplateParameters: map[string]*anypb.Any{"os_version": osParam},
 				}.Build(),
 			}.Build(),
@@ -384,26 +607,25 @@ var _ = Describe("mutateBMI", func() {
 	})
 
 	It("should merge user template_parameters with system parameters", func() {
-		catalogItemsClient := defaultFakeCatalogItemsClient()
 
 		osParam, err := anypb.New(wrapperspb.String("rhel9.4"))
 		Expect(err).ToNot(HaveOccurred())
 
 		t := &task{
 			r: &function{
-				logger:                              logger,
-				bareMetalInstanceCatalogItemsClient: catalogItemsClient,
-				bareMetalInstanceTypesClient:        defaultFakeBareMetalInstanceTypesClient(),
+				logger:                       logger,
+				bareMetalInstanceTypesClient: defaultFakeBareMetalInstanceTypesClient(),
 			},
 			bareMetalInstance: privatev1.BareMetalInstance_builder{
 				Id: "bmi-test",
 				Spec: privatev1.BareMetalInstanceSpec_builder{
 					CatalogItem:        privatev1.BareMetalInstanceCatalogItemReference_builder{Id: "catalog-1"}.Build(),
-					SshPublicKey:       new("ssh-ed25519 AAAA... test@example.com"),
+					Template:           privatev1.BareMetalInstanceTemplateReference_builder{Id: "osac.templates.default"}.Build(),
 					TemplateParameters: map[string]*anypb.Any{"os_version": osParam},
-					InstanceType:       privatev1.BareMetalInstanceTypeLocalReference_builder{Id: "default-type"}.Build(),
+					InstanceType:       privatev1.BareMetalInstanceTypeReference_builder{Id: "default-type", Shared: true}.Build(),
 				}.Build(),
 			}.Build(),
+			sshPublicKey:       "ssh-ed25519 AAAA... test@example.com",
 			userDataSecretName: "bmi-test-user-data",
 		}
 
@@ -419,26 +641,25 @@ var _ = Describe("mutateBMI", func() {
 	})
 
 	It("should let system parameters override user-provided ones", func() {
-		catalogItemsClient := defaultFakeCatalogItemsClient()
 
 		userSshParam, err := anypb.New(wrapperspb.String("user-provided-key"))
 		Expect(err).ToNot(HaveOccurred())
 
 		t := &task{
 			r: &function{
-				logger:                              logger,
-				bareMetalInstanceCatalogItemsClient: catalogItemsClient,
-				bareMetalInstanceTypesClient:        defaultFakeBareMetalInstanceTypesClient(),
+				logger:                       logger,
+				bareMetalInstanceTypesClient: defaultFakeBareMetalInstanceTypesClient(),
 			},
 			bareMetalInstance: privatev1.BareMetalInstance_builder{
 				Id: "bmi-test",
 				Spec: privatev1.BareMetalInstanceSpec_builder{
 					CatalogItem:        privatev1.BareMetalInstanceCatalogItemReference_builder{Id: "catalog-1"}.Build(),
-					SshPublicKey:       new("ssh-ed25519 AAAA... real@example.com"),
+					Template:           privatev1.BareMetalInstanceTemplateReference_builder{Id: "osac.templates.default"}.Build(),
 					TemplateParameters: map[string]*anypb.Any{"sshPublicKey": userSshParam},
-					InstanceType:       privatev1.BareMetalInstanceTypeLocalReference_builder{Id: "default-type"}.Build(),
+					InstanceType:       privatev1.BareMetalInstanceTypeReference_builder{Id: "default-type", Shared: true}.Build(),
 				}.Build(),
 			}.Build(),
+			sshPublicKey: "ssh-ed25519 AAAA... real@example.com",
 		}
 
 		var obj bmfov1alpha1.BareMetalInstance
@@ -451,16 +672,12 @@ var _ = Describe("mutateBMI", func() {
 			"system sshPublicKey must override user-provided template_parameters value")
 	})
 
-	It("should return error when catalog item fetch fails", func() {
-		catalogItemsClient := &fakeCatalogItemsClient{
-			getError: errors.New("catalog item not found"),
-		}
+	It("should reject an instance without a materialized Template", func() {
 
 		t := &task{
 			r: &function{
-				logger:                              logger,
-				bareMetalInstanceCatalogItemsClient: catalogItemsClient,
-				bareMetalInstanceTypesClient:        defaultFakeBareMetalInstanceTypesClient(),
+				logger:                       logger,
+				bareMetalInstanceTypesClient: defaultFakeBareMetalInstanceTypesClient(),
 			},
 			bareMetalInstance: privatev1.BareMetalInstance_builder{
 				Id: "bmi-test",
@@ -473,30 +690,40 @@ var _ = Describe("mutateBMI", func() {
 		var obj bmfov1alpha1.BareMetalInstance
 		err := t.mutateBMI(ctx, &obj)
 		Expect(err).To(HaveOccurred())
-		Expect(err.Error()).To(ContainSubstring("failed to get catalog item"))
-		Expect(err.Error()).To(ContainSubstring("missing-catalog"))
+		Expect(err.Error()).To(ContainSubstring("materialized template"))
 	})
 
-	It("should include imageURL in templateParameters when image is set", func() {
-		catalogItemsClient := defaultFakeCatalogItemsClient()
+	It("should include imageURL in templateParameters when disk_image is set", func() {
+		ctrl := gomock.NewController(GinkgoT())
+		DeferCleanup(ctrl.Finish)
+		diskImagesClient := NewMockDiskImagesClient(ctrl)
+		diskImagesClient.EXPECT().
+			Get(gomock.Any(), gomock.Any()).
+			Return(privatev1.DiskImagesGetResponse_builder{
+				Object: privatev1.DiskImage_builder{
+					Id: "disk-image-1",
+					Spec: privatev1.DiskImageSpec_builder{
+						SourceRef: "quay.io/org/rhel9:latest",
+					}.Build(),
+				}.Build(),
+			}.Build(), nil)
 
 		t := &task{
 			r: &function{
-				logger:                              logger,
-				bareMetalInstanceCatalogItemsClient: catalogItemsClient,
-				bareMetalInstanceTypesClient:        defaultFakeBareMetalInstanceTypesClient(),
+				logger:                       logger,
+				bareMetalInstanceTypesClient: defaultFakeBareMetalInstanceTypesClient(),
+				diskImagesClient:             diskImagesClient,
 			},
 			bareMetalInstance: privatev1.BareMetalInstance_builder{
 				Id: "bmi-test",
 				Spec: privatev1.BareMetalInstanceSpec_builder{
 					CatalogItem:  privatev1.BareMetalInstanceCatalogItemReference_builder{Id: "catalog-1"}.Build(),
-					InstanceType: privatev1.BareMetalInstanceTypeLocalReference_builder{Id: "default-type"}.Build(),
-					Image: privatev1.BareMetalInstanceImage_builder{
-						SourceType: "registry",
-						SourceRef:  "quay.io/org/rhel9:latest",
-					}.Build(),
+					Template:     privatev1.BareMetalInstanceTemplateReference_builder{Id: "osac.templates.default"}.Build(),
+					InstanceType: privatev1.BareMetalInstanceTypeReference_builder{Id: "default-type", Shared: true}.Build(),
+					DiskImage:    privatev1.DiskImageReference_builder{Id: "disk-image-1"}.Build(),
 				}.Build(),
 			}.Build(),
+			sshPublicKey: "ssh-ed25519 AAAA... test@example.com",
 		}
 
 		var obj bmfov1alpha1.BareMetalInstance
@@ -508,23 +735,93 @@ var _ = Describe("mutateBMI", func() {
 		Expect(params["imageURL"]).To(Equal("quay.io/org/rhel9:latest"))
 	})
 
-	It("should not include imageURL in templateParameters when image is not set", func() {
-		catalogItemsClient := defaultFakeCatalogItemsClient()
+	It("should return a wrapped error when disk_image resolution fails", func() {
+		ctrl := gomock.NewController(GinkgoT())
+		DeferCleanup(ctrl.Finish)
+		diskImagesClient := NewMockDiskImagesClient(ctrl)
+		diskImagesClient.EXPECT().
+			Get(gomock.Any(), gomock.Any()).
+			Return(nil, errors.New("disk image not found"))
 
 		t := &task{
 			r: &function{
-				logger:                              logger,
-				bareMetalInstanceCatalogItemsClient: catalogItemsClient,
-				bareMetalInstanceTypesClient:        defaultFakeBareMetalInstanceTypesClient(),
+				logger:                       logger,
+				bareMetalInstanceTypesClient: defaultFakeBareMetalInstanceTypesClient(),
+				diskImagesClient:             diskImagesClient,
+			},
+			bareMetalInstance: privatev1.BareMetalInstance_builder{
+				Id: "bmi-test",
+				Spec: privatev1.BareMetalInstanceSpec_builder{
+					Template:     privatev1.BareMetalInstanceTemplateReference_builder{Id: "osac.templates.default"}.Build(),
+					CatalogItem:  privatev1.BareMetalInstanceCatalogItemReference_builder{Id: "catalog-1"}.Build(),
+					InstanceType: privatev1.BareMetalInstanceTypeReference_builder{Id: "default-type", Shared: true}.Build(),
+					DiskImage:    privatev1.DiskImageReference_builder{Id: "missing-disk-image"}.Build(),
+				}.Build(),
+			}.Build(),
+		}
+
+		var obj bmfov1alpha1.BareMetalInstance
+		err := t.mutateBMI(ctx, &obj)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("failed to resolve disk image"))
+		Expect(err.Error()).To(ContainSubstring("missing-disk-image"))
+	})
+
+	It("should produce identical templateParameters across repeated reconciliations (idempotency)", func() {
+		ctrl := gomock.NewController(GinkgoT())
+		DeferCleanup(ctrl.Finish)
+		diskImagesClient := NewMockDiskImagesClient(ctrl)
+		diskImagesClient.EXPECT().
+			Get(gomock.Any(), gomock.Any()).
+			Return(privatev1.DiskImagesGetResponse_builder{
+				Object: privatev1.DiskImage_builder{
+					Id: "disk-image-1",
+					Spec: privatev1.DiskImageSpec_builder{
+						SourceRef: "quay.io/org/rhel9:latest",
+					}.Build(),
+				}.Build(),
+			}.Build(), nil).
+			Times(2)
+
+		t := &task{
+			r: &function{
+				logger:                       logger,
+				bareMetalInstanceTypesClient: defaultFakeBareMetalInstanceTypesClient(),
+				diskImagesClient:             diskImagesClient,
+			},
+			bareMetalInstance: privatev1.BareMetalInstance_builder{
+				Id: "bmi-test",
+				Spec: privatev1.BareMetalInstanceSpec_builder{
+					Template:     privatev1.BareMetalInstanceTemplateReference_builder{Id: "osac.templates.default"}.Build(),
+					CatalogItem:  privatev1.BareMetalInstanceCatalogItemReference_builder{Id: "catalog-1"}.Build(),
+					InstanceType: privatev1.BareMetalInstanceTypeReference_builder{Id: "default-type", Shared: true}.Build(),
+					DiskImage:    privatev1.DiskImageReference_builder{Id: "disk-image-1"}.Build(),
+				}.Build(),
+			}.Build(),
+		}
+
+		var first, second bmfov1alpha1.BareMetalInstance
+		Expect(t.mutateBMI(ctx, &first)).To(Succeed())
+		Expect(t.mutateBMI(ctx, &second)).To(Succeed())
+		Expect(second.Spec.TemplateParameters).To(Equal(first.Spec.TemplateParameters))
+	})
+
+	It("should not include imageURL in templateParameters when image is not set", func() {
+
+		t := &task{
+			r: &function{
+				logger:                       logger,
+				bareMetalInstanceTypesClient: defaultFakeBareMetalInstanceTypesClient(),
 			},
 			bareMetalInstance: privatev1.BareMetalInstance_builder{
 				Id: "bmi-test",
 				Spec: privatev1.BareMetalInstanceSpec_builder{
 					CatalogItem:  privatev1.BareMetalInstanceCatalogItemReference_builder{Id: "catalog-1"}.Build(),
-					SshPublicKey: new("ssh-ed25519 AAAA... test@example.com"),
-					InstanceType: privatev1.BareMetalInstanceTypeLocalReference_builder{Id: "default-type"}.Build(),
+					Template:     privatev1.BareMetalInstanceTemplateReference_builder{Id: "osac.templates.default"}.Build(),
+					InstanceType: privatev1.BareMetalInstanceTypeReference_builder{Id: "default-type", Shared: true}.Build(),
 				}.Build(),
 			}.Build(),
+			sshPublicKey: "ssh-ed25519 AAAA... test@example.com",
 		}
 
 		var obj bmfov1alpha1.BareMetalInstance
@@ -537,29 +834,40 @@ var _ = Describe("mutateBMI", func() {
 	})
 
 	It("should let system imageURL override user-provided template_parameters value", func() {
-		catalogItemsClient := defaultFakeCatalogItemsClient()
+		ctrl := gomock.NewController(GinkgoT())
+		DeferCleanup(ctrl.Finish)
+		diskImagesClient := NewMockDiskImagesClient(ctrl)
+		diskImagesClient.EXPECT().
+			Get(gomock.Any(), gomock.Any()).
+			Return(privatev1.DiskImagesGetResponse_builder{
+				Object: privatev1.DiskImage_builder{
+					Id: "disk-image-1",
+					Spec: privatev1.DiskImageSpec_builder{
+						SourceRef: "quay.io/org/rhel9:latest",
+					}.Build(),
+				}.Build(),
+			}.Build(), nil)
 
 		userImageParam, err := anypb.New(wrapperspb.String("user-provided-image"))
 		Expect(err).ToNot(HaveOccurred())
 
 		t := &task{
 			r: &function{
-				logger:                              logger,
-				bareMetalInstanceCatalogItemsClient: catalogItemsClient,
-				bareMetalInstanceTypesClient:        defaultFakeBareMetalInstanceTypesClient(),
+				logger:                       logger,
+				bareMetalInstanceTypesClient: defaultFakeBareMetalInstanceTypesClient(),
+				diskImagesClient:             diskImagesClient,
 			},
 			bareMetalInstance: privatev1.BareMetalInstance_builder{
 				Id: "bmi-test",
 				Spec: privatev1.BareMetalInstanceSpec_builder{
 					CatalogItem:        privatev1.BareMetalInstanceCatalogItemReference_builder{Id: "catalog-1"}.Build(),
-					InstanceType:       privatev1.BareMetalInstanceTypeLocalReference_builder{Id: "default-type"}.Build(),
+					Template:           privatev1.BareMetalInstanceTemplateReference_builder{Id: "osac.templates.default"}.Build(),
+					InstanceType:       privatev1.BareMetalInstanceTypeReference_builder{Id: "default-type", Shared: true}.Build(),
 					TemplateParameters: map[string]*anypb.Any{"imageURL": userImageParam},
-					Image: privatev1.BareMetalInstanceImage_builder{
-						SourceType: "registry",
-						SourceRef:  "quay.io/org/rhel9:latest",
-					}.Build(),
+					DiskImage:          privatev1.DiskImageReference_builder{Id: "disk-image-1"}.Build(),
 				}.Build(),
 			}.Build(),
+			sshPublicKey: "ssh-ed25519 AAAA... test@example.com",
 		}
 
 		var obj bmfov1alpha1.BareMetalInstance
@@ -572,28 +880,38 @@ var _ = Describe("mutateBMI", func() {
 			"system imageURL must override user-provided template_parameters value")
 	})
 
-	It("should let system imageSourceType override user-provided template_parameters value", func() {
-		catalogItemsClient := defaultFakeCatalogItemsClient()
+	It("should never include imageSourceType in templateParameters when disk_image is set", func() {
+		ctrl := gomock.NewController(GinkgoT())
+		DeferCleanup(ctrl.Finish)
+		diskImagesClient := NewMockDiskImagesClient(ctrl)
+		diskImagesClient.EXPECT().
+			Get(gomock.Any(), gomock.Any()).
+			Return(privatev1.DiskImagesGetResponse_builder{
+				Object: privatev1.DiskImage_builder{
+					Id: "disk-image-1",
+					Spec: privatev1.DiskImageSpec_builder{
+						SourceRef: "quay.io/org/rhel9:latest",
+					}.Build(),
+				}.Build(),
+			}.Build(), nil)
 
 		userSourceTypeParam, err := anypb.New(wrapperspb.String("user-provided-type"))
 		Expect(err).ToNot(HaveOccurred())
 
 		t := &task{
 			r: &function{
-				logger:                              logger,
-				bareMetalInstanceCatalogItemsClient: catalogItemsClient,
-				bareMetalInstanceTypesClient:        defaultFakeBareMetalInstanceTypesClient(),
+				logger:                       logger,
+				bareMetalInstanceTypesClient: defaultFakeBareMetalInstanceTypesClient(),
+				diskImagesClient:             diskImagesClient,
 			},
 			bareMetalInstance: privatev1.BareMetalInstance_builder{
 				Id: "bmi-test",
 				Spec: privatev1.BareMetalInstanceSpec_builder{
 					CatalogItem:        &privatev1.BareMetalInstanceCatalogItemReference{Id: "catalog-1"},
+					Template:           privatev1.BareMetalInstanceTemplateReference_builder{Id: "osac.templates.default"}.Build(),
 					TemplateParameters: map[string]*anypb.Any{"imageSourceType": userSourceTypeParam},
-					Image: privatev1.BareMetalInstanceImage_builder{
-						SourceType: "oci",
-						SourceRef:  "quay.io/org/rhel9:latest",
-					}.Build(),
-					InstanceType: privatev1.BareMetalInstanceTypeLocalReference_builder{Id: "default-type"}.Build(),
+					DiskImage:          privatev1.DiskImageReference_builder{Id: "disk-image-1"}.Build(),
+					InstanceType:       privatev1.BareMetalInstanceTypeReference_builder{Id: "default-type", Shared: true}.Build(),
 				}.Build(),
 			}.Build(),
 		}
@@ -604,31 +922,41 @@ var _ = Describe("mutateBMI", func() {
 
 		var params map[string]any
 		Expect(json.Unmarshal([]byte(obj.Spec.TemplateParameters), &params)).To(Succeed())
-		Expect(params["imageSourceType"]).To(Equal("oci"),
-			"system imageSourceType must override user-provided template_parameters value")
+		Expect(params["imageSourceType"]).To(Equal("user-provided-type"),
+			"the reconciler never touches imageSourceType; only user-provided template_parameters can set it")
 	})
 
 	It("should include imageURL alongside sshPublicKey in templateParameters", func() {
-		catalogItemsClient := defaultFakeCatalogItemsClient()
+		ctrl := gomock.NewController(GinkgoT())
+		DeferCleanup(ctrl.Finish)
+		diskImagesClient := NewMockDiskImagesClient(ctrl)
+		diskImagesClient.EXPECT().
+			Get(gomock.Any(), gomock.Any()).
+			Return(privatev1.DiskImagesGetResponse_builder{
+				Object: privatev1.DiskImage_builder{
+					Id: "disk-image-1",
+					Spec: privatev1.DiskImageSpec_builder{
+						SourceRef: "quay.io/org/fedora:latest",
+					}.Build(),
+				}.Build(),
+			}.Build(), nil)
 
 		t := &task{
 			r: &function{
-				logger:                              logger,
-				bareMetalInstanceCatalogItemsClient: catalogItemsClient,
-				bareMetalInstanceTypesClient:        defaultFakeBareMetalInstanceTypesClient(),
+				logger:                       logger,
+				bareMetalInstanceTypesClient: defaultFakeBareMetalInstanceTypesClient(),
+				diskImagesClient:             diskImagesClient,
 			},
 			bareMetalInstance: privatev1.BareMetalInstance_builder{
 				Id: "bmi-test",
 				Spec: privatev1.BareMetalInstanceSpec_builder{
 					CatalogItem:  privatev1.BareMetalInstanceCatalogItemReference_builder{Id: "catalog-1"}.Build(),
-					SshPublicKey: new("ssh-ed25519 AAAA... test@example.com"),
-					Image: privatev1.BareMetalInstanceImage_builder{
-						SourceType: "registry",
-						SourceRef:  "quay.io/org/fedora:latest",
-					}.Build(),
-					InstanceType: privatev1.BareMetalInstanceTypeLocalReference_builder{Id: "default-type"}.Build(),
+					Template:     privatev1.BareMetalInstanceTemplateReference_builder{Id: "osac.templates.default"}.Build(),
+					DiskImage:    privatev1.DiskImageReference_builder{Id: "disk-image-1"}.Build(),
+					InstanceType: privatev1.BareMetalInstanceTypeReference_builder{Id: "default-type", Shared: true}.Build(),
 				}.Build(),
 			}.Build(),
+			sshPublicKey:       "ssh-ed25519 AAAA... test@example.com",
 			userDataSecretName: "bmi-test-user-data",
 		}
 
@@ -644,19 +972,18 @@ var _ = Describe("mutateBMI", func() {
 	})
 
 	It("should copy single network attachment with all fields", func() {
-		catalogItemsClient := defaultFakeCatalogItemsClient()
 
 		t := &task{
 			r: &function{
-				logger:                              logger,
-				bareMetalInstanceCatalogItemsClient: catalogItemsClient,
-				bareMetalInstanceTypesClient:        defaultFakeBareMetalInstanceTypesClient(),
+				logger:                       logger,
+				bareMetalInstanceTypesClient: defaultFakeBareMetalInstanceTypesClient(),
 			},
 			bareMetalInstance: privatev1.BareMetalInstance_builder{
 				Id: "bmi-test",
 				Spec: privatev1.BareMetalInstanceSpec_builder{
 					CatalogItem:  privatev1.BareMetalInstanceCatalogItemReference_builder{Id: "catalog-1"}.Build(),
-					InstanceType: privatev1.BareMetalInstanceTypeLocalReference_builder{Id: "default-type"}.Build(),
+					Template:     privatev1.BareMetalInstanceTemplateReference_builder{Id: "osac.templates.default"}.Build(),
+					InstanceType: privatev1.BareMetalInstanceTypeReference_builder{Id: "default-type", Shared: true}.Build(),
 					NetworkAttachments: []*privatev1.BareMetalNetworkAttachment{
 						privatev1.BareMetalNetworkAttachment_builder{
 							Subnet: privatev1.SubnetLocalReference_builder{
@@ -688,38 +1015,25 @@ var _ = Describe("mutateBMI", func() {
 		Expect(obj.Spec.NetworkAttachments[0].Primary).To(BeTrue())
 	})
 
-	It("should copy multiple network attachments preserving order", func() {
-		catalogItemsClient := defaultFakeCatalogItemsClient()
+	It("should normalize omitted primary to true on sole network attachment", func() {
 
 		t := &task{
 			r: &function{
-				logger:                              logger,
-				bareMetalInstanceCatalogItemsClient: catalogItemsClient,
-				bareMetalInstanceTypesClient:        defaultFakeBareMetalInstanceTypesClient(),
+				logger:                       logger,
+				bareMetalInstanceTypesClient: defaultFakeBareMetalInstanceTypesClient(),
 			},
 			bareMetalInstance: privatev1.BareMetalInstance_builder{
 				Id: "bmi-test",
 				Spec: privatev1.BareMetalInstanceSpec_builder{
 					CatalogItem:  privatev1.BareMetalInstanceCatalogItemReference_builder{Id: "catalog-1"}.Build(),
-					InstanceType: privatev1.BareMetalInstanceTypeLocalReference_builder{Id: "default-type"}.Build(),
+					Template:     privatev1.BareMetalInstanceTemplateReference_builder{Id: "osac.templates.default"}.Build(),
+					InstanceType: privatev1.BareMetalInstanceTypeReference_builder{Id: "default-type", Shared: true}.Build(),
 					NetworkAttachments: []*privatev1.BareMetalNetworkAttachment{
 						privatev1.BareMetalNetworkAttachment_builder{
 							Subnet: privatev1.SubnetLocalReference_builder{
 								Id: "subnet-data",
 							}.Build(),
 							Interface: new("data-0"),
-							Primary:   new(true),
-						}.Build(),
-						privatev1.BareMetalNetworkAttachment_builder{
-							Subnet: privatev1.SubnetLocalReference_builder{
-								Id: "subnet-storage",
-							}.Build(),
-							SecurityGroups: []*privatev1.SecurityGroupLocalReference{
-								privatev1.SecurityGroupLocalReference_builder{
-									Id: "sg-storage",
-								}.Build(),
-							},
-							Interface: new("data-1"),
 						}.Build(),
 					},
 				}.Build(),
@@ -729,30 +1043,25 @@ var _ = Describe("mutateBMI", func() {
 		var obj bmfov1alpha1.BareMetalInstance
 		err := t.mutateBMI(ctx, &obj)
 		Expect(err).ToNot(HaveOccurred())
-		Expect(obj.Spec.NetworkAttachments).To(HaveLen(2))
+		Expect(obj.Spec.NetworkAttachments).To(HaveLen(1))
 		Expect(obj.Spec.NetworkAttachments[0].SubnetRef).To(Equal("subnet-data"))
 		Expect(obj.Spec.NetworkAttachments[0].Interface).To(Equal("data-0"))
 		Expect(obj.Spec.NetworkAttachments[0].Primary).To(BeTrue())
-		Expect(obj.Spec.NetworkAttachments[1].SubnetRef).To(Equal("subnet-storage"))
-		Expect(obj.Spec.NetworkAttachments[1].SecurityGroupRefs).To(Equal([]string{"sg-storage"}))
-		Expect(obj.Spec.NetworkAttachments[1].Interface).To(Equal("data-1"))
-		Expect(obj.Spec.NetworkAttachments[1].Primary).To(BeFalse())
 	})
 
 	It("should leave NetworkAttachments empty when proto has none", func() {
-		catalogItemsClient := defaultFakeCatalogItemsClient()
 
 		t := &task{
 			r: &function{
-				logger:                              logger,
-				bareMetalInstanceCatalogItemsClient: catalogItemsClient,
-				bareMetalInstanceTypesClient:        defaultFakeBareMetalInstanceTypesClient(),
+				logger:                       logger,
+				bareMetalInstanceTypesClient: defaultFakeBareMetalInstanceTypesClient(),
 			},
 			bareMetalInstance: privatev1.BareMetalInstance_builder{
 				Id: "bmi-test",
 				Spec: privatev1.BareMetalInstanceSpec_builder{
 					CatalogItem:  privatev1.BareMetalInstanceCatalogItemReference_builder{Id: "catalog-1"}.Build(),
-					InstanceType: privatev1.BareMetalInstanceTypeLocalReference_builder{Id: "default-type"}.Build(),
+					Template:     privatev1.BareMetalInstanceTemplateReference_builder{Id: "osac.templates.default"}.Build(),
+					InstanceType: privatev1.BareMetalInstanceTypeReference_builder{Id: "default-type", Shared: true}.Build(),
 				}.Build(),
 			}.Build(),
 		}
@@ -764,19 +1073,18 @@ var _ = Describe("mutateBMI", func() {
 	})
 
 	It("should handle attachment with optional fields omitted", func() {
-		catalogItemsClient := defaultFakeCatalogItemsClient()
 
 		t := &task{
 			r: &function{
-				logger:                              logger,
-				bareMetalInstanceCatalogItemsClient: catalogItemsClient,
-				bareMetalInstanceTypesClient:        defaultFakeBareMetalInstanceTypesClient(),
+				logger:                       logger,
+				bareMetalInstanceTypesClient: defaultFakeBareMetalInstanceTypesClient(),
 			},
 			bareMetalInstance: privatev1.BareMetalInstance_builder{
 				Id: "bmi-test",
 				Spec: privatev1.BareMetalInstanceSpec_builder{
 					CatalogItem:  privatev1.BareMetalInstanceCatalogItemReference_builder{Id: "catalog-1"}.Build(),
-					InstanceType: privatev1.BareMetalInstanceTypeLocalReference_builder{Id: "default-type"}.Build(),
+					Template:     privatev1.BareMetalInstanceTemplateReference_builder{Id: "osac.templates.default"}.Build(),
+					InstanceType: privatev1.BareMetalInstanceTypeReference_builder{Id: "default-type", Shared: true}.Build(),
 					NetworkAttachments: []*privatev1.BareMetalNetworkAttachment{
 						privatev1.BareMetalNetworkAttachment_builder{
 							Subnet: privatev1.SubnetLocalReference_builder{
@@ -795,26 +1103,37 @@ var _ = Describe("mutateBMI", func() {
 		Expect(obj.Spec.NetworkAttachments[0].SubnetRef).To(Equal("subnet-1"))
 		Expect(obj.Spec.NetworkAttachments[0].SecurityGroupRefs).To(BeEmpty())
 		Expect(obj.Spec.NetworkAttachments[0].Interface).To(BeEmpty())
-		Expect(obj.Spec.NetworkAttachments[0].Primary).To(BeFalse())
+		Expect(obj.Spec.NetworkAttachments[0].Primary).To(BeTrue())
 	})
 
-	It("should not include imageSourceType when source_type is empty", func() {
-		catalogItemsClient := defaultFakeCatalogItemsClient()
+	It("should not include imageSourceType when disk_image is set and no user override is provided", func() {
+		ctrl := gomock.NewController(GinkgoT())
+		DeferCleanup(ctrl.Finish)
+		diskImagesClient := NewMockDiskImagesClient(ctrl)
+		diskImagesClient.EXPECT().
+			Get(gomock.Any(), gomock.Any()).
+			Return(privatev1.DiskImagesGetResponse_builder{
+				Object: privatev1.DiskImage_builder{
+					Id: "disk-image-1",
+					Spec: privatev1.DiskImageSpec_builder{
+						SourceRef: "quay.io/org/rhel9:latest",
+					}.Build(),
+				}.Build(),
+			}.Build(), nil)
 
 		t := &task{
 			r: &function{
-				logger:                              logger,
-				bareMetalInstanceCatalogItemsClient: catalogItemsClient,
-				bareMetalInstanceTypesClient:        defaultFakeBareMetalInstanceTypesClient(),
+				logger:                       logger,
+				bareMetalInstanceTypesClient: defaultFakeBareMetalInstanceTypesClient(),
+				diskImagesClient:             diskImagesClient,
 			},
 			bareMetalInstance: privatev1.BareMetalInstance_builder{
 				Id: "bmi-test",
 				Spec: privatev1.BareMetalInstanceSpec_builder{
 					CatalogItem:  &privatev1.BareMetalInstanceCatalogItemReference{Id: "catalog-1"},
-					InstanceType: privatev1.BareMetalInstanceTypeLocalReference_builder{Id: "default-type"}.Build(),
-					Image: privatev1.BareMetalInstanceImage_builder{
-						SourceRef: "quay.io/org/rhel9:latest",
-					}.Build(),
+					Template:     privatev1.BareMetalInstanceTemplateReference_builder{Id: "osac.templates.default"}.Build(),
+					InstanceType: privatev1.BareMetalInstanceTypeReference_builder{Id: "default-type", Shared: true}.Build(),
+					DiskImage:    privatev1.DiskImageReference_builder{Id: "disk-image-1"}.Build(),
 				}.Build(),
 			}.Build(),
 		}
@@ -829,44 +1148,7 @@ var _ = Describe("mutateBMI", func() {
 		Expect(params).ToNot(HaveKey("imageSourceType"))
 	})
 
-	It("should strip user-provided imageSourceType when image has empty source_type", func() {
-		catalogItemsClient := defaultFakeCatalogItemsClient()
-
-		userSourceTypeParam, err := anypb.New(wrapperspb.String("user-injected-type"))
-		Expect(err).ToNot(HaveOccurred())
-
-		t := &task{
-			r: &function{
-				logger:                              logger,
-				bareMetalInstanceCatalogItemsClient: catalogItemsClient,
-				bareMetalInstanceTypesClient:        defaultFakeBareMetalInstanceTypesClient(),
-			},
-			bareMetalInstance: privatev1.BareMetalInstance_builder{
-				Id: "bmi-test",
-				Spec: privatev1.BareMetalInstanceSpec_builder{
-					CatalogItem:        &privatev1.BareMetalInstanceCatalogItemReference{Id: "catalog-1"},
-					TemplateParameters: map[string]*anypb.Any{"imageSourceType": userSourceTypeParam},
-					Image: privatev1.BareMetalInstanceImage_builder{
-						SourceRef: "oci://registry.example.com/rhel9:latest",
-					}.Build(),
-					InstanceType: privatev1.BareMetalInstanceTypeLocalReference_builder{Id: "default-type"}.Build(),
-				}.Build(),
-			}.Build(),
-		}
-
-		var obj bmfov1alpha1.BareMetalInstance
-		err = t.mutateBMI(ctx, &obj)
-		Expect(err).ToNot(HaveOccurred())
-
-		var params map[string]any
-		Expect(json.Unmarshal([]byte(obj.Spec.TemplateParameters), &params)).To(Succeed())
-		Expect(params).To(HaveKey("imageURL"))
-		Expect(params).ToNot(HaveKey("imageSourceType"),
-			"user-provided imageSourceType must be stripped when spec image has no source_type")
-	})
-
 	It("should resolve instance_type and map host_label_selector to Selector.HostSelector", func() {
-		catalogItemsClient := defaultFakeCatalogItemsClient()
 		instanceTypesClient := &fakeBareMetalInstanceTypesClient{
 			getResponse: privatev1.BareMetalInstanceTypesGetResponse_builder{
 				Object: privatev1.BareMetalInstanceType_builder{
@@ -885,20 +1167,21 @@ var _ = Describe("mutateBMI", func() {
 
 		t := &task{
 			r: &function{
-				logger:                              logger,
-				bareMetalInstanceCatalogItemsClient: catalogItemsClient,
-				bareMetalInstanceTypesClient:        instanceTypesClient,
+				logger:                       logger,
+				bareMetalInstanceTypesClient: instanceTypesClient,
 			},
 			bareMetalInstance: privatev1.BareMetalInstance_builder{
 				Id: "bmi-test",
 				Spec: privatev1.BareMetalInstanceSpec_builder{
 					CatalogItem:  privatev1.BareMetalInstanceCatalogItemReference_builder{Id: "catalog-1"}.Build(),
-					InstanceType: privatev1.BareMetalInstanceTypeLocalReference_builder{Id: "gpu-large"}.Build(),
+					Template:     privatev1.BareMetalInstanceTemplateReference_builder{Id: "osac.templates.default"}.Build(),
+					InstanceType: privatev1.BareMetalInstanceTypeReference_builder{Id: "gpu-large", Shared: true}.Build(),
 				}.Build(),
 			}.Build(),
 		}
 
 		var obj bmfov1alpha1.BareMetalInstance
+		obj.Spec.Selector.HostSelector = map[string]string{"stale": "old-value"}
 		err := t.mutateBMI(ctx, &obj)
 		Expect(err).ToNot(HaveOccurred())
 		Expect(obj.Spec.Selector.HostSelector).To(HaveLen(2))
@@ -907,7 +1190,6 @@ var _ = Describe("mutateBMI", func() {
 	})
 
 	It("should return error when instance_type has empty host_label_selector", func() {
-		catalogItemsClient := defaultFakeCatalogItemsClient()
 		instanceTypesClient := &fakeBareMetalInstanceTypesClient{
 			getResponse: privatev1.BareMetalInstanceTypesGetResponse_builder{
 				Object: privatev1.BareMetalInstanceType_builder{
@@ -918,15 +1200,15 @@ var _ = Describe("mutateBMI", func() {
 
 		t := &task{
 			r: &function{
-				logger:                              logger,
-				bareMetalInstanceCatalogItemsClient: catalogItemsClient,
-				bareMetalInstanceTypesClient:        instanceTypesClient,
+				logger:                       logger,
+				bareMetalInstanceTypesClient: instanceTypesClient,
 			},
 			bareMetalInstance: privatev1.BareMetalInstance_builder{
 				Id: "bmi-test",
 				Spec: privatev1.BareMetalInstanceSpec_builder{
 					CatalogItem:  privatev1.BareMetalInstanceCatalogItemReference_builder{Id: "catalog-1"}.Build(),
-					InstanceType: privatev1.BareMetalInstanceTypeLocalReference_builder{Id: "empty-type"}.Build(),
+					Template:     privatev1.BareMetalInstanceTemplateReference_builder{Id: "osac.templates.default"}.Build(),
+					InstanceType: privatev1.BareMetalInstanceTypeReference_builder{Id: "empty-type", Shared: true}.Build(),
 				}.Build(),
 			}.Build(),
 		}
@@ -938,22 +1220,21 @@ var _ = Describe("mutateBMI", func() {
 	})
 
 	It("should return error when instance_type lookup fails", func() {
-		catalogItemsClient := defaultFakeCatalogItemsClient()
 		instanceTypesClient := &fakeBareMetalInstanceTypesClient{
 			getError: errors.New("instance type not found"),
 		}
 
 		t := &task{
 			r: &function{
-				logger:                              logger,
-				bareMetalInstanceCatalogItemsClient: catalogItemsClient,
-				bareMetalInstanceTypesClient:        instanceTypesClient,
+				logger:                       logger,
+				bareMetalInstanceTypesClient: instanceTypesClient,
 			},
 			bareMetalInstance: privatev1.BareMetalInstance_builder{
 				Id: "bmi-test",
 				Spec: privatev1.BareMetalInstanceSpec_builder{
 					CatalogItem:  privatev1.BareMetalInstanceCatalogItemReference_builder{Id: "catalog-1"}.Build(),
-					InstanceType: privatev1.BareMetalInstanceTypeLocalReference_builder{Id: "missing-type"}.Build(),
+					Template:     privatev1.BareMetalInstanceTemplateReference_builder{Id: "osac.templates.default"}.Build(),
+					InstanceType: privatev1.BareMetalInstanceTypeReference_builder{Id: "missing-type", Shared: true}.Build(),
 				}.Build(),
 			}.Build(),
 		}
@@ -966,7 +1247,6 @@ var _ = Describe("mutateBMI", func() {
 	})
 
 	It("should handle instance_type with empty host_label_selector", func() {
-		catalogItemsClient := defaultFakeCatalogItemsClient()
 		instanceTypesClient := &fakeBareMetalInstanceTypesClient{
 			getResponse: privatev1.BareMetalInstanceTypesGetResponse_builder{
 				Object: privatev1.BareMetalInstanceType_builder{
@@ -982,15 +1262,15 @@ var _ = Describe("mutateBMI", func() {
 
 		t := &task{
 			r: &function{
-				logger:                              logger,
-				bareMetalInstanceCatalogItemsClient: catalogItemsClient,
-				bareMetalInstanceTypesClient:        instanceTypesClient,
+				logger:                       logger,
+				bareMetalInstanceTypesClient: instanceTypesClient,
 			},
 			bareMetalInstance: privatev1.BareMetalInstance_builder{
 				Id: "bmi-test",
 				Spec: privatev1.BareMetalInstanceSpec_builder{
 					CatalogItem:  privatev1.BareMetalInstanceCatalogItemReference_builder{Id: "catalog-1"}.Build(),
-					InstanceType: privatev1.BareMetalInstanceTypeLocalReference_builder{Id: "basic-type"}.Build(),
+					Template:     privatev1.BareMetalInstanceTemplateReference_builder{Id: "osac.templates.default"}.Build(),
+					InstanceType: privatev1.BareMetalInstanceTypeReference_builder{Id: "basic-type", Shared: true}.Build(),
 				}.Build(),
 			}.Build(),
 		}
@@ -1001,75 +1281,31 @@ var _ = Describe("mutateBMI", func() {
 		Expect(err.Error()).To(ContainSubstring("has no host_label_selector"))
 	})
 
-	It("should fall back to the template host_type when instance_type is absent", func() {
-		catalogItemsClient := defaultFakeCatalogItemsClient()
-		templatesClient := &fakeBareMetalInstanceTemplatesClient{
-			getResponse: privatev1.BareMetalInstanceTemplatesGetResponse_builder{
-				Object: privatev1.BareMetalInstanceTemplate_builder{
-					Id:       "osac.templates.default",
-					HostType: "gpu_host",
-				}.Build(),
-			}.Build(),
-		}
-
+	It("returns an error when the materialized instance has no instance_type", func() {
 		t := &task{
 			r: &function{
-				logger:                              logger,
-				bareMetalInstanceCatalogItemsClient: catalogItemsClient,
-				bareMetalInstanceTypesClient:        defaultFakeBareMetalInstanceTypesClient(),
-				bareMetalInstanceTemplatesClient:    templatesClient,
+				logger:                       logger,
+				bareMetalInstanceTypesClient: defaultFakeBareMetalInstanceTypesClient(),
 			},
 			bareMetalInstance: privatev1.BareMetalInstance_builder{
 				Id: "bmi-test",
 				Spec: privatev1.BareMetalInstanceSpec_builder{
 					CatalogItem: privatev1.BareMetalInstanceCatalogItemReference_builder{Id: "catalog-1"}.Build(),
+					Template:    privatev1.BareMetalInstanceTemplateReference_builder{Id: "osac.templates.default"}.Build(),
 				}.Build(),
 			}.Build(),
 		}
 
 		var obj bmfov1alpha1.BareMetalInstance
 		err := t.mutateBMI(ctx, &obj)
-		Expect(err).ToNot(HaveOccurred())
-		Expect(obj.Spec.Selector.HostSelector).To(HaveLen(1))
-		Expect(obj.Spec.Selector.HostSelector["hostType"]).To(Equal("gpu_host"))
-	})
-
-	It("should not error when instance_type is absent and the template has no host_type", func() {
-		catalogItemsClient := defaultFakeCatalogItemsClient()
-		templatesClient := &fakeBareMetalInstanceTemplatesClient{
-			getResponse: privatev1.BareMetalInstanceTemplatesGetResponse_builder{
-				Object: privatev1.BareMetalInstanceTemplate_builder{
-					Id: "osac.templates.default",
-				}.Build(),
-			}.Build(),
-		}
-
-		t := &task{
-			r: &function{
-				logger:                              logger,
-				bareMetalInstanceCatalogItemsClient: catalogItemsClient,
-				bareMetalInstanceTypesClient:        defaultFakeBareMetalInstanceTypesClient(),
-				bareMetalInstanceTemplatesClient:    templatesClient,
-			},
-			bareMetalInstance: privatev1.BareMetalInstance_builder{
-				Id: "bmi-test",
-				Spec: privatev1.BareMetalInstanceSpec_builder{
-					CatalogItem: privatev1.BareMetalInstanceCatalogItemReference_builder{Id: "catalog-1"}.Build(),
-				}.Build(),
-			}.Build(),
-		}
-
-		var obj bmfov1alpha1.BareMetalInstance
-		err := t.mutateBMI(ctx, &obj)
-		Expect(err).ToNot(HaveOccurred())
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("instance_type"))
 	})
 })
 
 var _ = Describe("update", func() {
 	It("should preserve operator-managed spec fields when patching an existing CR", func() {
 		ctx := context.Background()
-		ctrl := gomock.NewController(GinkgoT())
-		DeferCleanup(ctrl.Finish)
 
 		const (
 			bmiID        = "bmi-test-id"
@@ -1084,11 +1320,21 @@ var _ = Describe("update", func() {
 				Labels: map[string]string{
 					labels.BareMetalInstanceUuid: bmiID,
 				},
+				Annotations: map[string]string{"osac.openshift.io/owner-reference": "stored-owner-private"},
 			},
 			Spec: bmfov1alpha1.BareMetalInstanceSpec{
 				TemplateID:     "osac.templates.default",
 				ExternalHostID: "host-42",
 				HostClass:      "openstack",
+				RestartTrigger: 1,
+				NetworkAttachments: []bmfov1alpha1.BareMetalNetworkAttachment{{
+					SubnetRef: "stored-subnet-private", SecurityGroupRefs: []string{"stored-security-group-private"}, Primary: true,
+				}},
+			},
+			Status: bmfov1alpha1.BareMetalInstanceStatus{
+				NetworkAttachmentStatuses: []bmfov1alpha1.BareMetalNetworkAttachmentStatus{{
+					Interface: "data-0", SubnetRef: "stored-subnet-private", IPAddress: "192.0.2.10", Primary: true,
+				}},
 			},
 		}
 
@@ -1098,22 +1344,22 @@ var _ = Describe("update", func() {
 			WithObjects(existingCR).
 			Build()
 
-		hubCache := controllers.NewMockHubCache(ctrl)
-		hubCache.EXPECT().
-			Get(gomock.Any(), hubID).
-			Return(&controllers.HubEntry{
-				Namespace: hubNamespace,
-				Client:    fakeClient,
-			}, nil)
-
-		catalogItemsClient := defaultFakeCatalogItemsClient()
-
+		var logOutput bytes.Buffer
 		t := &task{
 			r: &function{
-				logger:                              logger,
-				hubCache:                            hubCache,
-				bareMetalInstanceCatalogItemsClient: catalogItemsClient,
-				bareMetalInstanceTypesClient:        defaultFakeBareMetalInstanceTypesClient(),
+				logger: slog.New(slog.NewTextHandler(&logOutput, nil)),
+				networkingHubReader: &fakeBareMetalNetworkingHubReader{
+					resolution: controllers.NetworkingHubResolution{
+						NetworkingHub: controllers.NetworkingHub{
+							ID:        hubID,
+							Namespace: hubNamespace,
+							Client:    fakeClient,
+						},
+						HubID: hubID,
+						State: privatev1.NetworkClassState_NETWORK_CLASS_STATE_READY,
+					},
+				},
+				bareMetalInstanceTypesClient: defaultFakeBareMetalInstanceTypesClient(),
 			},
 			bareMetalInstance: privatev1.BareMetalInstance_builder{
 				Id: bmiID,
@@ -1122,8 +1368,16 @@ var _ = Describe("update", func() {
 					Tenant:     "test-tenant",
 				}.Build(),
 				Spec: privatev1.BareMetalInstanceSpec_builder{
-					CatalogItem:  privatev1.BareMetalInstanceCatalogItemReference_builder{Id: "catalog-1"}.Build(),
-					InstanceType: privatev1.BareMetalInstanceTypeLocalReference_builder{Id: "default-type"}.Build(),
+					CatalogItem:    privatev1.BareMetalInstanceCatalogItemReference_builder{Id: "catalog-1"}.Build(),
+					Template:       privatev1.BareMetalInstanceTemplateReference_builder{Id: "osac.templates.default"}.Build(),
+					InstanceType:   privatev1.BareMetalInstanceTypeReference_builder{Id: "default-type", Shared: true}.Build(),
+					RestartTrigger: 42,
+					NetworkAttachments: []*privatev1.BareMetalNetworkAttachment{
+						privatev1.BareMetalNetworkAttachment_builder{
+							Subnet:         &privatev1.SubnetLocalReference{Name: "requested-subnet"},
+							SecurityGroups: []*privatev1.SecurityGroupLocalReference{{Name: "requested-security-group"}},
+						}.Build(),
+					},
 				}.Build(),
 				Status: privatev1.BareMetalInstanceStatus_builder{
 					Hub:   hubID,
@@ -1145,6 +1399,14 @@ var _ = Describe("update", func() {
 			"ExternalHostID must be preserved — it is managed by the bare-metal-fulfillment-operator")
 		Expect(updatedCR.Spec.HostClass).To(Equal("openstack"),
 			"HostClass must be preserved — it is managed by the bare-metal-fulfillment-operator")
+		Expect(updatedCR.Spec.RestartTrigger).To(Equal(int64(42)))
+		Expect(updatedCR.Spec.NetworkAttachments).To(Equal(existingCR.Spec.NetworkAttachments))
+		Expect(updatedCR.Annotations).To(HaveKeyWithValue("osac.openshift.io/owner-reference", "stored-owner-private"))
+		Expect(t.bareMetalInstance.GetStatus().GetNetworkAttachmentStatuses()).To(HaveLen(1))
+		Expect(t.bareMetalInstance.GetStatus().GetNetworkAttachmentStatuses()[0].GetIpAddress()).To(Equal("192.0.2.10"))
+		Expect(logOutput.String()).To(ContainSubstring("preserving stored network attachments"))
+		Expect(logOutput.String()).NotTo(ContainSubstring("stored-subnet-private"))
+		Expect(logOutput.String()).NotTo(ContainSubstring("stored-security-group-private"))
 	})
 })
 
@@ -1189,6 +1451,54 @@ var _ = Describe("delete", func() {
 		Expect(hasFinalizer(t.bareMetalInstance)).To(BeFalse())
 	})
 
+	It("should retain the finalizer while automatic networking resources are terminating", func() {
+		scheme := newFakeScheme()
+		hubCache := controllers.NewMockHubCache(ctrl)
+		hubCache.EXPECT().Get(gomock.Any(), hubID).Return(&controllers.HubEntry{
+			Namespace: hubNamespace, Client: fake.NewClientBuilder().WithScheme(scheme).Build(),
+		}, nil)
+		t := newTaskForDelete(bmiID, hubID, hubCache)
+		cleanup := &fakeWorkloadNetworkingCleanup{}
+		t.r.networkingCleanup = cleanup
+
+		Expect(t.delete(ctx)).To(MatchError(ContainSubstring("automatic workload networking resources are still terminating")))
+		Expect(cleanup.calls).To(Equal(1))
+		Expect(cleanup.workloadID).To(Equal(bmiID))
+		Expect(hasFinalizer(t.bareMetalInstance)).To(BeTrue())
+	})
+
+	It("should wait for automatic networking cleanup before deleting the workload CR", func() {
+		cr := newBareMetalInstanceCR(bmiID, hubNamespace, crName, nil)
+		scheme := newFakeScheme()
+		deleteCalled := false
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(cr).
+			WithInterceptorFuncs(interceptor.Funcs{
+				Delete: func(ctx context.Context, client clnt.WithWatch, obj clnt.Object, opts ...clnt.DeleteOption) error {
+					deleteCalled = true
+					return nil
+				},
+			}).
+			Build()
+
+		hubCache := controllers.NewMockHubCache(ctrl)
+		hubCache.EXPECT().Get(gomock.Any(), hubID).Return(&controllers.HubEntry{
+			Namespace: hubNamespace, Client: fakeClient,
+		}, nil)
+
+		t := newTaskForDelete(bmiID, hubID, hubCache)
+		cleanup := &fakeWorkloadNetworkingCleanup{}
+		t.r.networkingCleanup = cleanup
+
+		err := t.delete(ctx)
+		Expect(err).To(MatchError(ContainSubstring("automatic workload networking resources are still terminating")))
+		Expect(cleanup.calls).To(Equal(1))
+		Expect(cleanup.workloadID).To(Equal(bmiID))
+		Expect(deleteCalled).To(BeFalse())
+		Expect(hasFinalizer(t.bareMetalInstance)).To(BeTrue())
+	})
+
 	It("should call hubClient.Delete when K8s object exists without DeletionTimestamp", func() {
 		cr := newBareMetalInstanceCR(bmiID, hubNamespace, crName, nil)
 
@@ -1217,7 +1527,10 @@ var _ = Describe("delete", func() {
 		t := newTaskForDelete(bmiID, hubID, hubCache)
 
 		err := t.delete(ctx)
-		Expect(err).ToNot(HaveOccurred())
+		Expect(err).To(MatchError("kubernetes bare metal instance deletion is still in progress"))
+		var retryable interface{ RequeueAfter() time.Duration }
+		Expect(errors.As(err, &retryable)).To(BeTrue())
+		Expect(retryable.RequeueAfter()).To(Equal(time.Second))
 		Expect(deleteCalled).To(BeTrue())
 		Expect(hasFinalizer(t.bareMetalInstance)).To(BeTrue())
 	})
@@ -1251,7 +1564,10 @@ var _ = Describe("delete", func() {
 		t := newTaskForDelete(bmiID, hubID, hubCache)
 
 		err := t.delete(ctx)
-		Expect(err).ToNot(HaveOccurred())
+		Expect(err).To(MatchError("kubernetes bare metal instance deletion is still in progress"))
+		var retryable interface{ RequeueAfter() time.Duration }
+		Expect(errors.As(err, &retryable)).To(BeTrue())
+		Expect(retryable.RequeueAfter()).To(Equal(time.Second))
 		Expect(deleteCalled).To(BeFalse())
 		Expect(hasFinalizer(t.bareMetalInstance)).To(BeTrue())
 	})
@@ -1319,7 +1635,8 @@ var _ = Describe("delete", func() {
 		}.Build()
 
 		f := &function{
-			logger: logger,
+			logger:            logger,
+			networkingCleanup: &fakeWorkloadNetworkingCleanup{complete: true},
 		}
 
 		t := &task{
@@ -1368,7 +1685,7 @@ var _ = Describe("ensureUserDataSecret", func() {
 			bareMetalInstance: privatev1.BareMetalInstance_builder{
 				Id: bmiID,
 				Spec: privatev1.BareMetalInstanceSpec_builder{
-					UserData: new("#cloud-config\npackages:\n  - vim"),
+					UserDataSource: privatev1.UserDataSource_builder{Inline: new("#cloud-config\npackages:\n  - vim")}.Build(),
 				}.Build(),
 			}.Build(),
 			hubNamespace:       hubNamespace,
@@ -1401,11 +1718,47 @@ var _ = Describe("ensureUserDataSecret", func() {
 		Expect(ownerRefs[0].Kind).To(Equal("BareMetalInstance"))
 	})
 
-	It("should be idempotent when Secret already exists", func() {
-		existingSecret := &unstructured.Unstructured{}
-		existingSecret.SetGroupVersionKind(gvks.Secret)
-		existingSecret.SetNamespace(hubNamespace)
-		existingSecret.SetName(bmiID + userDataSecretSuffix)
+	It("should create a Secret from a referenced OSAC Secret", func() {
+		ctrl := gomock.NewController(GinkgoT())
+		secretsClient := NewMockSecretsClient(ctrl)
+		secretsClient.EXPECT().Get(gomock.Any(), gomock.Any()).DoAndReturn(
+			func(_ context.Context, request *privatev1.SecretsGetRequest, _ ...grpc.CallOption) (*privatev1.SecretsGetResponse, error) {
+				Expect(request.GetId()).To(Equal("source-secret-id"))
+				return privatev1.SecretsGetResponse_builder{Object: privatev1.Secret_builder{
+					Data: map[string][]byte{userDataSecretKey: []byte("referenced-data")},
+				}.Build()}.Build(), nil
+			},
+		)
+		fakeClient := fake.NewClientBuilder().WithScheme(newFakeScheme()).Build()
+		t := &task{
+			r: &function{logger: logger, secretsClient: secretsClient},
+			bareMetalInstance: privatev1.BareMetalInstance_builder{Id: bmiID, Spec: privatev1.BareMetalInstanceSpec_builder{
+				UserDataSource: privatev1.UserDataSource_builder{Secret: privatev1.SecretLocalReference_builder{Id: "source-secret-id"}.Build()}.Build(),
+			}.Build()}.Build(),
+			hubNamespace: hubNamespace, hubClient: fakeClient, userDataSecretName: bmiID + userDataSecretSuffix,
+		}
+		Expect(t.ensureUserDataSecret(ctx, owner)).To(Succeed())
+		secret := &corev1.Secret{}
+		Expect(fakeClient.Get(ctx, clnt.ObjectKey{Namespace: hubNamespace, Name: bmiID + userDataSecretSuffix}, secret)).To(Succeed())
+		Expect(secret.StringData[userDataSecretKey]).To(Equal("referenced-data"))
+	})
+
+	It("should propagate referenced OSAC Secret fetch errors", func() {
+		ctrl := gomock.NewController(GinkgoT())
+		secretsClient := NewMockSecretsClient(ctrl)
+		secretsClient.EXPECT().Get(gomock.Any(), gomock.Any()).Return(nil, errors.New("fetch failed"))
+		t := &task{r: &function{logger: logger, secretsClient: secretsClient},
+			bareMetalInstance: privatev1.BareMetalInstance_builder{Spec: privatev1.BareMetalInstanceSpec_builder{
+				UserDataSource: privatev1.UserDataSource_builder{Secret: privatev1.SecretLocalReference_builder{Id: "source-secret-id"}.Build()}.Build(),
+			}.Build()}.Build(), userDataSecretName: bmiID + userDataSecretSuffix}
+		Expect(t.ensureUserDataSecret(ctx, owner)).To(MatchError(ContainSubstring("fetch failed")))
+	})
+
+	It("should preserve user data when Secret already exists", func() {
+		existingSecret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Namespace: hubNamespace, Name: bmiID + userDataSecretSuffix},
+			StringData: map[string]string{userDataSecretKey: "old-data"},
+		}
 
 		scheme := newFakeScheme()
 		fakeClient := fake.NewClientBuilder().
@@ -1418,7 +1771,7 @@ var _ = Describe("ensureUserDataSecret", func() {
 			bareMetalInstance: privatev1.BareMetalInstance_builder{
 				Id: bmiID,
 				Spec: privatev1.BareMetalInstanceSpec_builder{
-					UserData: new("some-data"),
+					UserDataSource: privatev1.UserDataSource_builder{Inline: new("some-data")}.Build(),
 				}.Build(),
 			}.Build(),
 			hubNamespace:       hubNamespace,
@@ -1428,6 +1781,9 @@ var _ = Describe("ensureUserDataSecret", func() {
 
 		err := t.ensureUserDataSecret(ctx, owner)
 		Expect(err).ToNot(HaveOccurred())
+		secret := &corev1.Secret{}
+		Expect(fakeClient.Get(ctx, clnt.ObjectKey{Namespace: hubNamespace, Name: bmiID + userDataSecretSuffix}, secret)).To(Succeed())
+		Expect(secret.StringData[userDataSecretKey]).To(Equal("old-data"))
 	})
 
 	It("should propagate error when Secret creation fails", func() {
@@ -1446,7 +1802,7 @@ var _ = Describe("ensureUserDataSecret", func() {
 			bareMetalInstance: privatev1.BareMetalInstance_builder{
 				Id: bmiID,
 				Spec: privatev1.BareMetalInstanceSpec_builder{
-					UserData: new("some-data"),
+					UserDataSource: privatev1.UserDataSource_builder{Inline: new("some-data")}.Build(),
 				}.Build(),
 			}.Build(),
 			hubNamespace:       hubNamespace,
@@ -1563,6 +1919,80 @@ var _ = Describe("syncStatus", func() {
 			Equal(privatev1.BareMetalInstanceState_BARE_METAL_INSTANCE_STATE_RUNNING))
 	})
 
+	It("should set state_transition_time when the state changes", func() {
+		t := newTask(0)
+		object := &bmfov1alpha1.BareMetalInstance{
+			Status: bmfov1alpha1.BareMetalInstanceStatus{
+				Phase: bmfov1alpha1.BareMetalInstancePhaseReady,
+				Conditions: []metav1.Condition{
+					{
+						Type:   string(bmfov1alpha1.HostConditionPowerSynced),
+						Status: metav1.ConditionTrue,
+						Reason: bmfov1alpha1.HostConditionReasonPowerOn,
+					},
+				},
+			},
+		}
+
+		t.syncStatus(object)
+
+		Expect(t.bareMetalInstance.GetStatus().GetStateTransitionTime()).ToNot(BeNil())
+		Expect(t.bareMetalInstance.GetStatus().GetStateTransitionTime().AsTime()).To(
+			BeTemporally("~", time.Now(), time.Second))
+	})
+
+	It("should use the backend transition time when it is available", func() {
+		transitionTime := time.Date(2026, time.January, 15, 12, 30, 45, 0, time.UTC)
+		t := newTask(0)
+		object := &bmfov1alpha1.BareMetalInstance{
+			Status: bmfov1alpha1.BareMetalInstanceStatus{
+				Phase: bmfov1alpha1.BareMetalInstancePhaseReady,
+				Conditions: []metav1.Condition{
+					{
+						Type:               string(bmfov1alpha1.HostConditionPowerSynced),
+						Status:             metav1.ConditionTrue,
+						Reason:             bmfov1alpha1.HostConditionReasonPowerOn,
+						LastTransitionTime: metav1.NewTime(transitionTime),
+					},
+				},
+			},
+		}
+
+		t.syncStatus(object)
+
+		Expect(t.bareMetalInstance.GetStatus().GetStateTransitionTime().AsTime()).To(Equal(transitionTime))
+	})
+
+	It("should preserve state_transition_time when the state is unchanged", func() {
+		transitionTime := timestamppb.New(time.Unix(123, 456))
+		t := &task{
+			r: &function{logger: logger},
+			bareMetalInstance: privatev1.BareMetalInstance_builder{
+				Id: "bmi-sync-test",
+				Status: privatev1.BareMetalInstanceStatus_builder{
+					State:               privatev1.BareMetalInstanceState_BARE_METAL_INSTANCE_STATE_RUNNING,
+					StateTransitionTime: transitionTime,
+				}.Build(),
+			}.Build(),
+		}
+		object := &bmfov1alpha1.BareMetalInstance{
+			Status: bmfov1alpha1.BareMetalInstanceStatus{
+				Phase: bmfov1alpha1.BareMetalInstancePhaseReady,
+				Conditions: []metav1.Condition{
+					{
+						Type:   string(bmfov1alpha1.HostConditionPowerSynced),
+						Status: metav1.ConditionTrue,
+						Reason: bmfov1alpha1.HostConditionReasonPowerOn,
+					},
+				},
+			},
+		}
+
+		t.syncStatus(object)
+
+		Expect(t.bareMetalInstance.GetStatus().GetStateTransitionTime().AsTime()).To(Equal(transitionTime.AsTime()))
+	})
+
 	It("should map Ready phase with PowerOff condition to STOPPED state", func() {
 		t := newTask(0)
 		object := &bmfov1alpha1.BareMetalInstance{
@@ -1670,12 +2100,9 @@ var _ = Describe("syncStatus", func() {
 			Equal(privatev1.BareMetalInstanceState_BARE_METAL_INSTANCE_STATE_DELETING))
 	})
 
-	It("should set PROVISIONED=True when ProvisionTemplateComplete is True", func() {
+	It("should set PROVISIONED reason=NetworkSetup when ProvisionTemplateComplete is True but network absent", func() {
 		t := newTask(0)
 		object := &bmfov1alpha1.BareMetalInstance{
-			Spec: bmfov1alpha1.BareMetalInstanceSpec{
-				TemplateID: "some_template",
-			},
 			Status: bmfov1alpha1.BareMetalInstanceStatus{
 				Conditions: []metav1.Condition{
 					{
@@ -1690,7 +2117,9 @@ var _ = Describe("syncStatus", func() {
 		cond := findProtoCondition(t.bareMetalInstance,
 			privatev1.BareMetalInstanceConditionType_BARE_METAL_INSTANCE_CONDITION_TYPE_PROVISIONED)
 		Expect(cond).ToNot(BeNil())
-		Expect(cond.GetStatus()).To(Equal(privatev1.ConditionStatus_CONDITION_STATUS_TRUE))
+		Expect(cond.GetStatus()).To(Equal(privatev1.ConditionStatus_CONDITION_STATUS_FALSE))
+		Expect(cond.GetReason()).To(Equal(string(bmfov1alpha1.StageNetworkSetup)))
+		Expect(cond.GetMessage()).To(Equal("Network attachment is in progress."))
 	})
 
 	It("should not set PROVISIONED=True when ProvisionTemplateComplete is absent", func() {
@@ -1721,12 +2150,8 @@ var _ = Describe("syncStatus", func() {
 		Expect(cond.GetStatus()).ToNot(Equal(privatev1.ConditionStatus_CONDITION_STATUS_TRUE))
 	})
 
-	It("should not demote PROVISIONED to False when ProvisionTemplateComplete goes False (ratchet)", func() {
+	It("should reflect the current stage when conditions advance (no ratchet)", func() {
 		t := newTask(0)
-		t.updateCondition(
-			privatev1.BareMetalInstanceConditionType_BARE_METAL_INSTANCE_CONDITION_TYPE_PROVISIONED,
-			privatev1.ConditionStatus_CONDITION_STATUS_TRUE, "", "")
-
 		object := &bmfov1alpha1.BareMetalInstance{
 			Status: bmfov1alpha1.BareMetalInstanceStatus{
 				Conditions: []metav1.Condition{
@@ -1738,7 +2163,7 @@ var _ = Describe("syncStatus", func() {
 					{
 						Type:   string(bmfov1alpha1.HostConditionProvisionTemplateComplete),
 						Status: metav1.ConditionFalse,
-						Reason: "Progressing",
+						Reason: bmfov1alpha1.HostConditionReasonProgressing,
 					},
 				},
 			},
@@ -1746,7 +2171,9 @@ var _ = Describe("syncStatus", func() {
 		t.syncStatus(object)
 		cond := findProtoCondition(t.bareMetalInstance,
 			privatev1.BareMetalInstanceConditionType_BARE_METAL_INSTANCE_CONDITION_TYPE_PROVISIONED)
-		Expect(cond.GetStatus()).To(Equal(privatev1.ConditionStatus_CONDITION_STATUS_TRUE))
+		Expect(cond).ToNot(BeNil())
+		Expect(cond.GetStatus()).To(Equal(privatev1.ConditionStatus_CONDITION_STATUS_FALSE))
+		Expect(cond.GetReason()).To(Equal(string(bmfov1alpha1.StageProvisioning)))
 	})
 
 	It("should map ProvisionTemplateComplete condition to CONFIGURATION_APPLIED with sanitized message", func() {
@@ -2249,6 +2676,301 @@ var _ = Describe("syncStatus", func() {
 		Expect(t.bareMetalInstance.GetStatus().HasHardware()).To(BeFalse())
 	})
 
+	// --- provisioning-progress (DeriveProvisioningProgress integration) ---
+
+	DescribeTable("should stamp PROVISIONED with the furthest-advanced in-progress stage",
+		func(conditions []metav1.Condition, expectedReason string, expectedMsg string) {
+			t := newTask(0)
+			object := &bmfov1alpha1.BareMetalInstance{
+				Status: bmfov1alpha1.BareMetalInstanceStatus{Conditions: conditions},
+			}
+			t.syncStatus(object)
+			cond := findProtoCondition(t.bareMetalInstance,
+				privatev1.BareMetalInstanceConditionType_BARE_METAL_INSTANCE_CONDITION_TYPE_PROVISIONED)
+			Expect(cond).ToNot(BeNil())
+			Expect(cond.GetStatus()).To(Equal(privatev1.ConditionStatus_CONDITION_STATUS_FALSE))
+			Expect(cond.GetReason()).To(Equal(expectedReason))
+			Expect(cond.GetMessage()).To(Equal(expectedMsg))
+			ready := findProtoCondition(t.bareMetalInstance,
+				privatev1.BareMetalInstanceConditionType_BARE_METAL_INSTANCE_CONDITION_TYPE_READY)
+			Expect(ready).ToNot(BeNil())
+			Expect(ready.GetStatus()).To(Equal(privatev1.ConditionStatus_CONDITION_STATUS_FALSE))
+		},
+		Entry("no conditions → HostAllocation stage",
+			[]metav1.Condition{},
+			string(bmfov1alpha1.StageHostAllocation), "Host allocation is in progress."),
+		Entry("Allocated=True → Provisioning stage",
+			[]metav1.Condition{
+				{Type: string(bmfov1alpha1.HostConditionAllocated), Status: metav1.ConditionTrue, Reason: "Allocated"},
+			},
+			string(bmfov1alpha1.StageProvisioning), "OS provisioning is in progress."),
+		Entry("ProvisionTemplateComplete=True → NetworkSetup/attachment step",
+			[]metav1.Condition{
+				{Type: string(bmfov1alpha1.HostConditionAllocated), Status: metav1.ConditionTrue, Reason: "Allocated"},
+				{Type: string(bmfov1alpha1.HostConditionProvisionTemplateComplete), Status: metav1.ConditionTrue, Reason: "Succeeded"},
+			},
+			string(bmfov1alpha1.StageNetworkSetup), "Network attachment is in progress."),
+		Entry("NetworkAttachmentsReady=True → NetworkSetup/handoff step",
+			[]metav1.Condition{
+				{Type: string(bmfov1alpha1.HostConditionNetworkAttachmentsReady), Status: metav1.ConditionTrue, Reason: "Ready"},
+			},
+			string(bmfov1alpha1.StageNetworkSetup), "Network handoff is in progress."),
+		Entry("NetworkHandoffComplete=True → NetworkSetup/IP-discovery step",
+			[]metav1.Condition{
+				{Type: string(bmfov1alpha1.HostConditionNetworkHandoffComplete), Status: metav1.ConditionTrue, Reason: "Complete"},
+			},
+			string(bmfov1alpha1.StageNetworkSetup), "IP address discovery is in progress."),
+	)
+
+	It("should select the furthest-advanced stage regardless of condition slice order", func() {
+		// Allocated first (earlier stage), ProvisionTemplateComplete second — but order must not matter.
+		condsFwd := []metav1.Condition{
+			{Type: string(bmfov1alpha1.HostConditionAllocated), Status: metav1.ConditionTrue, Reason: "Allocated"},
+			{Type: string(bmfov1alpha1.HostConditionProvisionTemplateComplete), Status: metav1.ConditionTrue, Reason: "Succeeded"},
+		}
+		condsRev := []metav1.Condition{
+			{Type: string(bmfov1alpha1.HostConditionProvisionTemplateComplete), Status: metav1.ConditionTrue, Reason: "Succeeded"},
+			{Type: string(bmfov1alpha1.HostConditionAllocated), Status: metav1.ConditionTrue, Reason: "Allocated"},
+		}
+		for _, conds := range [][]metav1.Condition{condsFwd, condsRev} {
+			t := newTask(0)
+			t.syncStatus(&bmfov1alpha1.BareMetalInstance{
+				Status: bmfov1alpha1.BareMetalInstanceStatus{Conditions: conds},
+			})
+			cond := findProtoCondition(t.bareMetalInstance,
+				privatev1.BareMetalInstanceConditionType_BARE_METAL_INSTANCE_CONDITION_TYPE_PROVISIONED)
+			Expect(cond).ToNot(BeNil())
+			Expect(cond.GetReason()).To(Equal(string(bmfov1alpha1.StageNetworkSetup)))
+		}
+	})
+
+	It("should set PROVISIONED=True/Provisioned when all network conditions are satisfied", func() {
+		t := newTask(0)
+		object := &bmfov1alpha1.BareMetalInstance{
+			Status: bmfov1alpha1.BareMetalInstanceStatus{
+				Conditions: []metav1.Condition{
+					{Type: string(bmfov1alpha1.HostConditionAllocated), Status: metav1.ConditionTrue, Reason: "Allocated"},
+					{Type: string(bmfov1alpha1.HostConditionProvisionTemplateComplete), Status: metav1.ConditionTrue, Reason: "Succeeded"},
+					{Type: string(bmfov1alpha1.HostConditionNetworkAttachmentsReady), Status: metav1.ConditionTrue, Reason: "Ready"},
+					{Type: string(bmfov1alpha1.HostConditionNetworkHandoffComplete), Status: metav1.ConditionTrue, Reason: "Complete"},
+					{Type: string(bmfov1alpha1.HostConditionIPDiscoveryComplete), Status: metav1.ConditionTrue, Reason: "Complete"},
+				},
+			},
+		}
+		t.syncStatus(object)
+		provisioned := findProtoCondition(t.bareMetalInstance,
+			privatev1.BareMetalInstanceConditionType_BARE_METAL_INSTANCE_CONDITION_TYPE_PROVISIONED)
+		Expect(provisioned).ToNot(BeNil())
+		Expect(provisioned.GetStatus()).To(Equal(privatev1.ConditionStatus_CONDITION_STATUS_TRUE))
+		Expect(provisioned.GetReason()).To(Equal(string(bmfov1alpha1.StateProvisioned)))
+		Expect(provisioned.GetMessage()).To(Equal("Infrastructure has been allocated and provisioned."))
+		ready := findProtoCondition(t.bareMetalInstance,
+			privatev1.BareMetalInstanceConditionType_BARE_METAL_INSTANCE_CONDITION_TYPE_READY)
+		Expect(ready).ToNot(BeNil())
+		Expect(ready.GetStatus()).To(Equal(privatev1.ConditionStatus_CONDITION_STATUS_FALSE))
+		Expect(ready.GetReason()).To(Equal(string(bmfov1alpha1.StageReady)))
+		Expect(ready.GetMessage()).To(Equal("Power synchronization is in progress."))
+	})
+
+	It("should set READY=True/Ready when PowerSynced is True", func() {
+		t := newTask(0)
+		object := &bmfov1alpha1.BareMetalInstance{
+			Status: bmfov1alpha1.BareMetalInstanceStatus{
+				Phase: bmfov1alpha1.BareMetalInstancePhaseReady,
+				Conditions: []metav1.Condition{
+					{Type: string(bmfov1alpha1.HostConditionPowerSynced), Status: metav1.ConditionTrue, Reason: bmfov1alpha1.HostConditionReasonPowerOn},
+				},
+			},
+		}
+		t.syncStatus(object)
+		provisioned := findProtoCondition(t.bareMetalInstance,
+			privatev1.BareMetalInstanceConditionType_BARE_METAL_INSTANCE_CONDITION_TYPE_PROVISIONED)
+		Expect(provisioned).ToNot(BeNil())
+		Expect(provisioned.GetStatus()).To(Equal(privatev1.ConditionStatus_CONDITION_STATUS_TRUE))
+		Expect(provisioned.GetReason()).To(Equal(string(bmfov1alpha1.StateProvisioned)))
+		ready := findProtoCondition(t.bareMetalInstance,
+			privatev1.BareMetalInstanceConditionType_BARE_METAL_INSTANCE_CONDITION_TYPE_READY)
+		Expect(ready).ToNot(BeNil())
+		Expect(ready.GetStatus()).To(Equal(privatev1.ConditionStatus_CONDITION_STATUS_TRUE))
+		Expect(ready.GetReason()).To(Equal(string(bmfov1alpha1.StateReady)))
+		Expect(ready.GetMessage()).To(Equal("The instance is ready."))
+	})
+
+	It("should advance past network-setup when all network conditions are trivially satisfied", func() {
+		// Represents an instance with no network attachment: operator sets all three
+		// network conditions True trivially. The derivation must reach Provisioned.
+		t := newTask(0)
+		object := &bmfov1alpha1.BareMetalInstance{
+			Status: bmfov1alpha1.BareMetalInstanceStatus{
+				Conditions: []metav1.Condition{
+					{Type: string(bmfov1alpha1.HostConditionNetworkAttachmentsReady), Status: metav1.ConditionTrue, Reason: "Ready"},
+					{Type: string(bmfov1alpha1.HostConditionNetworkHandoffComplete), Status: metav1.ConditionTrue, Reason: "Complete"},
+					{Type: string(bmfov1alpha1.HostConditionIPDiscoveryComplete), Status: metav1.ConditionTrue, Reason: "Complete"},
+				},
+			},
+		}
+		t.syncStatus(object)
+		provisioned := findProtoCondition(t.bareMetalInstance,
+			privatev1.BareMetalInstanceConditionType_BARE_METAL_INSTANCE_CONDITION_TYPE_PROVISIONED)
+		Expect(provisioned).ToNot(BeNil())
+		Expect(provisioned.GetStatus()).To(Equal(privatev1.ConditionStatus_CONDITION_STATUS_TRUE))
+		Expect(provisioned.GetReason()).To(Equal(string(bmfov1alpha1.StateProvisioned)))
+	})
+
+	DescribeTable("should stamp the IC-5 failure message on the carrier condition",
+		func(conditions []metav1.Condition, carrier privatev1.BareMetalInstanceConditionType,
+			expectedReason string, expectedMsg string) {
+			t := newTask(0)
+			object := &bmfov1alpha1.BareMetalInstance{
+				Status: bmfov1alpha1.BareMetalInstanceStatus{Conditions: conditions},
+			}
+			t.syncStatus(object)
+			cond := findProtoCondition(t.bareMetalInstance, carrier)
+			Expect(cond).ToNot(BeNil())
+			Expect(cond.GetStatus()).To(Equal(privatev1.ConditionStatus_CONDITION_STATUS_FALSE))
+			Expect(cond.GetReason()).To(Equal(expectedReason))
+			Expect(cond.GetMessage()).To(Equal(expectedMsg))
+		},
+		Entry("NoMatchingHosts → PROVISIONED",
+			[]metav1.Condition{{Type: string(bmfov1alpha1.HostConditionAllocated), Status: metav1.ConditionFalse, Reason: bmfov1alpha1.HostConditionReasonNoMatchingHosts}},
+			privatev1.BareMetalInstanceConditionType_BARE_METAL_INSTANCE_CONDITION_TYPE_PROVISIONED,
+			string(bmfov1alpha1.FailureNoMatchingHosts), "No bare metal host matched the requested profile."),
+		Entry("HostAllocationFailed → PROVISIONED",
+			[]metav1.Condition{{Type: string(bmfov1alpha1.HostConditionAllocated), Status: metav1.ConditionFalse, Reason: "SomeAllocationError"}},
+			privatev1.BareMetalInstanceConditionType_BARE_METAL_INSTANCE_CONDITION_TYPE_PROVISIONED,
+			string(bmfov1alpha1.FailureHostAllocation), "Host allocation failed."),
+		Entry("ProvisionJobFailed → PROVISIONED",
+			[]metav1.Condition{{Type: string(bmfov1alpha1.HostConditionProvisionTemplateComplete), Status: metav1.ConditionFalse, Reason: "ProvisionFailed"}},
+			privatev1.BareMetalInstanceConditionType_BARE_METAL_INSTANCE_CONDITION_TYPE_PROVISIONED,
+			string(bmfov1alpha1.FailureProvisionJob), "OS installation and configuration did not complete; the provisioning job failed."),
+		Entry("NetworkAttachmentFailed → PROVISIONED",
+			[]metav1.Condition{{Type: string(bmfov1alpha1.HostConditionNetworkAttachmentsReady), Status: metav1.ConditionFalse, Reason: "AttachmentFailed"}},
+			privatev1.BareMetalInstanceConditionType_BARE_METAL_INSTANCE_CONDITION_TYPE_PROVISIONED,
+			string(bmfov1alpha1.FailureNetworkAttachment), "Network attachment did not complete."),
+		Entry("NetworkHandoffFailed → PROVISIONED",
+			[]metav1.Condition{{Type: string(bmfov1alpha1.HostConditionNetworkHandoffComplete), Status: metav1.ConditionFalse, Reason: "HandoffFailed"}},
+			privatev1.BareMetalInstanceConditionType_BARE_METAL_INSTANCE_CONDITION_TYPE_PROVISIONED,
+			string(bmfov1alpha1.FailureNetworkHandoff), "Network handoff (reboot) did not complete."),
+		Entry("IPDiscoveryFailed → PROVISIONED",
+			[]metav1.Condition{{Type: string(bmfov1alpha1.HostConditionIPDiscoveryComplete), Status: metav1.ConditionFalse, Reason: "DiscoveryFailed"}},
+			privatev1.BareMetalInstanceConditionType_BARE_METAL_INSTANCE_CONDITION_TYPE_PROVISIONED,
+			string(bmfov1alpha1.FailureIPDiscovery), "IP address discovery did not complete."),
+		Entry("ReadyTimeout → READY",
+			[]metav1.Condition{
+				{Type: string(bmfov1alpha1.HostConditionNetworkAttachmentsReady), Status: metav1.ConditionTrue, Reason: "Ready"},
+				{Type: string(bmfov1alpha1.HostConditionNetworkHandoffComplete), Status: metav1.ConditionTrue, Reason: "Complete"},
+				{Type: string(bmfov1alpha1.HostConditionIPDiscoveryComplete), Status: metav1.ConditionTrue, Reason: "Complete"},
+				{Type: string(bmfov1alpha1.HostConditionPowerSynced), Status: metav1.ConditionFalse, Reason: bmfov1alpha1.HostConditionReasonPowerSyncFailed},
+			},
+			privatev1.BareMetalInstanceConditionType_BARE_METAL_INSTANCE_CONDITION_TYPE_READY,
+			string(bmfov1alpha1.FailureReadyTimeout), "The instance did not reach its powered-on ready state."),
+	)
+
+	It("should keep PROVISIONED=True/Provisioned when the ready-axis fails (ReadyTimeout)", func() {
+		// The DescribeTable above asserts the READY carrier for ReadyTimeout.
+		// This locks the other side: PROVISIONED must stay True (provisioning completed).
+		t := newTask(0)
+		object := &bmfov1alpha1.BareMetalInstance{
+			Status: bmfov1alpha1.BareMetalInstanceStatus{
+				Conditions: []metav1.Condition{
+					{Type: string(bmfov1alpha1.HostConditionNetworkAttachmentsReady), Status: metav1.ConditionTrue, Reason: "Ready"},
+					{Type: string(bmfov1alpha1.HostConditionNetworkHandoffComplete), Status: metav1.ConditionTrue, Reason: "Complete"},
+					{Type: string(bmfov1alpha1.HostConditionIPDiscoveryComplete), Status: metav1.ConditionTrue, Reason: "Complete"},
+					{Type: string(bmfov1alpha1.HostConditionPowerSynced), Status: metav1.ConditionFalse, Reason: bmfov1alpha1.HostConditionReasonPowerSyncFailed},
+				},
+			},
+		}
+		t.syncStatus(object)
+		provisioned := findProtoCondition(t.bareMetalInstance,
+			privatev1.BareMetalInstanceConditionType_BARE_METAL_INSTANCE_CONDITION_TYPE_PROVISIONED)
+		Expect(provisioned).ToNot(BeNil())
+		Expect(provisioned.GetStatus()).To(Equal(privatev1.ConditionStatus_CONDITION_STATUS_TRUE))
+		Expect(provisioned.GetReason()).To(Equal(string(bmfov1alpha1.StateProvisioned)))
+		Expect(provisioned.GetMessage()).To(Equal(messageProvisioned))
+	})
+
+	It("should not surface raw operator error text in any condition (TC-FR5-02)", func() {
+		const rawError = "internal: ironic returned HTTP 503 with body: <stack-trace-xyz>"
+		t := newTask(0)
+		object := &bmfov1alpha1.BareMetalInstance{
+			Status: bmfov1alpha1.BareMetalInstanceStatus{
+				Conditions: []metav1.Condition{
+					// The operator condition Message carries raw internal text; only Reason is classified.
+					{Type: string(bmfov1alpha1.HostConditionAllocated), Status: metav1.ConditionFalse,
+						Reason: bmfov1alpha1.HostConditionReasonNoMatchingHosts, Message: rawError},
+				},
+			},
+		}
+		t.syncStatus(object)
+		for _, c := range t.bareMetalInstance.GetStatus().GetConditions() {
+			Expect(c.GetReason()).NotTo(ContainSubstring(rawError))
+			Expect(c.GetMessage()).NotTo(ContainSubstring(rawError))
+		}
+	})
+
+	It("should present a retrying provision attempt as sanitized in-progress provisioning", func() {
+		const rawError = "AAP HTTP 500: internal inventory traceback"
+		t := newTask(0)
+		object := &bmfov1alpha1.BareMetalInstance{
+			Status: bmfov1alpha1.BareMetalInstanceStatus{
+				Phase: bmfov1alpha1.BareMetalInstancePhaseProgressing,
+				Conditions: []metav1.Condition{
+					{Type: string(bmfov1alpha1.HostConditionAllocated), Status: metav1.ConditionTrue},
+					{
+						Type:    string(bmfov1alpha1.HostConditionProvisionTemplateComplete),
+						Status:  metav1.ConditionFalse,
+						Reason:  bmfov1alpha1.HostConditionReasonRetrying,
+						Message: "Provisioning retry scheduled after failed attempt: " + rawError,
+					},
+				},
+			},
+		}
+
+		t.syncStatus(object)
+
+		Expect(t.bareMetalInstance.GetStatus().GetState()).To(Equal(
+			privatev1.BareMetalInstanceState_BARE_METAL_INSTANCE_STATE_PROVISIONING))
+		provisioned := findProtoCondition(t.bareMetalInstance,
+			privatev1.BareMetalInstanceConditionType_BARE_METAL_INSTANCE_CONDITION_TYPE_PROVISIONED)
+		Expect(provisioned).NotTo(BeNil())
+		Expect(provisioned.GetStatus()).To(Equal(privatev1.ConditionStatus_CONDITION_STATUS_FALSE))
+		Expect(provisioned.GetReason()).To(Equal(string(bmfov1alpha1.StageProvisioning)))
+		Expect(provisioned.GetMessage()).To(Equal("Provisioning is retrying after an unsuccessful attempt."))
+		for _, condition := range t.bareMetalInstance.GetStatus().GetConditions() {
+			Expect(condition.GetReason()).NotTo(ContainSubstring(rawError))
+			Expect(condition.GetMessage()).NotTo(ContainSubstring(rawError))
+		}
+	})
+
+	It("should set READY=False and leave PROVISIONED unchanged for Deleting phase", func() {
+		t := newTask(0)
+		// Pre-populate PROVISIONED=True to verify it is not touched during deletion.
+		t.updateCondition(
+			privatev1.BareMetalInstanceConditionType_BARE_METAL_INSTANCE_CONDITION_TYPE_PROVISIONED,
+			privatev1.ConditionStatus_CONDITION_STATUS_TRUE,
+			string(bmfov1alpha1.StateProvisioned), "Infrastructure has been allocated and provisioned.")
+		object := &bmfov1alpha1.BareMetalInstance{
+			Status: bmfov1alpha1.BareMetalInstanceStatus{
+				Phase: bmfov1alpha1.BareMetalInstancePhaseDeleting,
+				Conditions: []metav1.Condition{
+					// PowerSynced=True would yield StateReady via derivation; the Deleting guard must prevent that.
+					{Type: string(bmfov1alpha1.HostConditionPowerSynced), Status: metav1.ConditionTrue, Reason: bmfov1alpha1.HostConditionReasonPowerOn},
+				},
+			},
+		}
+		t.syncStatus(object)
+		provisioned := findProtoCondition(t.bareMetalInstance,
+			privatev1.BareMetalInstanceConditionType_BARE_METAL_INSTANCE_CONDITION_TYPE_PROVISIONED)
+		Expect(provisioned).ToNot(BeNil())
+		Expect(provisioned.GetStatus()).To(Equal(privatev1.ConditionStatus_CONDITION_STATUS_TRUE))
+		ready := findProtoCondition(t.bareMetalInstance,
+			privatev1.BareMetalInstanceConditionType_BARE_METAL_INSTANCE_CONDITION_TYPE_READY)
+		Expect(ready).ToNot(BeNil())
+		Expect(ready.GetStatus()).To(Equal(privatev1.ConditionStatus_CONDITION_STATUS_FALSE))
+	})
+
+	// --- end provisioning-progress ---
+
 	It("should clear previously-set hardware when CRD Hardware becomes nil", func() {
 		t := newTask(0)
 		// First sync: hardware present
@@ -2309,6 +3031,43 @@ var _ = Describe("mapConditionStatus", func() {
 	})
 })
 
+var _ = Describe("stepMessage", func() {
+	DescribeTable("returns the curated in-progress message per step",
+		func(step bmfov1alpha1.ProvisioningStep, expectedMsg string) {
+			Expect(stepMessage(step)).To(Equal(expectedMsg))
+		},
+		Entry("HostAllocation", bmfov1alpha1.StepHostAllocation, "Host allocation is in progress."),
+		Entry("Provisioning", bmfov1alpha1.StepProvisioning, "OS provisioning is in progress."),
+		Entry("NetworkSetupAttachment", bmfov1alpha1.StepNetworkSetupAttachment, "Network attachment is in progress."),
+		Entry("NetworkSetupHandoff", bmfov1alpha1.StepNetworkSetupHandoff, "Network handoff is in progress."),
+		Entry("NetworkSetupIPDiscovery", bmfov1alpha1.StepNetworkSetupIPDiscovery, "IP address discovery is in progress."),
+		Entry("ReadyPowerSync", bmfov1alpha1.StepReadyPowerSync, "Power synchronization is in progress."),
+	)
+
+	It("returns empty string for an unrecognized step", func() {
+		Expect(stepMessage(bmfov1alpha1.ProvisioningStep("Unknown"))).To(BeEmpty())
+	})
+})
+
+var _ = Describe("failureMessage", func() {
+	DescribeTable("returns the IC-5 curated message per failure classification",
+		func(failure bmfov1alpha1.FailureClassification, expectedMsg string) {
+			Expect(failureMessage(failure)).To(Equal(expectedMsg))
+		},
+		Entry("NoMatchingHosts", bmfov1alpha1.FailureNoMatchingHosts, "No bare metal host matched the requested profile."),
+		Entry("HostAllocationFailed", bmfov1alpha1.FailureHostAllocation, "Host allocation failed."),
+		Entry("ProvisionJobFailed", bmfov1alpha1.FailureProvisionJob, "OS installation and configuration did not complete; the provisioning job failed."),
+		Entry("NetworkAttachmentFailed", bmfov1alpha1.FailureNetworkAttachment, "Network attachment did not complete."),
+		Entry("NetworkHandoffFailed", bmfov1alpha1.FailureNetworkHandoff, "Network handoff (reboot) did not complete."),
+		Entry("IPDiscoveryFailed", bmfov1alpha1.FailureIPDiscovery, "IP address discovery did not complete."),
+		Entry("ReadyTimeout", bmfov1alpha1.FailureReadyTimeout, "The instance did not reach its powered-on ready state."),
+	)
+
+	It("returns empty string for an unrecognized classification", func() {
+		Expect(failureMessage(bmfov1alpha1.FailureClassification("Unknown"))).To(BeEmpty())
+	})
+})
+
 var _ = Describe("Kubernetes validation error handling", func() {
 	It("should set state to FAILED when K8s Create returns Invalid error", func() {
 		ctx := context.Background()
@@ -2357,7 +3116,8 @@ var _ = Describe("Kubernetes validation error handling", func() {
 			}.Build(),
 			Spec: privatev1.BareMetalInstanceSpec_builder{
 				CatalogItem:  privatev1.BareMetalInstanceCatalogItemReference_builder{Id: "catalog-1"}.Build(),
-				InstanceType: privatev1.BareMetalInstanceTypeLocalReference_builder{Id: "default-type"}.Build(),
+				Template:     privatev1.BareMetalInstanceTemplateReference_builder{Id: "osac.templates.default"}.Build(),
+				InstanceType: privatev1.BareMetalInstanceTypeReference_builder{Id: "default-type", Shared: true}.Build(),
 			}.Build(),
 			Status: privatev1.BareMetalInstanceStatus_builder{
 				Hub: hubID,
@@ -2365,12 +3125,11 @@ var _ = Describe("Kubernetes validation error handling", func() {
 		}.Build()
 
 		f := &function{
-			logger:                              logger,
-			hubCache:                            hubCache,
-			bareMetalInstancesClient:            bareMetalInstancesClient,
-			bareMetalInstanceCatalogItemsClient: defaultFakeCatalogItemsClient(),
-			bareMetalInstanceTypesClient:        defaultFakeBareMetalInstanceTypesClient(),
-			maskCalculator:                      masks.NewCalculator().Build(),
+			logger:                       logger,
+			hubCache:                     hubCache,
+			bareMetalInstancesClient:     bareMetalInstancesClient,
+			bareMetalInstanceTypesClient: defaultFakeBareMetalInstanceTypesClient(),
+			maskCalculator:               masks.NewCalculator().Build(),
 		}
 
 		err := f.run(ctx, bmi)
@@ -2389,29 +3148,6 @@ var _ = Describe("Kubernetes validation error handling", func() {
 	})
 })
 
-func defaultFakeCatalogItemsClient() *fakeCatalogItemsClient {
-	return &fakeCatalogItemsClient{
-		getResponse: privatev1.BareMetalInstanceCatalogItemsGetResponse_builder{
-			Object: privatev1.BareMetalInstanceCatalogItem_builder{
-				Template: privatev1.BareMetalInstanceTemplateReference_builder{
-					Id: "osac.templates.default",
-				}.Build(),
-			}.Build(),
-		}.Build(),
-	}
-}
-
-// fakeCatalogItemsClient is a simple test double for the BareMetalInstanceCatalogItemsClient.
-type fakeCatalogItemsClient struct {
-	privatev1.BareMetalInstanceCatalogItemsClient
-	getResponse *privatev1.BareMetalInstanceCatalogItemsGetResponse
-	getError    error
-}
-
-func (c *fakeCatalogItemsClient) Get(ctx context.Context, req *privatev1.BareMetalInstanceCatalogItemsGetRequest, opts ...grpc.CallOption) (*privatev1.BareMetalInstanceCatalogItemsGetResponse, error) {
-	return c.getResponse, c.getError
-}
-
 func defaultFakeBareMetalInstanceTypesClient() *fakeBareMetalInstanceTypesClient {
 	return &fakeBareMetalInstanceTypesClient{
 		getResponse: privatev1.BareMetalInstanceTypesGetResponse_builder{
@@ -2419,7 +3155,7 @@ func defaultFakeBareMetalInstanceTypesClient() *fakeBareMetalInstanceTypesClient
 				Spec: privatev1.BareMetalInstanceTypeSpec_builder{
 					HostLabelSelector: privatev1.BareMetalLabelSelector_builder{
 						MatchLabels: map[string]string{
-							"hostType": "compute",
+							"resourceClass": "compute",
 						},
 					}.Build(),
 				}.Build(),
@@ -2436,16 +3172,5 @@ type fakeBareMetalInstanceTypesClient struct {
 }
 
 func (c *fakeBareMetalInstanceTypesClient) Get(ctx context.Context, req *privatev1.BareMetalInstanceTypesGetRequest, opts ...grpc.CallOption) (*privatev1.BareMetalInstanceTypesGetResponse, error) {
-	return c.getResponse, c.getError
-}
-
-// fakeBareMetalInstanceTemplatesClient is a test double for the BareMetalInstanceTemplatesClient.
-type fakeBareMetalInstanceTemplatesClient struct {
-	privatev1.BareMetalInstanceTemplatesClient
-	getResponse *privatev1.BareMetalInstanceTemplatesGetResponse
-	getError    error
-}
-
-func (c *fakeBareMetalInstanceTemplatesClient) Get(ctx context.Context, req *privatev1.BareMetalInstanceTemplatesGetRequest, opts ...grpc.CallOption) (*privatev1.BareMetalInstanceTemplatesGetResponse, error) {
 	return c.getResponse, c.getError
 }

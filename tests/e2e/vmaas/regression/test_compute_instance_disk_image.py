@@ -1,38 +1,93 @@
 from __future__ import annotations
 
+import re
 import subprocess
-from uuid import uuid4
+from datetime import datetime, timedelta
 
 import pytest
 
-from tests.e2e.core.grpc_client import GRPCClient
+from tests.e2e.core.grpc_client import PRIVATE_API, GRPCClient
 from tests.e2e.core.helpers import (
     assert_grpc_rejected,
+    unique_name,
     wait_for_cr,
     wait_for_deletion,
     wait_for_grpc_removal,
     wait_for_provision,
     wait_for_running,
+    wait_for_security_group_cr,
+    wait_for_security_group_ready,
 )
 from tests.e2e.core.k8s_client import K8sClient
+from tests.e2e.core.runner import poll_until
+from tests.e2e.core.wait_kinds import WaitResourceKind
+from tests.e2e.vmaas.networking_lifecycle_helpers import (
+    create_and_wait_for_subnet,
+    create_and_wait_for_virtual_network,
+    delete_and_wait_for_security_group,
+    delete_and_wait_for_subnet,
+    delete_and_wait_for_virtual_network,
+)
+
+pytestmark = pytest.mark.regression
 
 SOURCE_REF = "quay.io/containerdisks/fedora:41"
+DELETION_TEST_FINALIZER = "osac-6513-e2e"
 
 
-def _unique_name(prefix: str = "e2e-cidi") -> str:
-    return f"{prefix}-{uuid4().hex[:8]}"
+def _set_deletion_test_finalizer(private_grpc: GRPCClient, ci_id: str, *, present: bool) -> None:
+    """Hold or release the instance, rereading after concurrent controller updates."""
+
+    def update_finalizers() -> bool:
+        object_ = private_grpc.call(service=f"{PRIVATE_API}.ComputeInstances/Get", data={"id": ci_id})["object"]
+        metadata = object_["metadata"]
+        finalizers = metadata.get("finalizers", [])
+        if (DELETION_TEST_FINALIZER in finalizers) == present:
+            return True
+        if present:
+            finalizers = [*finalizers, DELETION_TEST_FINALIZER]
+        else:
+            finalizers = [value for value in finalizers if value != DELETION_TEST_FINALIZER]
+        try:
+            private_grpc.call(
+                service=f"{PRIVATE_API}.ComputeInstances/Update",
+                data={
+                    "object": {
+                        "id": ci_id,
+                        "metadata": {"finalizers": finalizers, "version": metadata.get("version", 0)},
+                    },
+                    "updateMask": {"paths": ["metadata.finalizers"]},
+                    "lock": True,
+                },
+            )
+        except subprocess.CalledProcessError as exc:
+            if re.search(r"(?m)^\s*Code:\s*Aborted\s*$", (exc.stderr or "") + "\n" + (exc.stdout or "")):
+                return False
+            raise
+        return True
+
+    poll_until(
+        fn=update_finalizers,
+        until=bool,
+        retries=10,
+        delay=1,
+        description="ComputeInstance test finalizer",
+        resource_kind=WaitResourceKind.COMPUTE_INSTANCE,
+        resource_id=ci_id,
+    )
 
 
 def test_compute_instance_with_disk_image(
     grpc: GRPCClient,
     vm_template: str,
     default_subnet: str,
+    default_security_group: str,
     default_instance_type: str,
     k8s_hub_client: K8sClient,
     default_storage_tier: str,
 ) -> None:
     """AC-1 / TC-FR7-01: Create CI with DiskImage reference, verify VM runs with correct image."""
-    di_name = _unique_name("e2e-di")
+    di_name = unique_name("e2e-di")
     di_id: str | None = None
     ci_id: str | None = None
     ci_name: str | None = None
@@ -50,8 +105,9 @@ def test_compute_instance_with_disk_image(
             template=vm_template,
             disk_image_name=di_name,
             subnet_ids=[default_subnet],
+            security_group_ids=[default_security_group],
             instance_type=default_instance_type,
-            name=_unique_name("e2e-ci"),
+            name=unique_name("e2e-ci"),
             boot_disk_storage_tier=default_storage_tier,
         )
         ci_id = response["object"]["id"]
@@ -83,132 +139,125 @@ def test_compute_instance_with_disk_image(
             grpc.delete_disk_image(disk_image_id=di_id)
 
 
-def test_obsolete_disk_image_blocks_creation(
-    grpc: GRPCClient, vm_template: str, default_subnet: str, default_instance_type: str, default_storage_tier: str
-) -> None:
-    """AC-2 / TC-FR7-04: OBSOLETE DiskImage blocks ComputeInstance creation."""
-    di_name = _unique_name("e2e-di")
-    di_id: str | None = None
-
-    try:
-        di_id = grpc.create_disk_image(name=di_name, source_ref=SOURCE_REF)
-
-        grpc.update_disk_image_lifecycle(disk_image_id=di_id, lifecycle="DISK_IMAGE_LIFECYCLE_DEPRECATED")
-        grpc.update_disk_image_lifecycle(disk_image_id=di_id, lifecycle="DISK_IMAGE_LIFECYCLE_OBSOLETE")
-
-        with pytest.raises(subprocess.CalledProcessError) as exc_info:
-            grpc.create_compute_instance_with_disk_image(
-                template=vm_template,
-                disk_image_name=di_name,
-                subnet_ids=[default_subnet],
-                instance_type=default_instance_type,
-                boot_disk_storage_tier=default_storage_tier,
-            )
-        assert_grpc_rejected(exc_info, "FailedPrecondition")
-    finally:
-        if di_id is not None:
-            grpc.delete_disk_image(disk_image_id=di_id)
-
-
-def test_deprecated_disk_image_allows_creation_with_warning(
+def test_deletion_feedback_with_removed_disk_image_releases_network(
     grpc: GRPCClient,
+    private_grpc: GRPCClient,
     vm_template: str,
-    default_subnet: str,
     default_instance_type: str,
-    k8s_hub_client: K8sClient,
     default_storage_tier: str,
+    k8s_hub_client: K8sClient,
 ) -> None:
-    """AC-3 / TC-FR7-05: DEPRECATED DiskImage allows creation with warning."""
-    di_name = _unique_name("e2e-di")
-    di_id: str | None = None
+    """A stale image reference cannot block VM feedback or dependent network deletion."""
+    vn_id: str | None = None
+    vn_cr: str | None = None
+    subnet_id: str | None = None
+    subnet_cr: str | None = None
+    sg_id: str | None = None
+    sg_cr: str | None = None
+    image_id: str | None = None
     ci_id: str | None = None
-    ci_name: str | None = None
+    ci_cr: str | None = None
+    finalizer_present = False
 
     try:
-        di_id = grpc.create_disk_image(name=di_name, source_ref=SOURCE_REF)
+        vn_id, vn_cr = create_and_wait_for_virtual_network(
+            grpc, k8s_hub_client, unique_name("e2e-deleting-vn"), "172.29.0.0/16"
+        )
+        subnet_id, subnet_cr = create_and_wait_for_subnet(
+            grpc, k8s_hub_client, vn_id, "172.29.1.0/24", name_prefix="e2e-deleting-subnet"
+        )
+        sg_id = grpc.create_security_group(name=unique_name("e2e-deleting-sg"), virtual_network=vn_id)
+        sg_cr = wait_for_security_group_cr(k8s=k8s_hub_client, uuid=sg_id)
+        wait_for_security_group_ready(k8s=k8s_hub_client, name=sg_cr)
 
-        grpc.update_disk_image_lifecycle(disk_image_id=di_id, lifecycle="DISK_IMAGE_LIFECYCLE_DEPRECATED")
-
+        image_name = unique_name("e2e-deleting-image")
+        image_id = grpc.create_disk_image(name=image_name, source_ref=SOURCE_REF)
         response = grpc.create_compute_instance_with_disk_image(
             template=vm_template,
-            disk_image_name=di_name,
-            subnet_ids=[default_subnet],
+            disk_image_name=image_name,
+            subnet_ids=[subnet_id],
+            security_group_ids=[sg_id],
             instance_type=default_instance_type,
-            name=_unique_name("e2e-ci"),
+            name=unique_name("e2e-deleting-ci"),
             boot_disk_storage_tier=default_storage_tier,
         )
         ci_id = response["object"]["id"]
-        assert ci_id, "CI creation with DEPRECATED DiskImage should succeed"
-        ci_name = wait_for_cr(k8s=k8s_hub_client, uuid=ci_id)
+        ci_cr = wait_for_cr(k8s=k8s_hub_client, uuid=ci_id)
+        wait_for_provision(k8s=k8s_hub_client, name=ci_cr)
+        wait_for_running(k8s=k8s_hub_client, name=ci_cr)
 
-        warnings: list[str] = response.get("warnings", [])
-        assert any("deprecated" in w.lower() for w in warnings), (
-            f"Response should contain deprecation warning, got: {warnings}"
+        _set_deletion_test_finalizer(private_grpc, ci_id, present=True)
+        finalizer_present = True
+        grpc.delete_compute_instance(ci_id=ci_id)
+        grpc.delete_disk_image(disk_image_id=image_id)
+        deleted_image_id = image_id
+        image_id = None
+        with pytest.raises(subprocess.CalledProcessError) as exc_info:
+            grpc.get_disk_image(disk_image_id=deleted_image_id)
+        assert_grpc_rejected(exc_info, "NotFound")
+
+        # Send deletion feedback with the full object, including its stale image reference.
+        feedback = private_grpc.call(service=f"{PRIVATE_API}.ComputeInstances/Get", data={"id": ci_id})["object"]
+        assert feedback["metadata"].get("deletionTimestamp"), "ComputeInstance should be deleting"
+        assert feedback["spec"]["diskImage"]["id"] == deleted_image_id
+        deleting_state = "COMPUTE_INSTANCE_STATE_DELETING"
+        status = feedback.setdefault("status", {})
+        if status.get("state") != deleting_state:
+            transition = datetime.fromisoformat(feedback["metadata"]["deletionTimestamp"].replace("Z", "+00:00"))
+            if previous := status.get("stateTransitionTime"):
+                previous_time = datetime.fromisoformat(previous.replace("Z", "+00:00"))
+                transition = max(transition, previous_time + timedelta(microseconds=1))
+            status["state"] = deleting_state
+            status["stateTransitionTime"] = transition.isoformat().replace("+00:00", "Z")
+        private_grpc.call(
+            service=f"{PRIVATE_API}.ComputeInstances/Update",
+            data={"object": feedback, "updateMask": {"paths": ["status.state", "status.state_transition_time"]}},
         )
+        persisted = private_grpc.call(service=f"{PRIVATE_API}.ComputeInstances/Get", data={"id": ci_id})["object"]
+        assert persisted["status"]["state"] == deleting_state
+        assert persisted["spec"]["diskImage"]["id"] == deleted_image_id
+
+        _set_deletion_test_finalizer(private_grpc, ci_id, present=False)
+        finalizer_present = False
+        wait_for_deletion(k8s=k8s_hub_client, name=ci_cr)
+        wait_for_grpc_removal(grpc=grpc, uuid=ci_id)
+        ci_id = None
+
+        delete_and_wait_for_security_group(grpc, k8s_hub_client, sg_id, sg_cr)
+        sg_id = None
+        delete_and_wait_for_subnet(grpc, k8s_hub_client, subnet_id, subnet_cr)
+        subnet_id = None
+        delete_and_wait_for_virtual_network(grpc, k8s_hub_client, vn_id, vn_cr)
+        vn_id = None
     finally:
+        if finalizer_present and ci_id is not None:
+            _set_deletion_test_finalizer(private_grpc, ci_id, present=False)
         if ci_id is not None:
             grpc.delete_compute_instance(ci_id=ci_id)
-            if ci_name is not None:
-                wait_for_deletion(k8s=k8s_hub_client, name=ci_name)
+            if ci_cr is not None:
+                wait_for_deletion(k8s=k8s_hub_client, name=ci_cr)
             wait_for_grpc_removal(grpc=grpc, uuid=ci_id)
-        if di_id is not None:
-            grpc.delete_disk_image(disk_image_id=di_id)
-
-
-def test_template_disk_image_default(grpc: GRPCClient, private_grpc: GRPCClient) -> None:
-    """AC-4 / TC-FR8-01: Template records its disk_image default, resolved from name to id at store time.
-
-    A custom ComputeInstanceTemplate cannot drive real VM provisioning in e2e: spec.templateID is
-    written verbatim into the ComputeInstance CR and used by AAP as the Ansible role name to run,
-    and only AAP-published templates (e.g. osac.templates.ocp_virt_vm) have a backing role. A
-    custom template's CR therefore can neither provision nor delete, and — because the fulfillment
-    object is finalizer-coupled to the CR — its gRPC object would never be removed, timing out
-    teardown. So this test verifies the default where it is actually applied server-side: the
-    reference-validator interceptor resolves spec_defaults.disk_image.name to an id and backfills
-    it before storage. Provisioning a VM from a custom template default is not e2e-testable until
-    the backend supports provisionable custom templates.
-    """
-    di_name = _unique_name("e2e-di")
-    di_id: str | None = None
-    template_id: str | None = None
-
-    try:
-        di_id = grpc.create_disk_image(name=di_name, source_ref=SOURCE_REF)
-
-        # Mirror the AAP publisher id pattern ("{collection}.{name}", dotted/underscored, no
-        # hyphens); template_id is mandatory on the helper (forwarded verbatim) and must match
-        # the CRD regex ^[a-zA-Z_][a-zA-Z0-9._]*$ that osac-operator enforces on spec.templateID.
-        template_ref_id = f"e2e.templates.di_default_{uuid4().hex[:8]}"
-        template_id = private_grpc.create_compute_instance_template(
-            template_id=template_ref_id,
-            name=_unique_name("e2e-tmpl"),
-            title="E2E DiskImage default test",
-            description="Template with disk_image in spec_defaults",
-            spec_defaults={"disk_image": {"name": di_name}},
-        )
-
-        template = private_grpc.get_compute_instance_template(template_id=template_id)
-        disk_image_ref = template["object"].get("specDefaults", {}).get("diskImage", {})
-        assert disk_image_ref.get("id") == di_id, (
-            f"Template spec_defaults should record disk_image resolved to its id, got: {disk_image_ref}"
-        )
-    finally:
-        if template_id is not None:
-            private_grpc.delete_compute_instance_template(template_id=template_id)
-        if di_id is not None:
-            grpc.delete_disk_image(disk_image_id=di_id)
+        if image_id is not None:
+            grpc.delete_disk_image(disk_image_id=image_id)
+        if sg_id is not None:
+            delete_and_wait_for_security_group(grpc, k8s_hub_client, sg_id, sg_cr)
+        if subnet_id is not None:
+            delete_and_wait_for_subnet(grpc, k8s_hub_client, subnet_id, subnet_cr)
+        if vn_id is not None:
+            delete_and_wait_for_virtual_network(grpc, k8s_hub_client, vn_id, vn_cr)
 
 
 def test_disk_image_deletion_protection(
     grpc: GRPCClient,
     vm_template: str,
     default_subnet: str,
+    default_security_group: str,
     default_instance_type: str,
     k8s_hub_client: K8sClient,
     default_storage_tier: str,
 ) -> None:
     """AC-5 / TC-FR12-01 + TC-FR12-04: Deletion protection lifecycle."""
-    di_name = _unique_name("e2e-di")
+    di_name = unique_name("e2e-di")
     di_id: str | None = None
     ci_id: str | None = None
     ci_name: str | None = None
@@ -220,8 +269,9 @@ def test_disk_image_deletion_protection(
             template=vm_template,
             disk_image_name=di_name,
             subnet_ids=[default_subnet],
+            security_group_ids=[default_security_group],
             instance_type=default_instance_type,
-            name=_unique_name("e2e-ci"),
+            name=unique_name("e2e-ci"),
             boot_disk_storage_tier=default_storage_tier,
         )
         ci_id = response["object"]["id"]
@@ -249,53 +299,5 @@ def test_disk_image_deletion_protection(
             if ci_name is not None:
                 wait_for_deletion(k8s=k8s_hub_client, name=ci_name)
             wait_for_grpc_removal(grpc=grpc, uuid=ci_id)
-        if di_id is not None:
-            grpc.delete_disk_image(disk_image_id=di_id)
-
-
-def test_disk_image_deletion_protection_template(grpc: GRPCClient, private_grpc: GRPCClient) -> None:
-    """TC-FR12-02: Cannot delete a DiskImage referenced by a ComputeInstanceTemplate."""
-    di_name = _unique_name("e2e-di")
-    di_id: str | None = None
-    template_id: str | None = None
-
-    try:
-        di_id = grpc.create_disk_image(name=di_name, source_ref=SOURCE_REF)
-
-        # spec_defaults.disk_image is a DiskImageReference proto — the reference-validator
-        # interceptor resolves the NAME to an id and backfills it before storage. template_id is
-        # mandatory on the helper (AAP-publisher id shape); this test never creates a CR, so the
-        # id is never resolved as an AAP role.
-        template_id = private_grpc.create_compute_instance_template(
-            template_id=f"e2e.templates.di_protect_{uuid4().hex[:8]}",
-            name=_unique_name("e2e-tmpl"),
-            title="E2E DiskImage deletion protection test",
-            description="Template referencing a disk_image via spec_defaults",
-            spec_defaults={"disk_image": {"name": di_name}},
-        )
-
-        # Deletion is blocked while the template references the disk image.
-        with pytest.raises(subprocess.CalledProcessError) as exc_info:
-            grpc.delete_disk_image(disk_image_id=di_id)
-        assert_grpc_rejected(exc_info, "FailedPrecondition")
-        combined = (exc_info.value.stderr or "") + (exc_info.value.stdout or "")
-        assert "compute instance template" in combined.lower(), (
-            f"Error should identify the referencing template, got: {combined.strip()}"
-        )
-
-        # Remove the referrer, then deletion succeeds — protection is reference-bound, not permanent.
-        private_grpc.delete_compute_instance_template(template_id=template_id)
-        template_id = None
-        deleted_di_id = di_id
-        grpc.delete_disk_image(disk_image_id=di_id)
-        di_id = None
-
-        # A successful Delete RPC does not prove absence — confirm the DiskImage is actually gone.
-        with pytest.raises(subprocess.CalledProcessError) as exc_info:
-            grpc.get_disk_image(disk_image_id=deleted_di_id)
-        assert_grpc_rejected(exc_info, "NotFound")
-    finally:
-        if template_id is not None:
-            private_grpc.delete_compute_instance_template(template_id=template_id)
         if di_id is not None:
             grpc.delete_disk_image(disk_image_id=di_id)

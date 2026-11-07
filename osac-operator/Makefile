@@ -74,7 +74,7 @@ vet: ## Run go vet against code.
 
 .PHONY: test
 test: manifests generate fmt vet envtest ## Run tests.
-	GOTOOLCHAIN=$(GOTOOLCHAIN_AUTO) KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" go test $$(go list ./... | grep -v '/test/integration$$') -coverprofile cover.out
+	GOTOOLCHAIN=$(GOTOOLCHAIN_AUTO) KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" go test $$(go list ./... | grep -v '/test/integration') -coverprofile cover.out
 
 .PHONY: helm-lint
 helm-lint: ## Lint Helm charts.
@@ -145,12 +145,12 @@ tag-api: ## Tag a new release of the api/ Go module (e.g. make tag-api API_VERSI
 
 .PHONY: build
 build: test ## Build manager and console-proxy binaries (runs all tests first).
-	go build -o bin/manager cmd/main.go
+	go build -o bin/manager ./cmd
 	go build -o bin/console-proxy cmd/console-proxy/main.go
 
 .PHONY: run
 run: manifests generate fmt vet ## Run a controller from your host.
-	go run ./cmd/main.go
+	go run ./cmd
 
 # If you wish to build the manager image targeting other platforms you can use the --platform flag.
 # (i.e. docker build --platform linux/arm64). However, you must enable docker buildKit for it.
@@ -163,6 +163,10 @@ image-build: ## Build container image with manager and console-proxy.
 image-push: ## Push container image.
 	$(CONTAINER_TOOL) push ${IMG}
 
+.PHONY: kind-load-image
+kind-load-image: ## Load the built image into the dev-full Kind cluster.
+	$(call kind-load-image,$(IMG))
+
 .PHONY: image-run
 image-run: ## Run container image locally.
 	$(CONTAINER_TOOL) run --rm --userns keep-id --name osac-controller \
@@ -174,7 +178,7 @@ image-run: ## Run container image locally.
 
 .PHONY: kind-load
 kind-load: image-build
-	$(KIND) load docker-image -n ${KIND_CLUSTER_NAME} ${IMG}
+	$(call kind-load-image,$(IMG))
 
 # PLATFORMS defines the target platforms for the manager image be built to provide support to multiple
 # architectures. (i.e. make docker-buildx IMG=myregistry/mypoperator:0.0.1). To use this option you need to:
@@ -238,6 +242,7 @@ CONTROLLER_TOOLS_VERSION ?= v0.20.0
 ENVTEST_VERSION ?= release-0.19
 
 include $(shell git rev-parse --show-toplevel)/tools/golangci-lint.mk
+include $(shell git rev-parse --show-toplevel)/osac-installer/scripts/dev-full/kind-load-image.mk
 
 .PHONY: controller-gen
 controller-gen: $(CONTROLLER_GEN) ## Download controller-gen locally if necessary.

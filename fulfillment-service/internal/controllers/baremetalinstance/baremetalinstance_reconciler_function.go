@@ -13,7 +13,9 @@ language governing permissions and limitations under the License.
 
 package baremetalinstance
 
-//go:generate mockgen -source=../../api/osac/private/v1/baremetal_instances_service_grpc.pb.go -destination=bare_metal_instances_client_mock.go -package=baremetalinstance BareMetalInstancesClient
+//go:generate mockgen -destination=bare_metal_instances_client_mock.go -package=baremetalinstance github.com/osac-project/osac/proto/gen/osac/private/v1 BareMetalInstancesClient
+//go:generate mockgen -destination=secrets_client_mock.go -package=baremetalinstance github.com/osac-project/osac/proto/gen/osac/private/v1 SecretsClient
+//go:generate mockgen -destination=disk_images_client_mock.go -package=baremetalinstance github.com/osac-project/osac/proto/gen/osac/private/v1 DiskImagesClient
 
 import (
 	"context"
@@ -27,7 +29,9 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/timestamppb"
 	corev1 "k8s.io/api/core/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	clnt "sigs.k8s.io/controller-runtime/pkg/client"
@@ -35,23 +39,45 @@ import (
 
 	bmfov1alpha1 "github.com/osac-project/osac/bare-metal-fulfillment-operator/api/v1alpha1"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/controllers"
 	"github.com/osac-project/osac/fulfillment-service/internal/controllers/finalizers"
 	"github.com/osac-project/osac/fulfillment-service/internal/kubernetes/annotations"
 	"github.com/osac-project/osac/fulfillment-service/internal/kubernetes/labels"
 	"github.com/osac-project/osac/fulfillment-service/internal/masks"
 	"github.com/osac-project/osac/fulfillment-service/internal/utils"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
 const objectPrefix = "bmi-"
 
-// defaultHostType is a placeholder until host type is modeled in the template proto.
-const defaultHostType = "default"
-
 const userDataSecretSuffix = "-user-data"
 
 const userDataSecretKey = "userdata"
+
+// Curated tenant-facing condition messages.
+const (
+	messageProvisioned                 = "Infrastructure has been allocated and provisioned."
+	messageReady                       = "The instance is ready."
+	messageStepHostAllocation          = "Host allocation is in progress."
+	messageStepProvisioning            = "OS provisioning is in progress."
+	messageStepProvisioningRetrying    = "Provisioning is retrying after an unsuccessful attempt."
+	messageStepNetworkSetupAttachment  = "Network attachment is in progress."
+	messageStepNetworkSetupHandoff     = "Network handoff is in progress."
+	messageStepNetworkSetupIPDiscovery = "IP address discovery is in progress."
+	messageStepReadyPowerSync          = "Power synchronization is in progress."
+
+	// Curated failure messages — exact strings, one per FailureClassification.
+	messageFailureNoMatchingHosts   = "No bare metal host matched the requested profile."
+	messageFailureHostAllocation    = "Host allocation failed."
+	messageFailureProvisionJob      = "OS installation and configuration did not complete; the provisioning job failed."
+	messageFailureNetworkAttachment = "Network attachment did not complete."
+	messageFailureNetworkHandoff    = "Network handoff (reboot) did not complete."
+	messageFailureIPDiscovery       = "IP address discovery did not complete."
+	messageFailureReadyTimeout      = "The instance did not reach its powered-on ready state."
+
+	// Controller-side failure that never reaches the operator's lifecycle.
+	messageFailureSSHKey = "The registered SSH-key Secret could not be resolved."
+)
 
 // FunctionBuilder contains the data and logic needed to build a function that reconciles bare metal instances.
 type FunctionBuilder struct {
@@ -61,19 +87,23 @@ type FunctionBuilder struct {
 }
 
 type function struct {
-	logger                              *slog.Logger
-	hubCache                            controllers.HubCache
-	bareMetalInstancesClient            privatev1.BareMetalInstancesClient
-	bareMetalInstanceCatalogItemsClient privatev1.BareMetalInstanceCatalogItemsClient
-	bareMetalInstanceTypesClient        privatev1.BareMetalInstanceTypesClient
-	bareMetalInstanceTemplatesClient    privatev1.BareMetalInstanceTemplatesClient
-	hubsClient                          privatev1.HubsClient
-	maskCalculator                      *masks.Calculator
+	logger                           *slog.Logger
+	hubCache                         controllers.HubCache
+	networkingHubReader              controllers.NetworkingHubReader
+	networkingCleanup                controllers.WorkloadNetworkingCleanup
+	bareMetalInstancesClient         privatev1.BareMetalInstancesClient
+	bareMetalInstanceTypesClient     privatev1.BareMetalInstanceTypesClient
+	bareMetalInstanceTemplatesClient privatev1.BareMetalInstanceTemplatesClient
+	hubsClient                       privatev1.HubsClient
+	secretsClient                    privatev1.SecretsClient
+	diskImagesClient                 privatev1.DiskImagesClient
+	maskCalculator                   *masks.Calculator
 }
 
 type task struct {
 	r                  *function
 	bareMetalInstance  *privatev1.BareMetalInstance
+	sshPublicKey       string
 	hubId              string
 	hubNamespace       string
 	hubClient          clnt.Client
@@ -119,14 +149,23 @@ func (b *FunctionBuilder) Build() (result controllers.ReconcilerFunction[*privat
 	}
 
 	object := &function{
-		logger:                              b.logger,
-		bareMetalInstancesClient:            privatev1.NewBareMetalInstancesClient(b.connection),
-		bareMetalInstanceCatalogItemsClient: privatev1.NewBareMetalInstanceCatalogItemsClient(b.connection),
-		bareMetalInstanceTypesClient:        privatev1.NewBareMetalInstanceTypesClient(b.connection),
-		bareMetalInstanceTemplatesClient:    privatev1.NewBareMetalInstanceTemplatesClient(b.connection),
-		hubsClient:                          privatev1.NewHubsClient(b.connection),
-		hubCache:                            b.hubCache,
-		maskCalculator:                      masks.NewCalculator().Build(),
+		logger:                           b.logger,
+		networkingCleanup:                controllers.NewWorkloadNetworkingCleanup(b.connection),
+		bareMetalInstancesClient:         privatev1.NewBareMetalInstancesClient(b.connection),
+		bareMetalInstanceTypesClient:     privatev1.NewBareMetalInstanceTypesClient(b.connection),
+		bareMetalInstanceTemplatesClient: privatev1.NewBareMetalInstanceTemplatesClient(b.connection),
+		hubsClient:                       privatev1.NewHubsClient(b.connection),
+		secretsClient:                    privatev1.NewSecretsClient(b.connection),
+		diskImagesClient:                 privatev1.NewDiskImagesClient(b.connection),
+		hubCache:                         b.hubCache,
+		maskCalculator:                   masks.NewCalculator().Build(),
+	}
+	object.networkingHubReader, err = controllers.NewNetworkingHubReader().
+		SetNetworkClassesClient(privatev1.NewNetworkClassesClient(b.connection)).
+		SetHubCache(b.hubCache).
+		Build()
+	if err != nil {
+		return nil, err
 	}
 	result = object.run
 	return
@@ -144,8 +183,35 @@ func (r *function) run(ctx context.Context, bareMetalInstance *privatev1.BareMet
 	} else {
 		err = t.update(ctx)
 	}
-	if err != nil {
-		return err
+	var reconcileRetryErr error
+	var secretErr *controllers.SSHKeyResolutionError
+	if errors.As(err, &secretErr) {
+		if !secretErr.Permanent {
+			return err
+		}
+		// Create validates the reference before persistence, but its data can
+		// become invalid before reconciliation. Do not persist partial changes
+		// from that failure; retain only the failure status below.
+		proto.Reset(bareMetalInstance)
+		proto.Merge(bareMetalInstance, oldBareMetalInstance)
+		t.setState(privatev1.BareMetalInstanceState_BARE_METAL_INSTANCE_STATE_FAILED, nil)
+		t.updateCondition(
+			privatev1.BareMetalInstanceConditionType_BARE_METAL_INSTANCE_CONDITION_TYPE_PROVISIONED,
+			privatev1.ConditionStatus_CONDITION_STATUS_FALSE,
+			secretErr.Reason, messageFailureSSHKey)
+		t.updateCondition(
+			privatev1.BareMetalInstanceConditionType_BARE_METAL_INSTANCE_CONDITION_TYPE_READY,
+			privatev1.ConditionStatus_CONDITION_STATUS_FALSE, "", "")
+	} else if err != nil {
+		handled, retry := controllers.HandleResourceNetworkingHubResolutionError(err, t.setPending, t.setFailed)
+		if !handled {
+			if !controllers.IsRequeueable(err) {
+				return err
+			}
+			reconcileRetryErr = err
+		} else if retry {
+			reconcileRetryErr = err
+		}
 	}
 	updateMask := r.maskCalculator.Calculate(oldBareMetalInstance, bareMetalInstance)
 
@@ -153,8 +219,10 @@ func (r *function) run(ctx context.Context, bareMetalInstance *privatev1.BareMet
 		Object:     bareMetalInstance,
 		UpdateMask: updateMask,
 	}.Build())
-
-	return err
+	if err != nil {
+		return err
+	}
+	return reconcileRetryErr
 }
 
 func (t *task) update(ctx context.Context) error {
@@ -178,8 +246,12 @@ func (t *task) update(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	existingObject := object != nil
+	if err := t.resolveSSHKey(ctx, object); err != nil {
+		return fmt.Errorf("failed to resolve ssh key: %w", err)
+	}
 
-	if t.bareMetalInstance.GetSpec().HasUserData() {
+	if t.bareMetalInstance.GetSpec().GetUserDataSource() != nil {
 		t.userDataSecretName = fmt.Sprintf("%s%s", t.bareMetalInstance.GetId(), userDataSecretSuffix)
 	}
 
@@ -191,9 +263,20 @@ func (t *task) update(ctx context.Context) error {
 			},
 		}
 	}
+	storedNetworkAttachments := slices.Clone(object.Spec.NetworkAttachments)
 
 	result, err := controllerutil.CreateOrPatch(ctx, t.hubClient, object, func() error {
-		return t.mutateBMI(ctx, object)
+		if err := t.mutateBMI(ctx, object); err != nil {
+			return err
+		}
+		if existingObject {
+			if !equalNetworkAttachments(storedNetworkAttachments, object.Spec.NetworkAttachments) {
+				t.r.logger.WarnContext(ctx, "Private and stored network attachments differ; preserving stored network attachments on existing BareMetalInstance",
+					slog.String("namespace", object.GetNamespace()), slog.String("name", object.GetName()))
+			}
+			object.Spec.NetworkAttachments = storedNetworkAttachments
+		}
+		return nil
 	})
 	if err != nil {
 		return controllers.HandleK8sWriteError(ctx, t.r.logger, err, t.setFailed)
@@ -214,12 +297,42 @@ func (t *task) update(ctx context.Context) error {
 	return nil
 }
 
+func materializedBareMetalSSHKey(object *bmfov1alpha1.BareMetalInstance) string {
+	if object == nil || object.Spec.TemplateParameters == "" {
+		return ""
+	}
+	var params map[string]any
+	if err := json.Unmarshal([]byte(object.Spec.TemplateParameters), &params); err != nil {
+		return ""
+	}
+	value, _ := params["sshPublicKey"].(string)
+	return value
+}
+
+func (t *task) resolveSSHKey(ctx context.Context, object *bmfov1alpha1.BareMetalInstance) error {
+	ref := t.bareMetalInstance.GetSpec().GetSshKey()
+	if ref == nil {
+		t.sshPublicKey = ""
+		return nil
+	}
+	if materialized := materializedBareMetalSSHKey(object); materialized != "" {
+		t.sshPublicKey = materialized
+		return nil
+	}
+	key, err := controllers.ResolveSSHKey(ctx, t.r.secretsClient, ref)
+	if err != nil {
+		return err
+	}
+	t.sshPublicKey = key
+	return nil
+}
+
 func (t *task) setDefaults() {
 	if !t.bareMetalInstance.HasStatus() {
 		t.bareMetalInstance.SetStatus(&privatev1.BareMetalInstanceStatus{})
 	}
 	if t.bareMetalInstance.GetStatus().GetState() == privatev1.BareMetalInstanceState_BARE_METAL_INSTANCE_STATE_UNSPECIFIED {
-		t.bareMetalInstance.GetStatus().SetState(privatev1.BareMetalInstanceState_BARE_METAL_INSTANCE_STATE_PROVISIONING)
+		t.setState(privatev1.BareMetalInstanceState_BARE_METAL_INSTANCE_STATE_PROVISIONING, nil)
 	}
 	for value := range privatev1.BareMetalInstanceConditionType_name {
 		if value != 0 {
@@ -252,17 +365,23 @@ func (t *task) delete(ctx context.Context) (err error) {
 	// Do nothing if we don't know the hub yet:
 	t.hubId = t.bareMetalInstance.GetStatus().GetHub()
 	if t.hubId == "" {
+		if err = controllers.ReconcileWorkloadNetworkingCleanup(ctx, t.r.networkingCleanup, t.bareMetalInstance.GetId()); err != nil {
+			return err
+		}
 		t.removeFinalizer()
 		return nil
 	}
 
-	t.bareMetalInstance.GetStatus().SetState(privatev1.BareMetalInstanceState_BARE_METAL_INSTANCE_STATE_DELETING)
+	t.setState(privatev1.BareMetalInstanceState_BARE_METAL_INSTANCE_STATE_DELETING, nil)
 	t.updateCondition(
 		privatev1.BareMetalInstanceConditionType_BARE_METAL_INSTANCE_CONDITION_TYPE_READY,
 		privatev1.ConditionStatus_CONDITION_STATUS_FALSE, "", "")
 	err = t.getHub(ctx)
 	if err != nil {
 		if errors.Is(err, controllers.ErrHubNotFound) {
+			if err = controllers.ReconcileWorkloadNetworkingCleanup(ctx, t.r.networkingCleanup, t.bareMetalInstance.GetId()); err != nil {
+				return err
+			}
 			controllers.RemoveFinalizerOnDecommissionedHub(ctx, t.r.logger, t.hubId, "bare_metal_instance_id", t.bareMetalInstance.GetId(), t.removeFinalizer)
 			return nil
 		}
@@ -279,8 +398,14 @@ func (t *task) delete(ctx context.Context) (err error) {
 			"Bare metal instance doesn't exist",
 			slog.String("id", t.bareMetalInstance.GetId()),
 		)
+		if err = controllers.ReconcileWorkloadNetworkingCleanup(ctx, t.r.networkingCleanup, t.bareMetalInstance.GetId()); err != nil {
+			return err
+		}
 		t.removeFinalizer()
 		return
+	}
+	if err = controllers.ReconcileWorkloadNetworkingCleanup(ctx, t.r.networkingCleanup, t.bareMetalInstance.GetId()); err != nil {
+		return err
 	}
 
 	if object.GetDeletionTimestamp() == nil {
@@ -303,11 +428,29 @@ func (t *task) delete(ctx context.Context) (err error) {
 		)
 	}
 
-	return
+	// Kubernetes deletion is asynchronous, and the fulfillment event stream does
+	// not observe the BMFO object's finalizer progress. Keep this BMI queued until
+	// getKubeObject reports that the BMFO object is gone, then remove the
+	// fulfillment finalizer on the next reconciliation.
+	return controllers.RequeueAfterKubernetesDeletion("bare metal instance")
 }
 
 func (t *task) selectHub(ctx context.Context) error {
 	t.hubId = t.bareMetalInstance.GetStatus().GetHub()
+	if len(t.bareMetalInstance.GetSpec().GetNetworkAttachments()) > 0 {
+		if t.r.networkingHubReader == nil {
+			return controllers.ErrCanonicalHubUnavailable
+		}
+		resolution, err := controllers.ResolveResourceNetworkingHub(ctx, t.r.networkingHubReader, t.hubId)
+		if err != nil {
+			return err
+		}
+		t.hubId = resolution.HubID
+		t.hubNamespace = resolution.Namespace
+		t.hubClient = resolution.Client
+		t.r.logger.DebugContext(ctx, "Selected canonical networking hub", slog.String("id", t.hubId))
+		return nil
+	}
 	if t.hubId == "" {
 		response, err := t.r.hubsClient.List(ctx, privatev1.HubsListRequest_builder{}.Build())
 		if err != nil {
@@ -400,11 +543,23 @@ func (t *task) setFailed(err error) {
 	if !t.bareMetalInstance.HasStatus() {
 		t.bareMetalInstance.SetStatus(&privatev1.BareMetalInstanceStatus{})
 	}
-	t.bareMetalInstance.GetStatus().SetState(privatev1.BareMetalInstanceState_BARE_METAL_INSTANCE_STATE_FAILED)
+	t.setState(privatev1.BareMetalInstanceState_BARE_METAL_INSTANCE_STATE_FAILED, nil)
 	t.updateCondition(
 		privatev1.BareMetalInstanceConditionType_BARE_METAL_INSTANCE_CONDITION_TYPE_CONFIGURATION_APPLIED,
 		privatev1.ConditionStatus_CONDITION_STATUS_FALSE,
 		"ValidationFailed",
+		err.Error(),
+	)
+}
+
+func (t *task) setPending(err error) {
+	if !t.bareMetalInstance.HasStatus() {
+		t.bareMetalInstance.SetStatus(&privatev1.BareMetalInstanceStatus{})
+	}
+	t.updateCondition(
+		privatev1.BareMetalInstanceConditionType_BARE_METAL_INSTANCE_CONDITION_TYPE_PROVISIONED,
+		privatev1.ConditionStatus_CONDITION_STATUS_FALSE,
+		"ResourcesUnavailable",
 		err.Error(),
 	)
 }
@@ -445,23 +600,71 @@ func (t *task) syncStatus(object *bmfov1alpha1.BareMetalInstance) {
 
 	t.syncState(object, powerSynced)
 
-	readyStatus := privatev1.ConditionStatus_CONDITION_STATUS_TRUE
-	state := t.bareMetalInstance.GetStatus().GetState()
-	if state == privatev1.BareMetalInstanceState_BARE_METAL_INSTANCE_STATE_PROVISIONING ||
-		state == privatev1.BareMetalInstanceState_BARE_METAL_INSTANCE_STATE_DELETING ||
-		state == privatev1.BareMetalInstanceState_BARE_METAL_INSTANCE_STATE_FAILED {
-		readyStatus = privatev1.ConditionStatus_CONDITION_STATUS_FALSE
-	}
-	t.updateCondition(privatev1.BareMetalInstanceConditionType_BARE_METAL_INSTANCE_CONDITION_TYPE_READY, readyStatus, "", "")
-
-	// PROVISIONED is a ratchet: only promoted True once the template completes;
-	// never demoted False once set (re-provisioning cycles must not un-provision the instance).
-	// TemplateComplete=True implies Allocated=True by ordering, so no separate allocation check needed.
-	templateCond := object.GetStatusCondition(bmfov1alpha1.HostConditionProvisionTemplateComplete)
-	if templateCond != nil && templateCond.Status == metav1.ConditionTrue {
+	// Derive PROVISIONED and READY from the operator's lifecycle conditions. The
+	// Deleting phase is guarded: conditions may still indicate a ready instance, but
+	// provisioning progress is not meaningful while the instance is being deleted.
+	if object.Status.Phase != bmfov1alpha1.BareMetalInstancePhaseDeleting {
+		progress := bmfov1alpha1.DeriveProvisioningProgress(object.Status.Conditions)
+		switch progress.State {
+		case bmfov1alpha1.StateInProgress:
+			stage := progress.Step.Stage()
+			message := stepMessage(progress.Step)
+			if progress.Retrying {
+				message = messageStepProvisioningRetrying
+			}
+			t.updateCondition(
+				privatev1.BareMetalInstanceConditionType_BARE_METAL_INSTANCE_CONDITION_TYPE_PROVISIONED,
+				privatev1.ConditionStatus_CONDITION_STATUS_FALSE,
+				string(stage), message)
+			t.updateCondition(
+				privatev1.BareMetalInstanceConditionType_BARE_METAL_INSTANCE_CONDITION_TYPE_READY,
+				privatev1.ConditionStatus_CONDITION_STATUS_FALSE, "", "")
+		case bmfov1alpha1.StateProvisioned:
+			t.updateCondition(
+				privatev1.BareMetalInstanceConditionType_BARE_METAL_INSTANCE_CONDITION_TYPE_PROVISIONED,
+				privatev1.ConditionStatus_CONDITION_STATUS_TRUE,
+				string(bmfov1alpha1.StateProvisioned), messageProvisioned)
+			t.updateCondition(
+				privatev1.BareMetalInstanceConditionType_BARE_METAL_INSTANCE_CONDITION_TYPE_READY,
+				privatev1.ConditionStatus_CONDITION_STATUS_FALSE,
+				string(bmfov1alpha1.StageReady), stepMessage(bmfov1alpha1.StepReadyPowerSync))
+		case bmfov1alpha1.StateReady:
+			t.updateCondition(
+				privatev1.BareMetalInstanceConditionType_BARE_METAL_INSTANCE_CONDITION_TYPE_PROVISIONED,
+				privatev1.ConditionStatus_CONDITION_STATUS_TRUE,
+				string(bmfov1alpha1.StateProvisioned), messageProvisioned)
+			t.updateCondition(
+				privatev1.BareMetalInstanceConditionType_BARE_METAL_INSTANCE_CONDITION_TYPE_READY,
+				privatev1.ConditionStatus_CONDITION_STATUS_TRUE,
+				string(bmfov1alpha1.StateReady), messageReady)
+		case bmfov1alpha1.StateFailed:
+			if progress.Step == bmfov1alpha1.StepReadyPowerSync {
+				// Ready-axis failure: provisioning completed; the host did not reach its
+				// desired power state. PROVISIONED stays True; READY carries the failure.
+				t.updateCondition(
+					privatev1.BareMetalInstanceConditionType_BARE_METAL_INSTANCE_CONDITION_TYPE_PROVISIONED,
+					privatev1.ConditionStatus_CONDITION_STATUS_TRUE,
+					string(bmfov1alpha1.StateProvisioned), messageProvisioned)
+				t.updateCondition(
+					privatev1.BareMetalInstanceConditionType_BARE_METAL_INSTANCE_CONDITION_TYPE_READY,
+					privatev1.ConditionStatus_CONDITION_STATUS_FALSE,
+					string(progress.Failure), failureMessage(progress.Failure))
+			} else {
+				// Provisioning-axis failure. PROVISIONED carries the failure reason;
+				// READY is False (provisioning never completed).
+				t.updateCondition(
+					privatev1.BareMetalInstanceConditionType_BARE_METAL_INSTANCE_CONDITION_TYPE_PROVISIONED,
+					privatev1.ConditionStatus_CONDITION_STATUS_FALSE,
+					string(progress.Failure), failureMessage(progress.Failure))
+				t.updateCondition(
+					privatev1.BareMetalInstanceConditionType_BARE_METAL_INSTANCE_CONDITION_TYPE_READY,
+					privatev1.ConditionStatus_CONDITION_STATUS_FALSE, "", "")
+			}
+		}
+	} else {
 		t.updateCondition(
-			privatev1.BareMetalInstanceConditionType_BARE_METAL_INSTANCE_CONDITION_TYPE_PROVISIONED,
-			privatev1.ConditionStatus_CONDITION_STATUS_TRUE, "", "")
+			privatev1.BareMetalInstanceConditionType_BARE_METAL_INSTANCE_CONDITION_TYPE_READY,
+			privatev1.ConditionStatus_CONDITION_STATUS_FALSE, "", "")
 	}
 
 	protoStatuses := make([]*privatev1.BareMetalNetworkAttachmentStatus, 0, len(object.Status.NetworkAttachmentStatuses))
@@ -544,33 +747,49 @@ func (t *task) syncStatus(object *bmfov1alpha1.BareMetalInstance) {
 func (t *task) syncState(object *bmfov1alpha1.BareMetalInstance, powerSynced *metav1.Condition) {
 	switch object.Status.Phase {
 	case bmfov1alpha1.BareMetalInstancePhaseFailed:
-		t.bareMetalInstance.GetStatus().SetState(privatev1.BareMetalInstanceState_BARE_METAL_INSTANCE_STATE_FAILED)
+		t.setState(privatev1.BareMetalInstanceState_BARE_METAL_INSTANCE_STATE_FAILED, nil)
 		return
 	case bmfov1alpha1.BareMetalInstancePhaseDeleting:
-		t.bareMetalInstance.GetStatus().SetState(privatev1.BareMetalInstanceState_BARE_METAL_INSTANCE_STATE_DELETING)
+		t.setState(privatev1.BareMetalInstanceState_BARE_METAL_INSTANCE_STATE_DELETING, nil)
 		return
 	}
 
 	if powerSynced == nil {
-		t.bareMetalInstance.GetStatus().SetState(privatev1.BareMetalInstanceState_BARE_METAL_INSTANCE_STATE_PROVISIONING)
+		t.setState(privatev1.BareMetalInstanceState_BARE_METAL_INSTANCE_STATE_PROVISIONING, nil)
 		return
 	}
 
 	switch {
 	case powerSynced.Status == metav1.ConditionTrue && powerSynced.Reason == bmfov1alpha1.HostConditionReasonPowerOn:
-		t.bareMetalInstance.GetStatus().SetState(privatev1.BareMetalInstanceState_BARE_METAL_INSTANCE_STATE_RUNNING)
+		t.setState(privatev1.BareMetalInstanceState_BARE_METAL_INSTANCE_STATE_RUNNING, &powerSynced.LastTransitionTime)
 	case powerSynced.Status == metav1.ConditionTrue && powerSynced.Reason == bmfov1alpha1.HostConditionReasonPowerOff:
-		t.bareMetalInstance.GetStatus().SetState(privatev1.BareMetalInstanceState_BARE_METAL_INSTANCE_STATE_STOPPED)
+		t.setState(privatev1.BareMetalInstanceState_BARE_METAL_INSTANCE_STATE_STOPPED, &powerSynced.LastTransitionTime)
 	case powerSynced.Status == metav1.ConditionFalse && powerSynced.Reason == bmfov1alpha1.HostConditionReasonProgressing:
 		if object.Spec.RunStrategy == bmfov1alpha1.RunStrategyHalted {
-			t.bareMetalInstance.GetStatus().SetState(privatev1.BareMetalInstanceState_BARE_METAL_INSTANCE_STATE_STOPPING)
+			t.setState(privatev1.BareMetalInstanceState_BARE_METAL_INSTANCE_STATE_STOPPING, &powerSynced.LastTransitionTime)
 		} else {
-			t.bareMetalInstance.GetStatus().SetState(privatev1.BareMetalInstanceState_BARE_METAL_INSTANCE_STATE_STARTING)
+			t.setState(privatev1.BareMetalInstanceState_BARE_METAL_INSTANCE_STATE_STARTING, &powerSynced.LastTransitionTime)
 		}
 	case powerSynced.Status == metav1.ConditionFalse:
-		t.bareMetalInstance.GetStatus().SetState(privatev1.BareMetalInstanceState_BARE_METAL_INSTANCE_STATE_FAILED)
+		t.setState(privatev1.BareMetalInstanceState_BARE_METAL_INSTANCE_STATE_FAILED, &powerSynced.LastTransitionTime)
 	default:
-		t.bareMetalInstance.GetStatus().SetState(privatev1.BareMetalInstanceState_BARE_METAL_INSTANCE_STATE_PROVISIONING)
+		t.setState(privatev1.BareMetalInstanceState_BARE_METAL_INSTANCE_STATE_PROVISIONING, &powerSynced.LastTransitionTime)
+	}
+}
+
+func (t *task) setState(state privatev1.BareMetalInstanceState, transitionTime *metav1.Time) {
+	if !t.bareMetalInstance.HasStatus() {
+		t.bareMetalInstance.SetStatus(&privatev1.BareMetalInstanceStatus{})
+	}
+	status := t.bareMetalInstance.GetStatus()
+	if status.GetState() == state {
+		return
+	}
+	status.SetState(state)
+	if transitionTime != nil && !transitionTime.IsZero() {
+		status.SetStateTransitionTime(timestamppb.New(transitionTime.Time))
+	} else {
+		status.SetStateTransitionTime(controllers.NowTruncated())
 	}
 }
 
@@ -602,6 +821,52 @@ func sanitizeConditionMessage(condType bmfov1alpha1.BareMetalInstanceConditionTy
 	return ""
 }
 
+// stepMessage returns the curated tenant-facing in-progress message for the given
+// provisioning step. Returns "" for an unrecognized step so callers never panic on
+// future step additions before this switch is updated.
+func stepMessage(step bmfov1alpha1.ProvisioningStep) string {
+	switch step {
+	case bmfov1alpha1.StepHostAllocation:
+		return messageStepHostAllocation
+	case bmfov1alpha1.StepProvisioning:
+		return messageStepProvisioning
+	case bmfov1alpha1.StepNetworkSetupAttachment:
+		return messageStepNetworkSetupAttachment
+	case bmfov1alpha1.StepNetworkSetupHandoff:
+		return messageStepNetworkSetupHandoff
+	case bmfov1alpha1.StepNetworkSetupIPDiscovery:
+		return messageStepNetworkSetupIPDiscovery
+	case bmfov1alpha1.StepReadyPowerSync:
+		return messageStepReadyPowerSync
+	default:
+		return ""
+	}
+}
+
+// failureMessage returns the curated tenant-facing message for the given
+// failure classification. Returns "" for an unrecognized classification so
+// callers never panic on future additions before this switch is updated.
+func failureMessage(failure bmfov1alpha1.FailureClassification) string {
+	switch failure {
+	case bmfov1alpha1.FailureNoMatchingHosts:
+		return messageFailureNoMatchingHosts
+	case bmfov1alpha1.FailureHostAllocation:
+		return messageFailureHostAllocation
+	case bmfov1alpha1.FailureProvisionJob:
+		return messageFailureProvisionJob
+	case bmfov1alpha1.FailureNetworkAttachment:
+		return messageFailureNetworkAttachment
+	case bmfov1alpha1.FailureNetworkHandoff:
+		return messageFailureNetworkHandoff
+	case bmfov1alpha1.FailureIPDiscovery:
+		return messageFailureIPDiscovery
+	case bmfov1alpha1.FailureReadyTimeout:
+		return messageFailureReadyTimeout
+	default:
+		return ""
+	}
+}
+
 // mutateBMI sets the fulfillment-service-owned metadata and spec fields, leaving
 // operator-managed fields (ExternalHostID, HostClass, etc.) untouched.
 func (t *task) mutateBMI(ctx context.Context, object *bmfov1alpha1.BareMetalInstance) error {
@@ -614,69 +879,41 @@ func (t *task) mutateBMI(ctx context.Context, object *bmfov1alpha1.BareMetalInst
 	}
 	object.Annotations[annotations.Tenant] = t.bareMetalInstance.GetMetadata().GetTenant()
 
-	// Determine template ID: use direct template if present, otherwise resolve from catalog item.
-	var templateID string
-	if t.bareMetalInstance.GetSpec().HasTemplate() {
-		templateID = t.bareMetalInstance.GetSpec().GetTemplate().GetId()
-	} else if t.bareMetalInstance.GetSpec().HasCatalogItem() {
-		catalogItemResp, err := t.r.bareMetalInstanceCatalogItemsClient.Get(ctx, privatev1.BareMetalInstanceCatalogItemsGetRequest_builder{
-			Id: t.bareMetalInstance.GetSpec().GetCatalogItem().GetId(),
-		}.Build())
-		if err != nil {
-			return fmt.Errorf("failed to get catalog item '%s': %w", t.bareMetalInstance.GetSpec().GetCatalogItem().GetId(), err)
-		}
-		templateID = catalogItemResp.GetObject().GetTemplate().GetId()
-	} else {
-		return fmt.Errorf("BareMetalInstance must have either template or catalog_item")
+	// The API materializes the Template; the catalog reference is provenance only.
+	templateID := t.bareMetalInstance.GetSpec().GetTemplate().GetId()
+	if templateID == "" {
+		return fmt.Errorf("BareMetalInstance must have a materialized template")
 	}
 
-	// Resolve host selection labels for the CRD's Selector.HostSelector. When an instance type is
-	// specified, map its host_label_selector. Otherwise fall back to the template's host_type
-	// (legacy path), which the backends map to the osac.openshift.io/host-type label.
-	if object.Spec.Selector.HostSelector == nil {
-		object.Spec.Selector.HostSelector = make(map[string]string)
+	instanceTypeRef := t.bareMetalInstance.GetSpec().GetInstanceType()
+	if instanceTypeRef == nil {
+		return fmt.Errorf("BareMetalInstance '%s' has no instance_type", t.bareMetalInstance.GetId())
 	}
-	if t.bareMetalInstance.GetSpec().HasInstanceType() {
-		instanceTypeRef := t.bareMetalInstance.GetSpec().GetInstanceType()
-		instanceTypeResp, err := t.r.bareMetalInstanceTypesClient.Get(ctx, privatev1.BareMetalInstanceTypesGetRequest_builder{
-			Id: instanceTypeRef.GetId(),
-		}.Build())
-		if err != nil {
-			return fmt.Errorf("failed to get instance type '%s': %w", instanceTypeRef.GetId(), err)
-		}
 
-		instanceType := instanceTypeResp.GetObject()
-		if instanceType.GetSpec().HasHostLabelSelector() {
-			for key, value := range instanceType.GetSpec().GetHostLabelSelector().GetMatchLabels() {
-				object.Spec.Selector.HostSelector[key] = value
-			}
+	// Replace any prior selector so updates cannot retain legacy placement labels.
+	object.Spec.Selector.HostSelector = make(map[string]string)
+	instanceTypeResp, err := t.r.bareMetalInstanceTypesClient.Get(ctx, privatev1.BareMetalInstanceTypesGetRequest_builder{
+		Id: instanceTypeRef.GetId(),
+	}.Build())
+	if err != nil {
+		return fmt.Errorf("failed to get instance type '%s': %w", instanceTypeRef.GetId(), err)
+	}
+
+	instanceType := instanceTypeResp.GetObject()
+	if instanceType.GetSpec().HasHostLabelSelector() {
+		for key, value := range instanceType.GetSpec().GetHostLabelSelector().GetMatchLabels() {
+			object.Spec.Selector.HostSelector[key] = value
 		}
-	} else {
-		// Fall back to template host_type when no instance type is specified.
-		templateResp, err := t.r.bareMetalInstanceTemplatesClient.Get(ctx, privatev1.BareMetalInstanceTemplatesGetRequest_builder{
-			Id: templateID,
-		}.Build())
-		if err != nil {
-			return fmt.Errorf("failed to get instance template '%s': %w", templateID, err)
-		}
-		hostType := templateResp.GetObject().GetHostType()
-		if hostType == "" {
-			hostType = defaultHostType
-		}
-		object.Spec.Selector.HostSelector["hostType"] = hostType
 	}
 
 	// Validate that HostSelector is non-empty after resolving from instance type or template.
 	// The CRD requires MinProperties=1, so an empty selector would fail K8s admission.
 	// Return an explicit error here rather than letting K8s reject with a generic validation error.
 	if len(object.Spec.Selector.HostSelector) == 0 {
-		if t.bareMetalInstance.GetSpec().HasInstanceType() {
-			return fmt.Errorf(
-				"instance type '%s' has no host_label_selector - cannot determine host selection",
-				t.bareMetalInstance.GetSpec().GetInstanceType().GetId(),
-			)
-		}
-		return fmt.Errorf("cannot determine host selection: no instance_type and no template host_type")
+		return fmt.Errorf(
+			"instance type '%s' has no host_label_selector - cannot determine host selection",
+			instanceTypeRef.GetId(),
+		)
 	}
 
 	object.Spec.TemplateID = templateID
@@ -697,19 +934,21 @@ func (t *task) mutateBMI(ctx context.Context, object *bmfov1alpha1.BareMetalInst
 		}
 	}
 
-	if t.bareMetalInstance.GetSpec().HasSshPublicKey() {
-		params["sshPublicKey"] = t.bareMetalInstance.GetSpec().GetSshPublicKey()
+	if t.sshPublicKey != "" {
+		params["sshPublicKey"] = t.sshPublicKey
 	}
 	if t.userDataSecretName != "" {
 		params["userDataSecret"] = t.userDataSecretName
 	}
-	if t.bareMetalInstance.GetSpec().HasImage() {
-		params["imageURL"] = t.bareMetalInstance.GetSpec().GetImage().GetSourceRef()
-		if st := t.bareMetalInstance.GetSpec().GetImage().GetSourceType(); st != "" {
-			params["imageSourceType"] = st
-		} else {
-			delete(params, "imageSourceType")
+	if diskImageRef := t.bareMetalInstance.GetSpec().GetDiskImage(); diskImageRef != nil {
+		diskImageKey := controllers.RefKeyStr(diskImageRef)
+		diResp, diErr := t.r.diskImagesClient.Get(ctx, privatev1.DiskImagesGetRequest_builder{
+			Id: diskImageKey,
+		}.Build())
+		if diErr != nil {
+			return fmt.Errorf("failed to resolve disk image '%s': %w", diskImageKey, diErr)
 		}
+		params["imageURL"] = diResp.GetObject().GetSpec().GetSourceRef()
 	}
 	if len(params) > 0 {
 		paramsJSON, err := json.Marshal(params)
@@ -729,24 +968,36 @@ func (t *task) mutateBMI(ctx context.Context, object *bmfov1alpha1.BareMetalInst
 	}
 
 	protoAttachments := t.bareMetalInstance.GetSpec().GetNetworkAttachments()
+	var networkAttachments []bmfov1alpha1.BareMetalNetworkAttachment
 	if len(protoAttachments) > 0 {
-		networkAttachments := make([]bmfov1alpha1.BareMetalNetworkAttachment, 0, len(protoAttachments))
+		networkAttachments = make([]bmfov1alpha1.BareMetalNetworkAttachment, 0, len(protoAttachments))
 		for _, att := range protoAttachments {
 			secGroupRefs := make([]string, 0, len(att.GetSecurityGroups()))
 			for _, sg := range att.GetSecurityGroups() {
 				secGroupRefs = append(secGroupRefs, controllers.RefKeyStr(sg))
 			}
+			primary := att.GetPrimary()
+			if len(protoAttachments) == 1 {
+				primary = true
+			}
 			networkAttachments = append(networkAttachments, bmfov1alpha1.BareMetalNetworkAttachment{
 				SubnetRef:         controllers.RefKeyStr(att.GetSubnet()),
 				SecurityGroupRefs: secGroupRefs,
 				Interface:         att.GetInterface(),
-				Primary:           att.GetPrimary(),
+				Primary:           primary,
 			})
 		}
-		object.Spec.NetworkAttachments = networkAttachments
 	}
+	object.Spec.NetworkAttachments = networkAttachments
 
 	return nil
+}
+
+func equalNetworkAttachments(left, right []bmfov1alpha1.BareMetalNetworkAttachment) bool {
+	if len(left) == 0 && len(right) == 0 {
+		return true
+	}
+	return apiequality.Semantic.DeepEqual(left, right)
 }
 
 // ensureUserDataSecret creates a Kubernetes Secret containing the cloud-init user data
@@ -755,6 +1006,10 @@ func (t *task) mutateBMI(ctx context.Context, object *bmfov1alpha1.BareMetalInst
 func (t *task) ensureUserDataSecret(ctx context.Context, owner *bmfov1alpha1.BareMetalInstance) error {
 	if t.userDataSecretName == "" {
 		return nil
+	}
+	userData, err := t.resolveUserData(ctx)
+	if err != nil {
+		return err
 	}
 
 	secret := &corev1.Secret{
@@ -774,11 +1029,11 @@ func (t *task) ensureUserDataSecret(ctx context.Context, owner *bmfov1alpha1.Bar
 			},
 		},
 		StringData: map[string]string{
-			userDataSecretKey: t.bareMetalInstance.GetSpec().GetUserData(),
+			userDataSecretKey: userData,
 		},
 	}
 
-	err := t.hubClient.Create(ctx, secret)
+	err = t.hubClient.Create(ctx, secret)
 	if apierrors.IsAlreadyExists(err) {
 		return nil
 	}
@@ -792,4 +1047,26 @@ func (t *task) ensureUserDataSecret(ctx context.Context, owner *bmfov1alpha1.Bar
 		slog.String("name", secret.GetName()),
 	)
 	return nil
+}
+
+func (t *task) resolveUserData(ctx context.Context) (string, error) {
+	ref := t.bareMetalInstance.GetSpec().GetUserDataSource().GetSecret()
+	if ref == nil {
+		return t.bareMetalInstance.GetSpec().GetUserDataSource().GetInline(), nil
+	}
+	if t.r.secretsClient == nil {
+		return "", errors.New("secrets client is required to resolve user_data_source.secret")
+	}
+	if ref.GetId() == "" {
+		return "", errors.New("user_data_source.secret must have an id")
+	}
+	response, err := t.r.secretsClient.Get(ctx, privatev1.SecretsGetRequest_builder{Id: ref.GetId()}.Build())
+	if err != nil {
+		return "", fmt.Errorf("failed to fetch user_data_source.secret: %w", err)
+	}
+	value, ok := response.GetObject().GetData()[userDataSecretKey]
+	if !ok || len(value) == 0 {
+		return "", fmt.Errorf("secret %q is missing non-empty data[%q]", ref.GetId(), userDataSecretKey)
+	}
+	return string(value), nil
 }

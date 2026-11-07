@@ -1,5 +1,34 @@
 # Full scenario: everything enabled, exercises all template branches.
 
+global:
+  osacDeploymentId: "ci/osac"
+  networking:
+    provisioningEnabled: true
+    excludedIpv4Cidrs:
+    - 192.0.2.0/24
+    # Synthetic registration names keep this chart smoke fixture independent
+    # of provider-specific manager configuration owned by the manager teams.
+    fabricManager: test_fabric
+    k8sManager: cudn_evpn
+    networkClass:
+      defaults:
+        virtualNetworkIPv4CIDR: 10.200.0.0/16
+        subnetIPv4CIDR: 10.200.0.0/22
+        ingressRules:
+        - protocol: PROTOCOL_TCP
+          ipv4Cidr: 0.0.0.0/0
+          portFrom: 22
+          portTo: 22
+        egressRules:
+        - protocol: PROTOCOL_ALL
+          ipv4Cidr: 0.0.0.0/0
+      eastWestCapabilities:
+        supportsEastWestEthernet: true
+      addressPlan:
+        overlay: 0.5
+        fabric: 0.25
+        lbVip: 0.25
+
 ui:
   enabled: true
   externalHostname: osac-ui.example.com
@@ -11,6 +40,7 @@ ui:
           configMap: ca-bundle
   auth:
     oidcClientId: osac-ui
+    oidcIssuerURL: https://keycloak.keycloak.svc.cluster.local/realms/osac
     certs:
       caBundle:
         configMap: ca-bundle
@@ -26,7 +56,10 @@ operator:
     templatePrefix: "osac"
   fulfillment:
     serverAddress: "fulfillment-internal-api:8001"
-    tokenFile: "/var/run/secrets/kubernetes.io/serviceaccount/token"
+    credentials:
+      secretName: fulfillment-controller-credentials
+      clientIdKey: client-id
+      clientSecretKey: client-secret
 
 service:
   variant: openshift
@@ -40,6 +73,8 @@ service:
         items:
         - key: client-id
           param: client-id
+        - key: client-secret
+          param: client-secret
   idp:
     provider: keycloak
     url: https://keycloak.keycloak.svc.cluster.local
@@ -56,6 +91,17 @@ service:
         items:
         - key: url
           param: url
+  vault:
+    endpoint: https://vault.example.com
+    lifecycleRole: vault-lifecycle
+    keycloakClientId: vault-client
+    keycloakIssuerUrl: https://keycloak.keycloak.svc.cluster.local/realms/osac
+    credentials:
+    - secret:
+        name: vault-credentials
+        items:
+        - key: client-secret
+          param: client-secret
 
 aap:
   aap:
@@ -65,11 +111,24 @@ aap:
   bootstrap:
     enabled: true
     image: ghcr.io/osac-project/osac-aap:latest
-  configAsCode:
-    importBcmAgentsEnabled: false
-
-csiDriver:
-  enabled: true
+  instanceGroups:
+    clusterFulfillment:
+      enabled: true
+      config:
+        DNS_CLASS: "dns.route53.dns"
+        DNS_ZONE: "test.example.com"
+        EXTERNAL_ACCESS_BASE_DOMAIN: "test.example.com"
+        EXTERNAL_ACCESS_SUPPORTED_BASE_DOMAINS: "test.example.com"
+        EXTERNAL_ACCESS_API_INTERNAL_NETWORK: "hypershift"
+        HOSTED_CLUSTER_BASE_DOMAIN: "test.example.com"
+        HOSTED_CLUSTER_CONTROLLER_AVAILABILITY_POLICY: "SingleReplica"
+        HOSTED_CLUSTER_INFRASTRUCTURE_AVAILABILITY_POLICY: "SingleReplica"
+      secret: {}
+    networkFulfillment:
+      enabled: true
+      config:
+        ACME_FABRIC_URL: "https://test-fabric.example.com"
+      secret: {}
 
 bmf:
   bcm:
@@ -93,42 +152,3 @@ dbMigrate:
   enabled: true
   image: ghcr.io/osac-project/fulfillment-service:latest
   dbUrlFile: "/etc/fulfillment-service/db/url"
-
-clusterFulfillment:
-  enabled: true
-  config:
-    NETWORK_CLASS: "netris"
-    NETWORK_STEPS_COLLECTION: "netris.steps"
-    DNS_CLASS: "dns.route53.dns"
-    DNS_ZONE: "test.example.com"
-    NETRIS_CONTROLLER_URL: "https://test-ctl.netris.io"
-    NETRIS_USERNAME: "testuser"
-    NETRIS_SITE_ID: "1"
-    NETRIS_TENANT_ID: "1"
-    NETRIS_TENANT_NAME: "Admin"
-    EXTERNAL_ACCESS_BASE_DOMAIN: "test.example.com"
-    EXTERNAL_ACCESS_SUPPORTED_BASE_DOMAINS: "test.example.com"
-    EXTERNAL_ACCESS_API_INTERNAL_NETWORK: "hypershift"
-    HOSTED_CLUSTER_BASE_DOMAIN: "test.example.com"
-    HOSTED_CLUSTER_CONTROLLER_AVAILABILITY_POLICY: "SingleReplica"
-    HOSTED_CLUSTER_INFRASTRUCTURE_AVAILABILITY_POLICY: "SingleReplica"
-    IMPORT_AGENTS_NAMESPACE: "hardware-inventory"
-    IMPORT_AGENTS_INFRAENV_NAME: "infraenv"
-    IMPORT_AGENTS_PULL_SECRET_NAME: "pull-secret"
-    IMPORT_AGENTS_DISABLE_BMC_CERT_VERIFICATION: "true"
-    BCM_API_URL: "https://bcm-head.example.com:8081"
-    BCM_VALIDATE_CERTS: "false"
-    BCM_DISABLE_BMC_CERT_VERIFICATION: "true"
-  secret:
-    NETRIS_PASSWORD: "test-password"
-
-networkFulfillment:
-  enabled: true
-  config:
-    NETRIS_CONTROLLER_URL: "https://test-ctl.netris.io"
-    NETRIS_USERNAME: "testuser"
-    NETRIS_SITE_ID: "1"
-    NETRIS_TENANT_ID: "1"
-    NETRIS_TENANT_NAME: "Admin"
-  secret:
-    NETRIS_PASSWORD: "test-password"

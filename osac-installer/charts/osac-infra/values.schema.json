@@ -1,0 +1,356 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "OSAC Infrastructure Helm Chart Values",
+  "description": "Configuration values for OSAC shared infrastructure (Phase 2)",
+  "type": "object",
+  "properties": {
+    "hookResources": {
+      "type": "object",
+      "description": "Resource requests and limits applied to every cliImage hook Job. These hooks invoke `oc`, whose peak memory scales with the cluster's CRD count because of API discovery caching, so the limit is shared rather than set per hook. Raise the memory limit on clusters with unusually large CRD counts.",
+      "properties": {
+        "limits": {
+          "type": "object",
+          "properties": {
+            "cpu": {
+              "type": "string",
+              "description": "CPU limit as a Kubernetes quantity, for example 200m or 1",
+              "pattern": "^(\\+|-)?(([0-9]+(\\.[0-9]*)?)|(\\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\\+|-)?[0-9]+))?$"
+            },
+            "memory": {
+              "type": "string",
+              "description": "Memory limit as a Kubernetes quantity, for example 1Gi or 512Mi",
+              "pattern": "^(\\+|-)?(([0-9]+(\\.[0-9]*)?)|(\\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\\+|-)?[0-9]+))?$"
+            }
+          }
+        },
+        "requests": {
+          "type": "object",
+          "properties": {
+            "cpu": {
+              "type": "string",
+              "description": "CPU request as a Kubernetes quantity, for example 50m",
+              "pattern": "^(\\+|-)?(([0-9]+(\\.[0-9]*)?)|(\\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\\+|-)?[0-9]+))?$"
+            },
+            "memory": {
+              "type": "string",
+              "description": "Memory request as a Kubernetes quantity, for example 128Mi",
+              "pattern": "^(\\+|-)?(([0-9]+(\\.[0-9]*)?)|(\\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\\+|-)?[0-9]+))?$"
+            }
+          }
+        }
+      }
+    },
+    "metal3": {
+      "type": "object",
+      "description": "Metal3/Ironic activation for the Bare Metal Fulfillment operator's Metal3 inventory backend",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Apply the Provisioning CR that activates Ironic with no provisioning network and cluster-wide BareMetalHost discovery",
+          "default": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "mce": {
+      "type": "object",
+      "properties": {
+        "imageService": {
+          "type": "object",
+          "description": "Assisted Image Service configuration",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "description": "Create and run the Assisted Image Service",
+              "default": true
+            }
+          }
+        }
+      }
+    },
+    "keycloak": {
+      "type": "object",
+      "description": "Keycloak deployment configuration.",
+      "properties": {
+        "oidcIdpTrust": {
+          "type": "object",
+          "description": "CA certificates for external OIDC identity providers. The configured PEM bundle is added to the shared trust-manager bundle.",
+          "properties": {
+            "caPem": {
+              "type": "string",
+              "description": "Optional PEM-encoded CA certificate bundle for external OIDC identity providers. Set with --set-file keycloak.oidcIdpTrust.caPem=/path/to/idp-ca.pem.",
+              "default": ""
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": true
+    },
+    "bundledPostgres": {
+      "type": "object",
+      "description": "Bundled PostgreSQL for dev/CI and testing only; not intended for production.",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Deploy the bundled PostgreSQL instance.",
+          "default": false
+        }
+      }
+    },
+    "topolvm": {
+      "type": "object",
+      "description": "Optional TopoLVM CSI driver for local development clusters.",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Install the TopoLVM Helm dependency.",
+          "default": false
+        }
+      },
+      "additionalProperties": true
+    },
+    "netbox": {
+      "type": "object",
+      "description": "NetBox deployment for the bmaas_netbox E2E test flavor (dev/CI only; not for production).",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Deploy NetBox via the netbox-community subchart.",
+          "default": false
+        },
+        "apiTokenSecret": {
+          "type": "string",
+          "description": "Name of the Secret written into osacNamespace by the post-install seed Job (default: netbox-api-token). Contains the API token for the bare-metal-fulfillment-operator."
+        }
+      }
+    },
+    "bundledVault": {
+      "type": "object",
+      "description": "Bundled OpenBao (Vault-compatible) secret store for testing and CI. Not intended for production.",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Deploy a bundled OpenBao instance. Disabled by default — enable in a profile infra.yaml and set keycloakIssuerUrl.",
+          "default": false
+        },
+        "image": {
+          "type": "string",
+          "description": "OpenBao container image (must be 2.5+ for namespace support)",
+          "default": "ghcr.io/openbao/openbao:2.6.1"
+        },
+        "podSecurityContext": {
+          "type": "object",
+          "description": "Pod-level securityContext for the OpenBao deployment. Defaults to {runAsNonRoot: true} with seccompProfile RuntimeDefault — no hardcoded UID, so OpenShift's restricted-v2 SCC can allocate from the namespace UID range. Any non-nil value here FULLY REPLACES the template default — partial overrides must include every key you want rendered.",
+          "properties": {
+            "runAsNonRoot": { "type": "boolean" },
+            "runAsUser": { "type": "integer" },
+            "runAsGroup": { "type": "integer" },
+            "fsGroup": { "type": "integer" }
+          }
+        },
+        "resources": {
+          "type": "object",
+          "description": "Container resource requests and limits",
+          "properties": {
+            "limits": {
+              "type": "object",
+              "properties": {
+                "cpu": { "type": "string", "description": "CPU limit" },
+                "memory": { "type": "string", "description": "Memory limit" }
+              }
+            },
+            "requests": {
+              "type": "object",
+              "properties": {
+                "cpu": { "type": "string", "description": "CPU request" },
+                "memory": { "type": "string", "description": "Memory request" }
+              }
+            }
+          }
+        },
+        "keycloakIssuerUrl": {
+          "type": "string",
+          "description": "Keycloak OIDC issuer URL for JWT auth bootstrap. Required when bundledVault is enabled. On OpenShift this must be the external route URL (not the internal service URL) to avoid issuer mismatch.",
+          "default": ""
+        },
+        "keycloakAudience": {
+          "type": "string",
+          "description": "Expected aud claim in JWT tokens",
+          "default": "osac-api"
+        },
+        "vaultNamespace": {
+          "type": "string",
+          "description": "OpenBao/Vault logical namespace (not Kubernetes namespace). The init script creates this as a child namespace inside the OpenBao server and configures JWT auth and policies within it.",
+          "default": "osac"
+        }
+      }
+    },
+    "evpn": {
+      "type": "object",
+      "description": "OpenShift host networking for VMaaS with CUDN EVPN.",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Configure host networking and fabric BGP for CUDN EVPN.",
+          "default": false
+        },
+        "nmstate": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "install": {
+              "type": "boolean",
+              "description": "Install the NMState operator subscription.",
+              "default": true
+            },
+            "channel": {
+              "type": "string",
+              "minLength": 1,
+              "description": "NMState operator subscription channel.",
+              "default": "stable"
+            }
+          },
+          "required": ["install", "channel"]
+        },
+        "configureClusterNetwork": {
+          "type": "boolean",
+          "description": "Enable FRR and route advertisements in the cluster network operator; this restarts OVN-Kubernetes.",
+          "default": true
+        },
+        "vtepCIDR": {
+          "type": "string",
+          "description": "IPv4 range that contains each configured node VTEP address.",
+          "pattern": "^$|^((25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])\\.){3}(25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])/([0-9]|[12][0-9]|3[0-2])$",
+          "default": ""
+        },
+        "bgp": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "asn": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4294967294,
+              "description": "Default node ASN; individual nodes can override it.",
+              "default": 0
+            },
+            "acceptPrefixes": {
+              "type": "array",
+              "description": "Fabric loopback ranges; only /32 routes inside them are accepted.",
+              "items": {
+                "type": "string",
+                "pattern": "^((25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])\\.){3}(25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])/([0-9]|[12][0-9]|3[0-2])$"
+              },
+              "default": []
+            },
+            "waitForEstablished": {
+              "type": "boolean",
+              "description": "Fail installation unless every configured BGP session is Established.",
+              "default": true
+            },
+            "timeoutSeconds": {
+              "type": "integer",
+              "minimum": 60,
+              "description": "Maximum wait for each BGP session to become Established.",
+              "default": 900
+            }
+          },
+          "required": ["asn", "acceptPrefixes", "waitForEstablished", "timeoutSeconds"]
+        },
+        "nodes": {
+          "type": "array",
+          "description": "VMaaS nodes with their VTEP addresses and fabric uplinks.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "name": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Kubernetes node name."
+              },
+              "vtepIP": {
+                "type": "string",
+                "format": "ipv4",
+                "description": "Unique node VTEP IPv4 address inside vtepCIDR."
+              },
+              "asn": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 4294967294,
+                "description": "Node ASN; defaults to bgp.asn."
+              },
+              "uplinks": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "interface": {
+                      "type": "string",
+                      "pattern": "^[A-Za-z0-9_.:-]{1,15}$",
+                      "description": "Node interface connected to a fabric leaf."
+                    },
+                    "address": {
+                      "type": "string",
+                      "pattern": "^((25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])\\.){3}(25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])/([0-9]|[12][0-9]|3[0-2])$",
+                      "description": "Optional static IPv4 address for this uplink."
+                    },
+                    "peerAddress": {
+                      "type": "string",
+                      "format": "ipv4",
+                      "description": "Fabric leaf BGP peer IPv4 address."
+                    },
+                    "peerASN": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 4294967294,
+                      "description": "Fabric leaf BGP ASN."
+                    }
+                  },
+                  "required": ["interface", "peerAddress", "peerASN"]
+                }
+              }
+            },
+            "required": ["name", "vtepIP", "uplinks"]
+          },
+          "default": []
+        }
+      },
+      "required": ["enabled", "nmstate", "configureClusterNetwork", "vtepCIDR", "bgp", "nodes"]
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "evpn": {
+            "properties": {"enabled": {"const": true}},
+            "required": ["enabled"]
+          }
+        },
+        "required": ["evpn"]
+      },
+      "then": {
+        "properties": {
+          "evpn": {
+            "properties": {
+              "vtepCIDR": {"minLength": 1},
+              "bgp": {
+                "properties": {
+                  "asn": {"minimum": 1},
+                  "acceptPrefixes": {"minItems": 1}
+                }
+              },
+              "nodes": {"minItems": 1}
+            }
+          }
+        }
+      }
+    }
+  ],
+  "required": []
+}

@@ -23,32 +23,38 @@
 #   Test 6 (Unknown OS value falls through to linux defaults):
 #     ansible-playbook ... -e test_unknown_os_fallback=true
 #
-#   Test 7 (security group labels propagated to VM):
+#   Test 7 (vm_network labels propagated to VM):
 #     ansible-playbook ... -e test_create_sg_labels=true
 #
-#   Test 8 (Windows sysprep without password rejected):
-#     ansible-playbook ... -e test_windows_sysprep_requires_password=true
-#
-#   Test 9 (Windows sysprep with valid password accepted):
-#     ansible-playbook ... -e test_windows_sysprep_valid=true
-#
-#   Test 10 (Subnet reference extracted from networkAttachments):
+#   Test 8 (namespace and networks from vm_network):
 #     ansible-playbook ... -e test_create_subnet_ref_extracted=true
 #
-#   Test 11 (Missing networkAttachments rejected):
+#   Test 9 (missing vm_network rejected):
 #     ansible-playbook ... -e test_create_missing_subnet_fails=true
 #
-#   Test 12 (Missing spec.cores/memoryGiB rejected):
-#     ansible-playbook ... -e test_create_missing_cores_fails=true
+#   Test 10 (Missing spec.vcpus/memoryGiB rejected):
+#     ansible-playbook ... -e test_create_missing_vcpus_fails=true
 #
-#   Test 13 (GPU single device, count=1):
+#   Test 11 (GPU single device, count=1):
 #     ansible-playbook ... -e test_create_gpu_single=true
 #
-#   Test 14 (GPU multiple devices, count=3):
+#   Test 12 (GPU multiple devices, count=3):
 #     ansible-playbook ... -e test_create_gpu_many=true
 #
-#   Test 15 (No GPU -- no hostDevices in template spec):
+#   Test 13 (No GPU -- no hostDevices in template spec):
 #     ansible-playbook ... -e test_create_no_gpu=true
+#
+#   Test 14 (Linux VM with user-data -- no sysprep extraction):
+#     ansible-playbook ... -e test_linux_userdata_no_extraction=true
+#
+#   Test 15 (Windows with user-data -- pre-secrets base spec):
+#     ansible-playbook ... -e test_windows_userdata_sysprep=true
+#
+#   Test 16 (Windows without user-data -- no sysprep created):
+#     ansible-playbook ... -e test_windows_no_userdata=true
+#
+#   Test 17 (Linux with user-data -- cloud-init path regression):
+#     ansible-playbook ... -e test_linux_userdata_cloudinit=true
 
 # ──────────────────────────────────────────────────────────────
 # Test 1: Verify spec defaults are merged into a minimal fixture
@@ -64,6 +70,8 @@
 
   vars:
     compute_instance_label: "osac.openshift.io/computeinstance"
+    vm_network_networks: [{name: tenant, pod: {}}]
+    vm_network_interfaces: [{name: tenant, binding: {name: l2bridge}}]
 
   tasks:
     - when: test_create_defaults | default(false) | bool
@@ -87,12 +95,12 @@
               - compute_instance.metadata.name == "test-vm-defaults"
             fail_msg: "Compute instance name not extracted correctly"
 
-        - name: Verify CPU cores read from resolved spec
+        - name: Verify CPU vCPUs read from resolved spec
           ansible.builtin.assert:
             that:
-              - vm_cpu_cores is defined
-              - vm_cpu_cores | int == 2
-            fail_msg: "Expected cpu cores of 2 from spec.cores, got {{ vm_cpu_cores | default('undefined') }}"
+              - vm_cpu_sockets is defined
+              - vm_cpu_sockets | int == 2
+            fail_msg: "Expected 2 vCPUs from spec.vcpus, got {{ vm_cpu_sockets | default('undefined') }}"
 
         - name: Verify memory read from resolved spec
           ansible.builtin.assert:
@@ -134,6 +142,8 @@
 
   vars:
     compute_instance_label: "osac.openshift.io/computeinstance"
+    vm_network_networks: [{name: tenant, pod: {}}]
+    vm_network_interfaces: [{name: tenant, binding: {name: l2bridge}}]
 
   tasks:
     - when: test_create_validation_valid | default(false) | bool
@@ -204,6 +214,8 @@
 
   vars:
     compute_instance_label: "osac.openshift.io/computeinstance"
+    vm_network_networks: [{name: tenant, pod: {}}]
+    vm_network_interfaces: [{name: tenant, binding: {name: l2bridge}}]
 
   tasks:
     - when: test_windows_requires_image | default(false) | bool
@@ -261,6 +273,8 @@
 
   vars:
     compute_instance_label: "osac.openshift.io/computeinstance"
+    vm_network_networks: [{name: tenant, pod: {}}]
+    vm_network_interfaces: [{name: tenant, binding: {name: l2bridge}}]
 
   tasks:
     - when: test_windows_with_image | default(false) | bool
@@ -276,7 +290,6 @@
             default_spec: "{{ _guest_os_windows_default_spec }}"
             default_arg_specs: "{{ _guest_os_windows_default_arg_specs }}"
             template_parameters: {}
-            vm_enable_sysprep: false
 
         - name: Set compute instance name
           ansible.builtin.set_fact:
@@ -304,6 +317,8 @@
 
   vars:
     compute_instance_label: "osac.openshift.io/computeinstance"
+    vm_network_networks: [{name: tenant, pod: {}}]
+    vm_network_interfaces: [{name: tenant, binding: {name: l2bridge}}]
 
   tasks:
     - when: test_unknown_os_fallback | default(false) | bool
@@ -326,11 +341,11 @@
             name: osac.templates.ocp_virt_vm
             tasks_from: create_validate.yaml
 
-        - name: Assert CPU cores come from spec (2 cores)
+        - name: Assert CPU vCPUs come from spec (2 vCPUs)
           ansible.builtin.assert:
             that:
-              - vm_cpu_cores | int == 2
-            fail_msg: "Expected 2 cores from spec.cores, got {{ vm_cpu_cores | default('undefined') }}"
+              - vm_cpu_sockets | int == 2
+            fail_msg: "Expected 2 vCPUs from spec.vcpus, got {{ vm_cpu_sockets | default('undefined') }}"
 
         - name: Assert memory comes from spec (2Gi)
           ansible.builtin.assert:
@@ -345,11 +360,10 @@
             fail_msg: "Expected linux default (10Gi), got {{ vm_boot_disk_size | default('undefined') }}"
 
 # ──────────────────────────────────────────────────────────────
-# Test 7: Security group labels are propagated to default_vm_labels
-# Expected: default_vm_labels includes osac.openshift.io/<sg-ref>: ""
-#           for each securityGroupRef across all spec.networkAttachments
+# Test 7: The vm_network labels are added to the VM labels
+# Expected: default_vm_labels holds the base label and the API ID label
 # ──────────────────────────────────────────────────────────────
-- name: "Test ocp_virt_vm -- security group labels propagated to VM"
+- name: "Test ocp_virt_vm -- vm_network labels propagated to VM"
   hosts: localhost
 
   collections:
@@ -357,272 +371,98 @@
 
   vars:
     compute_instance_label: "osac.openshift.io/computeinstance"
+    vm_network_networks: [{name: tenant, pod: {}}]
+    vm_network_interfaces: [{name: tenant, binding: {name: l2bridge}}]
 
   tasks:
     - when: test_create_sg_labels | default(false) | bool
       block:
-        - name: Read ComputeInstance fixture with security groups
+        - name: Read ComputeInstance fixture
           ansible.builtin.set_fact:
-            compute_instance: "{{ lookup('file', 'fixtures/computeinstance-with-security-groups.yaml') | from_yaml }}"
+            compute_instance: "{{ lookup('file', 'fixtures/computeinstance-defaults-test.yaml') | from_yaml }}"
+            vm_network_labels:
+              osac.openshift.io/compute-instance-id: 3c0b9d2e-1111-4a5b-9c7d-2e4f6a8b0c12
 
         - name: Set compute instance name
           ansible.builtin.set_fact:
             compute_instance_name: "{{ compute_instance.metadata.name }}"
 
-        - name: Run create_validate to extract VM config and build labels
+        - name: Run create_validate to build labels
           ansible.builtin.include_role:
             name: osac.templates.ocp_virt_vm
             tasks_from: create_validate.yaml
 
-        - name: Verify compute instance base label is present
+        - name: Verify the base label and the API ID label
           ansible.builtin.assert:
             that:
-              - default_vm_labels is defined
-              - default_vm_labels['osac.openshift.io/computeinstance'] == 'test-vm-sgs'
-            fail_msg: >-
-              Expected default_vm_labels to contain osac.openshift.io/computeinstance=test-vm-sgs,
-              got {{ default_vm_labels | default('undefined') }}
-
-        - name: Verify securitygroup-web01 label is present in VM labels
-          ansible.builtin.assert:
-            that:
-              - "'osac.openshift.io/securitygroup-web01' in default_vm_labels"
-              - default_vm_labels['osac.openshift.io/securitygroup-web01'] == ''
-            fail_msg: >-
-              Expected default_vm_labels to contain osac.openshift.io/securitygroup-web01='',
-              got {{ default_vm_labels | default('undefined') }}
-
-        - name: Verify securitygroup-db01 label is present in VM labels
-          ansible.builtin.assert:
-            that:
-              - "'osac.openshift.io/securitygroup-db01' in default_vm_labels"
-              - default_vm_labels['osac.openshift.io/securitygroup-db01'] == ''
-            fail_msg: >-
-              Expected default_vm_labels to contain osac.openshift.io/securitygroup-db01='',
-              got {{ default_vm_labels | default('undefined') }}
-
-        - name: Verify securitygroup-mon01 label is present in VM labels
-          ansible.builtin.assert:
-            that:
-              - "'osac.openshift.io/securitygroup-mon01' in default_vm_labels"
-              - default_vm_labels['osac.openshift.io/securitygroup-mon01'] == ''
-            fail_msg: >-
-              Expected default_vm_labels to contain osac.openshift.io/securitygroup-mon01='',
-              got {{ default_vm_labels | default('undefined') }}
-
-        - name: Verify exactly 4 labels are set (computeinstance + 3 SGs)
-          ansible.builtin.assert:
-            that:
-              - default_vm_labels | length == 4
-            fail_msg: >-
-              Expected 4 labels in default_vm_labels (1 base + 3 SGs),
-              got {{ default_vm_labels | length }}: {{ default_vm_labels | default('undefined') }}
+              - default_vm_labels | length == 2
+              - default_vm_labels['osac.openshift.io/computeinstance'] == compute_instance_name
+              - default_vm_labels['osac.openshift.io/compute-instance-id'] == '3c0b9d2e-1111-4a5b-9c7d-2e4f6a8b0c12'
+            fail_msg: "Unexpected VM labels: {{ default_vm_labels | default('undefined') }}"
 
 # ──────────────────────────────────────────────────────────────
-# Test 8: Windows sysprep enabled without password must fail
+# Test 8: The VM namespace, networks, and interfaces come from vm_network
 # ──────────────────────────────────────────────────────────────
-- name: "Test ocp_virt_vm -- Windows sysprep requires admin password"
+- name: "Test ocp_virt_vm -- namespace and networks from vm_network"
   hosts: localhost
-
-  collections:
-    - osac.templates
-
-  vars:
-    compute_instance_label: "osac.openshift.io/computeinstance"
-
-  tasks:
-    - when: test_windows_sysprep_requires_password | default(false) | bool
-      block:
-        - name: Load ocp_virt_vm role defaults (Windows profile maps)
-          ansible.builtin.include_vars:
-            file: "{{ playbook_dir }}/../defaults/main.yaml"
-
-        - name: Load Windows fixture with sysprep enabled and no password
-          ansible.builtin.set_fact:
-            compute_instance: "{{ lookup('file', 'fixtures/computeinstance-windows-with-image-test.yaml') | from_yaml }}"
-            guest_os_family: windows
-            default_spec: "{{ _guest_os_windows_default_spec }}"
-            default_arg_specs: "{{ _guest_os_windows_default_arg_specs }}"
-            template_parameters: {}
-            vm_enable_sysprep: true
-            vm_sysprep_admin_password: ""
-
-        - name: Set compute instance name
-          ansible.builtin.set_fact:
-            compute_instance_name: "{{ compute_instance.metadata.name }}"
-
-        - name: Run create_validate (expect failure — empty sysprep password)
-          block:
-            - name: Include create_validate
-              ansible.builtin.include_role:
-                name: osac.templates.ocp_virt_vm
-                tasks_from: create_validate.yaml
-          rescue:
-            - name: Capture error message
-              ansible.builtin.set_fact:
-                validation_error: "{{ ansible_failed_result.msg | default('') }}"
-                sysprep_password_failed: true
-
-            - name: Verify failure was due to missing sysprep password
-              ansible.builtin.assert:
-                that:
-                  - "'vm_sysprep_admin_password' in validation_error"
-                fail_msg: "Validation failed for unexpected reason: {{ validation_error }}"
-
-        - name: Verify validation failed without sysprep password
-          ansible.builtin.assert:
-            that:
-              - sysprep_password_failed | default(false)
-            fail_msg: >-
-              Expected create_validate to fail when vm_enable_sysprep is true
-              and vm_sysprep_admin_password is empty
-
-# ──────────────────────────────────────────────────────────────
-# Test 9: Windows sysprep enabled with valid password passes
-# Expected: validation passes, vm_hostname truncated to 15 chars
-# ──────────────────────────────────────────────────────────────
-- name: "Test ocp_virt_vm -- Windows sysprep with valid password passes validation"
-  hosts: localhost
-
-  collections:
-    - osac.templates
-
-  vars:
-    compute_instance_label: "osac.openshift.io/computeinstance"
-
-  tasks:
-    - when: test_windows_sysprep_valid | default(false) | bool
-      block:
-        - name: Load ocp_virt_vm role defaults (Windows profile maps)
-          ansible.builtin.include_vars:
-            file: "{{ playbook_dir }}/../defaults/main.yaml"
-
-        - name: Load Windows fixture with sysprep enabled and valid password
-          ansible.builtin.set_fact:
-            compute_instance: "{{ lookup('file', 'fixtures/computeinstance-windows-with-image-test.yaml') | from_yaml }}"
-            guest_os_family: windows
-            default_spec: "{{ _guest_os_windows_default_spec }}"
-            default_arg_specs: "{{ _guest_os_windows_default_arg_specs }}"
-            template_parameters: {}
-            vm_enable_sysprep: true
-            vm_sysprep_admin_password: "{{ lookup('ansible.builtin.password', '/dev/null length=16 chars=ascii_letters,digits') }}"
-
-        - name: Set compute instance name
-          ansible.builtin.set_fact:
-            compute_instance_name: "{{ compute_instance.metadata.name }}"
-
-        - name: Run create_validate
-          ansible.builtin.include_role:
-            name: osac.templates.ocp_virt_vm
-            tasks_from: create_validate.yaml
-
-        - name: Verify image source from ComputeInstance spec
-          ansible.builtin.assert:
-            that:
-              - vm_image_source == "registry.example.com/osac/windows-golden:ltsc2022"
-            fail_msg: "Expected vm_image_source from spec, got {{ vm_image_source | default('undefined') }}"
-
-        - name: Verify vm_hostname is set and truncated to 15 chars (NetBIOS limit)
-          ansible.builtin.assert:
-            that:
-              - vm_hostname is defined
-              - vm_hostname | length <= 15
-              - vm_hostname == "test-win-with-i"
-            fail_msg: "Expected vm_hostname='test-win-with-i' (truncated), got {{ vm_hostname | default('undefined') }}"
-
-# ──────────────────────────────────────────────────────────────
-# Test 10: Subnet reference extracted from networkAttachments
-# Expected: vm_subnet_ref == subnetRef from fixture
-# ──────────────────────────────────────────────────────────────
-- name: "Test ocp_virt_vm -- subnet reference extracted from networkAttachments"
-  hosts: localhost
-
-  collections:
-    - osac.templates
-
-  vars:
-    compute_instance_label: "osac.openshift.io/computeinstance"
 
   tasks:
     - when: test_create_subnet_ref_extracted | default(false) | bool
       block:
-        - name: Read ComputeInstance fixture with networkAttachments
-          ansible.builtin.set_fact:
-            compute_instance: "{{ lookup('file', 'fixtures/computeinstance-with-security-groups.yaml') | from_yaml }}"
-
-        - name: Set compute instance name
-          ansible.builtin.set_fact:
-            compute_instance_name: "{{ compute_instance.metadata.name }}"
-
-        - name: Run create_validate to extract subnet reference
+        - name: Resolve the target namespace
           ansible.builtin.include_role:
             name: osac.templates.ocp_virt_vm
-            tasks_from: create_validate.yaml
+            tasks_from: resolve_target_namespace.yaml
+          vars:
+            osac_job_vars:
+              vm_network:
+                namespace: tenant-a-subnet-1
+                networks: [{name: tenant, pod: {}}]
+                interfaces: [{name: tenant, binding: {name: l2bridge}}]
+                labels: {osac.openshift.io/compute-instance-id: 3c0b9d2e-1111-4a5b-9c7d-2e4f6a8b0c12}
 
-        - name: Verify vm_subnet_ref matches first subnetRef
+        - name: Verify the resolved network
           ansible.builtin.assert:
             that:
-              - vm_subnet_ref is defined
-              - vm_subnet_ref == "test-subnet"
-            fail_msg: "Expected vm_subnet_ref='test-subnet', got {{ vm_subnet_ref | default('undefined') }}"
+              - compute_instance_target_namespace == 'tenant-a-subnet-1'
+              - vm_network_networks[0].name == 'tenant'
+              - vm_network_interfaces[0].binding.name == 'l2bridge'
+              - vm_network_labels['osac.openshift.io/compute-instance-id'] == '3c0b9d2e-1111-4a5b-9c7d-2e4f6a8b0c12'
 
 # ──────────────────────────────────────────────────────────────
-# Test 11: Missing networkAttachments must fail validation
-# Expected: validation fails with message about networkAttachments
+# Test 9: A job input without vm_network is rejected
 # ──────────────────────────────────────────────────────────────
-- name: "Test ocp_virt_vm -- missing networkAttachments rejected"
+- name: "Test ocp_virt_vm -- missing vm_network rejected"
   hosts: localhost
-
-  collections:
-    - osac.templates
-
-  vars:
-    compute_instance_label: "osac.openshift.io/computeinstance"
 
   tasks:
     - when: test_create_missing_subnet_fails | default(false) | bool
       block:
-        - name: Read ComputeInstance fixture without networkAttachments
-          ansible.builtin.set_fact:
-            compute_instance: "{{ lookup('file', 'fixtures/computeinstance-no-subnet-test.yaml') | from_yaml }}"
-
-        - name: Set compute instance name
-          ansible.builtin.set_fact:
-            compute_instance_name: "{{ compute_instance.metadata.name }}"
-
-        - name: Run create_validate (expect failure — no networkAttachments)
+        - name: Resolve the target namespace (expect failure)
           block:
-            - name: Include create_validate
+            - name: Include resolve_target_namespace
               ansible.builtin.include_role:
                 name: osac.templates.ocp_virt_vm
-                tasks_from: create_validate.yaml
+                tasks_from: resolve_target_namespace.yaml
+              vars:
+                osac_job_vars: {}
           rescue:
-            - name: Capture error message
+            - name: Record the failure
               ansible.builtin.set_fact:
-                validation_error: "{{ ansible_failed_result.msg | default('') }}"
-                missing_subnet_failed: true
+                missing_vm_network_failed: "{{ 'no vm_network' in (ansible_failed_result.msg | default('')) }}"
 
-            - name: Verify failure was due to missing networkAttachments
-              ansible.builtin.assert:
-                that:
-                  - "'spec.networkAttachments[0].subnetRef set' in validation_error"
-                fail_msg: "Validation failed for unexpected reason: {{ validation_error }}"
-
-        - name: Verify validation failed without networkAttachments
+        - name: Verify the input was rejected
           ansible.builtin.assert:
             that:
-              - missing_subnet_failed | default(false)
-            fail_msg: >-
-              Expected create_validate to fail when spec.networkAttachments
-              is not set on the ComputeInstance
+              - missing_vm_network_failed | default(false)
 
 # ──────────────────────────────────────────────────────────────
-# Test 12: Missing spec.cores/memoryGiB must fail validation
-# Expected: validation fails with message about spec.cores/spec.memoryGiB
+# Test 10: Missing spec.vcpus/memoryGiB must fail validation
+# Expected: validation fails with message about spec.vcpus/spec.memoryGiB
 # (these are resolved by osac-operator from instance_type; there is no
 # role-level default anymore since instance_type is mandatory)
 # ──────────────────────────────────────────────────────────────
-- name: "Test ocp_virt_vm -- missing spec.cores/memoryGiB rejected"
+- name: "Test ocp_virt_vm -- missing spec.vcpus/memoryGiB rejected"
   hosts: localhost
 
   collections:
@@ -630,19 +470,21 @@
 
   vars:
     compute_instance_label: "osac.openshift.io/computeinstance"
+    vm_network_networks: [{name: tenant, pod: {}}]
+    vm_network_interfaces: [{name: tenant, binding: {name: l2bridge}}]
 
   tasks:
-    - when: test_create_missing_cores_fails | default(false) | bool
+    - when: test_create_missing_vcpus_fails | default(false) | bool
       block:
-        - name: Read ComputeInstance fixture without spec.cores/memoryGiB
+        - name: Read ComputeInstance fixture without spec.vcpus/memoryGiB
           ansible.builtin.set_fact:
-            compute_instance: "{{ lookup('file', 'fixtures/computeinstance-missing-cores-test.yaml') | from_yaml }}"
+            compute_instance: "{{ lookup('file', 'fixtures/computeinstance-missing-vcpus-test.yaml') | from_yaml }}"
 
         - name: Set compute instance name
           ansible.builtin.set_fact:
             compute_instance_name: "{{ compute_instance.metadata.name }}"
 
-        - name: Run create_validate (expect failure — no spec.cores/memoryGiB)
+        - name: Run create_validate (expect failure — no spec.vcpus/memoryGiB)
           block:
             - name: Include create_validate
               ansible.builtin.include_role:
@@ -652,24 +494,24 @@
             - name: Capture error message
               ansible.builtin.set_fact:
                 validation_error: "{{ ansible_failed_result.msg | default('') }}"
-                missing_cores_failed: true
+                missing_vcpus_failed: true
 
-            - name: Verify failure was due to missing spec.cores/memoryGiB
+            - name: Verify failure was due to missing spec.vcpus/memoryGiB
               ansible.builtin.assert:
                 that:
-                  - "'spec.cores and spec.memoryGiB' in validation_error"
+                  - "'spec.vcpus and spec.memoryGiB' in validation_error"
                 fail_msg: "Validation failed for unexpected reason: {{ validation_error }}"
 
-        - name: Verify validation failed without spec.cores/memoryGiB
+        - name: Verify validation failed without spec.vcpus/memoryGiB
           ansible.builtin.assert:
             that:
-              - missing_cores_failed | default(false)
+              - missing_vcpus_failed | default(false)
             fail_msg: >-
-              Expected create_validate to fail when spec.cores/spec.memoryGiB
+              Expected create_validate to fail when spec.vcpus/spec.memoryGiB
               are not set on the ComputeInstance
 
 # ──────────────────────────────────────────────────────────────
-# Test 13: GPU with count=1 produces exactly one hostDevices entry
+# Test 11: GPU with count=1 produces exactly one hostDevices entry
 # Expected: vm_template_spec.domain.devices.hostDevices has 1 entry
 #           with name=gpu-0 and deviceName matching spec.gpu.resourceName
 # ──────────────────────────────────────────────────────────────
@@ -681,6 +523,8 @@
 
   vars:
     compute_instance_label: "osac.openshift.io/computeinstance"
+    vm_network_networks: [{name: tenant, pod: {}}]
+    vm_network_interfaces: [{name: tenant, binding: {name: l2bridge}}]
 
   tasks:
     - when: test_create_gpu_single | default(false) | bool
@@ -721,8 +565,18 @@
               Expected hostDevices[0] name='gpu-0' deviceName='nvidia.com/GB100',
               got {{ vm_template_spec.domain.devices.hostDevices[0] }}
 
+        - name: Verify Linux GPU VM boots UEFI (large PCI BARs need OVMF, not BIOS)
+          ansible.builtin.assert:
+            that:
+              - vm_template_spec.domain.firmware is defined
+              - vm_template_spec.domain.firmware.bootloader.efi is defined
+              - vm_template_spec.domain.firmware.bootloader.efi.secureBoot == false
+            fail_msg: >-
+              Expected Linux GPU VM to set firmware.bootloader.efi (secureBoot=false),
+              got {{ vm_template_spec.domain.firmware | default('(no firmware key)') }}
+
 # ──────────────────────────────────────────────────────────────
-# Test 14: GPU with count=3 produces three hostDevices entries
+# Test 12: GPU with count=3 produces three hostDevices entries
 # Expected: vm_template_spec.domain.devices.hostDevices has 3 entries
 #           with sequential names (gpu-0, gpu-1, gpu-2) and same deviceName
 # ──────────────────────────────────────────────────────────────
@@ -734,6 +588,8 @@
 
   vars:
     compute_instance_label: "osac.openshift.io/computeinstance"
+    vm_network_networks: [{name: tenant, pod: {}}]
+    vm_network_interfaces: [{name: tenant, binding: {name: l2bridge}}]
 
   tasks:
     - when: test_create_gpu_many | default(false) | bool
@@ -778,7 +634,7 @@
               hostDevices entries incorrect: {{ vm_template_spec.domain.devices.hostDevices }}
 
 # ──────────────────────────────────────────────────────────────
-# Test 15: No GPU (spec.gpu absent) produces no hostDevices
+# Test 13: No GPU (spec.gpu absent) produces no hostDevices
 # Expected: vm_template_spec.domain.devices.hostDevices is not defined
 # ──────────────────────────────────────────────────────────────
 - name: "Test ocp_virt_vm -- no GPU produces no hostDevices"
@@ -789,6 +645,8 @@
 
   vars:
     compute_instance_label: "osac.openshift.io/computeinstance"
+    vm_network_networks: [{name: tenant, pod: {}}]
+    vm_network_interfaces: [{name: tenant, binding: {name: l2bridge}}]
 
   tasks:
     - when: test_create_no_gpu | default(false) | bool
@@ -818,3 +676,375 @@
             fail_msg: >-
               Expected no hostDevices when spec.gpu is absent, but found
               {{ vm_template_spec.domain.devices.hostDevices | default('(key not present)') }}
+
+        - name: Verify non-GPU Linux VM keeps the BIOS default (no UEFI firmware)
+          ansible.builtin.assert:
+            that:
+              - vm_template_spec.domain.firmware is not defined
+            fail_msg: >-
+              Expected no firmware block for a non-GPU Linux VM, but found
+              {{ vm_template_spec.domain.firmware | default('(key not present)') }}
+
+# ──────────────────────────────────────────────────────────────
+# Test 14: Linux VM with user-data -- no sysprep extraction
+# Expected: user-data secret ref is extracted correctly for Linux,
+#           no sysprep-related variables are set
+# ──────────────────────────────────────────────────────────────
+- name: "Test ocp_virt_vm -- Linux VM with user-data passes validation"
+  hosts: localhost
+
+  collections:
+    - osac.templates
+
+  vars:
+    compute_instance_label: "osac.openshift.io/computeinstance"
+    vm_network_networks: [{name: tenant, pod: {}}]
+    vm_network_interfaces: [{name: tenant, binding: {name: l2bridge}}]
+
+  tasks:
+    - when: test_linux_userdata_no_extraction | default(false) | bool
+      block:
+        - name: Load ocp_virt_vm role defaults
+          ansible.builtin.include_vars:
+            file: "{{ playbook_dir }}/../defaults/main.yaml"
+
+        - name: Read minimal ComputeInstance fixture (Linux with userDataSecretRef)
+          ansible.builtin.set_fact:
+            compute_instance:
+              apiVersion: osac.openshift.io/v1alpha1
+              kind: ComputeInstance
+              metadata:
+                name: test-linux-userdata
+                namespace: osac-system
+              spec:
+                templateID: osac.templates.ocp_virt_vm
+                vcpus: 2
+                memoryGiB: 2
+                networkAttachments:
+                  - subnetRef: test-subnet
+                userDataSecretRef:
+                  name: linux-cloud-init
+            guest_os_family: linux
+
+        - name: Set compute instance name
+          ansible.builtin.set_fact:
+            compute_instance_name: "{{ compute_instance.metadata.name }}"
+
+        - name: Run create_validate
+          ansible.builtin.include_role:
+            name: osac.templates.ocp_virt_vm
+            tasks_from: create_validate.yaml
+
+        - name: Verify vm_user_data_secret_ref is set (user-data present)
+          ansible.builtin.assert:
+            that:
+              - vm_user_data_secret_ref is defined
+              - vm_user_data_secret_ref == "linux-cloud-init"
+            fail_msg: >-
+              Expected vm_user_data_secret_ref='linux-cloud-init',
+              got {{ vm_user_data_secret_ref | default('undefined') }}
+
+# ──────────────────────────────────────────────────────────────
+# Test 15: Windows VM with user-data — pre-secrets base spec
+# Expected: vm_user_data_secret_ref extracted, Windows template spec built
+#           (EFI, no cloudInitNoCloud), base spec has only root-disk before
+#           create_secrets runs.
+# The actual sysprep Secret copy, SATA CD-ROM disk/volume injection,
+# destination Secret reference, and byte-identical userdata→Unattend.xml
+# assertions are covered by the Kind-backed sysprep_secret_copy scenario
+# (tests/integration/targets/compute_instance_create/tasks/
+# sysprep_secret_copy.yml), which exercises the real create_secrets.yaml
+# path end-to-end.
+# ──────────────────────────────────────────────────────────────
+- name: "Test ocp_virt_vm -- Windows VM with user-data pre-secrets base spec"
+  hosts: localhost
+
+  collections:
+    - osac.templates
+
+  vars:
+    compute_instance_label: "osac.openshift.io/computeinstance"
+    vm_network_networks: [{name: tenant, pod: {}}]
+    vm_network_interfaces: [{name: tenant, binding: {name: l2bridge}}]
+
+  tasks:
+    - when: test_windows_userdata_sysprep | default(false) | bool
+      block:
+        - name: Load ocp_virt_vm role defaults (Windows profile maps)
+          ansible.builtin.include_vars:
+            file: "{{ playbook_dir }}/../defaults/main.yaml"
+
+        - name: Load Windows fixture with userDataSecretRef
+          ansible.builtin.set_fact:
+            compute_instance: "{{ lookup('file', 'fixtures/computeinstance-windows-userdata-test.yaml') | from_yaml }}"
+            guest_os_family: windows
+            default_spec: "{{ _guest_os_windows_default_spec }}"
+            default_arg_specs: "{{ _guest_os_windows_default_arg_specs }}"
+            template_parameters: {}
+
+        - name: Set compute instance name
+          ansible.builtin.set_fact:
+            compute_instance_name: "{{ compute_instance.metadata.name }}"
+
+        - name: Run create_validate to extract VM config
+          ansible.builtin.include_role:
+            name: osac.templates.ocp_virt_vm
+            tasks_from: create_validate.yaml
+
+        - name: Run create_build_spec to build VM template spec
+          ansible.builtin.include_role:
+            name: osac.templates.ocp_virt_vm
+            tasks_from: create_build_spec.yaml
+
+        - name: Verify vm_user_data_secret_ref extracted from spec
+          ansible.builtin.assert:
+            that:
+              - vm_user_data_secret_ref is defined
+              - vm_user_data_secret_ref == "win-admin-creds"
+            fail_msg: >-
+              Expected vm_user_data_secret_ref='win-admin-creds',
+              got {{ vm_user_data_secret_ref | default('undefined') }}
+
+        - name: Verify sysprep path preconditions (Windows + non-empty user-data ref)
+          ansible.builtin.assert:
+            that:
+              - guest_os_family == 'windows'
+              - vm_user_data_secret_ref | length > 0
+            fail_msg: >-
+              Sysprep path requires guest_os_family='windows' and non-empty
+              vm_user_data_secret_ref; got guest_os_family='{{ guest_os_family }}'
+              vm_user_data_secret_ref='{{ vm_user_data_secret_ref }}'
+
+        - name: Verify Windows template spec includes EFI secure boot
+          ansible.builtin.assert:
+            that:
+              - vm_template_spec.domain.firmware.bootloader.efi.secureBoot == true
+            fail_msg: >-
+              Expected Windows EFI secureBoot=true,
+              got {{ vm_template_spec.domain.firmware | default('undefined') }}
+
+        - name: Verify base template spec has only root-disk volume (no cloudInitNoCloud)
+          ansible.builtin.assert:
+            that:
+              - vm_template_spec.volumes | length == 1
+              - vm_template_spec.volumes[0].name == 'root-disk'
+            fail_msg: >-
+              Expected only root-disk volume before create_secrets runs,
+              got {{ vm_template_spec.volumes }}
+
+# ──────────────────────────────────────────────────────────────
+# Test 16: Windows VM without user-data — no sysprep created
+# Expected: vm_user_data_secret_ref is empty, base template spec has only
+#           root-disk volume, no sysprep or cloudInitNoCloud volumes
+# ──────────────────────────────────────────────────────────────
+- name: "Test ocp_virt_vm -- Windows VM without user-data skips sysprep"
+  hosts: localhost
+
+  collections:
+    - osac.templates
+
+  vars:
+    compute_instance_label: "osac.openshift.io/computeinstance"
+    vm_network_networks: [{name: tenant, pod: {}}]
+    vm_network_interfaces: [{name: tenant, binding: {name: l2bridge}}]
+
+  tasks:
+    - when: test_windows_no_userdata | default(false) | bool
+      block:
+        - name: Load ocp_virt_vm role defaults (Windows profile maps)
+          ansible.builtin.include_vars:
+            file: "{{ playbook_dir }}/../defaults/main.yaml"
+
+        - name: Load Windows fixture without userDataSecretRef
+          ansible.builtin.set_fact:
+            compute_instance: "{{ lookup('file', 'fixtures/computeinstance-windows-with-image-test.yaml') | from_yaml }}"
+            guest_os_family: windows
+            default_spec: "{{ _guest_os_windows_default_spec }}"
+            default_arg_specs: "{{ _guest_os_windows_default_arg_specs }}"
+            template_parameters: {}
+
+        - name: Set compute instance name
+          ansible.builtin.set_fact:
+            compute_instance_name: "{{ compute_instance.metadata.name }}"
+
+        - name: Run create_validate to extract VM config
+          ansible.builtin.include_role:
+            name: osac.templates.ocp_virt_vm
+            tasks_from: create_validate.yaml
+
+        - name: Run create_build_spec to build VM template spec
+          ansible.builtin.include_role:
+            name: osac.templates.ocp_virt_vm
+            tasks_from: create_build_spec.yaml
+
+        - name: Verify vm_user_data_secret_ref is empty (no userDataSecretRef on CR)
+          ansible.builtin.assert:
+            that:
+              - vm_user_data_secret_ref is defined
+              - vm_user_data_secret_ref | length == 0
+            fail_msg: >-
+              Expected empty vm_user_data_secret_ref when userDataSecretRef is absent,
+              got '{{ vm_user_data_secret_ref | default('undefined') }}'
+
+        - name: Verify sysprep path is skipped (empty ref fails condition)
+          ansible.builtin.assert:
+            that:
+              - not (guest_os_family == 'windows' and vm_user_data_secret_ref | length > 0)
+            fail_msg: >-
+              Sysprep path condition should be false; got guest_os_family='{{ guest_os_family }}'
+              vm_user_data_secret_ref='{{ vm_user_data_secret_ref }}'
+
+        - name: Verify only root-disk volume in template spec (no sysprep, no cloudInit)
+          ansible.builtin.assert:
+            that:
+              - vm_template_spec.volumes | length == 1
+              - vm_template_spec.volumes[0].name == 'root-disk'
+            fail_msg: >-
+              Expected only root-disk volume when no user-data is provided,
+              got {{ vm_template_spec.volumes }}
+
+        - name: Verify no sysprep disk in devices
+          ansible.builtin.assert:
+            that:
+              - vm_template_spec.domain.devices.disks | selectattr('name', 'equalto', 'sysprep-disk') | list | length == 0
+            fail_msg: >-
+              Expected no sysprep-disk when userDataSecretRef is absent,
+              but found one in {{ vm_template_spec.domain.devices.disks }}
+
+# ──────────────────────────────────────────────────────────────
+# Test 17: Linux VM with user-data — cloud-init path (regression check)
+# Expected: vm_user_data_secret_ref extracted, Linux template spec built
+#           (no EFI/clock), cloud-init patch adds cloudInitNoCloud volume
+#           with virtio bus, no sysprep volume present
+# ──────────────────────────────────────────────────────────────
+- name: "Test ocp_virt_vm -- Linux VM with user-data uses cloud-init path"
+  hosts: localhost
+
+  collections:
+    - osac.templates
+
+  vars:
+    compute_instance_label: "osac.openshift.io/computeinstance"
+    vm_network_networks: [{name: tenant, pod: {}}]
+    vm_network_interfaces: [{name: tenant, binding: {name: l2bridge}}]
+
+  tasks:
+    - when: test_linux_userdata_cloudinit | default(false) | bool
+      block:
+        - name: Load ocp_virt_vm role defaults
+          ansible.builtin.include_vars:
+            file: "{{ playbook_dir }}/../defaults/main.yaml"
+
+        - name: Build Linux ComputeInstance with userDataSecretRef
+          ansible.builtin.set_fact:
+            compute_instance:
+              apiVersion: osac.openshift.io/v1alpha1
+              kind: ComputeInstance
+              metadata:
+                name: test-linux-cloudinit
+                namespace: osac-system
+              spec:
+                templateID: osac.templates.ocp_virt_vm
+                vcpus: 2
+                memoryGiB: 2
+                networkAttachments:
+                  - subnetRef: test-subnet
+                userDataSecretRef:
+                  name: linux-cloud-init
+            guest_os_family: linux
+
+        - name: Set compute instance name
+          ansible.builtin.set_fact:
+            compute_instance_name: "{{ compute_instance.metadata.name }}"
+
+        - name: Run create_validate to extract VM config
+          ansible.builtin.include_role:
+            name: osac.templates.ocp_virt_vm
+            tasks_from: create_validate.yaml
+
+        - name: Run create_build_spec to build VM template spec
+          ansible.builtin.include_role:
+            name: osac.templates.ocp_virt_vm
+            tasks_from: create_build_spec.yaml
+
+        - name: Verify vm_user_data_secret_ref extracted from spec
+          ansible.builtin.assert:
+            that:
+              - vm_user_data_secret_ref is defined
+              - vm_user_data_secret_ref == "linux-cloud-init"
+            fail_msg: >-
+              Expected vm_user_data_secret_ref='linux-cloud-init',
+              got {{ vm_user_data_secret_ref | default('undefined') }}
+
+        - name: Verify cloud-init path preconditions (non-Windows + non-empty user-data ref)
+          ansible.builtin.assert:
+            that:
+              - guest_os_family != 'windows'
+              - vm_user_data_secret_ref | length > 0
+            fail_msg: >-
+              Cloud-init path requires guest_os_family!='windows' and non-empty
+              vm_user_data_secret_ref; got guest_os_family='{{ guest_os_family }}'
+              vm_user_data_secret_ref='{{ vm_user_data_secret_ref }}'
+
+        - name: Verify Linux template spec has no Windows-specific firmware or clock
+          ansible.builtin.assert:
+            that:
+              - vm_template_spec.domain.firmware is not defined
+              - vm_template_spec.domain.clock is not defined
+            fail_msg: >-
+              Linux VM should not have Windows firmware/clock blocks,
+              got firmware={{ vm_template_spec.domain.firmware | default('(absent)') }}
+              clock={{ vm_template_spec.domain.clock | default('(absent)') }}
+
+        - name: Verify base template spec has only root-disk volume (no sysprep)
+          ansible.builtin.assert:
+            that:
+              - vm_template_spec.volumes | length == 1
+              - vm_template_spec.volumes[0].name == 'root-disk'
+            fail_msg: >-
+              Expected only root-disk volume before create_secrets runs,
+              got {{ vm_template_spec.volumes }}
+
+        - name: Apply cloud-init patch (offline replay of create_secrets combine logic)
+          ansible.builtin.set_fact:
+            cloudinit_patched_spec: "{{ vm_template_spec | combine(cloud_init_patch, recursive=True, list_merge='append') }}"
+          vars:
+            cloud_init_patch:
+              domain:
+                devices:
+                  disks:
+                    - name: cloud-init-disk
+                      disk:
+                        bus: virtio
+                      serial: cloud-init
+              volumes:
+                - name: cloud-init-disk
+                  cloudInitNoCloud:
+                    secretRef:
+                      name: "{{ compute_instance_name }}-user-data"
+
+        - name: Verify cloud-init disk uses virtio bus
+          ansible.builtin.assert:
+            that:
+              - cloudinit_patched_spec.domain.devices.disks | selectattr('name', 'equalto', 'cloud-init-disk') | list | length == 1
+              - (cloudinit_patched_spec.domain.devices.disks | selectattr('name', 'equalto', 'cloud-init-disk') | first).disk.bus == 'virtio'
+            fail_msg: >-
+              Expected cloud-init-disk with disk.bus=virtio,
+              got {{ cloudinit_patched_spec.domain.devices.disks }}
+
+        - name: Verify cloudInitNoCloud volume references correct secret
+          ansible.builtin.assert:
+            that:
+              - cloudinit_patched_spec.volumes | selectattr('name', 'equalto', 'cloud-init-disk') | list | length == 1
+              - (cloudinit_patched_spec.volumes | selectattr('name', 'equalto', 'cloud-init-disk') | first).cloudInitNoCloud.secretRef.name == "test-linux-cloudinit-user-data"
+            fail_msg: >-
+              Expected cloudInitNoCloud volume with secret 'test-linux-cloudinit-user-data',
+              got {{ cloudinit_patched_spec.volumes }}
+
+        - name: Verify no sysprep disk in patched spec
+          ansible.builtin.assert:
+            that:
+              - cloudinit_patched_spec.domain.devices.disks | selectattr('name', 'equalto', 'sysprep-disk') | list | length == 0
+            fail_msg: >-
+              Expected no sysprep-disk for Linux VM,
+              but found one in {{ cloudinit_patched_spec.domain.devices.disks }}

@@ -16,6 +16,7 @@ package servers
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
 	"time"
 
 	"buf.build/go/protovalidate"
@@ -26,9 +27,9 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
-	publicv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/public/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/database"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
 
 var _ = Describe("Private instance types server", func() {
@@ -84,9 +85,9 @@ var _ = Describe("Private instance types server", func() {
 						Name: "standard-4-16",
 					}.Build(),
 					Spec: privatev1.InstanceTypeSpec_builder{
-						Cores:       4,
+						Vcpus:       4,
 						MemoryGib:   16,
-						Description: "Standard 4 cores, 16 GiB RAM.",
+						Description: "Standard 4 vCPUs, 16 GiB RAM.",
 					}.Build(),
 				}.Build(),
 			}.Build())
@@ -97,7 +98,7 @@ var _ = Describe("Private instance types server", func() {
 			Expect(object.GetId()).To(Equal("standard-4-16"))
 			Expect(object.GetSpec().GetState()).To(Equal(
 				privatev1.InstanceTypeState_INSTANCE_TYPE_STATE_ACTIVE))
-			Expect(object.GetSpec().GetCores()).To(Equal(int32(4)))
+			Expect(object.GetSpec().GetVcpus()).To(Equal(int32(4)))
 			Expect(object.GetSpec().GetMemoryGib()).To(Equal(int32(16)))
 		})
 
@@ -108,7 +109,7 @@ var _ = Describe("Private instance types server", func() {
 						Name: "deprecated-on-create",
 					}.Build(),
 					Spec: privatev1.InstanceTypeSpec_builder{
-						Cores:     4,
+						Vcpus:     4,
 						MemoryGib: 16,
 						State:     privatev1.InstanceTypeState_INSTANCE_TYPE_STATE_DEPRECATED,
 					}.Build(),
@@ -128,7 +129,7 @@ var _ = Describe("Private instance types server", func() {
 						Name: "gpu-a100-8core",
 					}.Build(),
 					Spec: privatev1.InstanceTypeSpec_builder{
-						Cores:       8,
+						Vcpus:       8,
 						MemoryGib:   64,
 						Description: "8 vCPU, 64 GiB, 1x A100 GPU.",
 						Gpu: privatev1.GpuSpec_builder{
@@ -153,7 +154,7 @@ var _ = Describe("Private instance types server", func() {
 			const count = 10
 			for i := range count {
 				spec := privatev1.InstanceTypeSpec_builder{
-					Cores:       4,
+					Vcpus:       4,
 					MemoryGib:   16,
 					Description: fmt.Sprintf("Type %d.", i),
 				}
@@ -191,9 +192,9 @@ var _ = Describe("Private instance types server", func() {
 						Name: "standard-4-16",
 					}.Build(),
 					Spec: privatev1.InstanceTypeSpec_builder{
-						Cores:       4,
+						Vcpus:       4,
 						MemoryGib:   16,
-						Description: "Standard 4 cores, 16 GiB RAM.",
+						Description: "Standard 4 vCPUs, 16 GiB RAM.",
 					}.Build(),
 				}.Build(),
 			}.Build())
@@ -215,9 +216,9 @@ var _ = Describe("Private instance types server", func() {
 						Name: "standard-4-16",
 					}.Build(),
 					Spec: privatev1.InstanceTypeSpec_builder{
-						Cores:       4,
+						Vcpus:       4,
 						MemoryGib:   16,
-						Description: "Standard 4 cores, 16 GiB RAM.",
+						Description: "Standard 4 vCPUs, 16 GiB RAM.",
 						Gpu: privatev1.GpuSpec_builder{
 							PciDeviceSelector: "10DE:20B0",
 							ResourceName:      "nvidia.com/A100",
@@ -250,6 +251,65 @@ var _ = Describe("Private instance types server", func() {
 			Expect(getResponse.GetObject().GetSpec().GetDescription()).To(Equal("Updated description."))
 		})
 
+		It("Updates labels and annotations with a field mask", func() {
+			createResponse, err := server.Create(ctx, privatev1.InstanceTypesCreateRequest_builder{
+				Object: privatev1.InstanceType_builder{
+					Metadata: privatev1.Metadata_builder{Name: "metadata-update-test"}.Build(),
+					Spec: privatev1.InstanceTypeSpec_builder{
+						Vcpus:       4,
+						MemoryGib:   16,
+						Description: "Metadata update test.",
+					}.Build(),
+				}.Build(),
+			}.Build())
+			Expect(err).NotTo(HaveOccurred())
+			object := createResponse.GetObject()
+
+			labels := map[string]string{"admin.osac.openshift.io/metadata-test": "private-label"}
+			annotations := map[string]string{"operator.admin.osac.openshift.io/metadata-test": "private-annotation"}
+			updateResponse, err := server.Update(ctx, privatev1.InstanceTypesUpdateRequest_builder{
+				Object: privatev1.InstanceType_builder{
+					Id: object.GetId(),
+					Metadata: privatev1.Metadata_builder{
+						Labels:      labels,
+						Annotations: annotations,
+					}.Build(),
+				}.Build(),
+				UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{
+					"metadata.labels",
+					"metadata.annotations",
+				}},
+			}.Build())
+			Expect(err).NotTo(HaveOccurred())
+			Expect(maps.Equal(updateResponse.GetObject().GetMetadata().GetLabels(), labels)).To(BeTrue())
+			Expect(maps.Equal(updateResponse.GetObject().GetMetadata().GetAnnotations(), annotations)).To(BeTrue())
+
+			getResponse, err := server.Get(ctx, privatev1.InstanceTypesGetRequest_builder{Id: object.GetId()}.Build())
+			Expect(err).NotTo(HaveOccurred())
+			Expect(maps.Equal(getResponse.GetObject().GetMetadata().GetLabels(), labels)).To(BeTrue())
+			Expect(maps.Equal(getResponse.GetObject().GetMetadata().GetAnnotations(), annotations)).To(BeTrue())
+
+			_, err = server.Update(ctx, privatev1.InstanceTypesUpdateRequest_builder{
+				Object: privatev1.InstanceType_builder{
+					Id: object.GetId(),
+					Metadata: privatev1.Metadata_builder{
+						Labels:      map[string]string{},
+						Annotations: map[string]string{},
+					}.Build(),
+				}.Build(),
+				UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{
+					"metadata.labels",
+					"metadata.annotations",
+				}},
+			}.Build())
+			Expect(err).NotTo(HaveOccurred())
+
+			getResponse, err = server.Get(ctx, privatev1.InstanceTypesGetRequest_builder{Id: object.GetId()}.Build())
+			Expect(err).NotTo(HaveOccurred())
+			Expect(getResponse.GetObject().GetMetadata().GetLabels()).To(BeEmpty())
+			Expect(getResponse.GetObject().GetMetadata().GetAnnotations()).To(BeEmpty())
+		})
+
 		It("Delete object", func() {
 			// Create the object with a finalizer:
 			createResponse, err := server.Create(ctx, privatev1.InstanceTypesCreateRequest_builder{
@@ -259,9 +319,9 @@ var _ = Describe("Private instance types server", func() {
 						Finalizers: []string{"a"},
 					}.Build(),
 					Spec: privatev1.InstanceTypeSpec_builder{
-						Cores:       4,
+						Vcpus:       4,
 						MemoryGib:   16,
-						Description: "Standard 4 cores, 16 GiB RAM.",
+						Description: "Standard 4 vCPUs, 16 GiB RAM.",
 						Gpu: privatev1.GpuSpec_builder{
 							PciDeviceSelector: "10DE:20B0",
 							ResourceName:      "nvidia.com/A100",
@@ -299,7 +359,7 @@ var _ = Describe("Private instance types server", func() {
 							},
 						}.Build(),
 						Spec: privatev1.InstanceTypeSpec_builder{
-							Cores:       4,
+							Vcpus:       4,
 							MemoryGib:   16,
 							Description: "Label test.",
 						}.Build(),
@@ -317,7 +377,7 @@ var _ = Describe("Private instance types server", func() {
 							Name: "label-test",
 						}.Build(),
 						Spec: privatev1.InstanceTypeSpec_builder{
-							Cores:       4,
+							Vcpus:       4,
 							MemoryGib:   16,
 							Description: "Label test.",
 						}.Build(),
@@ -336,7 +396,7 @@ var _ = Describe("Private instance types server", func() {
 							},
 						}.Build(),
 						Spec: privatev1.InstanceTypeSpec_builder{
-							Cores:       4,
+							Vcpus:       4,
 							MemoryGib:   16,
 							Description: "Label test.",
 						}.Build(),
@@ -383,7 +443,7 @@ var _ = Describe("Private instance types server", func() {
 							},
 						}.Build(),
 						Spec: privatev1.InstanceTypeSpec_builder{
-							Cores:       4,
+							Vcpus:       4,
 							MemoryGib:   16,
 							Description: "Annotation test.",
 						}.Build(),
@@ -401,7 +461,7 @@ var _ = Describe("Private instance types server", func() {
 							Name: "annotation-test",
 						}.Build(),
 						Spec: privatev1.InstanceTypeSpec_builder{
-							Cores:       4,
+							Vcpus:       4,
 							MemoryGib:   16,
 							Description: "Annotation test.",
 						}.Build(),
@@ -420,7 +480,7 @@ var _ = Describe("Private instance types server", func() {
 							},
 						}.Build(),
 						Spec: privatev1.InstanceTypeSpec_builder{
-							Cores:       4,
+							Vcpus:       4,
 							MemoryGib:   16,
 							Description: "Annotation test.",
 						}.Build(),
@@ -458,7 +518,7 @@ var _ = Describe("Private instance types server", func() {
 							Name: name,
 						}.Build(),
 						Spec: privatev1.InstanceTypeSpec_builder{
-							Cores:       4,
+							Vcpus:       4,
 							MemoryGib:   16,
 							Description: "State test.",
 						}.Build(),
@@ -707,14 +767,14 @@ var _ = Describe("Private instance types server", func() {
 
 		// Immutability tests (TEST-02)
 		Describe("Immutability", func() {
-			It("Rejects update of cores", func() {
+			It("Rejects update of vCPUs", func() {
 				createResponse, err := server.Create(ctx, privatev1.InstanceTypesCreateRequest_builder{
 					Object: privatev1.InstanceType_builder{
 						Metadata: privatev1.Metadata_builder{
-							Name: "immutable-cores",
+							Name: "immutable-vcpus",
 						}.Build(),
 						Spec: privatev1.InstanceTypeSpec_builder{
-							Cores:       4,
+							Vcpus:       4,
 							MemoryGib:   16,
 							Description: "Immutability test.",
 						}.Build(),
@@ -726,7 +786,7 @@ var _ = Describe("Private instance types server", func() {
 					Object: privatev1.InstanceType_builder{
 						Id: createResponse.GetObject().GetId(),
 						Spec: privatev1.InstanceTypeSpec_builder{
-							Cores:     8,
+							Vcpus:     8,
 							MemoryGib: 16,
 						}.Build(),
 					}.Build(),
@@ -735,7 +795,7 @@ var _ = Describe("Private instance types server", func() {
 				status, ok := grpcstatus.FromError(err)
 				Expect(ok).To(BeTrue())
 				Expect(status.Code()).To(Equal(grpccodes.InvalidArgument))
-				Expect(status.Message()).To(ContainSubstring("spec.cores"))
+				Expect(status.Message()).To(ContainSubstring("spec.vcpus"))
 				Expect(status.Message()).To(ContainSubstring("immutable"))
 			})
 
@@ -746,7 +806,7 @@ var _ = Describe("Private instance types server", func() {
 							Name: "immutable-memory",
 						}.Build(),
 						Spec: privatev1.InstanceTypeSpec_builder{
-							Cores:       4,
+							Vcpus:       4,
 							MemoryGib:   16,
 							Description: "Immutability test.",
 						}.Build(),
@@ -758,7 +818,7 @@ var _ = Describe("Private instance types server", func() {
 					Object: privatev1.InstanceType_builder{
 						Id: createResponse.GetObject().GetId(),
 						Spec: privatev1.InstanceTypeSpec_builder{
-							Cores:     4,
+							Vcpus:     4,
 							MemoryGib: 32,
 						}.Build(),
 					}.Build(),
@@ -778,7 +838,7 @@ var _ = Describe("Private instance types server", func() {
 							Name: "original",
 						}.Build(),
 						Spec: privatev1.InstanceTypeSpec_builder{
-							Cores:       4,
+							Vcpus:       4,
 							MemoryGib:   16,
 							Description: "Immutability test.",
 						}.Build(),
@@ -793,7 +853,7 @@ var _ = Describe("Private instance types server", func() {
 							Name: "renamed",
 						}.Build(),
 						Spec: privatev1.InstanceTypeSpec_builder{
-							Cores:     4,
+							Vcpus:     4,
 							MemoryGib: 16,
 						}.Build(),
 					}.Build(),
@@ -813,7 +873,7 @@ var _ = Describe("Private instance types server", func() {
 							Name: "immutable-gpu",
 						}.Build(),
 						Spec: privatev1.InstanceTypeSpec_builder{
-							Cores:     8,
+							Vcpus:     8,
 							MemoryGib: 64,
 							Gpu: privatev1.GpuSpec_builder{
 								PciDeviceSelector: "10DE:20B0",
@@ -829,7 +889,7 @@ var _ = Describe("Private instance types server", func() {
 					Object: privatev1.InstanceType_builder{
 						Id: createResponse.GetObject().GetId(),
 						Spec: privatev1.InstanceTypeSpec_builder{
-							Cores:     8,
+							Vcpus:     8,
 							MemoryGib: 64,
 							Gpu: privatev1.GpuSpec_builder{
 								PciDeviceSelector: "10DE:20B0",
@@ -848,6 +908,118 @@ var _ = Describe("Private instance types server", func() {
 			})
 		})
 
+		Describe("No-mask update", func() {
+			It("Update without UpdateMask succeeds with sparse metadata", func() {
+				createRequest := privatev1.InstanceTypesCreateRequest_builder{
+					Object: privatev1.InstanceType_builder{
+						Metadata: privatev1.Metadata_builder{
+							Name:   "no-mask-test",
+							Labels: map[string]string{"env": "prod", "team": "infra"},
+						}.Build(),
+						Spec: privatev1.InstanceTypeSpec_builder{
+							Vcpus:       4,
+							MemoryGib:   8,
+							Description: "original",
+						}.Build(),
+					}.Build(),
+				}.Build()
+				createResponse, err := server.Create(ctx, createRequest)
+				Expect(err).NotTo(HaveOccurred())
+
+				// Update with NO mask — client sends only the ID and
+				// the spec change, minimal metadata (no labels, no name)
+				updateRequest := privatev1.InstanceTypesUpdateRequest_builder{
+					Object: privatev1.InstanceType_builder{
+						Id: createResponse.GetObject().GetId(),
+						Spec: privatev1.InstanceTypeSpec_builder{
+							Vcpus:       4, // same immutables
+							MemoryGib:   8,
+							Description: "updated",
+						}.Build(),
+						// Metadata intentionally sparse — no name, no labels
+					}.Build(),
+					// UpdateMask intentionally nil
+				}.Build()
+				_, err = server.Update(ctx, updateRequest)
+				Expect(err).NotTo(HaveOccurred()) // TODAY: this FAILS
+
+				// Verify metadata survived
+				getRequest := privatev1.InstanceTypesGetRequest_builder{
+					Id: createResponse.GetObject().GetId(),
+				}.Build()
+				getResponse, err := server.Get(ctx, getRequest)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(getResponse.GetObject().GetMetadata().GetName()).To(Equal("no-mask-test"))
+				Expect(getResponse.GetObject().GetMetadata().GetLabels()).To(Equal(
+					map[string]string{"env": "prod", "team": "infra"},
+				))
+				Expect(getResponse.GetObject().GetSpec().GetDescription()).To(Equal("updated"))
+			})
+
+			It("Update without UpdateMask preserves all mutable metadata when client omits them", func() {
+				// Create with ALL vulnerable metadata fields populated
+				createRequest := privatev1.InstanceTypesCreateRequest_builder{
+					Object: privatev1.InstanceType_builder{
+						Metadata: privatev1.Metadata_builder{
+							Name:        "metadata-wipe-test",
+							Labels:      map[string]string{"env": "prod", "team": "infra"},
+							Annotations: map[string]string{"note": "important", "owner": "test"},
+							Finalizers:  []string{"test-finalizer-1", "test-finalizer-2"},
+						}.Build(),
+						Spec: privatev1.InstanceTypeSpec_builder{
+							Vcpus:       2,
+							MemoryGib:   4,
+							Description: "original",
+						}.Build(),
+					}.Build(),
+				}.Build()
+				createResponse, err := server.Create(ctx, createRequest)
+				Expect(err).NotTo(HaveOccurred())
+
+				// Update with NO mask — include correct immutables + name,
+				// but OMIT all vulnerable metadata fields
+				updateRequest := privatev1.InstanceTypesUpdateRequest_builder{
+					Object: privatev1.InstanceType_builder{
+						Id: createResponse.GetObject().GetId(),
+						Metadata: privatev1.Metadata_builder{
+							Name: "metadata-wipe-test", // same name (immutable)
+							// Labels:      OMITTED
+							// Annotations: OMITTED
+							// Finalizers:  OMITTED
+							// Project:     OMITTED
+						}.Build(),
+						Spec: privatev1.InstanceTypeSpec_builder{
+							Vcpus:       2,
+							MemoryGib:   4,
+							Description: "updated",
+						}.Build(),
+					}.Build(),
+				}.Build()
+				_, err = server.Update(ctx, updateRequest)
+				Expect(err).NotTo(HaveOccurred())
+
+				// Verify ALL vulnerable metadata fields survived
+				getRequest := privatev1.InstanceTypesGetRequest_builder{
+					Id: createResponse.GetObject().GetId(),
+				}.Build()
+				getResponse, err := server.Get(ctx, getRequest)
+				Expect(err).NotTo(HaveOccurred())
+
+				metadata := getResponse.GetObject().GetMetadata()
+				Expect(metadata.GetLabels()).To(Equal(
+					map[string]string{"env": "prod", "team": "infra"},
+				))
+				Expect(metadata.GetAnnotations()).To(Equal(
+					map[string]string{"note": "important", "owner": "test"},
+				))
+				Expect(metadata.GetFinalizers()).To(Equal(
+					[]string{"test-finalizer-1", "test-finalizer-2"},
+				))
+				// Also verify spec fields survived
+				Expect(getResponse.GetObject().GetSpec().GetDescription()).To(Equal("updated"))
+			})
+		})
+
 		// Deletion protection tests (TEST-02)
 		Describe("Deletion protection", func() {
 			It("Blocks delete when referenced by compute instance", func() {
@@ -858,7 +1030,7 @@ var _ = Describe("Private instance types server", func() {
 							Finalizers: []string{"a"},
 						}.Build(),
 						Spec: privatev1.InstanceTypeSpec_builder{
-							Cores:       4,
+							Vcpus:       4,
 							MemoryGib:   16,
 							Description: "Referenced instance type.",
 						}.Build(),
@@ -911,7 +1083,7 @@ var _ = Describe("Private instance types server", func() {
 							Finalizers: []string{"a"},
 						}.Build(),
 						Spec: privatev1.InstanceTypeSpec_builder{
-							Cores:       4,
+							Vcpus:       4,
 							MemoryGib:   16,
 							Description: "Unreferenced instance type.",
 						}.Build(),
@@ -935,12 +1107,12 @@ var _ = Describe("Private instance types server", func() {
 			})
 		})
 
-		// Field-level validation (cores, memory_gib) is enforced by the
+		// Field-level validation (vCPUs, memory_gib) is enforced by the
 		// protovalidate interceptor, not the server handler. Unit tests bypass the
 		// interceptor chain, so those constraints cannot be covered here. See
 		// internal/validation/protovalidate_interceptor_test.go for coverage.
 
-		Describe("Cores and memory validation", func() {
+		Describe("Vcpus and memory validation", func() {
 			var validator protovalidate.Validator
 
 			BeforeEach(func() {
@@ -949,28 +1121,28 @@ var _ = Describe("Private instance types server", func() {
 				Expect(err).ToNot(HaveOccurred())
 			})
 
-			It("Accepts valid cores and memory_gib", func() {
+			It("Accepts valid vCPUs and memory_gib", func() {
 				spec := privatev1.InstanceTypeSpec_builder{
-					Cores:     4,
+					Vcpus:     4,
 					MemoryGib: 16,
 				}.Build()
 				err := validator.Validate(spec)
 				Expect(err).ToNot(HaveOccurred())
 			})
 
-			It("Rejects cores equal to zero", func() {
+			It("Rejects vCPUs equal to zero", func() {
 				spec := privatev1.InstanceTypeSpec_builder{
-					Cores:     0,
+					Vcpus:     0,
 					MemoryGib: 16,
 				}.Build()
 				err := validator.Validate(spec)
 				Expect(err).To(HaveOccurred())
-				Expect(err.Error()).To(ContainSubstring("cores"))
+				Expect(err.Error()).To(ContainSubstring("vcpus"))
 			})
 
 			It("Rejects memory_gib equal to zero", func() {
 				spec := privatev1.InstanceTypeSpec_builder{
-					Cores:     4,
+					Vcpus:     4,
 					MemoryGib: 0,
 				}.Build()
 				err := validator.Validate(spec)
@@ -978,19 +1150,19 @@ var _ = Describe("Private instance types server", func() {
 				Expect(err.Error()).To(ContainSubstring("memory_gib"))
 			})
 
-			It("Rejects negative cores", func() {
+			It("Rejects negative vCPUs", func() {
 				spec := privatev1.InstanceTypeSpec_builder{
-					Cores:     -1,
+					Vcpus:     -1,
 					MemoryGib: 16,
 				}.Build()
 				err := validator.Validate(spec)
 				Expect(err).To(HaveOccurred())
-				Expect(err.Error()).To(ContainSubstring("cores"))
+				Expect(err.Error()).To(ContainSubstring("vcpus"))
 			})
 
 			It("Rejects negative memory_gib", func() {
 				spec := privatev1.InstanceTypeSpec_builder{
-					Cores:     4,
+					Vcpus:     4,
 					MemoryGib: -1,
 				}.Build()
 				err := validator.Validate(spec)
@@ -1007,7 +1179,7 @@ var _ = Describe("Private instance types server", func() {
 							Name: "with-gpu",
 						}.Build(),
 						Spec: privatev1.InstanceTypeSpec_builder{
-							Cores:     8,
+							Vcpus:     8,
 							MemoryGib: 64,
 							Gpu: privatev1.GpuSpec_builder{
 								PciDeviceSelector: "10DE:20B0",
@@ -1025,7 +1197,7 @@ var _ = Describe("Private instance types server", func() {
 							Name: "without-gpu",
 						}.Build(),
 						Spec: privatev1.InstanceTypeSpec_builder{
-							Cores:     4,
+							Vcpus:     4,
 							MemoryGib: 16,
 						}.Build(),
 					}.Build(),
@@ -1047,7 +1219,7 @@ var _ = Describe("Private instance types server", func() {
 							Name: "gpu-a100",
 						}.Build(),
 						Spec: privatev1.InstanceTypeSpec_builder{
-							Cores:     8,
+							Vcpus:     8,
 							MemoryGib: 64,
 							Gpu: privatev1.GpuSpec_builder{
 								PciDeviceSelector: "10DE:20B0",
@@ -1065,7 +1237,7 @@ var _ = Describe("Private instance types server", func() {
 							Name: "gpu-h100",
 						}.Build(),
 						Spec: privatev1.InstanceTypeSpec_builder{
-							Cores:     16,
+							Vcpus:     16,
 							MemoryGib: 128,
 							Gpu: privatev1.GpuSpec_builder{
 								PciDeviceSelector: "10DE:2330",
@@ -1123,7 +1295,7 @@ var _ = Describe("Public instance types server", func() {
 						Name: name,
 					}.Build(),
 					Spec: privatev1.InstanceTypeSpec_builder{
-						Cores:       4,
+						Vcpus:       4,
 						MemoryGib:   16,
 						Description: "Public server test.",
 					}.Build(),

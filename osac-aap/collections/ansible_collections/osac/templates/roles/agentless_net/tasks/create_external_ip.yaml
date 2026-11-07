@@ -1,0 +1,6 @@
+---
+- name: Allocate an AgentlessNet ExternalIP
+  ansible.builtin.include_tasks: _external_ip.yaml
+  vars:
+    agentless_net_external_ip_action: reserve_external_ip
+    agentless_net_external_ip_operation: external_ip.allocate

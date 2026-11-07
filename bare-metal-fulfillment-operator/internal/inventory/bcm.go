@@ -23,6 +23,7 @@ import (
 	"math/rand"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -43,7 +44,7 @@ const certBaseDir = "/etc/osac/certs"
 // Satisfied by *bcmclient.Client; defined here so tests can substitute a mock
 // without depending on the bcmclient package.
 //
-//go:generate mockgen -destination=bcm_mock_test.go -package=inventory . BCMAPI,BMHLifecycleManager,BMCDiscoverer
+//go:generate mockgen -source=$GOFILE -destination=bcm_mock_test.go -package=$GOPACKAGE BCMAPI,BMCDiscoverer
 type BCMAPI interface {
 	CertWatcher() *certwatcher.CertWatcher
 	GetDevices(ctx context.Context) ([]bcmclient.Device, error)
@@ -51,19 +52,6 @@ type BCMAPI interface {
 	GetCategories(ctx context.Context) ([]bcmclient.Category, error)
 	GetPartitions(ctx context.Context) ([]bcmclient.Partition, error)
 	UpdateDevice(ctx context.Context, deviceRaw json.RawMessage) (*bcmclient.UpdateResponse, error)
-}
-
-// BMHLifecycleManager abstracts BareMetalHost CR operations for testability.
-// Satisfied by *baremetalhost.Manager.
-type BMHLifecycleManager interface {
-	CreateBMH(ctx context.Context, params baremetalhost.CreateParams) error
-	DeleteBMH(ctx context.Context, name string) error
-	BMHExists(ctx context.Context, name string) (bool, error)
-	IsBMHReady(ctx context.Context, name string) (bool, error)
-	EnsureBMCSecret(ctx context.Context, name, username, password string) error
-	DeleteBMCSecret(ctx context.Context, name string) error
-	GetHardwareNICs(ctx context.Context, name string) ([]string, error)
-	Namespace() string
 }
 
 // BMCDiscoverer resolves BMC system paths via Redfish. Satisfied by
@@ -134,16 +122,16 @@ func ParseBCMOptions(options map[string]any) (*BCMClientConfig, error) {
 }
 
 // BCMClient implements inventory.Client by wrapping a BCMAPI
-// for BCM API communication and a BMHLifecycleManager for BMH lifecycle.
+// for BCM API communication and a baremetalhost.BMHLifecycleManager for BMH lifecycle.
 type BCMClient struct {
 	client        BCMAPI
-	bmhManager    BMHLifecycleManager
+	bmhManager    baremetalhost.BMHLifecycleManager
 	bmcDiscoverer BMCDiscoverer
 	hostClass     string
 }
 
 // NewBCMClient creates a BCM inventory client with injected dependencies.
-func NewBCMClient(client BCMAPI, bmhManager BMHLifecycleManager, hostClass string) *BCMClient {
+func NewBCMClient(client BCMAPI, bmhManager baremetalhost.BMHLifecycleManager, hostClass string) *BCMClient {
 	return &BCMClient{
 		client:     client,
 		bmhManager: bmhManager,
@@ -165,19 +153,44 @@ func (c *BCMClient) CertWatcher() *certwatcher.CertWatcher {
 	return c.client.CertWatcher()
 }
 
-// FindFreeHost queries BCM for all devices and returns a randomly selected
-// free LiteNode matching the requested hostType. All filtering is client-side
-// because the BCM JSON API has no server-side filtering.
-func (c *BCMClient) FindFreeHost(ctx context.Context, matchExpressions map[string]string) (*Host, error) {
-	log := ctrllog.FromContext(ctx)
-	log.Info("Finding free BCM host")
+// Selector keys with dedicated handling, excluded from the generic label match.
+const (
+	managedByKey      = "managedBy"
+	provisionStateKey = "provisionState"
+)
 
-	matchManagedBy := matchExpressions["managedBy"]
+// reservedExtraValueKeys are OSAC-internal extra_values, never matchable as labels.
+var reservedExtraValueKeys = map[string]bool{
+	bcmclient.ExtraValueInstanceID:     true,
+	bcmclient.ExtraValueBMCAddress:     true,
+	bcmclient.ExtraValueBMCCredentials: true,
+	bcmclient.ExtraValueInterfaceMACs:  true,
+}
+
+// FindFreeHost returns a randomly selected free LiteNode whose extra_values
+// satisfy the selector labels (arbitrary key=value, matched client-side against
+// extra_values — the BCM JSON API has no server-side filtering). managedBy is a
+// default-aware ownership guard; provisionState is excluded (no BCM analog).
+func (c *BCMClient) FindFreeHost(ctx context.Context, matchExpressions map[string]string) (*Host, error) {
+	if err := validateBCMMatchExpressions(matchExpressions); err != nil {
+		return nil, err
+	}
+
+	log := ctrllog.FromContext(ctx)
+	log.Info("Finding free BCM host", "selectorKeys", sortedKeys(matchExpressions))
+
+	matchManagedBy := matchExpressions[managedByKey]
 	if matchManagedBy == "" {
 		matchManagedBy = shared.OsacDefaultManagedByValue
 	}
-	if matchManagedBy != shared.OsacDefaultManagedByValue {
-		return nil, nil
+
+	// Generic label match: the selector minus keys with dedicated handling.
+	labelMatchExpressions := make(map[string]string, len(matchExpressions))
+	for key, value := range matchExpressions {
+		if key == managedByKey || key == provisionStateKey {
+			continue
+		}
+		labelMatchExpressions[key] = value
 	}
 
 	devices, err := c.client.GetDevices(ctx)
@@ -185,24 +198,13 @@ func (c *BCMClient) FindFreeHost(ctx context.Context, matchExpressions map[strin
 		return nil, fmt.Errorf("FindFreeHost: %w", err)
 	}
 
-	hostType := matchExpressions["hostType"]
-
+	// available holds every valid, unassigned LiteNode regardless of the selector;
+	// it feeds the availability gauge (the total free pool by resource_class).
+	// candidates narrows that pool by the selector labels and managedBy ownership.
+	available := make([]bcmclient.Device, 0, len(devices))
 	candidates := make([]bcmclient.Device, 0, len(devices))
 	for _, d := range devices {
-		if d.ChildType != "LiteNode" {
-			continue
-		}
-
-		if d.ExtraValues == nil {
-			continue
-		}
-
-		resourceClass, _ := d.ExtraValues[bcmclient.ExtraValueResourceClass].(string)
-		if resourceClass == "" {
-			continue
-		}
-
-		if hostType != "" && resourceClass != hostType {
+		if d.ChildType != "LiteNode" || d.ExtraValues == nil {
 			continue
 		}
 
@@ -218,9 +220,92 @@ func (c *BCMClient) FindFreeHost(ctx context.Context, matchExpressions map[strin
 			continue
 		}
 
+		available = append(available, d)
+
+		if !deviceMatchesLabels(d, labelMatchExpressions) {
+			continue
+		}
+
+		if deviceManagedBy(d) != matchManagedBy {
+			continue
+		}
+
 		candidates = append(candidates, d)
 	}
 
+	updateAvailableMetric(available)
+
+	if len(candidates) == 0 {
+		log.Info("no free BCM host matches selector", "selectorKeys", sortedKeys(labelMatchExpressions))
+		return nil, nil
+	}
+
+	rand.Shuffle(len(candidates), func(i, j int) {
+		candidates[i], candidates[j] = candidates[j], candidates[i]
+	})
+
+	selected := &candidates[0]
+	// Report the selected device's resource_class as HostType (observability only;
+	// resource_class is also matchable as an ordinary label).
+	resourceClass, _ := selected.ExtraValues[bcmclient.ExtraValueResourceClass].(string)
+
+	return &Host{
+		InventoryHostID: fmt.Sprintf("%s/%s", c.bmhManager.Namespace(), selected.Hostname),
+		Name:            selected.Hostname,
+		HostType:        resourceClass,
+		HostClass:       c.hostClass,
+		ManagedBy:       matchManagedBy,
+	}, nil
+}
+
+// validateBCMMatchExpressions rejects an empty selector, empty keys, keys with
+// spaces, empty values, and OSAC-internal reserved keys.
+func validateBCMMatchExpressions(matchExpressions map[string]string) error {
+	if len(matchExpressions) == 0 {
+		return fmt.Errorf("invalid matchExpressions: empty map")
+	}
+	for key, value := range matchExpressions {
+		if key == "" {
+			return fmt.Errorf("invalid matchExpression: empty key not allowed")
+		}
+		if strings.Contains(key, " ") {
+			return fmt.Errorf("invalid matchExpression: key %q contains spaces", key)
+		}
+		if reservedExtraValueKeys[key] {
+			return fmt.Errorf("invalid matchExpression: %q is a reserved OSAC key", key)
+		}
+		if value == "" {
+			return fmt.Errorf("invalid matchExpression: empty value not allowed for key %q", key)
+		}
+	}
+	return nil
+}
+
+// deviceMatchesLabels reports whether the device's extra_values satisfy every
+// selector key=value (AND). Reserved keys are rejected by
+// validateBCMMatchExpressions before this is reached.
+func deviceMatchesLabels(d bcmclient.Device, matchExpressions map[string]string) bool {
+	for key, want := range matchExpressions {
+		got, ok := d.ExtraValues[key].(string)
+		if !ok || got != want {
+			return false
+		}
+	}
+	return true
+}
+
+// deviceManagedBy returns the device's managedBy label, defaulting to the
+// standard owner when absent or empty.
+func deviceManagedBy(d bcmclient.Device) string {
+	if v, ok := d.ExtraValues[managedByKey].(string); ok && v != "" {
+		return v
+	}
+	return shared.OsacDefaultManagedByValue
+}
+
+// updateAvailableMetric refreshes the available-hosts gauge, keyed by
+// resource_class as a best-effort reporting dimension.
+func updateAvailableMetric(candidates []bcmclient.Device) {
 	bcmHostsAvailable.Reset()
 	availableByType := map[string]float64{}
 	for _, cd := range candidates {
@@ -230,25 +315,17 @@ func (c *BCMClient) FindFreeHost(ctx context.Context, matchExpressions map[strin
 	for t, count := range availableByType {
 		bcmHostsAvailable.WithLabelValues(t).Set(count)
 	}
+}
 
-	if len(candidates) == 0 {
-		return nil, nil
+// sortedKeys returns the map's keys sorted, for stable, value-free logging.
+// Selector values may be sensitive and are never logged.
+func sortedKeys(m map[string]string) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
 	}
-
-	rand.Shuffle(len(candidates), func(i, j int) {
-		candidates[i], candidates[j] = candidates[j], candidates[i]
-	})
-
-	selected := &candidates[0]
-	resourceClass, _ := selected.ExtraValues[bcmclient.ExtraValueResourceClass].(string)
-
-	return &Host{
-		InventoryHostID: fmt.Sprintf("%s/%s", c.bmhManager.Namespace(), selected.Hostname),
-		Name:            selected.Hostname,
-		HostType:        resourceClass,
-		HostClass:       c.hostClass,
-		ManagedBy:       shared.OsacDefaultManagedByValue,
-	}, nil
+	sort.Strings(keys)
+	return keys
 }
 
 // AssignHost records the assignment identifier in BCM, resolves the BMC
@@ -276,12 +353,12 @@ func (c *BCMClient) AssignHost(ctx context.Context, inventoryHostID string, bare
 	if err := c.ensureBMHExists(ctx, device, bareMetalInstanceID); err != nil {
 		return nil, err
 	}
-	ready, err := c.bmhManager.IsBMHReady(ctx, device.Hostname)
+	available, err := c.bmhManager.IsBMHAvailable(ctx, device.Hostname)
 	if err != nil {
 		return nil, err
 	}
 	host := c.buildHost(device)
-	host.Ready = ready
+	host.Available = available
 	return host, nil
 }
 
@@ -407,7 +484,7 @@ func (c *BCMClient) ensureBMHExists(ctx context.Context, device *bcmclient.Devic
 
 	// Secret name is derived from the BMH so the two stay coupled.
 	secretName := bmhName + bmcSecretSuffix
-	if err := c.bmhManager.EnsureBMCSecret(ctx, secretName, username, password); err != nil {
+	if err := c.bmhManager.EnsureBMCSecret(ctx, secretName, username, password, bareMetalInstanceID); err != nil {
 		return fmt.Errorf("failed to create BMC credentials Secret for host %q: %w", device.Hostname, err)
 	}
 
@@ -586,67 +663,90 @@ func (c *BCMClient) buildHost(device *bcmclient.Device) *Host {
 	}
 }
 
-// UnassignHost clears the OSAC assignment from a BCM device and deletes the
-// on-demand BMH CR. Ordering is BCM update before BMH deletion for crash
-// recovery safety — both steps are individually idempotent.
-func (c *BCMClient) UnassignHost(ctx context.Context, inventoryHostID string, labels []string) error {
+// UnassignHost deletes generated resources before clearing the BCM claim.
+func (c *BCMClient) UnassignHost(ctx context.Context, inventoryHostID, bareMetalInstanceID string, labels []string) error {
 	_, hostname, err := ParseHostID(inventoryHostID)
 	if err != nil {
 		return fmt.Errorf("UnassignHost: %w", err)
 	}
-
-	log := ctrllog.FromContext(ctx)
-	log.Info("Unassigning BCM host", "hostname", hostname)
-
-	if err := c.clearBCMAssignment(ctx, hostname, labels); err != nil {
+	ctrllog.FromContext(ctx).Info("Unassigning BCM host", "hostname", hostname, "bmiUID", bareMetalInstanceID)
+	ownedByAnother, err := c.bcmHostOwnedByAnother(ctx, hostname, bareMetalInstanceID)
+	if err != nil {
 		return fmt.Errorf("UnassignHost: %w", err)
 	}
-
-	if err := c.bmhManager.DeleteBMH(ctx, hostname); err != nil {
+	if ownedByAnother {
+		return nil
+	}
+	if err := c.deleteBCMResources(ctx, hostname, bareMetalInstanceID); err != nil {
 		return fmt.Errorf("UnassignHost: %w", err)
 	}
-
-	// Delete the operator-created BMC Secret if we own it. Label-guarded inside
-	// DeleteBMCSecret, so admin-provided Secrets are never touched.
-	if err := c.bmhManager.DeleteBMCSecret(ctx, hostname+bmcSecretSuffix); err != nil {
+	_, err = c.clearBCMAssignment(ctx, hostname, bareMetalInstanceID, labels)
+	if err != nil {
 		return fmt.Errorf("UnassignHost: %w", err)
 	}
-
 	return nil
 }
 
-func (c *BCMClient) clearBCMAssignment(ctx context.Context, hostname string, labels []string) error {
+func (c *BCMClient) bcmHostOwnedByAnother(ctx context.Context, hostname, ownerUID string) (bool, error) {
+	device, err := c.client.GetDevice(ctx, hostname)
+	if err != nil || device == nil {
+		return false, err
+	}
+	owner, assigned := device.ExtraValues[bcmclient.ExtraValueInstanceID]
+	return assigned && owner != ownerUID, nil
+}
+
+func (c *BCMClient) deleteBCMResources(ctx context.Context, hostname, ownerUID string) error {
+	if err := c.bmhManager.DeleteBMH(ctx, hostname, ownerUID); err != nil {
+		return err
+	}
+	exists, err := c.bmhManager.BMHExists(ctx, hostname)
+	if err != nil {
+		return err
+	}
+	if exists {
+		return fmt.Errorf("BareMetalHost %s deletion pending", hostname)
+	}
+	return c.bmhManager.DeleteBMCSecret(ctx, hostname+bmcSecretSuffix, ownerUID)
+}
+
+func (c *BCMClient) clearBCMAssignment(ctx context.Context, hostname, bareMetalInstanceID string, labels []string) (bool, error) {
 	log := ctrllog.FromContext(ctx)
 
 	device, err := c.client.GetDevice(ctx, hostname)
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	if device == nil {
 		log.Info("BCM device not found, skipping extra_values cleanup", "hostname", hostname)
-		return nil
+		return false, nil
 	}
 
-	if _, assigned := device.ExtraValues[bcmclient.ExtraValueInstanceID]; !assigned {
+	owner, assigned := device.ExtraValues[bcmclient.ExtraValueInstanceID]
+	if assigned && owner != bareMetalInstanceID {
+		return true, nil
+	}
+
+	if !assigned {
 		log.Info("BCM host already unassigned, skipping extra_values cleanup", "hostname", hostname)
-		return nil
+		return false, nil
 	}
 
 	raw := device.Raw
 	raw, err = bcmclient.RemoveExtraValue(raw, bcmclient.ExtraValueInstanceID)
 	if err != nil {
-		return err
+		return false, err
 	}
 	for _, label := range labels {
 		raw, err = bcmclient.RemoveExtraValue(raw, label)
 		if err != nil {
-			return err
+			return false, err
 		}
 	}
 
 	_, err = c.client.UpdateDevice(ctx, raw)
-	return err
+	return false, err
 }
 
 // GetHostNICs reads all NIC MAC addresses from the BareMetalHost CR hardware inspection data.
@@ -671,4 +771,40 @@ func (c *BCMClient) GetHostNICs(ctx context.Context, inventoryHostID string) ([]
 		nics = append(nics, HostNIC{MAC: mac})
 	}
 	return nics, nil
+}
+
+// GetHostLogicalPortMACs reads the administrator mapping from BCM extra_values.
+func (c *BCMClient) GetHostLogicalPortMACs(ctx context.Context, inventoryHostID string) (map[string]string, error) {
+	_, hostname, err := ParseHostID(inventoryHostID)
+	if err != nil {
+		return nil, err
+	}
+	device, err := c.client.GetDevice(ctx, hostname)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get BCM device %s: %w", hostname, err)
+	}
+	if device == nil {
+		return nil, fmt.Errorf("BCM device %s not found", hostname)
+	}
+
+	// ExtraValues already preserves arbitrary JSON values. Accept an object or
+	// a JSON string so string-valued BCM metadata can carry the same mapping.
+	value := device.ExtraValues[bcmclient.ExtraValueInterfaceMACs]
+	var raw []byte
+	if text, ok := value.(string); ok {
+		raw = []byte(text)
+	} else if value != nil {
+		raw, err = json.Marshal(value)
+		if err != nil {
+			return nil, fmt.Errorf("host %s: failed to marshal %s extra value: %w", inventoryHostID, bcmclient.ExtraValueInterfaceMACs, err)
+		}
+	}
+	if len(raw) == 0 {
+		return map[string]string{}, nil
+	}
+	macs := map[string]string{}
+	if err := json.Unmarshal(raw, &macs); err != nil {
+		return nil, fmt.Errorf("host %s: failed to parse %s mapping: %w", inventoryHostID, bcmclient.ExtraValueInterfaceMACs, err)
+	}
+	return macs, nil
 }

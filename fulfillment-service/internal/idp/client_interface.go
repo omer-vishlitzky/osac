@@ -21,6 +21,11 @@ import "context"
 // This interface exists primarily to enable mocking in tests.
 // Production code uses the concrete *Client type.
 type ClientInterface interface {
+	CreateServiceAccountClient(ctx context.Context, clientID, tenantID string) (clientUUID, clientSecret, registrationAccessToken string, err error)
+	RotateServiceAccountClientSecret(ctx context.Context, clientID, clientUUID, registrationAccessToken,
+		clientSecret string) (newRegistrationAccessToken string, err error)
+	FindServiceAccountClient(ctx context.Context, clientID, tenantID string) (clientUUID string, found bool, err error)
+	DeleteServiceAccountClient(ctx context.Context, clientID, clientUUID, registrationAccessToken string) error
 	CreateTenant(ctx context.Context, tenant *Tenant) (*Tenant, error)
 	GetTenant(ctx context.Context, name string) (*Tenant, error)
 	UpdateTenant(ctx context.Context, tenant *Tenant) (*Tenant, error)
@@ -48,6 +53,7 @@ type ClientInterface interface {
 	AssignIdpManagerPermissions(ctx context.Context, userID string) error
 	GetUserByUsername(ctx context.Context, tenantName, username string) (*User, error)
 	CreateIdentityProvider(ctx context.Context, tenantName string, idpProvider *IdentityProvider) (*IdentityProvider, error)
+	UpdateIdentityProvider(ctx context.Context, tenantName string, idpProvider *IdentityProvider) (*IdentityProvider, error)
 	GetIdentityProvider(ctx context.Context, tenantName, alias string) (*IdentityProvider, error)
 	DeleteIdentityProvider(ctx context.Context, tenantName, alias string) error
 	ListIdentityProviders(ctx context.Context, tenantName string) ([]*IdentityProvider, error)

@@ -9,11 +9,13 @@ RESOLVED_REALM="${REALM_OUTPUT_PATH:-/realm/realm.json}"
 echo "Resolving Keycloak realm secrets..."
 
 if ! oc get secret "${SECRET_NAME}" -n "${NAMESPACE}"; then
-    echo "Generating osac-controller/osac-admin/osac-csi-driver client secrets..."
+    echo "Generating Keycloak client secrets..."
     oc create secret generic "${SECRET_NAME}" -n "${NAMESPACE}" \
         --from-literal=osac-controller="$(openssl rand -base64 18)" \
         --from-literal=osac-admin="$(openssl rand -base64 18)" \
-        --from-literal=osac-csi-driver="$(openssl rand -base64 18)"
+        --from-literal=osac-csi-driver="$(openssl rand -base64 18)" \
+        --from-literal=osac-ui-backend="$(openssl rand -base64 18)" \
+        --from-literal=osac-mcp-exchange="$(openssl rand -base64 18)"
 else
     # Upgrade path: add osac-csi-driver key if the Secret exists but predates
     # this client (i.e. was created before OSAC-4261).
@@ -23,18 +25,64 @@ else
         oc patch secret "${SECRET_NAME}" -n "${NAMESPACE}" \
             -p "{\"data\":{\"osac-csi-driver\":\"$(printf '%s' "${CSI_DRIVER_NEW}" | base64 -w0)\"}}"
     fi
+    # Upgrade path: add osac-ui-backend key if the Secret predates this client.
+    if ! oc get secret "${SECRET_NAME}" -n "${NAMESPACE}" -o jsonpath='{.data.osac-ui-backend}' | grep -q .; then
+        echo "Patching ${SECRET_NAME} to add osac-ui-backend key..."
+        UI_BACKEND_NEW=$(openssl rand -base64 18)
+        oc patch secret "${SECRET_NAME}" -n "${NAMESPACE}" \
+            -p "{\"data\":{\"osac-ui-backend\":\"$(printf '%s' "${UI_BACKEND_NEW}" | base64 -w0)\"}}"
+    fi
+    if ! oc get secret "${SECRET_NAME}" -n "${NAMESPACE}" -o jsonpath='{.data.osac-mcp-exchange}' | grep -q .; then
+        echo "Patching ${SECRET_NAME} to add osac-mcp-exchange key..."
+        MCP_EXCHANGE_NEW=$(openssl rand -base64 18)
+        oc patch secret "${SECRET_NAME}" -n "${NAMESPACE}" \
+            -p "{\"data\":{\"osac-mcp-exchange\":\"$(printf '%s' "${MCP_EXCHANGE_NEW}" | base64 -w0)\"}}"
+    fi
 fi
 
 CONTROLLER_SECRET=$(oc get secret "${SECRET_NAME}" -n "${NAMESPACE}" -o jsonpath='{.data.osac-controller}' | base64 -d)
 ADMIN_SECRET=$(oc get secret "${SECRET_NAME}" -n "${NAMESPACE}" -o jsonpath='{.data.osac-admin}' | base64 -d)
 CSI_DRIVER_SECRET=$(oc get secret "${SECRET_NAME}" -n "${NAMESPACE}" -o jsonpath='{.data.osac-csi-driver}' | base64 -d)
+UI_BACKEND_SECRET=$(oc get secret "${SECRET_NAME}" -n "${NAMESPACE}" -o jsonpath='{.data.osac-ui-backend}' | base64 -d)
 
 [[ -n "${CONTROLLER_SECRET}" ]] || { echo "ERROR: ${SECRET_NAME} missing osac-controller key" >&2; exit 1; }
 [[ -n "${ADMIN_SECRET}" ]] || { echo "ERROR: ${SECRET_NAME} missing osac-admin key" >&2; exit 1; }
 [[ -n "${CSI_DRIVER_SECRET}" ]] || { echo "ERROR: ${SECRET_NAME} missing osac-csi-driver key" >&2; exit 1; }
+[[ -n "${UI_BACKEND_SECRET}" ]] || { echo "ERROR: ${SECRET_NAME} missing osac-ui-backend key" >&2; exit 1; }
 
 REALM_ADMIN_USERNAME="${REALM_ADMIN_USERNAME:-admin}"
 REALM_ADMIN_PASSWORD="${REALM_ADMIN_PASSWORD:?REALM_ADMIN_PASSWORD must be set}"
+
+# OSAC-3884: the osac-ui client's rootUrl/redirectUris/webOrigins must be
+# absolute and match the browser-facing UI URL. Keycloak does not resolve a
+# relative redirectUri (e.g. "/*") against the Route hostname, so an absolute
+# callback from the UI is rejected with "Invalid parameter: redirect_uri".
+# The value comes from .Values.keycloak.uiUrl via the initContainer's env.
+OSAC_UI_URL="${OSAC_UI_URL:?OSAC_UI_URL must be set (Helm value keycloak.uiUrl)}"
+OSAC_UI_URL="${OSAC_UI_URL%/}"
+# Restricted to scheme://host[:port]: anything outside this charset would
+# either need JSON escaping before landing in realm.json, or silently produce
+# a redirectUri Keycloak will not match.
+# The rejected value is deliberately not echoed: it is unvalidated at this
+# point, so a path or query string on it could carry a token into the pod log.
+[[ "${OSAC_UI_URL}" =~ ^https?://[A-Za-z0-9._-]+(:[0-9]+)?$ ]] || {
+    echo "ERROR: OSAC_UI_URL must be an absolute scheme://host[:port] URL with no path; check the keycloak.uiUrl Helm value" >&2
+    exit 1
+}
+# Over plain HTTP the authorization code travels back to the UI unencrypted, so
+# http:// is accepted only for the local-development hosts documented on
+# .Values.keycloak.uiUrl (the kind dev-full UI is http://ui.osac.localhost:8080).
+if [[ "${OSAC_UI_URL}" == http://* ]]; then
+    OSAC_UI_HOST="${OSAC_UI_URL#http://}"
+    OSAC_UI_HOST="${OSAC_UI_HOST%%:*}"
+    case "${OSAC_UI_HOST}" in
+        localhost | *.localhost | 127.0.0.1) ;;
+        *)
+            echo "ERROR: OSAC_UI_URL must use https:// for '${OSAC_UI_HOST}'; http:// is allowed only for local development (localhost, *.localhost, 127.0.0.1)" >&2
+            exit 1
+            ;;
+    esac
+fi
 
 # REALM_ADMIN_USERNAME/PASSWORD are user-supplied Helm values (unlike the
 # auto-generated base64 client secrets above) substituted into JSON string
@@ -56,8 +104,10 @@ sed \
     -e "s#__OSAC_CONTROLLER_CLIENT_SECRET__#${CONTROLLER_SECRET}#" \
     -e "s#__OSAC_ADMIN_CLIENT_SECRET__#${ADMIN_SECRET}#" \
     -e "s#__OSAC_CSI_DRIVER_CLIENT_SECRET__#${CSI_DRIVER_SECRET}#" \
+    -e "s#__OSAC_UI_BACKEND_CLIENT_SECRET__#${UI_BACKEND_SECRET}#" \
     -e "s#__OSAC_REALM_ADMIN_USERNAME__#$(escape_sed_replacement "$(json_escape_string "${REALM_ADMIN_USERNAME}")")#" \
     -e "s#__OSAC_REALM_ADMIN_PASSWORD__#$(escape_sed_replacement "$(json_escape_string "${REALM_ADMIN_PASSWORD}")")#" \
+    -e "s#__OSAC_UI_URL__#$(escape_sed_replacement "${OSAC_UI_URL}")#g" \
     "${RAW_REALM}" > "${RESOLVED_REALM}"
 
 echo "Realm secrets resolved -> ${RESOLVED_REALM}"

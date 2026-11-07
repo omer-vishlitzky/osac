@@ -16,27 +16,27 @@ package servers
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log/slog"
+	"slices"
 
 	"github.com/prometheus/client_golang/prometheus"
 	grpccodes "google.golang.org/grpc/codes"
 	grpcstatus "google.golang.org/grpc/status"
 	"google.golang.org/protobuf/reflect/protoreflect"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
+	"github.com/osac-project/osac/fulfillment-service/internal/database"
 	"github.com/osac-project/osac/fulfillment-service/internal/database/dao"
-	"github.com/osac-project/osac/fulfillment-service/internal/events"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
 type PrivateExternalIPAttachmentsServerBuilder struct {
-	logger            *slog.Logger
-	notifier          events.Notifier
-	attributionLogic  auth.AttributionLogic
-	tenancyLogic      auth.TenancyLogic
-	metricsRegisterer prometheus.Registerer
-	filterDesc        protoreflect.MessageDescriptor
+	logger             *slog.Logger
+	attributionLogic   auth.AttributionLogic
+	tenancyLogic       auth.TenancyLogic
+	metricsRegisterer  prometheus.Registerer
+	filterDesc         protoreflect.MessageDescriptor
+	networkingSettings *NetworkingSettings
 }
 
 var _ privatev1.ExternalIPAttachmentsServer = (*PrivateExternalIPAttachmentsServer)(nil)
@@ -45,12 +45,16 @@ type PrivateExternalIPAttachmentsServer struct {
 	privatev1.UnimplementedExternalIPAttachmentsServer
 
 	logger                  *slog.Logger
+	tenancyLogic            auth.TenancyLogic
 	generic                 *GenericServer[*privatev1.ExternalIPAttachment]
+	networkClassesDao       *dao.GenericDAO[*privatev1.NetworkClass]
 	externalIPDao           *dao.GenericDAO[*privatev1.ExternalIP]
 	computeInstanceDao      *dao.GenericDAO[*privatev1.ComputeInstance]
 	clusterDao              *dao.GenericDAO[*privatev1.Cluster]
 	bareMetalInstanceDao    *dao.GenericDAO[*privatev1.BareMetalInstance]
 	externalIPAttachmentDao *dao.GenericDAO[*privatev1.ExternalIPAttachment]
+	lifecycle               *externalIPLifecycle
+	settings                NetworkingSettings
 }
 
 func NewPrivateExternalIPAttachmentsServer() *PrivateExternalIPAttachmentsServerBuilder {
@@ -59,11 +63,6 @@ func NewPrivateExternalIPAttachmentsServer() *PrivateExternalIPAttachmentsServer
 
 func (b *PrivateExternalIPAttachmentsServerBuilder) SetLogger(value *slog.Logger) *PrivateExternalIPAttachmentsServerBuilder {
 	b.logger = value
-	return b
-}
-
-func (b *PrivateExternalIPAttachmentsServerBuilder) SetNotifier(value events.Notifier) *PrivateExternalIPAttachmentsServerBuilder {
-	b.notifier = value
 	return b
 }
 
@@ -89,6 +88,13 @@ func (b *PrivateExternalIPAttachmentsServerBuilder) SetFilterDesc(value protoref
 	return b
 }
 
+// SetNetworkingSettings sets the networking installation settings. This is optional; the default is
+// DefaultNetworkingSettings.
+func (b *PrivateExternalIPAttachmentsServerBuilder) SetNetworkingSettings(value NetworkingSettings) *PrivateExternalIPAttachmentsServerBuilder {
+	b.networkingSettings = &value
+	return b
+}
+
 func (b *PrivateExternalIPAttachmentsServerBuilder) Build() (*PrivateExternalIPAttachmentsServer, error) {
 	if b.logger == nil {
 		return nil, errors.New("logger is mandatory")
@@ -97,11 +103,11 @@ func (b *PrivateExternalIPAttachmentsServerBuilder) Build() (*PrivateExternalIPA
 		return nil, errors.New("tenancy logic is mandatory")
 	}
 
-	externalIPDao, err := dao.NewGenericDAO[*privatev1.ExternalIP]().
+	externalIPDaoBuilder := dao.NewGenericDAO[*privatev1.ExternalIP]().
 		SetLogger(b.logger).
 		SetTenancyLogic(b.tenancyLogic).
-		SetMetricsRegisterer(b.metricsRegisterer).
-		Build()
+		SetMetricsRegisterer(b.metricsRegisterer)
+	externalIPDao, err := externalIPDaoBuilder.Build()
 	if err != nil {
 		return nil, err
 	}
@@ -133,7 +139,20 @@ func (b *PrivateExternalIPAttachmentsServerBuilder) Build() (*PrivateExternalIPA
 		return nil, err
 	}
 
-	externalIPAttachmentDao, err := dao.NewGenericDAO[*privatev1.ExternalIPAttachment]().
+	networkClassesDao, err := newNetworkClassesDAO(b.logger, b.tenancyLogic, b.metricsRegisterer)
+	if err != nil {
+		return nil, err
+	}
+
+	externalIPAttachmentDaoBuilder := dao.NewGenericDAO[*privatev1.ExternalIPAttachment]().
+		SetLogger(b.logger).
+		SetTenancyLogic(b.tenancyLogic).
+		SetMetricsRegisterer(b.metricsRegisterer)
+	externalIPAttachmentDao, err := externalIPAttachmentDaoBuilder.Build()
+	if err != nil {
+		return nil, err
+	}
+	natGatewayDao, err := dao.NewGenericDAO[*privatev1.NATGateway]().
 		SetLogger(b.logger).
 		SetTenancyLogic(b.tenancyLogic).
 		SetMetricsRegisterer(b.metricsRegisterer).
@@ -145,7 +164,6 @@ func (b *PrivateExternalIPAttachmentsServerBuilder) Build() (*PrivateExternalIPA
 	generic, err := NewGenericServer[*privatev1.ExternalIPAttachment]().
 		SetLogger(b.logger).
 		SetService(privatev1.ExternalIPAttachments_ServiceDesc.ServiceName).
-		SetNotifier(b.notifier).
 		SetAttributionLogic(b.attributionLogic).
 		SetTenancyLogic(b.tenancyLogic).
 		SetMetricsRegisterer(b.metricsRegisterer).
@@ -157,13 +175,26 @@ func (b *PrivateExternalIPAttachmentsServerBuilder) Build() (*PrivateExternalIPA
 
 	result := &PrivateExternalIPAttachmentsServer{
 		logger:                  b.logger,
+		tenancyLogic:            b.tenancyLogic,
 		generic:                 generic,
+		networkClassesDao:       networkClassesDao,
 		externalIPDao:           externalIPDao,
 		computeInstanceDao:      computeInstanceDao,
 		clusterDao:              clusterDao,
 		bareMetalInstanceDao:    bareMetalInstanceDao,
 		externalIPAttachmentDao: externalIPAttachmentDao,
+		settings:                resolveNetworkingSettings(b.networkingSettings),
 	}
+	result.lifecycle = newExternalIPLifecycle(
+		externalIPDao,
+		externalIPAttachmentDao,
+		natGatewayDao,
+		nil,
+		computeInstanceDao,
+		clusterDao,
+		bareMetalInstanceDao,
+		nil,
+	)
 	return result, nil
 }
 
@@ -179,59 +210,124 @@ func (s *PrivateExternalIPAttachmentsServer) Get(ctx context.Context,
 	return
 }
 
+// automaticExternalIPAttachmentPrefix is the reserved name prefix of automatic ExternalIPAttachments.
+const automaticExternalIPAttachmentPrefix = "auto-eipa-"
+
 func (s *PrivateExternalIPAttachmentsServer) Create(ctx context.Context,
 	request *privatev1.ExternalIPAttachmentsCreateRequest) (response *privatev1.ExternalIPAttachmentsCreateResponse, err error) {
 	attachment := request.GetObject()
-
+	if err = rejectOutputStatusOnCreate(attachment != nil && attachment.HasStatus()); err != nil {
+		return
+	}
 	err = s.validateExternalIPAttachment(attachment)
 	if err != nil {
 		return
 	}
-
-	spec := attachment.GetSpec()
-	externalIPRef := spec.GetExternalIp()
-	externalIPKey := refKey(externalIPRef)
-
-	err = s.validateExternalIPReference(ctx, externalIPKey)
-	if err != nil {
-		return
-	}
-
-	err = s.validateTargetReference(ctx, spec)
-	if err != nil {
-		return
-	}
-
-	targetID := s.getTargetID(spec)
-	err = s.validateUniqueness(ctx, externalIPKey, targetID)
-	if err != nil {
-		return
-	}
-
-	if attachment.GetStatus() == nil {
-		attachment.SetStatus(privatev1.ExternalIPAttachmentStatus_builder{
-			State: privatev1.ExternalIPAttachmentState_EXTERNAL_IP_ATTACHMENT_STATE_PENDING,
-		}.Build())
-	} else {
-		attachment.GetStatus().SetState(
-			privatev1.ExternalIPAttachmentState_EXTERNAL_IP_ATTACHMENT_STATE_PENDING)
-	}
-
-	err = s.generic.Create(ctx, request, &response)
-	if err != nil {
-		return
-	}
-
-	err = s.updateExternalIPAttachedFlag(ctx, externalIPKey, true)
-	if err != nil {
-		return
-	}
-
+	err = s.generic.CreateWithCandidatePreparation(ctx, request, &response,
+		func(ctx context.Context, _, candidate *privatev1.ExternalIPAttachment) error {
+			if err := lockTenantForCreate(ctx, candidate.GetMetadata().GetTenant()); err != nil {
+				return err
+			}
+			return s.prepareCreate(ctx, candidate)
+		})
 	return
+}
+
+// prepareCreate checks the gates of an ExternalIPAttachment create, in the order of the design, and sets the initial
+// status, including the ExternalIP address. The target is locked before the ExternalIP.
+func (s *PrivateExternalIPAttachmentsServer) prepareCreate(ctx context.Context,
+	attachment *privatev1.ExternalIPAttachment) error {
+	if err := validateReservedCreate(ctx, attachment.GetMetadata(), automaticExternalIPAttachmentPrefix); err != nil {
+		return err
+	}
+	spec := attachment.GetSpec()
+	externalIPKey := refKey(spec.GetExternalIp())
+	tenant := attachment.GetMetadata().GetTenant()
+
+	// Reject cross-tenant references before checking target readiness. This read is intentionally unlocked; the
+	// locked check below revalidates the tenant after taking the locks in the target-before-ExternalIP order.
+	if err := s.validateExternalIPTenant(ctx, tenant, externalIPKey); err != nil {
+		return err
+	}
+	if !s.settings.ProvisioningEnabled {
+		return grpcstatus.Error(grpccodes.FailedPrecondition,
+			"provider networking is disabled; workloads are not ready ExternalIPAttachment endpoints")
+	}
+
+	// Lock the target first. Workload deletion follows the same target-before-ExternalIP order.
+	targetHubReference, err := s.validateTargetReference(ctx, spec, attachment.GetMetadata())
+	if err != nil {
+		return err
+	}
+	externalIP, err := s.lockExternalIP(ctx, externalIPKey, tenant)
+	if err != nil {
+		return err
+	}
+	spec.SetExternalIp(privatev1.ExternalIPLocalReference_builder{Id: externalIP.GetId()}.Build())
+
+	// The ExternalIP is not a tenant default, and an automatic one is used only by the system's own create of
+	// auto-eipa-<ExternalIP ID>. This runs before the consumer check.
+	if externalIP.GetMetadata().GetLabels()[defaultLabel] == "true" {
+		return grpcstatus.Errorf(grpccodes.FailedPrecondition,
+			"ExternalIP '%s' is a tenant default and can't be attached", externalIP.GetId())
+	}
+	if isAutomatic(externalIP.GetMetadata()) &&
+		(!isSystemCreate(ctx, attachment.GetMetadata()) ||
+			attachment.GetMetadata().GetName() != automaticExternalIPAttachmentPrefix+externalIP.GetId()) {
+		return grpcstatus.Errorf(grpccodes.FailedPrecondition,
+			"ExternalIP '%s' is automatic; only the system attaches it", externalIP.GetId())
+	}
+	if err := s.lifecycle.ensureExternalIPAvailable(ctx, externalIP.GetId(),
+		externalIP.GetMetadata().GetName()); err != nil {
+		return err
+	}
+	if externalIP.GetStatus().GetState() != privatev1.ExternalIPState_EXTERNAL_IP_STATE_ALLOCATED {
+		return grpcstatus.Errorf(grpccodes.FailedPrecondition,
+			"ExternalIP '%s' is not in ALLOCATED state (current state: %s)",
+			externalIP.GetId(), externalIP.GetStatus().GetState().String())
+	}
+
+	canonicalHubID, err := canonicalNetworkingHubID(ctx, s.logger, s.networkClassesDao)
+	if err != nil {
+		return err
+	}
+	if err = validateNetworkingHubReferences(canonicalHubID, networkingHubReference{
+		resourceType: "ExternalIP",
+		id:           externalIP.GetId(),
+		hubID:        externalIP.GetStatus().GetHub(),
+	}, targetHubReference); err != nil {
+		return err
+	}
+
+	attachment.SetStatus(privatev1.ExternalIPAttachmentStatus_builder{
+		State:             privatev1.ExternalIPAttachmentState_EXTERNAL_IP_ATTACHMENT_STATE_PENDING,
+		ExternalIpAddress: externalIP.GetStatus().GetAddress(),
+	}.Build())
+	return nil
+}
+
+// lockExternalIP locks the ExternalIP of an attachment create and checks it belongs to the tenant and isn't being
+// deleted.
+func (s *PrivateExternalIPAttachmentsServer) lockExternalIP(ctx context.Context, key, tenant string) (
+	*privatev1.ExternalIP, error) {
+	externalIP, err := s.validateExternalIPReference(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	if err = validateTenantMatch(tenant, externalIP, "ExternalIP", key); err != nil {
+		return nil, err
+	}
+	return externalIP, nil
 }
 
 func (s *PrivateExternalIPAttachmentsServer) Update(ctx context.Context,
 	request *privatev1.ExternalIPAttachmentsUpdateRequest) (response *privatev1.ExternalIPAttachmentsUpdateResponse, err error) {
+	tx, txErr := database.TxFromContext(ctx)
+	if txErr != nil {
+		return nil, txErr
+	}
+	defer tx.ReportError(&err)
+
 	id := request.GetObject().GetId()
 	if id == "" {
 		err = grpcstatus.Errorf(grpccodes.InvalidArgument, "object identifier is mandatory")
@@ -239,56 +335,87 @@ func (s *PrivateExternalIPAttachmentsServer) Update(ctx context.Context,
 	}
 
 	mask := request.GetUpdateMask()
-	if updateIncludesField(mask,
-		"spec.external_ip", "spec.compute_instance", "spec.cluster",
-		"spec.baremetal_instance", "spec.target_endpoint") {
-		getRequest := &privatev1.ExternalIPAttachmentsGetRequest{}
-		getRequest.SetId(id)
-		var getResponse *privatev1.ExternalIPAttachmentsGetResponse
-		err = s.generic.Get(ctx, getRequest, &getResponse)
-		if err != nil {
+	if err = validatePrivateLifecycleUpdateMask(mask,
+		[]string{"status.state", "status.message", "status.hub", "status.state_transition_time"},
+		[]string{"status.external_ip_address"}); err != nil {
+		return
+	}
+
+	parent, existingAttachment, targetMetadata, lockErr := s.lifecycle.lockAttachment(ctx, id)
+	if lockErr != nil {
+		err = translateLifecycleError(lockErr)
+		return
+	}
+	if updateIncludesField(mask, "status.state") &&
+		request.GetObject().GetStatus().GetState() == privatev1.ExternalIPAttachmentState_EXTERNAL_IP_ATTACHMENT_STATE_READY {
+		if existingAttachment.GetMetadata().HasDeletionTimestamp() {
+			err = grpcstatus.Errorf(grpccodes.FailedPrecondition,
+				"ExternalIPAttachment '%s' is being deleted; it cannot become READY", id)
 			return
 		}
-		err = validateImmutableFieldsExternalIPAttachment(request.GetObject(), getResponse.GetObject())
-		if err != nil {
+		if targetMetadata != nil && targetMetadata.HasDeletionTimestamp() {
+			targetKind, targetID := externalIPAttachmentTarget(existingAttachment)
+			err = grpcstatus.Errorf(grpccodes.FailedPrecondition,
+				"%s '%s' is being deleted; ExternalIPAttachment cannot become READY", targetKind, targetID)
+			return
+		}
+	}
+	if updateIncludesField(mask, "status.state") {
+		oldState := existingAttachment.GetStatus().GetState()
+		newState := request.GetObject().GetStatus().GetState()
+		if oldState != newState && !slices.Contains(validExternalIPAttachmentTransitions[oldState], newState) {
+			err = grpcstatus.Errorf(grpccodes.FailedPrecondition,
+				"invalid ExternalIPAttachment state transition from %s to %s", oldState, newState)
 			return
 		}
 	}
 
-	err = s.generic.Update(ctx, request, &response)
+	err = s.generic.UpdateWithCandidatePreparation(ctx, request, &response,
+		func(_ context.Context, current, candidate *privatev1.ExternalIPAttachment) error {
+			if err := validateNetworkingStatusOnlyUpdate("ExternalIPAttachment", current, candidate); err != nil {
+				return err
+			}
+			return rejectStateChangeWhileDeleting(current, candidate, current.GetMetadata())
+		})
+	if err != nil {
+		return
+	}
+	err = translateLifecycleError(s.lifecycle.settleAttachmentParent(ctx, parent, existingAttachment, response.GetObject()))
 	return
 }
 
 func (s *PrivateExternalIPAttachmentsServer) Delete(ctx context.Context,
 	request *privatev1.ExternalIPAttachmentsDeleteRequest) (response *privatev1.ExternalIPAttachmentsDeleteResponse, err error) {
+	tx, txErr := database.TxFromContext(ctx)
+	if txErr != nil {
+		return nil, txErr
+	}
+	defer tx.ReportError(&err)
+
 	id := request.GetId()
 	if id == "" {
 		err = grpcstatus.Errorf(grpccodes.InvalidArgument, "object identifier is mandatory")
 		return
 	}
-
-	getRequest := &privatev1.ExternalIPAttachmentsGetRequest{}
-	getRequest.SetId(id)
-	var getResponse *privatev1.ExternalIPAttachmentsGetResponse
-	err = s.generic.Get(ctx, getRequest, &getResponse)
-	if err != nil {
+	_, attachment, _, lockErr := s.lifecycle.lockAttachment(ctx, id)
+	if lockErr != nil {
+		err = translateLifecycleError(lockErr)
+		return
+	}
+	if deleteAlreadyAccepted(attachment.GetMetadata()) {
+		response = &privatev1.ExternalIPAttachmentsDeleteResponse{}
+		return
+	}
+	if isAutomatic(attachment.GetMetadata()) && !auth.IsControllerServiceAccount(ctx) {
+		err = grpcstatus.Errorf(grpccodes.FailedPrecondition,
+			"cannot delete automatic ExternalIPAttachment '%s': it is deleted with its workload", id)
 		return
 	}
 
-	externalIPRef := getResponse.GetObject().GetSpec().GetExternalIp()
-
-	err = s.generic.Delete(ctx, request, &response)
-	if err != nil {
-		return
+	err = translateLifecycleError(s.lifecycle.deleteAttachment(ctx, id))
+	if err == nil {
+		response = &privatev1.ExternalIPAttachmentsDeleteResponse{}
 	}
-
-	if externalIPRef != nil {
-		err = s.updateExternalIPAttachedFlag(ctx, refKey(externalIPRef), false)
-		if err != nil {
-			return
-		}
-	}
-
 	return
 }
 
@@ -346,46 +473,8 @@ func (s *PrivateExternalIPAttachmentsServer) validateExternalIPAttachment(
 	return nil
 }
 
-func validateImmutableFieldsExternalIPAttachment(
-	newAttachment, existingAttachment *privatev1.ExternalIPAttachment) error {
-	newSpec := newAttachment.GetSpec()
-	existingSpec := existingAttachment.GetSpec()
-
-	if refKey(newSpec.GetExternalIp()) != refKey(existingSpec.GetExternalIp()) {
-		return grpcstatus.Errorf(grpccodes.InvalidArgument,
-			"field 'spec.external_ip' is immutable and cannot be changed from '%s' to '%s'",
-			refKey(existingSpec.GetExternalIp()), refKey(newSpec.GetExternalIp()))
-	}
-
-	if refKey(newSpec.GetComputeInstance()) != refKey(existingSpec.GetComputeInstance()) {
-		return grpcstatus.Errorf(grpccodes.InvalidArgument,
-			"field 'spec.compute_instance' is immutable and cannot be changed from '%s' to '%s'",
-			refKey(existingSpec.GetComputeInstance()), refKey(newSpec.GetComputeInstance()))
-	}
-
-	if refKey(newSpec.GetCluster()) != refKey(existingSpec.GetCluster()) {
-		return grpcstatus.Errorf(grpccodes.InvalidArgument,
-			"field 'spec.cluster' is immutable and cannot be changed from '%s' to '%s'",
-			refKey(existingSpec.GetCluster()), refKey(newSpec.GetCluster()))
-	}
-
-	if refKey(newSpec.GetBaremetalInstance()) != refKey(existingSpec.GetBaremetalInstance()) {
-		return grpcstatus.Errorf(grpccodes.InvalidArgument,
-			"field 'spec.baremetal_instance' is immutable and cannot be changed from '%s' to '%s'",
-			refKey(existingSpec.GetBaremetalInstance()), refKey(newSpec.GetBaremetalInstance()))
-	}
-
-	if newSpec.GetTargetEndpoint() != existingSpec.GetTargetEndpoint() {
-		return grpcstatus.Errorf(grpccodes.InvalidArgument,
-			"field 'spec.target_endpoint' is immutable and cannot be changed from '%s' to '%s'",
-			existingSpec.GetTargetEndpoint().String(), newSpec.GetTargetEndpoint().String())
-	}
-
-	return nil
-}
-
 func (s *PrivateExternalIPAttachmentsServer) validateExternalIPReference(
-	ctx context.Context, externalIPID string) error {
+	ctx context.Context, externalIPID string) (*privatev1.ExternalIP, error) {
 	getResponse, err := s.externalIPDao.Get().
 		SetId(externalIPID).
 		SetLock(true).
@@ -393,170 +482,184 @@ func (s *PrivateExternalIPAttachmentsServer) validateExternalIPReference(
 	if err != nil {
 		var notFoundErr *dao.ErrNotFound
 		if errors.As(err, &notFoundErr) {
-			return grpcstatus.Errorf(grpccodes.InvalidArgument,
+			return nil, grpcstatus.Errorf(grpccodes.InvalidArgument,
 				"ExternalIP '%s' does not exist", externalIPID)
 		}
-		s.logger.ErrorContext(ctx, "Failed to query ExternalIP",
-			slog.String("external_ip_id", externalIPID),
-			slog.Any("error", err))
-		return grpcstatus.Errorf(grpccodes.Internal, "failed to validate external_ip")
+		return nil, ConvertDAOErrorToGRPC(err, "get", externalIPID)
 	}
 
 	externalIP := getResponse.GetObject()
+	if externalIP.HasMetadata() && externalIP.GetMetadata().HasDeletionTimestamp() {
+		return nil, grpcstatus.Errorf(grpccodes.FailedPrecondition,
+			"ExternalIP '%s' is being deleted", externalIPID)
+	}
 
 	if externalIP.GetStatus().GetState() != privatev1.ExternalIPState_EXTERNAL_IP_STATE_ALLOCATED {
-		return grpcstatus.Errorf(grpccodes.FailedPrecondition,
+		return nil, grpcstatus.Errorf(grpccodes.FailedPrecondition,
 			"ExternalIP '%s' is not in ALLOCATED state (current state: %s)",
 			externalIPID, externalIP.GetStatus().GetState().String())
 	}
 
-	if externalIP.GetStatus().GetAttached() {
-		return grpcstatus.Errorf(grpccodes.FailedPrecondition,
-			"ExternalIP '%s' is already attached", externalIPID)
-	}
-
-	return nil
+	return externalIP, nil
 }
 
-func (s *PrivateExternalIPAttachmentsServer) validateTargetReference(
-	ctx context.Context, spec *privatev1.ExternalIPAttachmentSpec) error {
+func (s *PrivateExternalIPAttachmentsServer) validateExternalIPTenant(
+	ctx context.Context, tenant, externalIPID string) error {
+	getResponse, err := s.externalIPDao.Get().
+		SetId(externalIPID).
+		Do(ctx)
+	if err != nil {
+		var notFoundErr *dao.ErrNotFound
+		if errors.As(err, &notFoundErr) {
+			// Preserve the existing target-before-reference error order when the
+			// ExternalIP does not exist. The locked validation below reports it.
+			return nil
+		}
+		return ConvertDAOErrorToGRPC(err, "get", externalIPID)
+	}
+
+	return validateTenantMatch(tenant, getResponse.GetObject(), "ExternalIP", externalIPID)
+}
+
+func (s *PrivateExternalIPAttachmentsServer) validateTargetReference(ctx context.Context,
+	spec *privatev1.ExternalIPAttachmentSpec, metadata *privatev1.Metadata) (networkingHubReference, error) {
 	switch {
 	case spec.HasComputeInstance():
-		return s.validateComputeInstanceReference(ctx, spec.GetComputeInstance())
+		return s.validateComputeInstanceReference(ctx, spec)
 	case spec.HasCluster():
-		return s.validateClusterReference(ctx, spec.GetCluster())
+		return s.validateClusterReference(ctx, spec, isAutomatic(metadata))
 	case spec.HasBaremetalInstance():
-		return s.validateBareMetalInstanceReference(ctx, spec.GetBaremetalInstance())
+		return s.validateBareMetalInstanceReference(ctx, spec)
 	default:
-		return grpcstatus.Errorf(grpccodes.InvalidArgument,
+		return networkingHubReference{}, grpcstatus.Errorf(grpccodes.InvalidArgument,
 			"exactly one target must be set (compute_instance, cluster, or baremetal_instance)")
 	}
 }
 
+// validateComputeInstanceReference locks the target VM and checks its endpoint readiness: RUNNING, condition READY
+// true, and the address of its network attachment reported.
 func (s *PrivateExternalIPAttachmentsServer) validateComputeInstanceReference(
-	ctx context.Context, ref *privatev1.ComputeInstanceLocalReference) error {
-	key := refKey(ref)
-	_, err := s.computeInstanceDao.Get().
+	ctx context.Context, spec *privatev1.ExternalIPAttachmentSpec) (networkingHubReference, error) {
+	key := refKey(spec.GetComputeInstance())
+	response, err := s.computeInstanceDao.Get().
 		SetId(key).
 		SetLock(true).
 		Do(ctx)
 	if err != nil {
 		var notFoundErr *dao.ErrNotFound
 		if errors.As(err, &notFoundErr) {
-			return grpcstatus.Errorf(grpccodes.InvalidArgument,
+			return networkingHubReference{}, grpcstatus.Errorf(grpccodes.InvalidArgument,
 				"ComputeInstance '%s' does not exist", key)
 		}
-		s.logger.ErrorContext(ctx, "Failed to query ComputeInstance",
-			slog.String("compute_instance_id", key),
-			slog.Any("error", err))
-		return grpcstatus.Errorf(grpccodes.Internal, "failed to validate compute_instance")
+		return networkingHubReference{}, ConvertDAOErrorToGRPC(err, "get", key)
 	}
-	return nil
+	computeInstance := response.GetObject()
+	spec.SetComputeInstance(privatev1.ComputeInstanceLocalReference_builder{Id: computeInstance.GetId()}.Build())
+	if computeInstance.GetMetadata().HasDeletionTimestamp() {
+		return networkingHubReference{}, grpcstatus.Errorf(grpccodes.FailedPrecondition,
+			"ComputeInstance '%s' is being deleted", key)
+	}
+	statuses := computeInstance.GetStatus().GetComputeNetworkAttachmentStatuses()
+	if computeInstance.GetStatus().GetState() != privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_RUNNING ||
+		!hasReadyComputeInstanceCondition(computeInstance) || len(statuses) == 0 || statuses[0].GetIpAddress() == "" {
+		return networkingHubReference{}, grpcstatus.Errorf(grpccodes.FailedPrecondition,
+			"ComputeInstance '%s' must be RUNNING and READY with its network attachment address before "+
+				"creating an ExternalIPAttachment", key)
+	}
+	return networkingHubReference{resourceType: "ComputeInstance", id: computeInstance.GetId(),
+		hubID: computeInstance.GetStatus().GetHub()}, nil
 }
 
-func (s *PrivateExternalIPAttachmentsServer) validateClusterReference(
-	ctx context.Context, ref *privatev1.ClusterLocalReference) error {
-	key := refKey(ref)
-	_, err := s.clusterDao.Get().
+// validateClusterReference locks the target Cluster and checks its endpoint readiness. The API endpoint needs the
+// API address, the ingress endpoint needs the ingress address; a manual attachment also needs the Cluster READY.
+func (s *PrivateExternalIPAttachmentsServer) validateClusterReference(ctx context.Context,
+	spec *privatev1.ExternalIPAttachmentSpec, automatic bool) (networkingHubReference, error) {
+	key := refKey(spec.GetCluster())
+	response, err := s.clusterDao.Get().
 		SetId(key).
 		SetLock(true).
 		Do(ctx)
 	if err != nil {
 		var notFoundErr *dao.ErrNotFound
 		if errors.As(err, &notFoundErr) {
-			return grpcstatus.Errorf(grpccodes.InvalidArgument,
+			return networkingHubReference{}, grpcstatus.Errorf(grpccodes.InvalidArgument,
 				"Cluster '%s' does not exist", key)
 		}
-		s.logger.ErrorContext(ctx, "Failed to query Cluster",
-			slog.String("cluster_id", key),
-			slog.Any("error", err))
-		return grpcstatus.Errorf(grpccodes.Internal, "failed to validate cluster")
+		return networkingHubReference{}, ConvertDAOErrorToGRPC(err, "get", key)
 	}
-	return nil
+	cluster := response.GetObject()
+	spec.SetCluster(privatev1.ClusterLocalReference_builder{Id: cluster.GetId()}.Build())
+	if cluster.GetMetadata().HasDeletionTimestamp() {
+		return networkingHubReference{}, grpcstatus.Errorf(grpccodes.FailedPrecondition,
+			"Cluster '%s' is being deleted", key)
+	}
+	if !automatic && cluster.GetStatus().GetState() != privatev1.ClusterState_CLUSTER_STATE_READY {
+		return networkingHubReference{}, grpcstatus.Errorf(grpccodes.FailedPrecondition,
+			"Cluster '%s' must be READY before creating an ExternalIPAttachment", key)
+	}
+	switch spec.GetTargetEndpoint() {
+	case privatev1.ExternalIPAttachmentEndpoint_EXTERNAL_IP_ATTACHMENT_ENDPOINT_API:
+		if cluster.GetStatus().GetApiEndpoint() == "" {
+			return networkingHubReference{}, grpcstatus.Errorf(grpccodes.FailedPrecondition,
+				"Cluster '%s' API endpoint is not ready for an ExternalIPAttachment", key)
+		}
+	case privatev1.ExternalIPAttachmentEndpoint_EXTERNAL_IP_ATTACHMENT_ENDPOINT_INGRESS:
+		if cluster.GetStatus().GetIngressEndpoint() == "" {
+			return networkingHubReference{}, grpcstatus.Errorf(grpccodes.FailedPrecondition,
+				"Cluster '%s' ingress endpoint is not ready for an ExternalIPAttachment", key)
+		}
+	default:
+		return networkingHubReference{}, grpcstatus.Errorf(grpccodes.InvalidArgument,
+			"Cluster ExternalIPAttachment requires an API or ingress endpoint")
+	}
+	return networkingHubReference{resourceType: "Cluster", id: cluster.GetId(), hubID: cluster.GetStatus().GetHub()}, nil
 }
 
+// validateBareMetalInstanceReference locks the target server and checks its endpoint readiness: RUNNING and the
+// address of its network attachment reported.
 func (s *PrivateExternalIPAttachmentsServer) validateBareMetalInstanceReference(
-	ctx context.Context, ref *privatev1.BareMetalInstanceLocalReference) error {
-	key := refKey(ref)
-	_, err := s.bareMetalInstanceDao.Get().
+	ctx context.Context, spec *privatev1.ExternalIPAttachmentSpec) (networkingHubReference, error) {
+	key := refKey(spec.GetBaremetalInstance())
+	response, err := s.bareMetalInstanceDao.Get().
 		SetId(key).
 		SetLock(true).
 		Do(ctx)
 	if err != nil {
 		var notFoundErr *dao.ErrNotFound
 		if errors.As(err, &notFoundErr) {
-			return grpcstatus.Errorf(grpccodes.InvalidArgument,
+			return networkingHubReference{}, grpcstatus.Errorf(grpccodes.InvalidArgument,
 				"BareMetalInstance '%s' does not exist", key)
 		}
-		s.logger.ErrorContext(ctx, "Failed to query BareMetalInstance",
-			slog.String("baremetal_instance_id", key),
-			slog.Any("error", err))
-		return grpcstatus.Errorf(grpccodes.Internal, "failed to validate baremetal_instance")
+		return networkingHubReference{}, ConvertDAOErrorToGRPC(err, "get", key)
 	}
-	return nil
+	instance := response.GetObject()
+	spec.SetBaremetalInstance(privatev1.BareMetalInstanceLocalReference_builder{Id: instance.GetId()}.Build())
+	if instance.GetMetadata().HasDeletionTimestamp() ||
+		instance.GetStatus().GetState() != privatev1.BareMetalInstanceState_BARE_METAL_INSTANCE_STATE_RUNNING ||
+		!hasBareMetalInstanceIP(instance) {
+		return networkingHubReference{}, grpcstatus.Errorf(grpccodes.FailedPrecondition,
+			"BareMetalInstance '%s' must be RUNNING with its network attachment address before creating an "+
+				"ExternalIPAttachment", key)
+	}
+	return networkingHubReference{resourceType: "BareMetalInstance", id: instance.GetId(),
+		hubID: instance.GetStatus().GetHub()}, nil
 }
 
-func (s *PrivateExternalIPAttachmentsServer) getTargetID(
-	spec *privatev1.ExternalIPAttachmentSpec) string {
-	switch {
-	case spec.HasComputeInstance():
-		return refKey(spec.GetComputeInstance())
-	case spec.HasCluster():
-		return refKey(spec.GetCluster())
-	case spec.HasBaremetalInstance():
-		return refKey(spec.GetBaremetalInstance())
-	default:
-		return ""
+func hasReadyComputeInstanceCondition(instance *privatev1.ComputeInstance) bool {
+	for _, condition := range instance.GetStatus().GetConditions() {
+		if condition.GetType() == privatev1.ComputeInstanceConditionType_COMPUTE_INSTANCE_CONDITION_TYPE_READY &&
+			condition.GetStatus() == privatev1.ConditionStatus_CONDITION_STATUS_TRUE {
+			return true
+		}
 	}
+	return false
 }
 
-func (s *PrivateExternalIPAttachmentsServer) validateUniqueness(
-	ctx context.Context, externalIPID string, targetID string) error {
-	eipFilter := fmt.Sprintf("this.spec.external_ip.id == %[1]q || this.spec.external_ip.name == %[1]q", externalIPID)
-	eipResp, err := s.externalIPAttachmentDao.List().
-		SetFilter(eipFilter).
-		SetLimit(1).
-		Do(ctx)
-	if err != nil {
-		s.logger.ErrorContext(ctx, "Failed to list attachments for uniqueness check",
-			slog.String("external_ip_id", externalIPID),
-			slog.Any("error", err))
-		return grpcstatus.Errorf(grpccodes.Internal, "failed to validate uniqueness")
+func hasBareMetalInstanceIP(instance *privatev1.BareMetalInstance) bool {
+	for _, attachment := range instance.GetStatus().GetNetworkAttachmentStatuses() {
+		if attachment.GetIpAddress() != "" {
+			return true
+		}
 	}
-	if eipResp.GetTotal() > 0 {
-		return grpcstatus.Errorf(grpccodes.AlreadyExists,
-			"an ExternalIPAttachment already exists for ExternalIP '%s'", externalIPID)
-	}
-
-	return nil
-}
-
-func (s *PrivateExternalIPAttachmentsServer) updateExternalIPAttachedFlag(
-	ctx context.Context, externalIPID string, attached bool) error {
-	getResponse, err := s.externalIPDao.Get().
-		SetId(externalIPID).
-		SetLock(true).
-		Do(ctx)
-	if err != nil {
-		s.logger.ErrorContext(ctx, "Failed to get ExternalIP for attached flag update",
-			slog.String("external_ip_id", externalIPID),
-			slog.Any("error", err))
-		return grpcstatus.Errorf(grpccodes.Internal, "failed to update ExternalIP attached status")
-	}
-
-	externalIP := getResponse.GetObject()
-	externalIP.GetStatus().SetAttached(attached)
-
-	_, err = s.externalIPDao.Update().
-		SetObject(externalIP).
-		Do(ctx)
-	if err != nil {
-		s.logger.ErrorContext(ctx, "Failed to update ExternalIP attached flag",
-			slog.String("external_ip_id", externalIPID),
-			slog.Bool("attached", attached),
-			slog.Any("error", err))
-		return grpcstatus.Errorf(grpccodes.Internal, "failed to update ExternalIP attached status")
-	}
-
-	return nil
+	return false
 }

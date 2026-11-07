@@ -17,23 +17,22 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"net/url"
+	"strings"
 
 	"github.com/prometheus/client_golang/prometheus"
 	grpccodes "google.golang.org/grpc/codes"
 	grpcstatus "google.golang.org/grpc/status"
 	"google.golang.org/protobuf/reflect/protoreflect"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
 	"github.com/osac-project/osac/fulfillment-service/internal/database/dao"
-	"github.com/osac-project/osac/fulfillment-service/internal/events"
-	"github.com/osac-project/osac/fulfillment-service/internal/references"
 	"github.com/osac-project/osac/fulfillment-service/internal/vault"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
 type PrivateIdentityProvidersServerBuilder struct {
 	logger            *slog.Logger
-	notifier          events.Notifier
 	attributionLogic  auth.AttributionLogic
 	tenancyLogic      auth.TenancyLogic
 	metricsRegisterer prometheus.Registerer
@@ -58,11 +57,6 @@ func NewPrivateIdentityProvidersServer() *PrivateIdentityProvidersServerBuilder 
 
 func (b *PrivateIdentityProvidersServerBuilder) SetLogger(value *slog.Logger) *PrivateIdentityProvidersServerBuilder {
 	b.logger = value
-	return b
-}
-
-func (b *PrivateIdentityProvidersServerBuilder) SetNotifier(value events.Notifier) *PrivateIdentityProvidersServerBuilder {
-	b.notifier = value
 	return b
 }
 
@@ -117,7 +111,6 @@ func (b *PrivateIdentityProvidersServerBuilder) Build() (result *PrivateIdentity
 	s.generic, err = NewGenericServer[*privatev1.IdentityProvider]().
 		SetLogger(b.logger).
 		SetService(privatev1.IdentityProviders_ServiceDesc.ServiceName).
-		SetNotifier(b.notifier).
 		SetAttributionLogic(b.attributionLogic).
 		SetTenancyLogic(b.tenancyLogic).
 		SetMetricsRegisterer(b.metricsRegisterer).
@@ -153,7 +146,13 @@ func (b *PrivateIdentityProvidersServerBuilder) Build() (result *PrivateIdentity
 
 func (s *PrivateIdentityProvidersServer) Create(ctx context.Context,
 	request *privatev1.IdentityProvidersCreateRequest) (response *privatev1.IdentityProvidersCreateResponse, err error) {
+	if err = validateOidcUrls(oidcFrom(request.GetObject())); err != nil {
+		return
+	}
 	if err = s.validateClientSecretSecret(ctx, request.GetObject()); err != nil {
+		return
+	}
+	if err = validateDefaultProjectForCreate(request.GetObject().GetMetadata()); err != nil {
 		return
 	}
 	err = s.generic.Create(ctx, request, &response)
@@ -174,8 +173,87 @@ func (s *PrivateIdentityProvidersServer) Get(ctx context.Context,
 
 func (s *PrivateIdentityProvidersServer) Update(ctx context.Context,
 	request *privatev1.IdentityProvidersUpdateRequest) (response *privatev1.IdentityProvidersUpdateResponse, err error) {
-	if err = s.validateClientSecretSecret(ctx, request.GetObject()); err != nil {
-		return
+	// Single pass through update mask to determine what to validate
+	mask := request.GetUpdateMask()
+	hasClientSecretUpdate := false
+	hasSpecUpdate := false
+	urlFieldsToValidate := []string{} // Start empty
+	validateAllUrls := false
+
+	oidcUrlFields := map[string]bool{
+		"spec.oidc.authorization_url": true,
+		"spec.oidc.token_url":         true,
+		"spec.oidc.issuer":            true,
+		"spec.oidc.user_info_url":     true,
+		"spec.oidc.jwks_url":          true,
+		"spec.oidc.logout_url":        true,
+	}
+
+	for _, path := range mask.GetPaths() {
+		// Check for full spec/oidc replacement
+		if path == "spec" || path == "spec.oidc" {
+			hasClientSecretUpdate = true
+			hasSpecUpdate = true
+			validateAllUrls = true
+			break // No need to continue
+		}
+
+		// Check for client secret update
+		if !hasClientSecretUpdate && strings.HasPrefix(path, "spec.oidc.client_secret_secret") {
+			hasClientSecretUpdate = true
+		}
+
+		// Collect URL fields being updated
+		if oidcUrlFields[path] {
+			urlFieldsToValidate = append(urlFieldsToValidate, path)
+		} else {
+			// Check for sub-paths (e.g., "spec.oidc.token_url.something")
+			for field := range oidcUrlFields {
+				if strings.HasPrefix(path, field+".") || strings.HasPrefix(field, path+".") {
+					urlFieldsToValidate = append(urlFieldsToValidate, field)
+					break
+				}
+			}
+		}
+
+		// Check for any spec update
+		if !hasSpecUpdate && (strings.HasPrefix(path, "spec.") || path == "spec") {
+			hasSpecUpdate = true
+		}
+	}
+
+	// Validate OIDC URLs if any URL fields are being updated
+	if validateAllUrls || len(urlFieldsToValidate) > 0 {
+		var fieldsToValidate []string
+		if validateAllUrls {
+			fieldsToValidate = nil // nil = validate all
+		} else {
+			fieldsToValidate = urlFieldsToValidate
+		}
+		if err = validateOidcUrlsPartial(oidcFrom(request.GetObject()), fieldsToValidate); err != nil {
+			return
+		}
+	}
+
+	// Validate client secret if needed
+	if hasClientSecretUpdate {
+		if err = s.validateClientSecretSecret(ctx, request.GetObject()); err != nil {
+			return
+		}
+	}
+	// Only reset phase when the client is changing spec fields (user-initiated intent change).
+	// Do NOT reset when the reconciler is writing status back (would cause infinite reconcile loop).
+	if hasSpecUpdate {
+		obj := request.GetObject()
+		if !obj.HasStatus() {
+			obj.SetStatus(&privatev1.IdentityProviderStatus{})
+		}
+		obj.GetStatus().SetPhase(privatev1.IdentityProviderPhase_IDENTITY_PROVIDER_PHASE_UNKNOWN)
+		// generic.Update strictly honours the update mask: only masked paths are
+		// copied from the request object to the stored clone. Without this, the
+		// phase reset above would be silently dropped.
+		mask := request.GetUpdateMask()
+		mask.Paths = append(mask.GetPaths(), "status.phase")
 	}
 	err = s.generic.Update(ctx, request, &response)
 	return
@@ -193,16 +271,112 @@ func (s *PrivateIdentityProvidersServer) Signal(ctx context.Context,
 	return
 }
 
-const (
-	// secretValueKey is the key in a Secret's data map that holds the client secret value.
-	secretValueKey = "value"
-)
-
 func oidcFrom(idp *privatev1.IdentityProvider) *privatev1.OidcConfig {
 	if idp == nil {
 		return nil
 	}
 	return idp.GetSpec().GetOidc()
+}
+
+// validateOidcUrls validates all URL fields in an OIDC configuration.
+// Returns an error if any URL is invalid or does not meet security requirements.
+func validateOidcUrls(oidc *privatev1.OidcConfig) error {
+	return validateOidcUrlsPartial(oidc, nil)
+}
+
+// validateOidcUrlsPartial validates OIDC URL fields, optionally limiting validation
+// to specific fields. If fieldsToValidate is nil, all fields are validated (full
+// validation for create or full replacement). If fieldsToValidate is non-nil, only
+// the listed fields are validated (partial update validation).
+func validateOidcUrlsPartial(oidc *privatev1.OidcConfig, fieldsToValidate []string) error {
+	if oidc == nil {
+		return nil
+	}
+
+	// Helper to check if a field should be validated
+	shouldValidate := func(fieldName string) bool {
+		if fieldsToValidate == nil {
+			return true // Validate all fields
+		}
+		for _, f := range fieldsToValidate {
+			if f == fieldName {
+				return true
+			}
+		}
+		return false
+	}
+
+	// Validate required URLs only if they're in the update mask (or validating all)
+	if shouldValidate("spec.oidc.authorization_url") {
+		if err := validateOidcUrl(oidc.GetAuthorizationUrl(), "spec.oidc.authorization_url", true); err != nil {
+			return err
+		}
+	}
+	if shouldValidate("spec.oidc.token_url") {
+		if err := validateOidcUrl(oidc.GetTokenUrl(), "spec.oidc.token_url", true); err != nil {
+			return err
+		}
+	}
+	if shouldValidate("spec.oidc.issuer") {
+		if err := validateOidcUrl(oidc.GetIssuer(), "spec.oidc.issuer", true); err != nil {
+			return err
+		}
+	}
+
+	// Validate optional URLs only if present and in update mask
+	if shouldValidate("spec.oidc.user_info_url") && oidc.HasUserInfoUrl() {
+		if err := validateOidcUrl(oidc.GetUserInfoUrl(), "spec.oidc.user_info_url", false); err != nil {
+			return err
+		}
+	}
+	if shouldValidate("spec.oidc.jwks_url") && oidc.HasJwksUrl() {
+		if err := validateOidcUrl(oidc.GetJwksUrl(), "spec.oidc.jwks_url", false); err != nil {
+			return err
+		}
+	}
+	if shouldValidate("spec.oidc.logout_url") && oidc.HasLogoutUrl() {
+		if err := validateOidcUrl(oidc.GetLogoutUrl(), "spec.oidc.logout_url", false); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// validateOidcUrl validates a single OIDC URL field.
+// It ensures the URL is:
+// - Not empty (if required)
+// - A valid absolute URL
+// - Uses HTTPS scheme (security requirement)
+func validateOidcUrl(urlStr, fieldName string, required bool) error {
+	if urlStr == "" {
+		if required {
+			return grpcstatus.Errorf(grpccodes.InvalidArgument, "%s is required", fieldName)
+		}
+		return nil
+	}
+
+	parsed, err := url.Parse(urlStr)
+	if err != nil {
+		return grpcstatus.Errorf(grpccodes.InvalidArgument, "%s must be a valid URL: %v", fieldName, err)
+	}
+
+	if !parsed.IsAbs() {
+		return grpcstatus.Errorf(grpccodes.InvalidArgument, "%s must be an absolute URL (e.g., https://example.com/path)", fieldName)
+	}
+
+	if parsed.Scheme != "https" {
+		return grpcstatus.Errorf(grpccodes.InvalidArgument, "%s must use HTTPS", fieldName)
+	}
+
+	if parsed.Hostname() == "" {
+		return grpcstatus.Errorf(grpccodes.InvalidArgument, "%s must have a hostname", fieldName)
+	}
+
+	if parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" {
+		return grpcstatus.Errorf(grpccodes.InvalidArgument, "%s must not contain query or fragment components", fieldName)
+	}
+	return nil
 }
 
 func (s *PrivateIdentityProvidersServer) validateClientSecretSecret(
@@ -218,53 +392,14 @@ func (s *PrivateIdentityProvidersServer) validateClientSecretSecret(
 	if ref.GetId() == "" && ref.GetName() == "" {
 		return grpcstatus.Errorf(grpccodes.InvalidArgument, "client_secret_secret must specify id or name")
 	}
-	resolved, err := references.NewDAOLookupFunc(s.secretsDao)(ctx, "", "", ref.GetId(), ref.GetName())
+	resolved, err := resolveSecretReferenceOfType(ctx, s.logger, s.secretsDao, ref,
+		"client_secret_secret", privatev1.SecretType_SECRET_TYPE_VALUE)
 	if err != nil {
-		var deniedErr *dao.ErrDenied
-		if errors.As(err, &deniedErr) {
-			return grpcstatus.Errorf(grpccodes.PermissionDenied, "%s", deniedErr.Reason)
-		}
-		var nf interface{ IsNotFound() bool }
-		if errors.As(err, &nf) && nf.IsNotFound() {
-			return grpcstatus.Errorf(grpccodes.InvalidArgument,
-				"there is no secret with identifier or name '%s'", refKey(ref))
-		}
-		s.logger.ErrorContext(ctx, "Failed to resolve client_secret_secret reference", "error", err)
-		return grpcstatus.Errorf(grpccodes.Internal, "failed to resolve client_secret_secret reference")
+		return err
 	}
 	if resolved.Tenant == auth.SharedTenant {
 		return grpcstatus.Errorf(grpccodes.InvalidArgument,
 			"shared secrets cannot be used as identity provider client_secret_secret references")
-	}
-	// Load the resolved Secret and ensure it carries a non-empty data["value"] entry, as required
-	// by the reconciler that consumes it. Rejecting here surfaces the problem as an INVALID_ARGUMENT
-	// at write time instead of a silent reconcile failure later.
-	secretResp, err := s.secretsDao.Get().SetId(resolved.ID).Do(ctx)
-	if err != nil {
-		s.logger.ErrorContext(ctx, "Failed to load client_secret_secret reference", "error", err)
-		return grpcstatus.Errorf(grpccodes.Internal, "failed to resolve client_secret_secret reference")
-	}
-	secret := secretResp.GetObject()
-	data := secret.GetData()
-	// Vault-backed secrets do not carry their data in the database column: the Secrets server nulls
-	// it after writing to Vault. Hydrate the value from the store so this create/update-time check
-	// reads the same value the reconciler later resolves via the Secrets API. Secrets that keep
-	// their data in the database column (non-Vault backends, tests) are validated directly.
-	if len(data) == 0 && s.secretStore != nil &&
-		secret.GetBackend() == privatev1.SecretBackend_SECRET_BACKEND_VAULT {
-		metadata := secret.GetMetadata()
-		fetched, fetchErr := s.secretStore.Fetch(ctx,
-			metadata.GetTenant(), metadata.GetProject(), metadata.GetName())
-		if fetchErr != nil {
-			s.logger.ErrorContext(ctx, "Failed to load client_secret_secret value from store", "error", fetchErr)
-			return grpcstatus.Errorf(grpccodes.Internal, "failed to resolve client_secret_secret reference")
-		}
-		data = fetched
-	}
-	if value, ok := data[secretValueKey]; !ok || len(value) == 0 {
-		return grpcstatus.Errorf(grpccodes.InvalidArgument,
-			"secret '%s' referenced by client_secret_secret must contain a non-empty '%s' entry",
-			refKey(ref), secretValueKey)
 	}
 	resolvedRef := &privatev1.SecretLocalReference{}
 	resolvedRef.SetId(resolved.ID)

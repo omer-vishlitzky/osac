@@ -40,25 +40,30 @@ import (
 	"k8s.io/klog/v2"
 	crlog "sigs.k8s.io/controller-runtime/pkg/log"
 
-	_ "github.com/osac-project/osac/fulfillment-service/internal/api/cleanapi"
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
-	publicv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/public/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
 	"github.com/osac-project/osac/fulfillment-service/internal/auth/jwe"
 	"github.com/osac-project/osac/fulfillment-service/internal/console"
 	"github.com/osac-project/osac/fulfillment-service/internal/database"
 	"github.com/osac-project/osac/fulfillment-service/internal/database/dao"
+	"github.com/osac-project/osac/fulfillment-service/internal/kafka"
 	hubscheme "github.com/osac-project/osac/fulfillment-service/internal/kubernetes/scheme"
 	"github.com/osac-project/osac/fulfillment-service/internal/logging"
 	"github.com/osac-project/osac/fulfillment-service/internal/metrics"
 	"github.com/osac-project/osac/fulfillment-service/internal/network"
 	"github.com/osac-project/osac/fulfillment-service/internal/provisioners"
 	"github.com/osac-project/osac/fulfillment-service/internal/recovery"
-	"github.com/osac-project/osac/fulfillment-service/internal/references"
 	"github.com/osac-project/osac/fulfillment-service/internal/servers"
+	"github.com/osac-project/osac/fulfillment-service/internal/serviceaccounts"
+	"github.com/osac-project/osac/fulfillment-service/internal/services"
 	shtdwn "github.com/osac-project/osac/fulfillment-service/internal/shutdown"
+	"github.com/osac-project/osac/fulfillment-service/internal/startup"
+	"github.com/osac-project/osac/fulfillment-service/internal/trust"
 	"github.com/osac-project/osac/fulfillment-service/internal/validation"
 	"github.com/osac-project/osac/fulfillment-service/internal/vault"
+	"github.com/osac-project/osac/fulfillment-service/internal/version"
+	_ "github.com/osac-project/osac/proto/gen/cleanapi"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
 
 // userIDResolver implements auth.UserIDResolver by querying the users DAO.
@@ -98,6 +103,7 @@ func Cmd() *cobra.Command {
 	network.AddListenerFlags(flags, network.GrpcListenerName, network.DefaultGrpcAddress)
 	network.AddListenerFlags(flags, network.MetricsListenerName, network.DefaultMetricsAddress)
 	database.AddFlags(flags)
+	kafka.AddFlags(flags)
 	flags.StringVar(
 		&runner.args.authType,
 		"grpc-authn-type",
@@ -131,6 +137,12 @@ func Cmd() *cobra.Command {
 		"ca-file",
 		[]string{},
 		caFileFlagHelp,
+	)
+	flags.StringVar(
+		&runner.args.kafkaTopicPrefix,
+		"kafka-topic-prefix",
+		servers.DefaultEventTopicPrefix,
+		kafkaTopicPrefixFlagHelp,
 	)
 	flags.StringSliceVar(
 		&runner.args.trustedTokenIssuers,
@@ -187,8 +199,23 @@ func Cmd() *cobra.Command {
 		},
 		emergencyServiceAccountsFlagHelp,
 	)
+	flags.BoolVar(
+		&runner.args.networkingProvisioningEnabled,
+		"networking-provisioning-enabled",
+		true,
+		"Value of global.networking.provisioningEnabled: whether OSAC runs provider networking jobs. "+
+			"It can't change after installation.",
+	)
+	flags.StringSliceVar(
+		&runner.args.networkingExcludedIPv4CIDRs,
+		"networking-excluded-ipv4-cidrs",
+		nil,
+		"Value of global.networking.excludedIpv4Cidrs: comma separated canonical IPv4 CIDRs that the "+
+			"provider's infrastructure uses.",
+	)
 	vault.AddBaseFlags(flags)
 	network.AddGrpcKeepaliveFlags(flags)
+	runner.args.services = services.RegisterFlags(flags)
 	return command
 }
 
@@ -198,6 +225,7 @@ type runnerContext struct {
 	flags  *pflag.FlagSet
 	args   struct {
 		caFiles                  []string
+		kafkaTopicPrefix         string
 		authType                 string
 		externalAuthAddress      string
 		trustedTokenIssuers      []string
@@ -208,16 +236,38 @@ type runnerContext struct {
 		tokenIssuer              string
 		emergencyServiceAccounts []string
 		vaultBase                vault.BaseConfig
+		services                 *services.Flags
+
+		networkingProvisioningEnabled bool
+		networkingExcludedIPv4CIDRs   []string
 	}
 }
 
 // run runs the `start grpc-server` command.
 func (c *runnerContext) run(cmd *cobra.Command, argv []string) error { //nolint:gocyclo
+	// Apply service flag defaults and validate (before context creation to avoid cancel leak):
+	c.args.services.EnableAllIfNoneSet(cmd.Flags())
+	if err := c.args.services.Validate(); err != nil {
+		return fmt.Errorf("invalid service flags: %w", err)
+	}
+	excludedIPv4CIDRs, err := servers.ParseExcludedIPv4CIDRs(c.args.networkingExcludedIPv4CIDRs)
+	if err != nil {
+		return fmt.Errorf("invalid --networking-excluded-ipv4-cidrs: %w", err)
+	}
+	networkingSettings := servers.NetworkingSettings{
+		ProvisioningEnabled: c.args.networkingProvisioningEnabled,
+		ExcludedIPv4CIDRs:   excludedIPv4CIDRs,
+		BareMetalEnabled:    c.args.services.BMaaS,
+	}
+
 	// Get the context and create a cancellable version:
 	ctx, cancel := context.WithCancel(cmd.Context())
 
 	// Get the dependencies from the context:
 	c.logger = logging.LoggerFromContext(ctx)
+	c.logger.InfoContext(ctx, "Service enablement",
+		slog.Any("enabled", c.args.services.EnabledServices()),
+	)
 
 	// Configure the Kubernetes libraries to use the logger:
 	logrLogger := logr.FromSlogHandler(c.logger.Handler())
@@ -242,7 +292,7 @@ func (c *runnerContext) run(cmd *cobra.Command, argv []string) error { //nolint:
 	}
 
 	// Load the trusted CA certificates:
-	caPool, err := network.NewCertPool().
+	caPool, err := trust.NewCertPool().
 		SetLogger(c.logger).
 		AddSystemFiles(true).
 		AddKubernetesFiles(true).
@@ -251,6 +301,79 @@ func (c *runnerContext) run(cmd *cobra.Command, argv []string) error { //nolint:
 	if err != nil {
 		return fmt.Errorf("failed to load trusted CA certificates: %w", err)
 	}
+
+	// Read the vault flags:
+	c.args.vaultBase, err = vault.BaseConfigFromFlags(c.flags)
+	if err != nil {
+		return fmt.Errorf("failed to read vault flags: %w", err)
+	}
+
+	// Set up vault:
+	if err = vault.ValidateBaseConfig(c.args.vaultBase); err != nil {
+		return fmt.Errorf("invalid vault configuration: %w", err)
+	}
+	c.logger.InfoContext(ctx, "Performing vault health check")
+	vaultCaPool := caPool
+	if c.args.vaultBase.CaCertFile != "" {
+		vaultCaPool, err = trust.NewCertPool().
+			SetLogger(c.logger).
+			AddSystemFiles(true).
+			AddKubernetesFiles(true).
+			AddFiles(c.args.caFiles...).
+			AddFile(c.args.vaultBase.CaCertFile).
+			Build()
+		if err != nil {
+			return fmt.Errorf("failed to load vault CA certificates: %w", err)
+		}
+	}
+	healthChecker, healthErr := vault.NewHealthChecker().
+		SetLogger(c.logger).
+		SetAddress(c.args.vaultBase.Endpoint).
+		SetCaPool(vaultCaPool).
+		Build()
+	if healthErr != nil {
+		return fmt.Errorf("failed to create Vault health checker: %w", healthErr)
+	}
+	healthCheckCtx, cancelHealthCheck := context.WithTimeout(ctx, 10*time.Second)
+	healthErr = healthChecker.Check(healthCheckCtx)
+	cancelHealthCheck()
+	if healthErr != nil {
+		c.logger.ErrorContext(ctx, "Vault health check failed",
+			slog.String("error", healthErr.Error()),
+		)
+	}
+
+	tenantTokenSource, tokenErr := vault.NewServiceTenantTokenSourceFromConfig(
+		c.logger, c.args.vaultBase, vaultCaPool,
+	)
+	if tokenErr != nil {
+		return fmt.Errorf("failed to create service tenant token source: %w", tokenErr)
+	}
+
+	secretStore, err := vault.NewVaultSecretStore().
+		SetLogger(c.logger).
+		SetAddress(c.args.vaultBase.Endpoint).
+		SetTokenSource(tenantTokenSource).
+		SetParentNamespace(c.args.vaultBase.Namespace).
+		SetKVMountPath(c.args.vaultBase.KVMountPath).
+		SetCaPool(vaultCaPool).
+		Build()
+	if err != nil {
+		return fmt.Errorf("failed to create vault secret store: %w", err)
+	}
+
+	// Create the Kafka configuration:
+	c.logger.InfoContext(ctx, "Creating Kafka configuration")
+	kafkaTool, err := kafka.NewTool().
+		SetLogger(c.logger).
+		SetFlags(c.flags).
+		SetCAPool(caPool).
+		Build()
+	if err != nil {
+		return err
+	}
+	kafkaConfig := kafkaTool.Config()
+	kafkaBrokers := kafkaTool.Brokers()
 
 	// Wait till the database is available:
 	dbTool, err := database.NewTool().
@@ -280,6 +403,19 @@ func (c *runnerContext) run(cmd *cobra.Command, argv []string) error { //nolint:
 		return err
 	}
 	shutdown.AddDatabasePool("database", 0, dbPool)
+
+	// Compare the installation settings with the ones stored at the first start, and refuse to start on a change
+	// that the installation doesn't support:
+	c.logger.InfoContext(ctx, "Checking installation settings")
+	err = startup.CheckInstallationSettings(ctx, c.logger, dbPool, startup.InstallationSettings{
+		ProvisioningEnabled: networkingSettings.ProvisioningEnabled,
+		EnabledServices:     c.args.services.EnabledServices(),
+		Release:             version.Get(),
+		ExcludedIPv4CIDRs:   networkingSettings.ExcludedIPv4CIDRs,
+	})
+	if err != nil {
+		return err
+	}
 
 	// Create the network listener:
 	listener, err := network.NewListener().
@@ -369,6 +505,15 @@ func (c *runnerContext) run(cmd *cobra.Command, argv []string) error { //nolint:
 		return fmt.Errorf("failed to create default tenancy logic: %w", err)
 	}
 
+	// Create the authorization evaluator:
+	evaluator, err := auth.NewEvaluator().
+		AddEmergencyServiceAccounts(c.args.emergencyServiceAccounts).
+		SetManagedServiceAccountResolver(serviceaccounts.ResolveAuthorization).
+		Build()
+	if err != nil {
+		return fmt.Errorf("failed to create authorization evaluator: %w", err)
+	}
+
 	// Prepare the authorization interceptor:
 	c.logger.InfoContext(ctx, "Creating Rego authorization interceptor")
 	authzInterceptor, err := auth.NewGrpcAuthzInterceptor().
@@ -376,25 +521,10 @@ func (c *runnerContext) run(cmd *cobra.Command, argv []string) error { //nolint:
 		AddAnonymousMethodRegex(anonymousMethodsRegex).
 		SetMetadataFetcher(metadataFetcher).
 		SetProjectMembershipMetadataFetcher(pmMetadataFetcher).
-		AddEmergencyServiceAccounts(c.args.emergencyServiceAccounts...).
+		SetEvaluator(evaluator).
 		Build()
 	if err != nil {
 		return fmt.Errorf("failed to create Rego authorization interceptor: %w", err)
-	}
-
-	// Create the notifier:
-	c.logger.InfoContext(ctx, "Creating notifier")
-	notifier, err := database.NewNotifier().
-		SetLogger(c.logger).
-		SetChannel("events").
-		SetPool(dbPool).
-		Build()
-	if err != nil {
-		return fmt.Errorf("failed to create notifier: %w", err)
-	}
-	err = notifier.Start(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to start notifier: %w", err)
 	}
 
 	// Create the private attribution logic:
@@ -410,7 +540,6 @@ func (c *runnerContext) run(cmd *cobra.Command, argv []string) error { //nolint:
 	c.logger.InfoContext(ctx, "Creating private users server")
 	privateUsersServer, err := servers.NewPrivateUsersServer().
 		SetLogger(c.logger).
-		SetNotifier(notifier).
 		SetAttributionLogic(privateAttributionLogic).
 		SetTenancyLogic(tenancyLogic).
 		SetMetricsRegisterer(metricsRegisterer).
@@ -440,19 +569,9 @@ func (c *runnerContext) run(cmd *cobra.Command, argv []string) error { //nolint:
 
 	// Prepare the reference validation interceptor:
 	c.logger.InfoContext(ctx, "Creating reference validation interceptor")
-	referenceValidator, err := references.NewReferenceValidator().
-		SetLogger(c.logger).
-		SetMetricsRegisterer(metricsRegisterer).
-		Build()
+	referenceValidator, err := newReferenceValidator(c.logger, tenancyLogic, metricsRegisterer)
 	if err != nil {
-		return fmt.Errorf("failed to create reference validation interceptor: %w", err)
-	}
-
-	// Register reference lookup functions for all resource types:
-	c.logger.InfoContext(ctx, "Registering reference lookup functions")
-	err = registerReferenceLookups(referenceValidator, c.logger, tenancyLogic, metricsRegisterer)
-	if err != nil {
-		return fmt.Errorf("failed to register reference lookups: %w", err)
+		return err
 	}
 
 	// Prepare the transactions manager:
@@ -500,6 +619,15 @@ func (c *runnerContext) run(cmd *cobra.Command, argv []string) error { //nolint:
 		return fmt.Errorf("failed to read gRPC keepalive configuration: %w", err)
 	}
 
+	// Create the disabled-service request counter and handler:
+	disabledServiceHandler, err := NewDisabledServiceHandler().
+		SetDisabledServices(buildDisabledServiceMap(c.args.services)).
+		SetMetricsRegisterer(metricsRegisterer).
+		Build()
+	if err != nil {
+		return fmt.Errorf("failed to create disabled-service handler: %w", err)
+	}
+
 	// Create the gRPC server:
 	c.logger.InfoContext(ctx, "Creating gRPC server")
 	grpcServer := grpc.NewServer(
@@ -511,6 +639,7 @@ func (c *runnerContext) run(cmd *cobra.Command, argv []string) error { //nolint:
 			MinTime:             keepaliveConfig.MinTime,
 			PermitWithoutStream: true,
 		}),
+		grpc.InTapHandle(disabledServiceHandler),
 		grpc.ChainUnaryInterceptor(
 			panicInterceptor.UnaryServer,
 			metricsInterceptor.UnaryServer,
@@ -572,6 +701,7 @@ func (c *runnerContext) run(cmd *cobra.Command, argv []string) error { //nolint:
 	c.logger.InfoContext(ctx, "Creating capabilities servers")
 	capabilitiesServer, err := servers.NewCapabilitiesServer().
 		SetLogger(c.logger).
+		SetServiceFlags(c.args.services).
 		AddAutnTrustedTokenIssuers(c.args.trustedTokenIssuers...).
 		Build()
 	if err != nil {
@@ -581,6 +711,8 @@ func (c *runnerContext) run(cmd *cobra.Command, argv []string) error { //nolint:
 	publicv1.RegisterCapabilitiesServer(grpcServer, capabilitiesServer)
 	privateCapabilitiesServer, err := servers.NewPrivateCapabilitiesServer().
 		SetLogger(c.logger).
+		SetServiceFlags(c.args.services).
+		SetNetworkingProvisioningEnabled(networkingSettings.ProvisioningEnabled).
 		AddAuthnTrustedTokenIssuers(c.args.trustedTokenIssuers...).
 		Build()
 	if err != nil {
@@ -588,73 +720,13 @@ func (c *runnerContext) run(cmd *cobra.Command, argv []string) error { //nolint:
 	}
 	// filterable-resource-exempt: static introspection endpoint, no List RPC or CEL filter field
 	privatev1.RegisterCapabilitiesServer(grpcServer, privateCapabilitiesServer)
+	// filterable-resource-exempt: installation settings has only a Get RPC, with no CEL filter field
+	privatev1.RegisterInstallationSettingsServer(grpcServer, &installationSettingsServer{store: dbPool})
 
 	// Create the runtime scheme for typed OSAC API objects:
 	hubScheme, err := hubscheme.NewHub()
 	if err != nil {
 		return fmt.Errorf("failed to create hub scheme: %w", err)
-	}
-
-	// Read the vault flags:
-	c.args.vaultBase, err = vault.BaseConfigFromFlags(c.flags)
-	if err != nil {
-		return fmt.Errorf("failed to read vault flags: %w", err)
-	}
-
-	// Set up vault if configured:
-	var secretStore vault.SecretStore
-	if c.args.vaultBase.Endpoint != "" {
-		c.logger.InfoContext(ctx, "Performing vault health check")
-		vaultCaPool := caPool
-		if c.args.vaultBase.CaCertFile != "" {
-			certPEM, readErr := os.ReadFile(c.args.vaultBase.CaCertFile)
-			if readErr != nil {
-				return fmt.Errorf(
-					"failed to read vault CA cert from file '%s': %w",
-					c.args.vaultBase.CaCertFile, readErr,
-				)
-			}
-			vaultCaPool = caPool.Clone()
-			if !vaultCaPool.AppendCertsFromPEM(certPEM) {
-				return fmt.Errorf(
-					"vault CA cert file '%s' contains no valid certificates",
-					c.args.vaultBase.CaCertFile,
-				)
-			}
-		}
-		healthChecker, healthErr := vault.NewHealthChecker().
-			SetLogger(c.logger).
-			SetAddress(c.args.vaultBase.Endpoint).
-			SetCaPool(vaultCaPool).
-			Build()
-		if healthErr != nil {
-			c.logger.ErrorContext(ctx, "Failed to create Vault health checker",
-				slog.String("error", healthErr.Error()),
-			)
-		} else if healthErr = healthChecker.Check(ctx); healthErr != nil {
-			c.logger.ErrorContext(ctx, "Vault health check failed",
-				slog.String("error", healthErr.Error()),
-			)
-		}
-
-		tenantTokenSource, tokenErr := vault.NewServiceTenantTokenSourceFromConfig(
-			c.logger, c.args.vaultBase, vaultCaPool,
-		)
-		if tokenErr != nil {
-			return fmt.Errorf("failed to create service tenant token source: %w", tokenErr)
-		}
-
-		secretStore, err = vault.NewVaultSecretStore().
-			SetLogger(c.logger).
-			SetAddress(c.args.vaultBase.Endpoint).
-			SetTokenSource(tenantTokenSource).
-			SetParentNamespace(c.args.vaultBase.Namespace).
-			SetKVMountPath(c.args.vaultBase.KVMountPath).
-			SetCaPool(vaultCaPool).
-			Build()
-		if err != nil {
-			return fmt.Errorf("failed to create vault secret store: %w", err)
-		}
 	}
 
 	// Create the tier resolver for the volumes server. The resolver looks up a
@@ -678,7 +750,6 @@ func (c *runnerContext) run(cmd *cobra.Command, argv []string) error { //nolint:
 	// Register all filterable resources' public and private servers:
 	resourceServers, err := RegisterResourceServers(ctx, grpcServer, ResourceServerDeps{
 		Logger:                  c.logger,
-		Notifier:                notifier,
 		PrivateAttributionLogic: privateAttributionLogic,
 		PublicAttributionLogic:  publicAttributionLogic,
 		TenancyLogic:            tenancyLogic,
@@ -687,6 +758,8 @@ func (c *runnerContext) run(cmd *cobra.Command, argv []string) error { //nolint:
 		SecretStore:             secretStore,
 		TierResolver:            tierResolver,
 		PrivateUsersServer:      privateUsersServer,
+		Services:                c.args.services,
+		NetworkingSettings:      networkingSettings,
 	})
 	if err != nil {
 		return err
@@ -723,103 +796,100 @@ func (c *runnerContext) run(cmd *cobra.Command, argv []string) error { //nolint:
 	// filterable-resource-exempt: singleton JWKS fetch, no List RPC or CEL filter field
 	publicv1.RegisterJsonWebKeySetServer(grpcServer, jsonWebKeySetServer)
 
-	// Build the console target resolver (lookup/policy only):
-	hubLookup := servers.NewPrivateServerHubLookup(privateHubsServer, privateSecretsServer)
-	consoleResolver, err := servers.NewConsoleTargetResolver().
-		SetLogger(c.logger).
-		SetComputeInstanceLookup(servers.NewPrivateServerCILookup(privateComputeInstancesServer)).
-		SetHubLookup(hubLookup).
-		SetHubClientFactory(servers.NewDefaultHubClientFactory(hubScheme)).
-		Build()
-	if err != nil {
-		return fmt.Errorf("failed to create console target resolver: %w", err)
+	if c.args.services.VMaaS {
+		// Build the console target resolver (lookup/policy only):
+		hubLookup := servers.NewPrivateServerHubLookup(privateHubsServer, privateSecretsServer)
+		consoleResolver, err := servers.NewConsoleTargetResolver().
+			SetLogger(c.logger).
+			SetComputeInstanceLookup(servers.NewPrivateServerCILookup(privateComputeInstancesServer)).
+			SetHubLookup(hubLookup).
+			SetHubClientFactory(servers.NewDefaultHubClientFactory(hubScheme)).
+			Build()
+		if err != nil {
+			return fmt.Errorf("failed to create console target resolver: %w", err)
+		}
+
+		// Build the console session service (orchestration):
+		sessionService, err := console.NewSessionService().
+			SetLogger(c.logger).
+			SetResolver(consoleResolver).
+			SetSealer(ticketSealer).
+			Build()
+		if err != nil {
+			return fmt.Errorf("failed to create console session service: %w", err)
+		}
+
+		// Create the console sessions server (thin adapter):
+		c.logger.InfoContext(ctx, "Creating console server")
+		consoleServer, err := servers.NewConsoleServer().
+			SetLogger(c.logger).
+			SetSessionService(sessionService).
+			Build()
+		if err != nil {
+			return fmt.Errorf("failed to create console server: %w", err)
+		}
+		// filterable-resource-exempt: session/action RPC, no List RPC or CEL filter field; also depends on
+		// privateHubsServer/privateComputeInstancesServer from RegisterResourceServers, so it must be built after
+		publicv1.RegisterConsoleSessionsServer(grpcServer, consoleServer)
 	}
 
-	// Build the console session service (orchestration):
-	sessionService, err := console.NewSessionService().
+	// Create the self subject access reviews servers:
+	c.logger.InfoContext(ctx, "Creating self subject access reviews server")
+	selfSubjectAccessReviewsServer, err := servers.NewSelfSubjectAccessReviewsServer().
 		SetLogger(c.logger).
-		SetResolver(consoleResolver).
-		SetSealer(ticketSealer).
+		SetEvaluator(evaluator).
+		SetTenancyLogic(tenancyLogic).
 		Build()
 	if err != nil {
-		return fmt.Errorf("failed to create console session service: %w", err)
+		return fmt.Errorf("failed to create self subject access reviews server: %w", err)
 	}
+	// filterable-resource-exempt: create-only permission check API, no List RPC or CEL filter field
+	publicv1.RegisterSelfSubjectAccessReviewsServer(grpcServer, selfSubjectAccessReviewsServer)
 
-	// Create the console sessions server (thin adapter):
-	c.logger.InfoContext(ctx, "Creating console server")
-	consoleServer, err := servers.NewConsoleServer().
+	c.logger.InfoContext(ctx, "Creating private self subject access reviews server")
+	privateSelfSubjectAccessReviewsServer, err := servers.NewPrivateSelfSubjectAccessReviewsServer().
 		SetLogger(c.logger).
-		SetSessionService(sessionService).
+		SetEvaluator(evaluator).
+		SetTenancyLogic(tenancyLogic).
 		Build()
 	if err != nil {
-		return fmt.Errorf("failed to create console server: %w", err)
+		return fmt.Errorf("failed to create private self subject access reviews server: %w", err)
 	}
-	// filterable-resource-exempt: session/action RPC, no List RPC or CEL filter field; also depends on
-	// privateHubsServer/privateComputeInstancesServer from RegisterResourceServers, so it must be built after
-	publicv1.RegisterConsoleSessionsServer(grpcServer, consoleServer)
+	// filterable-resource-exempt: create-only permission check API, no List RPC or CEL filter field
+	privatev1.RegisterSelfSubjectAccessReviewsServer(grpcServer, privateSelfSubjectAccessReviewsServer)
 
 	// Create the events server:
 	c.logger.InfoContext(ctx, "Creating events server")
-	eventsListener, err := database.NewListener().
-		SetLogger(c.logger).
-		SetUrl(dbTool.URL()).
-		SetChannel("events").
-		Build()
-	if err != nil {
-		return fmt.Errorf("failed to create events listener: %w", err)
-	}
 	eventsServer, err := servers.NewEventsServer().
 		SetLogger(c.logger).
-		SetListener(eventsListener).
+		SetKafkaConfig(kafkaConfig).
+		SetKafkaBrokers(kafkaBrokers...).
+		SetKafkaTopicPrefix(c.args.kafkaTopicPrefix).
 		SetTenancyLogic(tenancyLogic).
 		Build()
 	if err != nil {
 		return fmt.Errorf("failed to create events server: %w", err)
 	}
-	go func() {
-		err := eventsServer.Start(ctx)
-		if err == nil || errors.Is(err, context.Canceled) {
-			c.logger.InfoContext(ctx, "Events server finished")
-		} else {
-			c.logger.ErrorContext(
-				ctx,
-				"Events server finished",
-				slog.Any("error", err),
-			)
-		}
-	}()
+	shutdown.AddFunction("events", 0, func(context.Context) error {
+		return eventsServer.Close()
+	})
 	// filterable-resource-exempt: streaming Watch RPC, no List RPC or CEL filter field
 	publicv1.RegisterEventsServer(grpcServer, eventsServer)
 
 	// Create the private events server:
 	c.logger.InfoContext(ctx, "Creating private events server")
-	privateEventsListener, err := database.NewListener().
-		SetLogger(c.logger).
-		SetUrl(dbTool.URL()).
-		SetChannel("events").
-		Build()
-	if err != nil {
-		return fmt.Errorf("failed to create private events listener: %w", err)
-	}
 	privateEventsServer, err := servers.NewPrivateEventsServer().
 		SetLogger(c.logger).
-		SetListener(privateEventsListener).
+		SetKafkaConfig(kafkaConfig).
+		SetKafkaBrokers(kafkaBrokers...).
+		SetKafkaTopicPrefix(c.args.kafkaTopicPrefix).
 		Build()
 	if err != nil {
 		return fmt.Errorf("failed to create private events server: %w", err)
 	}
-	go func() {
-		err := privateEventsServer.Start(ctx)
-		if err == nil || errors.Is(err, context.Canceled) {
-			c.logger.InfoContext(ctx, "Private events server finished")
-		} else {
-			c.logger.ErrorContext(
-				ctx,
-				"Private events server finished",
-				slog.Any("error", err),
-			)
-		}
-	}()
+	shutdown.AddFunction("private events", 0, func(context.Context) error {
+		return privateEventsServer.Close()
+	})
 	// filterable-resource-exempt: streaming Watch RPC, no List RPC or CEL filter field
 	privatev1.RegisterEventsServer(grpcServer, privateEventsServer)
 
@@ -882,8 +952,9 @@ func (c *runnerContext) run(cmd *cobra.Command, argv []string) error { //nolint:
 }
 
 // anonymousMethodsRegex is regular expression for the methods that are considered public, including the capabilities,
-// JWKS, reflection, and health methods. These will skip authentication and authorization.
-const anonymousMethodsRegex = `^/(osac\.public\.v1\.(Capabilities/|JsonWebKeySet/)|grpc\.(reflection|health)\.).*$`
+// JWKS, and health methods. These will skip authentication and authorization. gRPC reflection requires a valid JWT
+// and is authorized separately in authz.rego.
+const anonymousMethodsRegex = `^/(osac\.public\.v1\.(Capabilities/|JsonWebKeySet/)|grpc\.health\.).*$`
 
 const shortHelp = `Starts the gRPC server`
 
@@ -908,6 +979,10 @@ no effect.
 const caFileFlagHelp = `
 _FILE_ - Files or directories containing trusted CA certificates in PEM format. Used for TLS connections to the external
 services.
+`
+
+const kafkaTopicPrefixFlagHelp = `
+_PREFIX_ - Prefix of the Kafka topics that contain fulfillment events.
 `
 
 const grpcAuthnTrustedTokenIssuersFlagHelp = `
@@ -971,8 +1046,8 @@ func newDAOTierResolver(
 		selected := backends[0]
 		backendID := selected.GetBackendId()
 
-		// Volume.status.backend (and osac.backend downstream) identifies the
-		// vendor CSI routing target, not this specific StorageBackend row, so
+		// Volume.status.provider (and the CSI vendor routing context downstream)
+		// identifies the vendor routing target, not this specific StorageBackend row, so
 		// it must carry the backend's provider (e.g. "vast") rather than its
 		// server-generated id -- osac-csi-driver's --vendor-controllers and
 		// --vendor-sockets maps are keyed by provider, set once in the Helm
@@ -987,7 +1062,7 @@ func newDAOTierResolver(
 		}
 
 		return &servers.TierResolution{
-			Backend:  backend.GetSpec().GetProvider(),
+			Provider: backend.GetSpec().GetProvider(),
 			Protocol: tier.GetSpec().GetProtocol(),
 		}, nil
 	}

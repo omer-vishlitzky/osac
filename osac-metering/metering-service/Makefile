@@ -10,30 +10,40 @@ IMG ?= ghcr.io/osac-project/metering-service:latest
 CONTAINER_TOOL ?= podman
 GO_VERSION ?= $(shell grep '^go ' go.mod | cut -d' ' -f2)
 GOTOOLCHAIN ?= go$(GO_VERSION)
-GINKGO ?= go run github.com/onsi/ginkgo/v2/ginkgo
 
 include $(shell git rev-parse --show-toplevel)/tools/golangci-lint.mk
 
-.PHONY: build test lint generate image-build image-push clean
+.PHONY: build test lint generate contract contract-check image-build image-push clean
 
 build:
 	go build -o bin/$(BINARY_NAME) ./cmd/metering-service
 
 test:
-	$(GINKGO) run -r internal
+	go test ./...
 
 lint: golangci-lint
 	$(GOLANGCI_LINT) run ./...
 
-generate:
-	buf generate
+# Writes the contract reference and checkable schema file into
+# osac-metering/docs/contract/.
+contract:
+	go run ./cmd/metering-contract
 
-# Context is `..` (osac-metering/), not `.` -- the Containerfile also
-# COPYs the sibling schema/ directory, which only exists one level up
-# from metering-service/ (matches build-metering-service-image.yaml's
-# `context: osac-metering`, `file: osac-metering/metering-service/Containerfile`).
+# Fails when the committed contract files are stale.
+contract-check:
+	go test ./tools/contract
+
+# Proto codegen is no longer per-module. Regenerate the shared
+# tree once from the repo-root proto/ module: `make -C ../../proto generate`.
+generate:
+	$(MAKE) -C ../../proto generate
+
+# Context is the repo root (`../..`), not osac-metering/ -- the Containerfile
+# COPYs the sibling schema/ directory AND the top-level proto/ module (the
+# latter reachable only from the repo root). Matches
+# build-metering-service-image.yaml's `context: .`.
 image-build:
-	$(CONTAINER_TOOL) build -t $(IMG) -f Containerfile ..
+	$(CONTAINER_TOOL) build -t $(IMG) -f Containerfile ../..
 
 image-push:
 	$(CONTAINER_TOOL) push $(IMG)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import shutil
+import subprocess
 import tempfile
 from typing import Any
 
@@ -46,9 +47,11 @@ class OsacCLI:
         return self._config_dir
 
     def _run(self, *args: str, timeout: int = 300) -> str:
+        __tracebackhide__ = True  # args can hold the login token script
         return run(self.binary, "--config", self._config_dir, *args, timeout=timeout)
 
     def _run_unchecked(self, *args: str, timeout: int = 300) -> tuple[str, int]:
+        __tracebackhide__ = True
         return run_unchecked(self.binary, "--config", self._config_dir, *args, timeout=timeout)
 
     def relogin(self) -> None:
@@ -79,6 +82,9 @@ class OsacCLI:
         run_strategy: str = "Always",
         user_data_secret_ref: str | None = None,
         instance_type: str | None = None,
+        ssh_key: str | None = None,
+        external_ip_attachment: bool = False,
+        project: str | None = None,
     ) -> str:
         args: list[str] = [
             "create",
@@ -90,6 +96,8 @@ class OsacCLI:
             "--run-strategy",
             run_strategy,
         ]
+        if project is not None:
+            args.extend(["--project", project])
         if name is not None:
             args.extend(["--name", name])
 
@@ -115,6 +123,8 @@ class OsacCLI:
 
         # Add additional disks
         if additional_disks is not None:
+            if not additional_disks:
+                args.extend(["--additional-disk", ""])
             for idx, disk in enumerate(additional_disks):
                 if not isinstance(disk, dict):
                     raise ValueError(f"additional_disks[{idx}]: must be a dict, got {type(disk).__name__}")
@@ -167,17 +177,31 @@ class OsacCLI:
 
         if user_data_secret_ref is not None:
             args.extend(["--user-data", user_data_secret_ref])
+        if ssh_key is not None:
+            args.extend(["--ssh-key", ssh_key])
+        if external_ip_attachment:
+            args.append("--external-ip-attachment")
 
         return self._parse_uuid(self._run(*args))
 
     def delete_compute_instance(self, *, uuid: str) -> None:
         self._run("delete", "computeinstance", uuid)
 
+    def edit_compute_instance(self, *, uuid: str) -> subprocess.CompletedProcess[str]:
+        """Edit a ComputeInstance and retain stderr for warning assertions."""
+        return subprocess.run(
+            (self.binary, "--config", self._config_dir, "edit", "--output", "json", "computeinstance", uuid),
+            capture_output=True,
+            text=True,
+            timeout=300,
+            check=True,
+        )
+
     def create_instance_type(
         self,
         *,
         name: str,
-        cores: int,
+        vcpus: int,
         memory_gib: int,
         description: str = "",
         gpu_pci_device_selector: str = "",
@@ -189,8 +213,8 @@ class OsacCLI:
             "instancetype",
             "--name",
             name,
-            "--cores",
-            str(cores),
+            "--vcpus",
+            str(vcpus),
             "--memory-gib",
             str(memory_gib),
         ]
@@ -216,8 +240,10 @@ class OsacCLI:
         template: str,
         name: str | None = None,
         pull_secret: str | None = None,
-        ssh_public_key_file: str | None = None,
+        ssh_key: str | None = None,
         version: str | None = None,
+        node_sets: dict[str, dict[str, Any]] | list[str] | None = None,
+        add_on_operators: list[str] | None = None,
         template_parameters: dict[str, str] | None = None,
         template_parameter_files: dict[str, str] | None = None,
     ) -> str:
@@ -226,10 +252,25 @@ class OsacCLI:
             args.extend(["--name", name])
         if pull_secret is not None:
             args.extend(["--pull-secret", pull_secret])
-        if ssh_public_key_file is not None:
-            args.extend(["--ssh-public-key-file", ssh_public_key_file])
+        if ssh_key is not None:
+            args.extend(["--ssh-key", ssh_key])
         if version is not None:
             args.extend(["--version", version])
+        if add_on_operators is not None:
+            for operator in add_on_operators:
+                args.extend(["--add-on-operator", operator])
+        if node_sets is not None:
+            if isinstance(node_sets, dict):
+                for key, val in node_sets.items():
+                    args.extend(
+                        [
+                            "--node-set",
+                            f"name={key},size={val['size']},baremetal-instance-type={val['baremetal_instance_type']['name']}",
+                        ]
+                    )
+            elif isinstance(node_sets, list):
+                for item in node_sets:
+                    args.extend(["--node-set", item])
         if template_parameters is not None:
             for key, value in template_parameters.items():
                 args.extend(["-p", f"{key}={value}"])
@@ -239,11 +280,16 @@ class OsacCLI:
 
         return self._parse_uuid(self._run(*args))
 
-    def create_secret(self, *, name: str, from_files: dict[str, str]) -> None:
+    def create_secret(self, *, name: str, from_files: dict[str, str], secret_type: str | None = None) -> None:
         args: list[str] = ["create", "secret", "--name", name]
+        if secret_type is not None:
+            args.extend(["--type", secret_type])
         for key, path in from_files.items():
             args.extend(["--from-file", f"{key}={path}"])
         self._run(*args)
+
+    def delete_secret(self, *, name: str) -> None:
+        self._run("delete", "secret", name)
 
     def get(self, resource: str, *, output: str | None = None) -> str:
         args: list[str] = ["get", resource]
@@ -257,10 +303,26 @@ class OsacCLI:
     def get_unchecked(self, resource: str) -> tuple[str, int]:
         return self._run_unchecked("get", resource)
 
-    def create_cluster_with_catalog_item(self, *, catalog_item: str, name: str, version: str | None = None) -> str:
+    def create_cluster_with_catalog_item(
+        self,
+        *,
+        catalog_item: str,
+        name: str,
+        version: str | None = None,
+        pull_secret: str | None = None,
+        ssh_key: str | None = None,
+        add_on_operators: list[str] | None = None,
+    ) -> str:
         args = ["create", "cluster", "--catalog-item", catalog_item, "--name", name]
         if version is not None:
             args.extend(["--version", version])
+        if pull_secret is not None:
+            args.extend(["--pull-secret", pull_secret])
+        if ssh_key is not None:
+            args.extend(["--ssh-key", ssh_key])
+        if add_on_operators is not None:
+            for operator in add_on_operators:
+                args.extend(["--add-on-operator", operator])
         return self._parse_uuid(self._run(*args))
 
     def create_compute_instance_with_catalog_item(
@@ -284,21 +346,33 @@ class OsacCLI:
         *,
         name: str,
         catalog_item: str,
+        instance_type: str | None = None,
         ssh_key: str | None = None,
+        disk_image: str | None = None,
         user_data: str | None = None,
         network_attachments: list[str] | None = None,
         external_ip_attachment: bool = False,
-    ) -> str:
+    ) -> tuple[str, list[str]]:
         args: list[str] = ["create", "baremetalinstance", "--name", name, "--catalog-item", catalog_item]
+        if instance_type is not None:
+            args.extend(["--set", f"instance_type.name={instance_type}", "--set", "instance_type.shared=true"])
         if ssh_key is not None:
             args.extend(["--ssh-key", ssh_key])
+        if disk_image is not None:
+            args.extend(["--disk-image", disk_image])
         if user_data is not None:
             args.extend(["--user-data", user_data])
         if external_ip_attachment:
             args.extend(["--external-ip-attachment"])
         for na in network_attachments or []:
             args.extend(["--network-attachment", na])
-        return self._parse_uuid(self._run(*args))
+        result = subprocess.run(
+            [self.binary, "--config", self._config_dir, *args], capture_output=True, text=True, timeout=300, check=True
+        )
+        warnings = [
+            line.removeprefix("Warning: ") for line in result.stderr.splitlines() if line.startswith("Warning: ")
+        ]
+        return self._parse_uuid(result.stdout.strip()), warnings
 
     def describe_baremetal_instance(self, *, name: str) -> str:
         return self._run("describe", "baremetalinstance", name)

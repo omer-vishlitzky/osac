@@ -17,25 +17,27 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"slices"
 
 	"github.com/prometheus/client_golang/prometheus"
 	grpccodes "google.golang.org/grpc/codes"
 	grpcstatus "google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protoreflect"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
 	"github.com/osac-project/osac/fulfillment-service/internal/database/dao"
-	"github.com/osac-project/osac/fulfillment-service/internal/events"
+	"github.com/osac-project/osac/fulfillment-service/internal/validation"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
 type PrivateSecurityGroupsServerBuilder struct {
-	logger            *slog.Logger
-	notifier          events.Notifier
-	attributionLogic  auth.AttributionLogic
-	tenancyLogic      auth.TenancyLogic
-	metricsRegisterer prometheus.Registerer
-	filterDesc        protoreflect.MessageDescriptor
+	logger             *slog.Logger
+	attributionLogic   auth.AttributionLogic
+	tenancyLogic       auth.TenancyLogic
+	metricsRegisterer  prometheus.Registerer
+	filterDesc         protoreflect.MessageDescriptor
+	networkingSettings *NetworkingSettings
 }
 
 var _ privatev1.SecurityGroupsServer = (*PrivateSecurityGroupsServer)(nil)
@@ -43,9 +45,13 @@ var _ privatev1.SecurityGroupsServer = (*PrivateSecurityGroupsServer)(nil)
 type PrivateSecurityGroupsServer struct {
 	privatev1.UnimplementedSecurityGroupsServer
 
-	logger            *slog.Logger
-	generic           *GenericServer[*privatev1.SecurityGroup]
-	virtualNetworkDao *dao.GenericDAO[*privatev1.VirtualNetwork]
+	logger   *slog.Logger
+	generic  *GenericServer[*privatev1.SecurityGroup]
+	settings NetworkingSettings
+	guards   *networkingGuards
+
+	// virtualNetworks resolves the parent reference with the caller's visibility.
+	virtualNetworks *dao.GenericDAO[*privatev1.VirtualNetwork]
 }
 
 func NewPrivateSecurityGroupsServer() *PrivateSecurityGroupsServerBuilder {
@@ -54,11 +60,6 @@ func NewPrivateSecurityGroupsServer() *PrivateSecurityGroupsServerBuilder {
 
 func (b *PrivateSecurityGroupsServerBuilder) SetLogger(value *slog.Logger) *PrivateSecurityGroupsServerBuilder {
 	b.logger = value
-	return b
-}
-
-func (b *PrivateSecurityGroupsServerBuilder) SetNotifier(value events.Notifier) *PrivateSecurityGroupsServerBuilder {
-	b.notifier = value
 	return b
 }
 
@@ -86,6 +87,13 @@ func (b *PrivateSecurityGroupsServerBuilder) SetFilterDesc(value protoreflect.Me
 	return b
 }
 
+// SetNetworkingSettings sets the networking installation settings. This is optional; the default is
+// DefaultNetworkingSettings.
+func (b *PrivateSecurityGroupsServerBuilder) SetNetworkingSettings(value NetworkingSettings) *PrivateSecurityGroupsServerBuilder {
+	b.networkingSettings = &value
+	return b
+}
+
 func (b *PrivateSecurityGroupsServerBuilder) Build() (result *PrivateSecurityGroupsServer, err error) {
 	// Check parameters:
 	if b.logger == nil {
@@ -100,12 +108,13 @@ func (b *PrivateSecurityGroupsServerBuilder) Build() (result *PrivateSecurityGro
 		err = errors.New("tenancy logic is mandatory")
 		return
 	}
-
-	// Create the VirtualNetwork DAO for parent validation:
-	virtualNetworkDao, err := dao.NewGenericDAO[*privatev1.VirtualNetwork]().
+	guards, err := newNetworkingGuards(b.logger)
+	if err != nil {
+		return
+	}
+	virtualNetworks, err := dao.NewGenericDAO[*privatev1.VirtualNetwork]().
 		SetLogger(b.logger).
 		SetTenancyLogic(b.tenancyLogic).
-		SetMetricsRegisterer(b.metricsRegisterer).
 		Build()
 	if err != nil {
 		return
@@ -115,7 +124,6 @@ func (b *PrivateSecurityGroupsServerBuilder) Build() (result *PrivateSecurityGro
 	generic, err := NewGenericServer[*privatev1.SecurityGroup]().
 		SetLogger(b.logger).
 		SetService(privatev1.SecurityGroups_ServiceDesc.ServiceName).
-		SetNotifier(b.notifier).
 		SetAttributionLogic(b.attributionLogic).
 		SetTenancyLogic(b.tenancyLogic).
 		SetMetricsRegisterer(b.metricsRegisterer).
@@ -127,9 +135,11 @@ func (b *PrivateSecurityGroupsServerBuilder) Build() (result *PrivateSecurityGro
 
 	// Create and populate the object:
 	result = &PrivateSecurityGroupsServer{
-		logger:            b.logger,
-		generic:           generic,
-		virtualNetworkDao: virtualNetworkDao,
+		logger:          b.logger,
+		generic:         generic,
+		settings:        resolveNetworkingSettings(b.networkingSettings),
+		guards:          guards,
+		virtualNetworks: virtualNetworks,
 	}
 	return
 }
@@ -146,68 +156,168 @@ func (s *PrivateSecurityGroupsServer) Get(ctx context.Context,
 	return
 }
 
+// automaticSecurityGroupPrefix is the reserved name prefix of the automatic Cluster SecurityGroups.
+const automaticSecurityGroupPrefix = "auto-sg-"
+
 func (s *PrivateSecurityGroupsServer) Create(ctx context.Context,
 	request *privatev1.SecurityGroupsCreateRequest) (response *privatev1.SecurityGroupsCreateResponse, err error) {
-	securityGroup := request.GetObject()
-
-	// Validate before creating:
-	err = s.validateSecurityGroup(ctx, securityGroup, nil)
-	if err != nil {
+	if err = rejectOutputStatusOnCreate(request.GetObject().HasStatus()); err != nil {
 		return
 	}
-
-	// Set owner reference annotation automatically
-	if securityGroup.GetMetadata() == nil {
-		securityGroup.Metadata = &privatev1.Metadata{}
-	}
-	if securityGroup.GetMetadata().GetAnnotations() == nil {
-		securityGroup.Metadata.Annotations = make(map[string]string)
-	}
-	securityGroup.Metadata.Annotations["osac.openshift.io/owner-reference"] = refKey(securityGroup.GetSpec().GetVirtualNetwork())
-
-	err = s.generic.Create(ctx, request, &response)
+	err = s.generic.CreateWithCandidatePreparation(ctx, request, &response,
+		func(ctx context.Context, _, group *privatev1.SecurityGroup) error {
+			if err := lockTenantForCreate(ctx, group.GetMetadata().GetTenant()); err != nil {
+				return err
+			}
+			return s.prepareCreate(ctx, group)
+		})
 	return
 }
 
+// prepareCreate validates a SecurityGroup create and sets its owner reference and initial status. The parent
+// VirtualNetwork is locked first.
+func (s *PrivateSecurityGroupsServer) prepareCreate(ctx context.Context, group *privatev1.SecurityGroup) error {
+	if err := validateReservedCreate(ctx, group.GetMetadata(), automaticSecurityGroupPrefix); err != nil {
+		return err
+	}
+	spec := group.GetSpec()
+	if spec == nil {
+		return grpcstatus.Errorf(grpccodes.InvalidArgument, "security group spec is mandatory")
+	}
+	key := refKey(spec.GetVirtualNetwork())
+	if spec.GetVirtualNetwork() == nil || key == "" {
+		return grpcstatus.Errorf(grpccodes.InvalidArgument, "field 'spec.virtual_network' is required")
+	}
+	virtualNetwork, err := lockParentVirtualNetwork(ctx, s.guards, s.virtualNetworks, key, group.GetMetadata())
+	if err != nil {
+		return err
+	}
+	spec.SetVirtualNetwork(privatev1.VirtualNetworkLocalReference_builder{Id: virtualNetwork.GetId()}.Build())
+	if err := validateSecurityRules(spec); err != nil {
+		return err
+	}
+	if err := s.rejectUnsupportedICMP(ctx, spec); err != nil {
+		return err
+	}
+	if group.GetMetadata().GetAnnotations() == nil {
+		group.GetMetadata().SetAnnotations(map[string]string{})
+	}
+	if _, ok := group.GetMetadata().GetAnnotations()[ownerReferenceAnnotation]; !ok {
+		group.GetMetadata().GetAnnotations()[ownerReferenceAnnotation] = virtualNetwork.GetId()
+	}
+	group.SetStatus(privatev1.SecurityGroupStatus_builder{
+		State: privatev1.SecurityGroupState_SECURITY_GROUP_STATE_PENDING,
+	}.Build())
+	return nil
+}
+
+// Update writes status only; the spec is immutable. Public rule updates use updateFromPublic.
 func (s *PrivateSecurityGroupsServer) Update(ctx context.Context,
 	request *privatev1.SecurityGroupsUpdateRequest) (response *privatev1.SecurityGroupsUpdateResponse, err error) {
-	// Get existing object for immutability validation:
-	id := request.GetObject().GetId()
-	if id == "" {
+	if request.GetObject().GetId() == "" {
 		err = grpcstatus.Errorf(grpccodes.InvalidArgument, "object identifier is mandatory")
 		return
 	}
-
-	getRequest := &privatev1.SecurityGroupsGetRequest{}
-	getRequest.SetId(id)
-	var getResponse *privatev1.SecurityGroupsGetResponse
-	err = s.generic.Get(ctx, getRequest, &getResponse)
-	if err != nil {
-		return
-	}
-
-	existingSecurityGroup := getResponse.GetObject()
-
-	// Validate with existing object context:
-	err = s.validateSecurityGroup(ctx, request.GetObject(), existingSecurityGroup)
-	if err != nil {
-		return
-	}
-
-	err = s.generic.Update(ctx, request, &response)
+	err = s.generic.UpdateWithCandidatePreparation(ctx, request, &response,
+		func(_ context.Context, current, candidate *privatev1.SecurityGroup) error {
+			if err := validateNetworkingStatusOnlyUpdate("SecurityGroup", current, candidate); err != nil {
+				return err
+			}
+			return rejectStateChangeWhileDeleting(current, candidate, current.GetMetadata())
+		})
 	return
+}
+
+// updateFromPublic replaces the rules of a SecurityGroup. The public server fixes the mask to spec.ingress and
+// spec.egress.
+func (s *PrivateSecurityGroupsServer) updateFromPublic(ctx context.Context,
+	request *privatev1.SecurityGroupsUpdateRequest) (*privatev1.SecurityGroupsUpdateResponse, error) {
+	var response *privatev1.SecurityGroupsUpdateResponse
+	err := s.generic.UpdateWithCandidatePreparation(ctx, request, &response,
+		func(ctx context.Context, current, candidate *privatev1.SecurityGroup) error {
+			if err := validateNetworkingStatusOnlyUpdate("SecurityGroup", current, candidate,
+				"spec.ingress", "spec.egress"); err != nil {
+				return err
+			}
+			return s.applyRuleUpdate(ctx, current, candidate)
+		})
+	return response, err
+}
+
+// securityGroupUpdatingMessage is the status message of a READY SecurityGroup whose rule update runs.
+const securityGroupUpdatingMessage = "Updating"
+
+// applyRuleUpdate checks the preconditions of a rule update of the locked SecurityGroup and, in the same transaction,
+// sets the status: a READY group stays READY with the message Updating, and a FAILED group becomes PENDING. With
+// provider networking disabled, the rules are only stored.
+func (s *PrivateSecurityGroupsServer) applyRuleUpdate(ctx context.Context,
+	current, candidate *privatev1.SecurityGroup) error {
+	if isAutomatic(current.GetMetadata()) {
+		return grpcstatus.Errorf(grpccodes.FailedPrecondition,
+			"SecurityGroup %s is automatic; its rules cannot change", current.GetId())
+	}
+	if current.GetMetadata().HasDeletionTimestamp() {
+		return grpcstatus.Errorf(grpccodes.FailedPrecondition, "SecurityGroup %s is being deleted", current.GetId())
+	}
+	state := current.GetStatus().GetState()
+	ready := state == privatev1.SecurityGroupState_SECURITY_GROUP_STATE_READY
+	updating := ready && current.GetStatus().GetMessage() == securityGroupUpdatingMessage
+	if (!ready || updating) && state != privatev1.SecurityGroupState_SECURITY_GROUP_STATE_FAILED {
+		return grpcstatus.Errorf(grpccodes.FailedPrecondition,
+			"SecurityGroup %s is being created or updated; retry when it is READY or FAILED", current.GetId())
+	}
+	if err := validateSecurityRules(candidate.GetSpec()); err != nil {
+		return err
+	}
+	if err := s.rejectUnsupportedICMP(ctx, candidate.GetSpec()); err != nil {
+		return err
+	}
+	status := proto.Clone(current.GetStatus()).(*privatev1.SecurityGroupStatus)
+	if status == nil {
+		status = &privatev1.SecurityGroupStatus{}
+	}
+	if s.settings.ProvisioningEnabled {
+		if ready {
+			status.SetMessage(securityGroupUpdatingMessage)
+		} else {
+			status.SetState(privatev1.SecurityGroupState_SECURITY_GROUP_STATE_PENDING)
+			status.ClearMessage()
+		}
+	}
+	candidate.SetStatus(status)
+	return nil
 }
 
 func (s *PrivateSecurityGroupsServer) Delete(ctx context.Context,
 	request *privatev1.SecurityGroupsDeleteRequest) (response *privatev1.SecurityGroupsDeleteResponse, err error) {
-	getRequest := &privatev1.SecurityGroupsGetRequest{}
-	getRequest.SetId(request.GetId())
-	var getResponse *privatev1.SecurityGroupsGetResponse
-	err = s.generic.Get(ctx, getRequest, &getResponse)
+	securityGroup, err := lockLifecycleResource(ctx, s.generic.dao, request.GetId(), "SecurityGroup")
 	if err != nil {
 		return
 	}
-	if err = validateNotDefault(getResponse.GetObject().GetMetadata().GetLabels(), "security group"); err != nil {
+	if deleteAlreadyAccepted(securityGroup.GetMetadata()) {
+		return &privatev1.SecurityGroupsDeleteResponse{}, nil
+	}
+	if isAutomatic(securityGroup.GetMetadata()) && !auth.IsControllerServiceAccount(ctx) {
+		err = grpcstatus.Errorf(grpccodes.FailedPrecondition,
+			"cannot delete automatic SecurityGroup '%s': it is deleted with its Cluster", securityGroup.GetId())
+		return
+	}
+	if err = validateNotDefault(ctx, securityGroup.GetMetadata().GetLabels(), "security group"); err != nil {
+		return
+	}
+	if err = s.guards.rejectDeleteIfWorkloadsReference(ctx, "SecurityGroup", securityGroup,
+		func(*privatev1.SubnetLocalReference) bool { return false },
+		func(refs []*privatev1.SecurityGroupLocalReference) bool {
+			for _, ref := range refs {
+				if referenceMatches(ref, securityGroup.GetId(), securityGroup.GetMetadata()) {
+					return true
+				}
+			}
+			return false
+		}); err != nil {
+		return
+	}
+	if err = markDeleting(ctx, s.generic.dao, securityGroup); err != nil {
 		return
 	}
 	err = s.generic.Delete(ctx, request, &response)
@@ -220,94 +330,65 @@ func (s *PrivateSecurityGroupsServer) Signal(ctx context.Context,
 	return
 }
 
-// validateSecurityGroup validates the SecurityGroup object.
-func (s *PrivateSecurityGroupsServer) validateSecurityGroup(ctx context.Context,
-	newSecurityGroup *privatev1.SecurityGroup, existingSecurityGroup *privatev1.SecurityGroup) error {
+// securityGroupICMPMessage is the error of an icmp rule on a deployment whose network managers cannot apply it. The
+// docs and the provider guide quote it.
+const securityGroupICMPMessage = "%s rule at index %d: protocol icmp is not supported by this " +
+	"deployment's network managers; use protocol all, which includes ICMP"
 
-	if newSecurityGroup == nil {
-		return grpcstatus.Errorf(grpccodes.InvalidArgument, "security group is mandatory")
+// firstICMPRule returns the direction and index of the first icmp rule, or an index of -1 when there is none.
+func firstICMPRule(spec *privatev1.SecurityGroupSpec) (string, int) {
+	isICMP := func(rule *privatev1.SecurityRule) bool {
+		return rule.GetProtocol() == privatev1.Protocol_PROTOCOL_ICMP
 	}
-
-	spec := newSecurityGroup.GetSpec()
-	if spec == nil {
-		return grpcstatus.Errorf(grpccodes.InvalidArgument, "security group spec is mandatory")
+	if index := slices.IndexFunc(spec.GetIngress(), isICMP); index >= 0 {
+		return "ingress", index
 	}
-
-	// Check immutable fields (only on Update)
-	if err := validateImmutableFieldsSecurityGroup(newSecurityGroup, existingSecurityGroup); err != nil {
-		return err
-	}
-
-	// Validate parent VirtualNetwork
-	// Only validate on Create or if virtual_network changed (though it shouldn't on Update)
-	if existingSecurityGroup == nil || refKey(spec.GetVirtualNetwork()) != refKey(existingSecurityGroup.GetSpec().GetVirtualNetwork()) {
-		if err := s.validateVirtualNetworkReference(ctx, spec); err != nil {
-			return err
-		}
-	}
-
-	// Validate security rules
-	if err := s.validateSecurityRules(spec); err != nil {
-		return err
-	}
-
-	return nil
+	return "egress", slices.IndexFunc(spec.GetEgress(), isICMP)
 }
 
-// validateVirtualNetworkReference validates that the referenced VirtualNetwork exists and is in READY state.
-func (s *PrivateSecurityGroupsServer) validateVirtualNetworkReference(ctx context.Context,
+// acceptsICMPRules reports whether SecurityGroup rules can use protocol icmp. A recorded capability decides. Without
+// one no manager was resolved: with provider networking disabled the rules are only stored, and otherwise the
+// capability is absent.
+func acceptsICMPRules(status *privatev1.NetworkClassStatus, provisioningEnabled bool) bool {
+	if status.HasSecurityGroupIcmp() {
+		return status.GetSecurityGroupIcmp()
+	}
+	return !provisioningEnabled
+}
+
+// rejectUnsupportedICMP rejects icmp rules on a NetworkClass whose managers cannot apply them. The cudn_evpn manager
+// keeps its own final error as a safety net.
+func (s *PrivateSecurityGroupsServer) rejectUnsupportedICMP(ctx context.Context,
 	spec *privatev1.SecurityGroupSpec) error {
-
-	virtualNetworkRef := spec.GetVirtualNetwork()
-	if virtualNetworkRef == nil {
-		return grpcstatus.Errorf(grpccodes.InvalidArgument, "field 'spec.virtual_network' is required")
+	direction, index := firstICMPRule(spec)
+	if index < 0 {
+		return nil
 	}
-	virtualNetworkKey := refKey(virtualNetworkRef)
-
-	// Get parent VirtualNetwork by ID
-	getResponse, err := s.virtualNetworkDao.Get().
-		SetId(virtualNetworkKey).
-		Do(ctx)
+	nc, err := findSingletonNetworkClass(ctx, s.guards.networkClasses)
 	if err != nil {
-		var notFoundErr *dao.ErrNotFound
-		if errors.As(err, &notFoundErr) {
-			return grpcstatus.Errorf(grpccodes.InvalidArgument,
-				"parent VirtualNetwork '%s' does not exist", virtualNetworkKey)
-		}
-		s.logger.ErrorContext(ctx, "Failed to query VirtualNetwork",
-			slog.String("virtual_network_id", virtualNetworkKey),
-			slog.Any("error", err))
-		return grpcstatus.Errorf(grpccodes.Internal, "failed to validate virtual_network")
+		return grpcstatus.Error(grpccodes.Internal, "failed to find the NetworkClass")
 	}
-
-	virtualNetwork := getResponse.GetObject()
-
-	// Check parent VirtualNetwork is READY
-	if virtualNetwork.GetStatus().GetState() != privatev1.VirtualNetworkState_VIRTUAL_NETWORK_STATE_READY {
-		return grpcstatus.Errorf(grpccodes.FailedPrecondition,
-			"parent VirtualNetwork '%s' is not in READY state (current state: %s)",
-			virtualNetworkKey, virtualNetwork.GetStatus().GetState().String())
+	if nc == nil {
+		return grpcstatus.Error(grpccodes.FailedPrecondition, "no NetworkClass is configured")
 	}
-
-	return nil
+	if acceptsICMPRules(nc.GetStatus(), s.settings.ProvisioningEnabled) {
+		return nil
+	}
+	return grpcstatus.Errorf(grpccodes.InvalidArgument, securityGroupICMPMessage, direction, index)
 }
 
 // validateSecurityRules validates the ingress and egress security rules.
-func (s *PrivateSecurityGroupsServer) validateSecurityRules(spec *privatev1.SecurityGroupSpec) error {
-	// Validate ingress rules
+func validateSecurityRules(spec *privatev1.SecurityGroupSpec) error {
 	for i, rule := range spec.GetIngress() {
 		if err := validateSecurityRule(rule, "ingress", i); err != nil {
 			return err
 		}
 	}
-
-	// Validate egress rules
 	for i, rule := range spec.GetEgress() {
 		if err := validateSecurityRule(rule, "egress", i); err != nil {
 			return err
 		}
 	}
-
 	return nil
 }
 
@@ -318,73 +399,17 @@ func validateSecurityRule(rule *privatev1.SecurityRule, ruleType string, index i
 			"%s rule at index %d is nil", ruleType, index)
 	}
 
-	// Protocol is required (UNSPECIFIED is not allowed)
-	if rule.GetProtocol() == privatev1.Protocol_PROTOCOL_UNSPECIFIED {
-		return grpcstatus.Errorf(grpccodes.InvalidArgument,
-			"%s rule at index %d: protocol is required", ruleType, index)
-	}
-
-	// Port validation for TCP/UDP protocols
-	if rule.GetProtocol() == privatev1.Protocol_PROTOCOL_TCP || rule.GetProtocol() == privatev1.Protocol_PROTOCOL_UDP {
-		// If port range is specified, validate it
-		if rule.HasPortFrom() || rule.HasPortTo() {
-			portFrom := rule.GetPortFrom()
-			portTo := rule.GetPortTo()
-
-			// Both must be set if either is set
-			if !rule.HasPortFrom() || !rule.HasPortTo() {
-				return grpcstatus.Errorf(grpccodes.InvalidArgument,
-					"%s rule at index %d: both port_from and port_to must be set together", ruleType, index)
-			}
-
-			// Validate port range
-			if portFrom < 1 || portFrom > 65535 {
-				return grpcstatus.Errorf(grpccodes.InvalidArgument,
-					"%s rule at index %d: port_from must be between 1 and 65535", ruleType, index)
-			}
-			if portTo < 1 || portTo > 65535 {
-				return grpcstatus.Errorf(grpccodes.InvalidArgument,
-					"%s rule at index %d: port_to must be between 1 and 65535", ruleType, index)
-			}
-			if portFrom > portTo {
-				return grpcstatus.Errorf(grpccodes.InvalidArgument,
-					"%s rule at index %d: port_from (%d) cannot be greater than port_to (%d)",
-					ruleType, index, portFrom, portTo)
-			}
-		}
-	}
-
-	// At least one CIDR must be specified
-	if rule.GetIpv4Cidr() == "" && rule.GetIpv6Cidr() == "" {
-		return grpcstatus.Errorf(grpccodes.InvalidArgument,
-			"%s rule at index %d: at least one of ipv4_cidr or ipv6_cidr must be provided", ruleType, index)
-	}
-
-	if err := canonicalizeDualStackCIDRs(
-		rule.GetIpv4Cidr, rule.SetIpv4Cidr,
-		rule.GetIpv6Cidr, rule.SetIpv6Cidr,
-	); err != nil {
+	err := validation.ValidateSecurityRule(validation.SecurityRule{
+		Protocol:    validation.SecurityRuleProtocol(rule.GetProtocol()),
+		PortFrom:    rule.GetPortFrom(),
+		PortTo:      rule.GetPortTo(),
+		HasPortFrom: rule.HasPortFrom(),
+		HasPortTo:   rule.HasPortTo(),
+		IPv4CIDR:    rule.GetIpv4Cidr(),
+	}, ruleType, index)
+	if err != nil {
 		return grpcstatus.Errorf(grpccodes.InvalidArgument,
 			"%s rule at index %d: %v", ruleType, index, err)
-	}
-
-	return nil
-}
-
-// validateImmutableFieldsSecurityGroup validates that immutable fields have not been changed.
-func validateImmutableFieldsSecurityGroup(newSecurityGroup *privatev1.SecurityGroup, existingSecurityGroup *privatev1.SecurityGroup) error {
-	if existingSecurityGroup == nil {
-		return nil // Create operation, no immutability checks
-	}
-
-	newSpec := newSecurityGroup.GetSpec()
-	existingSpec := existingSecurityGroup.GetSpec()
-
-	// Check immutable virtual_network field
-	if refKey(newSpec.GetVirtualNetwork()) != refKey(existingSpec.GetVirtualNetwork()) {
-		return grpcstatus.Errorf(grpccodes.InvalidArgument,
-			"field 'spec.virtual_network' is immutable and cannot be changed from '%s' to '%s'",
-			refKey(existingSpec.GetVirtualNetwork()), refKey(newSpec.GetVirtualNetwork()))
 	}
 
 	return nil

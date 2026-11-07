@@ -15,6 +15,7 @@ package servers
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 	. "github.com/onsi/ginkgo/v2"
@@ -22,12 +23,17 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
-	publicv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/public/v1"
+	"github.com/osac-project/osac/fulfillment-service/internal/database/dao"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
 
 var _ = Describe("Bare metal instances server", func() {
+	BeforeEach(func() {
+		Expect(createTestBareMetalInstanceType(ctx, "default-type", bareMetalNetworkPort("data-0", "fabric"))).To(Succeed())
+	})
 	Describe("Creation", func() {
 		It("Can be built if all the required parameters are set", func() {
 			server, err := NewBareMetalInstancesServer().
@@ -66,6 +72,9 @@ var _ = Describe("Bare metal instances server", func() {
 
 		BeforeEach(func() {
 			var err error
+			createDiskImageWithLifecycle("default-bmi-disk-image",
+				privatev1.DiskImageLifecycle_DISK_IMAGE_LIFECYCLE_AVAILABLE, nil)
+			seedTenantDefaultNetworking(testTenant, "", new("netris"))
 
 			// Seed a published catalog item.
 			catalogServer, err := NewPrivateBareMetalInstanceCatalogItemsServer().
@@ -74,6 +83,7 @@ var _ = Describe("Bare metal instances server", func() {
 				SetTenancyLogic(tenancy).
 				Build()
 			Expect(err).ToNot(HaveOccurred())
+			Expect(seedBareMetalCatalogItemTemplate(ctx, testTenant, "", "test-template", bareMetalInstanceTypeReference("default-type"))).To(Succeed())
 			catalogResp, err := catalogServer.Create(ctx, privatev1.BareMetalInstanceCatalogItemsCreateRequest_builder{
 				Object: privatev1.BareMetalInstanceCatalogItem_builder{
 					Metadata: privatev1.Metadata_builder{
@@ -86,6 +96,9 @@ var _ = Describe("Bare metal instances server", func() {
 			}.Build())
 			Expect(err).ToNot(HaveOccurred())
 			catalogItemID = catalogResp.GetObject().GetId()
+
+			// Tenant defaults so Creates that omit network_attachments can inject them.
+			seedTenantDefaultNetworking(testTenant, "", new("netris"))
 
 			server, err = NewBareMetalInstancesServer().
 				SetLogger(logger).
@@ -102,14 +115,63 @@ var _ = Describe("Bare metal instances server", func() {
 						Name: "test-baremetal-instance",
 					}.Build(),
 					Spec: publicv1.BareMetalInstanceSpec_builder{
-						CatalogItem:  publicv1.BareMetalInstanceCatalogItemReference_builder{Id: catalogItemID}.Build(),
-						SshPublicKey: new(testSSHPublicKey),
+						DiskImage:      publicv1.DiskImageReference_builder{Id: "default-bmi-disk-image"}.Build(),
+						CatalogItem:    publicv1.BareMetalInstanceCatalogItemReference_builder{Id: catalogItemID}.Build(),
+						UserDataSource: publicv1.UserDataSource_builder{Inline: new("#cloud-config")}.Build(),
 					}.Build(),
 				}.Build(),
 			}.Build())
 			Expect(err).ToNot(HaveOccurred())
 			Expect(response.GetObject().GetId()).ToNot(BeEmpty())
 			Expect(response.GetObject().GetSpec().GetCatalogItem().GetId()).To(Equal(catalogItemID))
+			Expect(response.GetObject().GetSpec().GetInstanceType().GetId()).To(Equal("default-type"))
+		})
+
+		It("Drops a caller-supplied status on create", func() {
+			// The insert is not checked by the metering source contract, so a spoofed state
+			// with a future transition time must never reach the stored object as a
+			// fabricated fact.
+			response, err := server.Create(ctx, publicv1.BareMetalInstancesCreateRequest_builder{
+				Object: publicv1.BareMetalInstance_builder{
+					Metadata: publicv1.Metadata_builder{
+						Name: "test-baremetal-instance-spoofed-status",
+					}.Build(),
+					Spec: publicv1.BareMetalInstanceSpec_builder{
+						DiskImage:      publicv1.DiskImageReference_builder{Id: "default-bmi-disk-image"}.Build(),
+						CatalogItem:    publicv1.BareMetalInstanceCatalogItemReference_builder{Id: catalogItemID}.Build(),
+						UserDataSource: publicv1.UserDataSource_builder{Inline: new("#cloud-config")}.Build(),
+					}.Build(),
+					Status: publicv1.BareMetalInstanceStatus_builder{
+						State: publicv1.BareMetalInstanceState_BARE_METAL_INSTANCE_STATE_RUNNING,
+						StateTransitionTime: timestamppb.New(
+							time.Now().Add(24 * time.Hour)),
+					}.Build(),
+				}.Build(),
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+			object := response.GetObject()
+			Expect(object.GetStatus().GetState()).To(
+				Equal(publicv1.BareMetalInstanceState_BARE_METAL_INSTANCE_STATE_UNSPECIFIED))
+			Expect(object.GetStatus().GetStateTransitionTime()).To(BeNil())
+		})
+
+		It("Returns a warning for a deprecated disk_image", func() {
+			createDiskImageWithLifecycle("deprecated-bmi-disk-image",
+				privatev1.DiskImageLifecycle_DISK_IMAGE_LIFECYCLE_DEPRECATED, nil)
+
+			response, err := server.Create(ctx, publicv1.BareMetalInstancesCreateRequest_builder{
+				Object: publicv1.BareMetalInstance_builder{
+					Metadata: publicv1.Metadata_builder{Name: "deprecated-baremetal-instance"}.Build(),
+					Spec: publicv1.BareMetalInstanceSpec_builder{
+						DiskImage:      publicv1.DiskImageReference_builder{Id: "deprecated-bmi-disk-image"}.Build(),
+						CatalogItem:    publicv1.BareMetalInstanceCatalogItemReference_builder{Id: catalogItemID}.Build(),
+						UserDataSource: publicv1.UserDataSource_builder{Inline: new("#cloud-config")}.Build(),
+					}.Build(),
+				}.Build(),
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+			Expect(response.GetWarnings()).To(HaveLen(1))
+			Expect(response.GetWarnings()[0]).To(ContainSubstring("deprecated"))
 		})
 
 		It("Fails to create without an object", func() {
@@ -126,8 +188,9 @@ var _ = Describe("Bare metal instances server", func() {
 				_, err := server.Create(ctx, publicv1.BareMetalInstancesCreateRequest_builder{
 					Object: publicv1.BareMetalInstance_builder{
 						Spec: publicv1.BareMetalInstanceSpec_builder{
-							CatalogItem:  publicv1.BareMetalInstanceCatalogItemReference_builder{Id: catalogItemID}.Build(),
-							SshPublicKey: new(testSSHPublicKey),
+							DiskImage:      publicv1.DiskImageReference_builder{Id: "default-bmi-disk-image"}.Build(),
+							CatalogItem:    publicv1.BareMetalInstanceCatalogItemReference_builder{Id: catalogItemID}.Build(),
+							UserDataSource: publicv1.UserDataSource_builder{Inline: new("#cloud-config")}.Build(),
 						}.Build(),
 						Metadata: publicv1.Metadata_builder{
 							Name: fmt.Sprintf("bmi-%d", i),
@@ -149,8 +212,9 @@ var _ = Describe("Bare metal instances server", func() {
 						Name: "test-baremetal-instance",
 					}.Build(),
 					Spec: publicv1.BareMetalInstanceSpec_builder{
-						CatalogItem:  publicv1.BareMetalInstanceCatalogItemReference_builder{Id: catalogItemID}.Build(),
-						SshPublicKey: new(testSSHPublicKey),
+						DiskImage:      publicv1.DiskImageReference_builder{Id: "default-bmi-disk-image"}.Build(),
+						CatalogItem:    publicv1.BareMetalInstanceCatalogItemReference_builder{Id: catalogItemID}.Build(),
+						UserDataSource: publicv1.UserDataSource_builder{Inline: new("#cloud-config")}.Build(),
 					}.Build(),
 				}.Build(),
 			}.Build())
@@ -172,10 +236,11 @@ var _ = Describe("Bare metal instances server", func() {
 						Name: "test-baremetal-instance",
 					}.Build(),
 					Spec: publicv1.BareMetalInstanceSpec_builder{
-						CatalogItem:  publicv1.BareMetalInstanceCatalogItemReference_builder{Id: catalogItemID}.Build(),
-						InstanceType: publicv1.BareMetalInstanceTypeLocalReference_builder{Id: "default-type"}.Build(),
-						RunStrategy:  new(publicv1.BareMetalInstanceRunStrategy_BARE_METAL_INSTANCE_RUN_STRATEGY_ALWAYS),
-						SshPublicKey: new(testSSHPublicKey),
+						DiskImage:      publicv1.DiskImageReference_builder{Id: "default-bmi-disk-image"}.Build(),
+						CatalogItem:    publicv1.BareMetalInstanceCatalogItemReference_builder{Id: catalogItemID}.Build(),
+						InstanceType:   publicv1.BareMetalInstanceTypeReference_builder{Id: "default-type", Shared: true}.Build(),
+						RunStrategy:    new(publicv1.BareMetalInstanceRunStrategy_BARE_METAL_INSTANCE_RUN_STRATEGY_ALWAYS),
+						UserDataSource: publicv1.UserDataSource_builder{Inline: new("#cloud-config")}.Build(),
 					}.Build(),
 				}.Build(),
 			}.Build())
@@ -198,6 +263,72 @@ var _ = Describe("Bare metal instances server", func() {
 				Equal(publicv1.BareMetalInstanceRunStrategy_BARE_METAL_INSTANCE_RUN_STRATEGY_HALTED))
 		})
 
+		It("Keeps the stored status across a maskless update carrying a status", func() {
+			createResponse, err := server.Create(ctx, publicv1.BareMetalInstancesCreateRequest_builder{
+				Object: publicv1.BareMetalInstance_builder{
+					Metadata: publicv1.Metadata_builder{
+						Name: "test-baremetal-instance",
+					}.Build(),
+					Spec: publicv1.BareMetalInstanceSpec_builder{
+						DiskImage:      publicv1.DiskImageReference_builder{Id: "default-bmi-disk-image"}.Build(),
+						CatalogItem:    publicv1.BareMetalInstanceCatalogItemReference_builder{Id: catalogItemID}.Build(),
+						InstanceType:   publicv1.BareMetalInstanceTypeReference_builder{Id: "default-type", Shared: true}.Build(),
+						UserDataSource: publicv1.UserDataSource_builder{Inline: new("#cloud-config")}.Build(),
+					}.Build(),
+				}.Build(),
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+			id := createResponse.GetObject().GetId()
+
+			// Store a state with its transition time, as the operator feedback would. The
+			// time must be after creation (the source contract clamps a first time on or
+			// before it) and truncated to whole seconds: the contract stores transition
+			// times at second granularity, so a sub-second seed would not round-trip.
+			storedTime := timestamppb.New(time.Now().Truncate(time.Second))
+			bmiDao, err := dao.NewGenericDAO[*privatev1.BareMetalInstance]().
+				SetLogger(logger).
+				SetTenancyLogic(tenancy).
+				Build()
+			Expect(err).ToNot(HaveOccurred())
+			stored, err := bmiDao.Get().SetId(id).Do(ctx)
+			Expect(err).ToNot(HaveOccurred())
+			storedObject := stored.GetObject()
+			storedObject.SetStatus(privatev1.BareMetalInstanceStatus_builder{
+				State:               privatev1.BareMetalInstanceState_BARE_METAL_INSTANCE_STATE_PROVISIONING,
+				StateTransitionTime: storedTime,
+			}.Build())
+			_, err = bmiDao.Update().SetObject(storedObject).Do(ctx)
+			Expect(err).ToNot(HaveOccurred())
+
+			// Round-trip the public object without a mask, carrying a fabricated state:
+			getResponse, err := server.Get(ctx, publicv1.BareMetalInstancesGetRequest_builder{
+				Id: id,
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+			tampered := getResponse.GetObject()
+			tampered.GetStatus().SetState(publicv1.BareMetalInstanceState_BARE_METAL_INSTANCE_STATE_RUNNING)
+			updateResponse, err := server.Update(ctx, publicv1.BareMetalInstancesUpdateRequest_builder{
+				Object: tampered,
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+
+			// The stored status and its transition time are unchanged:
+			Expect(updateResponse.GetObject().GetStatus().GetState()).To(
+				Equal(publicv1.BareMetalInstanceState_BARE_METAL_INSTANCE_STATE_PROVISIONING))
+			Expect(updateResponse.GetObject().GetStatus().GetStateTransitionTime().AsTime()).To(
+				Equal(storedTime.AsTime()))
+
+			// And they survive a round-trip through the database:
+			after, err := server.Get(ctx, publicv1.BareMetalInstancesGetRequest_builder{
+				Id: id,
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+			Expect(after.GetObject().GetStatus().GetState()).To(
+				Equal(publicv1.BareMetalInstanceState_BARE_METAL_INSTANCE_STATE_PROVISIONING))
+			Expect(after.GetObject().GetStatus().GetStateTransitionTime().AsTime()).To(
+				Equal(storedTime.AsTime()))
+		})
+
 		It("Fails to update without an object", func() {
 			_, err := server.Update(ctx, publicv1.BareMetalInstancesUpdateRequest_builder{}.Build())
 			Expect(err).To(HaveOccurred())
@@ -216,6 +347,21 @@ var _ = Describe("Bare metal instances server", func() {
 			Expect(s.Code()).To(Equal(codes.InvalidArgument))
 		})
 
+		It("Rejects public updates to the state transition timestamp", func() {
+			for _, path := range []string{"status", "status.state_transition_time"} {
+				_, err := server.Update(ctx, publicv1.BareMetalInstancesUpdateRequest_builder{
+					Object: publicv1.BareMetalInstance_builder{
+						Id: "test-baremetal-instance",
+					}.Build(),
+					UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{path}},
+				}.Build())
+				Expect(err).To(HaveOccurred())
+				s, ok := status.FromError(err)
+				Expect(ok).To(BeTrue())
+				Expect(s.Code()).To(Equal(codes.InvalidArgument))
+			}
+		})
+
 		It("Rejects update that changes immutable catalog_item", func() {
 			createResponse, err := server.Create(ctx, publicv1.BareMetalInstancesCreateRequest_builder{
 				Object: publicv1.BareMetalInstance_builder{
@@ -223,8 +369,9 @@ var _ = Describe("Bare metal instances server", func() {
 						Name: "test-baremetal-instance",
 					}.Build(),
 					Spec: publicv1.BareMetalInstanceSpec_builder{
-						CatalogItem:  publicv1.BareMetalInstanceCatalogItemReference_builder{Id: catalogItemID}.Build(),
-						SshPublicKey: new(testSSHPublicKey),
+						DiskImage:      publicv1.DiskImageReference_builder{Id: "default-bmi-disk-image"}.Build(),
+						CatalogItem:    publicv1.BareMetalInstanceCatalogItemReference_builder{Id: catalogItemID}.Build(),
+						UserDataSource: publicv1.UserDataSource_builder{Inline: new("#cloud-config")}.Build(),
 					}.Build(),
 				}.Build(),
 			}.Build())
@@ -255,8 +402,9 @@ var _ = Describe("Bare metal instances server", func() {
 						Name: "test-baremetal-instance",
 					}.Build(),
 					Spec: publicv1.BareMetalInstanceSpec_builder{
-						CatalogItem:  publicv1.BareMetalInstanceCatalogItemReference_builder{Id: catalogItemID}.Build(),
-						SshPublicKey: new(testSSHPublicKey),
+						DiskImage:      publicv1.DiskImageReference_builder{Id: "default-bmi-disk-image"}.Build(),
+						CatalogItem:    publicv1.BareMetalInstanceCatalogItemReference_builder{Id: catalogItemID}.Build(),
+						UserDataSource: publicv1.UserDataSource_builder{Inline: new("#cloud-config")}.Build(),
 					}.Build(),
 				}.Build(),
 			}.Build())

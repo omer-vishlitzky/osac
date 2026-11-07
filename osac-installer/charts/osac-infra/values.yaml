@@ -1,13 +1,27 @@
 cliImage: quay.io/openshift/origin-cli:4.20.0
+# Pod securityContext for cliImage hook Jobs. Leave unset so OpenShift
+# restricted-v2 SCC allocates the UID. Kind has no SCC and origin-cli
+# USER is 0, so kind-infra.yaml sets runAsUser/fsGroup.
+# cliJobPodSecurityContext:
+#   runAsNonRoot: true
+#   runAsUser: 1000
+#   fsGroup: 1000
+# Resources for every cliImage hook Job. These all shell out to `oc`, which
+# performs full API discovery and caches every API group and resource in
+# memory, so peak usage scales with the cluster's CRD count rather than with
+# what the hook itself does -- an `oc` baseline of ~150Mi plus the discovery
+# cache. 256Mi OOMKills on clusters carrying CNV, MCE, MetalLB, Kafka, ACM and
+# ODF CRDs, so the limit is shared across all hooks instead of being raised per
+# hook as each one is observed to fail. Raise it on clusters with unusually
+# large CRD counts.
+hookResources:
+  requests:
+    cpu: 50m
+    memory: 128Mi
+  limits:
+    cpu: 200m
+    memory: 1Gi
 osacNamespace: osac
-csiNamespace: osac-csi
-# Name of the "osac" umbrella chart's Helm release. The csi-driver subchart
-# (a dependency of that release) owns a Namespace template for csiNamespace,
-# so the create-csi-driver-credentials hook must pre-stamp that namespace
-# with this release's identity (name + osacNamespace) before it's created --
-# otherwise the later `helm upgrade --install osac` fails to adopt it
-# ("invalid ownership metadata").
-csiReleaseName: osac
 
 certManager:
   enabled: true
@@ -28,9 +42,30 @@ keycloak:
   enabled: true
   realmOverwrite: true
   hostname: "keycloak.keycloak.svc.cluster.local"
+  # uiUrl is the browser-facing base URL of the OSAC UI (scheme://host[:port],
+  # no trailing path). It is substituted into the osac-ui client's rootUrl,
+  # redirectUris and webOrigins in realm.json, which Keycloak validates the
+  # authorization-code redirect_uri against -- a relative value there breaks
+  # browser login with "Invalid parameter: redirect_uri" (OSAC-3884).
+  # The scheme must be https, except for the local-development hosts
+  # `localhost`, `*.localhost` and `127.0.0.1`, where plain http is allowed --
+  # anywhere else it would return the authorization code to the browser
+  # unencrypted, and the resolver rejects it.
+  # The default matches the kind dev-full UI HTTPRoute; on OpenShift
+  # `make install-infra` overrides it with the osac-ui Route URL.
+  uiUrl: "http://ui.osac.localhost:8080"
   adminUsername: admin
   adminPassword: admin
   defaultUserPassword: foobar
+  # extraEnv injects additional environment variables into the Keycloak pod.
+  # Use this for SPI overrides that must be set at the server level (e.g.
+  # KC_SPI_CONNECTIONS_HTTP_CLIENT_DEFAULT_DISABLE_TRUST_MANAGER for Kind).
+  extraEnv: []
+  oidcIdpTrust:
+    # PEM-encoded CA bundle for outbound TLS to an external OIDC identity
+    # provider. The chart adds it to the shared trust-manager bundle.
+    # Set with --set-file keycloak.oidcIdpTrust.caPem=/path/to/idp-ca.pem.
+    caPem: ""
   route:
     hostname: ""
     publicIngress: false
@@ -39,10 +74,13 @@ keycloak:
   # outside Kind/CI -- this chart is also used for real installs.
   devFixtures:
     enabled: false
+    mcpResourceURL: "https://mcp.osac.localhost:8443/"
   images:
     keycloak: quay.io/keycloak/keycloak:26.6.4
     postgres: quay.io/sclorg/postgresql-18-c10s@sha256:6be2c9d855f06fb665257a6b0911676a38d740be7022cc61acee1c99a832b1b2
 
+# Kind-only API stubs, including ClusterUserDefinedNetwork for dev-full.
+# They accept API objects but do not provide the corresponding controllers.
 fakeCrds:
   enabled: false
 
@@ -57,18 +95,89 @@ lvms:
   enabled: false
   channel: "stable-4.22"
 
+# Optional local LVM CSI provisioning for the Kind dev-full profile.
+topolvm:
+  enabled: false
+
 metallb:
   enabled: false
   channel: "stable"
+
+# Activate metal3/Ironic so the Bare Metal Fulfillment operator's Metal3
+# inventory backend can reconcile BareMetalHosts. The hook applies the
+# Provisioning CR with no provisioning network and cluster-wide BareMetalHost
+# discovery, the configuration CI and virtual clusters use.
+metal3:
+  enabled: false
 
 cnv:
   enabled: false
   channel: "stable"
 
+# EVPN host networking for VMaaS (k8sManager cudn_evpn). OpenShift only.
+# Configures FRR, route advertisements, NMState, per-node underlay addresses,
+# the tenant-vtep VTEP and BGP peering with the fabric. The fabric side
+# (switch ports, the node ASN on the fabric) must be configured separately.
+evpn:
+  enabled: false
+  nmstate:
+    # false when the NMState operator is already installed on the cluster.
+    install: true
+    channel: stable
+  # Patch the cluster network operator (FRR, route advertisements, routing via
+  # host, global IP forwarding). This restarts OVN-Kubernetes once.
+  configureClusterNetwork: true
+  # [REQUIRED when enabled] Range holding every node's VTEP IP.
+  vtepCIDR: ""
+  bgp:
+    # [REQUIRED when enabled] Node ASN; a node can override it.
+    asn: 0
+    # [REQUIRED when enabled] Fabric loopback ranges (remote VTEPs). Only /32
+    # routes inside these ranges are accepted from the fabric.
+    acceptPrefixes: []
+    # Fail the install when sessions are not Established within the timeout.
+    waitForEstablished: true
+    timeoutSeconds: 900
+  # [REQUIRED when enabled] One entry per node that runs VMs.
+  # nodes:
+  #   - name: worker-0            # Kubernetes node name
+  #     vtepIP: 10.200.255.1      # inside vtepCIDR, unique per node
+  #     asn: 4209999999           # optional, defaults to bgp.asn
+  #     uplinks:                  # one per cable to a leaf
+  #       - interface: ens6
+  #         address: 169.254.133.2/31   # optional; omit if already configured
+  #         peerAddress: 169.254.133.1
+  #         peerASN: 4200300002
+  nodes: []
+
 mce:
+  # Opt in only when this installation owns the multicluster engine lifecycle.
   enabled: false
   channel: "stable-2.17"
+  imageService:
+    # Keep enabled until the Assisted discovery-artifact fix is released and
+    # verified.
+    enabled: true
   osImages: []
+  # Temporary MCE 5.0 operand bridge until a stable MCE 5.0 catalog is
+  # available. These overrides render only when mce.enabled is true.
+  imageOverrides:
+    - image-name: assisted-service
+      image-remote: quay.io/edge-infrastructure
+      image-digest: sha256:c007ecc530f4bb0a43814f4373bdec6e27d1fa3698554b0935a07c086802e479
+      image-key: assisted_service_9
+    - image-name: assisted-installer-agent
+      image-remote: quay.io/edge-infrastructure
+      image-digest: sha256:0f4f6041821d1a03da280090cf8a857e6b081487301de7e37553b0398925b391
+      image-key: assisted_installer_agent
+    - image-name: assisted-installer
+      image-remote: quay.io/edge-infrastructure
+      image-digest: sha256:04fe09dddf10be4fa7dfd91bde7b4c6addb60b3d1291596a9399fe057f5f1f3b
+      image-key: assisted_installer
+    - image-name: assisted-installer-controller
+      image-remote: quay.io/edge-infrastructure
+      image-digest: sha256:54c095c08defc738558948ef1be52dd980642bf0020570435a68384d1d5177a3
+      image-key: assisted_installer_controller
 
 kafka:
   enabled: false
@@ -77,6 +186,23 @@ kafka:
     size: 100Gi
   version: "4.2.0"
   metadataVersion: "4.2-IV0"
+  exporter:
+    # Strimzi's Kafka Exporter reports consumer-group lag. It connects with a
+    # certificate Strimzi adds to the broker's super.users, so leave it off
+    # unless lag monitoring is wanted. This one value renders the exporter,
+    # its PodMonitor, and the MeteringConsumerLag rule.
+    enabled: false
+    # Heartbeat records a consumer may fall behind before MeteringConsumerLag
+    # fires. A metered resource sends about one heartbeat per minute, so a
+    # single-VM tenant grows lag by about one record per minute: 15 is about
+    # 15 minutes of growth, and the rule's 15-minute `for` makes a stalled
+    # consumer visible in roughly half an hour. Busy tenants cross it sooner.
+    lagThreshold: 15
+    podMonitor:
+      # Extra labels for the Kafka Exporter PodMonitor, for Prometheus
+      # installations that select monitors by label (for example a
+      # kube-prometheus-stack release label).
+      labels: {}
 
 # --- Shared PostgreSQL (dev/CI only) ---
 bundledPostgres:
@@ -91,6 +217,47 @@ bundledPostgres:
     requests:
       cpu: 50m
       memory: 128Mi
+
+# --- Bundled OpenBao (dev/CI only) ---
+# Vault-compatible secret store for testing and CI. Not for production.
+bundledVault:
+  enabled: false
+  image: "ghcr.io/openbao/openbao:2.6.2"
+  # Default podSecurityContext omits a hardcoded UID so that OpenShift's
+  # restricted-v2 SCC can allocate from the namespace UID range. Override
+  # this in a profile's infra.yaml when a specific UID is required (e.g. Kind).
+  # Profile overrides are merged with this chart default; unspecified keys
+  # such as seccompProfile are retained.
+  podSecurityContext:
+    runAsNonRoot: true
+    seccompProfile:
+      type: RuntimeDefault
+  resources:
+    limits:
+      cpu: 500m
+      memory: 512Mi
+    requests:
+      cpu: 100m
+      memory: 256Mi
+  # --- Bootstrap configuration ---
+  # keycloakIssuerUrl: Keycloak OIDC issuer URL for JWT auth bootstrap.
+  # Required when bundledVault is enabled. On OpenShift this must be the
+  # external route URL (not the internal service URL) to avoid OIDC discovery
+  # issuer mismatch.
+  keycloakIssuerUrl: ""
+  # keycloakAudience: expected "aud" claim in JWT tokens.
+  keycloakAudience: "osac-api"
+  # vaultNamespace: OpenBao/Vault logical namespace (NOT Kubernetes namespace).
+  # The init script creates this as a child namespace inside the OpenBao server
+  # and configures JWT auth and policies within it.
+  vaultNamespace: "osac"
+
+# --- NetBox (dev/CI only) ---
+# Deploys NetBox via the netbox-community Helm chart as a bare-metal inventory
+# backend for the bmaas_netbox E2E test flavor. Not intended for production.
+# All other netbox.* values are supplied by the profile overlay.
+netbox:
+  enabled: false
 
 # --- TLS certificate configuration for shared infrastructure ---
 certs:

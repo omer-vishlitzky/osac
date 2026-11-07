@@ -13,9 +13,12 @@ language governing permissions and limitations under the License.
 
 package computeinstance
 
-//go:generate mockgen -source=../../api/osac/private/v1/compute_instances_service_grpc.pb.go -destination=compute_instances_client_mock.go -package=computeinstance ComputeInstancesClient
-//go:generate mockgen -source=../../api/osac/private/v1/instance_types_service_grpc.pb.go -destination=instance_types_client_mock.go -package=computeinstance InstanceTypesClient
-//go:generate mockgen -source=../../api/osac/private/v1/disk_images_service_grpc.pb.go -destination=disk_images_client_mock.go -package=computeinstance DiskImagesClient
+//go:generate mockgen -destination=compute_instances_client_mock.go -package=computeinstance github.com/osac-project/osac/proto/gen/osac/private/v1 ComputeInstancesClient
+//go:generate mockgen -destination=external_ips_client_mock.go -package=computeinstance github.com/osac-project/osac/proto/gen/osac/private/v1 ExternalIPsClient
+//go:generate mockgen -destination=external_ip_attachments_client_mock.go -package=computeinstance github.com/osac-project/osac/proto/gen/osac/private/v1 ExternalIPAttachmentsClient
+//go:generate mockgen -destination=instance_types_client_mock.go -package=computeinstance github.com/osac-project/osac/proto/gen/osac/private/v1 InstanceTypesClient
+//go:generate mockgen -destination=disk_images_client_mock.go -package=computeinstance github.com/osac-project/osac/proto/gen/osac/private/v1 DiskImagesClient
+//go:generate mockgen -destination=secrets_client_mock.go -package=computeinstance github.com/osac-project/osac/proto/gen/osac/private/v1 SecretsClient
 
 import (
 	"context"
@@ -24,25 +27,29 @@ import (
 	"log/slog"
 	"math/rand/v2"
 	"slices"
+	"time"
 
-	"github.com/osac-project/osac/fulfillment-service/internal/computeinstancespec"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
-	"google.golang.org/protobuf/types/known/timestamppb"
 	corev1 "k8s.io/api/core/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	clnt "sigs.k8s.io/controller-runtime/pkg/client"
 
+	"github.com/osac-project/osac/fulfillment-service/internal/computeinstancespec"
+
 	osacv1alpha1 "github.com/osac-project/osac/osac-operator/api/v1alpha1"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/controllers"
 	"github.com/osac-project/osac/fulfillment-service/internal/controllers/finalizers"
 	"github.com/osac-project/osac/fulfillment-service/internal/kubernetes/annotations"
 	"github.com/osac-project/osac/fulfillment-service/internal/kubernetes/labels"
 	"github.com/osac-project/osac/fulfillment-service/internal/masks"
 	"github.com/osac-project/osac/fulfillment-service/internal/utils"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
 // objectPrefix is the prefix that will be used in the `generateName` field of the resources created in the hub.
@@ -60,6 +67,35 @@ const userDataSecretKey = "userdata"
 // instance's state untouched so it doesn't look like a permanent failure while it is retried.
 var errTransientK8sError = errors.New("transient kubernetes error")
 
+// Registration errors retain their private detail for the retry log, while the
+// public PROVISIONED condition is derived separately from persisted state.
+var errDiskRegistrationRetry = errors.New("disk registration retry")
+
+func diskRegistrationRetry(err error) error {
+	if err != nil {
+		err = fmt.Errorf("%w: %w", errDiskRegistrationRetry, err)
+	} else {
+		err = errDiskRegistrationRetry
+	}
+	return controllers.RequeueAfter(err, time.Second)
+}
+
+// SecretResolutionError classifies a failure while resolving the Secret referenced
+// by the ComputeInstance SSH key field.
+type SecretResolutionError struct {
+	Permanent bool
+	Reason    string
+	Err       error
+}
+
+func (e *SecretResolutionError) Error() string {
+	return fmt.Sprintf("failed to resolve SSH public key Secret: %v", e.Err)
+}
+
+func (e *SecretResolutionError) Unwrap() error {
+	return e.Err
+}
+
 // FunctionBuilder contains the data and logic needed to build a function that reconciles compute instances.
 type FunctionBuilder struct {
 	logger     *slog.Logger
@@ -68,22 +104,30 @@ type FunctionBuilder struct {
 }
 
 type function struct {
-	logger                 *slog.Logger
-	hubCache               controllers.HubCache
-	computeInstancesClient privatev1.ComputeInstancesClient
-	hubsClient             privatev1.HubsClient
-	instanceTypesClient    privatev1.InstanceTypesClient
-	diskImagesClient       privatev1.DiskImagesClient
-	maskCalculator         *masks.Calculator
+	logger                      *slog.Logger
+	hubCache                    controllers.HubCache
+	networkingHubReader         controllers.NetworkingHubReader
+	networkingCleanup           controllers.WorkloadNetworkingCleanup
+	computeInstancesClient      privatev1.ComputeInstancesClient
+	volumesClient               privatev1.VolumesClient
+	externalIPsClient           privatev1.ExternalIPsClient
+	externalIPAttachmentsClient privatev1.ExternalIPAttachmentsClient
+	hubsClient                  privatev1.HubsClient
+	instanceTypesClient         privatev1.InstanceTypesClient
+	diskImagesClient            privatev1.DiskImagesClient
+	secretsClient               privatev1.SecretsClient
+	maskCalculator              *masks.Calculator
 }
 
 type task struct {
 	r                  *function
 	computeInstance    *privatev1.ComputeInstance
+	registeredVolumes  []*privatev1.ComputeInstanceVolume
 	hubId              string
 	hubNamespace       string
 	hubClient          clnt.Client
 	userDataSecretName string
+	materializedSSHKey string
 }
 
 // NewFunction creates a new builder that can then be used to create a new compute instance reconciler function.
@@ -127,13 +171,25 @@ func (b *FunctionBuilder) Build() (result controllers.ReconcilerFunction[*privat
 
 	// Create and populate the object:
 	object := &function{
-		logger:                 b.logger,
-		computeInstancesClient: privatev1.NewComputeInstancesClient(b.connection),
-		hubsClient:             privatev1.NewHubsClient(b.connection),
-		instanceTypesClient:    privatev1.NewInstanceTypesClient(b.connection),
-		diskImagesClient:       privatev1.NewDiskImagesClient(b.connection),
-		hubCache:               b.hubCache,
-		maskCalculator:         masks.NewCalculator().Build(),
+		logger:                      b.logger,
+		networkingCleanup:           controllers.NewWorkloadNetworkingCleanup(b.connection),
+		computeInstancesClient:      privatev1.NewComputeInstancesClient(b.connection),
+		volumesClient:               privatev1.NewVolumesClient(b.connection),
+		externalIPsClient:           privatev1.NewExternalIPsClient(b.connection),
+		externalIPAttachmentsClient: privatev1.NewExternalIPAttachmentsClient(b.connection),
+		hubsClient:                  privatev1.NewHubsClient(b.connection),
+		instanceTypesClient:         privatev1.NewInstanceTypesClient(b.connection),
+		diskImagesClient:            privatev1.NewDiskImagesClient(b.connection),
+		secretsClient:               privatev1.NewSecretsClient(b.connection),
+		hubCache:                    b.hubCache,
+		maskCalculator:              masks.NewCalculator().Build(),
+	}
+	object.networkingHubReader, err = controllers.NewNetworkingHubReader().
+		SetNetworkClassesClient(privatev1.NewNetworkClassesClient(b.connection)).
+		SetHubCache(b.hubCache).
+		Build()
+	if err != nil {
+		return nil, err
 	}
 	result = object.run
 	return
@@ -151,11 +207,42 @@ func (r *function) run(ctx context.Context, computeInstance *privatev1.ComputeIn
 	} else {
 		reconcileErr = t.update(ctx)
 	}
-	if reconcileErr != nil && !errors.Is(reconcileErr, errTransientK8sError) {
-		t.setReconciliationFailed(reconcileErr)
+	var hubResolutionRetryErr error
+	if reconcileErr != nil {
+		handled, retry := controllers.HandleResourceNetworkingHubResolutionError(reconcileErr, t.setPending, t.setFailed)
+		if handled {
+			if retry {
+				hubResolutionRetryErr = reconcileErr
+			}
+			reconcileErr = nil
+		}
+	}
+	if reconcileErr != nil {
+		var secretErr *controllers.SSHKeyResolutionError
+		if errors.As(reconcileErr, &secretErr) {
+			if secretErr.Permanent {
+				t.setReconciliationFailedWithReason(secretErr.Err, secretErr.Reason)
+			} else {
+				// Resolution failures are retried without changing API status or creating
+				// a Kubernetes object. Restore the input so defaults and hub selection do
+				// not turn a transient lookup failure into a persisted mutation.
+				proto.Reset(computeInstance)
+				proto.Merge(computeInstance, oldComputeInstance)
+			}
+		} else if !errors.Is(reconcileErr, errTransientK8sError) &&
+			!errors.Is(reconcileErr, errDiskRegistrationRetry) && !controllers.IsRequeueable(reconcileErr) {
+			t.setReconciliationFailed(reconcileErr)
+		}
 	}
 	// Calculate which fields the reconciler actually modified and use a field mask
 	// to update only those fields. This prevents overwriting concurrent user changes.
+	// Disk registration persists status through separate API calls. If this pass
+	// started without status, compare against an empty status so the mask names
+	// only our changed fields instead of replacing all of status with this stale
+	// copy and erasing the newly persisted Volume IDs.
+	if !oldComputeInstance.HasStatus() && computeInstance.HasStatus() {
+		oldComputeInstance.SetStatus(&privatev1.ComputeInstanceStatus{})
+	}
 	updateMask := r.maskCalculator.Calculate(oldComputeInstance, computeInstance)
 
 	// Only send an update if there are actual changes
@@ -176,7 +263,10 @@ func (r *function) run(ctx context.Context, computeInstance *privatev1.ComputeIn
 		}
 		return reconcileErr
 	}
-	return updateErr
+	if updateErr != nil {
+		return updateErr
+	}
+	return hubResolutionRetryErr
 }
 
 func (t *task) update(ctx context.Context) error {
@@ -194,30 +284,38 @@ func (t *task) update(ctx context.Context) error {
 		return err
 	}
 
-	// Select the hub and return immediately if it was just selected. This ensures the hub is
-	// persisted before any Kubernetes objects are created.
-	hubJustSelected := t.computeInstance.GetStatus().GetHub() == ""
+	// Resolve the hub. The CR is created (or adopted by its label) before status.hub is written, at the end of the
+	// run, so a restart between the two never creates a second CR.
 	if err := t.selectHub(ctx); err != nil {
 		return err
 	}
 	t.computeInstance.GetStatus().SetHub(t.hubId)
-	if hubJustSelected {
-		return nil
-	}
 
 	// Get the K8S object:
 	object, err := t.getKubeObject(ctx)
 	if err != nil {
 		return err
 	}
+	if object != nil {
+		// SSH-key injection is initial-only. Preserve the key already materialized
+		// on the immutable CR instead of depending on the registry entry forever.
+		t.materializedSSHKey = object.Spec.SSHKey
+	}
+	ready, err := t.reconcileDiskRegistrationForWorkload(ctx, object == nil)
+	if err != nil {
+		return err
+	}
+	if !ready {
+		return nil
+	}
 
 	// Set the user data Secret name if user data is provided (no K8s call yet):
-	if t.computeInstance.GetSpec().HasUserData() {
+	if t.computeInstance.GetSpec().GetUserDataSource() != nil {
 		t.userDataSecretName = fmt.Sprintf("%s%s", t.computeInstance.GetId(), userDataSecretSuffix)
 	}
 
 	// Prepare the changes to the spec:
-	spec, err := t.buildSpec(ctx)
+	spec, err := t.buildSpecWithNetworkAttachments(ctx, object == nil)
 	if err != nil {
 		return err
 	}
@@ -255,8 +353,28 @@ func (t *task) update(ctx context.Context) error {
 			slog.String("name", object.GetName()),
 		)
 	} else {
+		var desiredNetworkSpec osacv1alpha1.ComputeInstanceSpec
+		if networkErr := t.buildSpecNetworkAttachments(ctx, &desiredNetworkSpec); networkErr != nil {
+			t.r.logger.WarnContext(ctx, "Failed to resolve private network attachments; preserving stored network attachments on existing ComputeInstance",
+				slog.String("namespace", object.GetNamespace()), slog.String("name", object.GetName()), slog.Any("error", networkErr))
+		} else if !equalNetworkAttachments(object.Spec.NetworkAttachments, desiredNetworkSpec.NetworkAttachments) {
+			t.r.logger.WarnContext(ctx, "Private and stored network attachments differ; preserving stored network attachments on existing ComputeInstance",
+				slog.String("namespace", object.GetNamespace()), slog.String("name", object.GetName()))
+		}
+		spec.NetworkAttachments = object.Spec.NetworkAttachments
 		update := object.DeepCopy()
 		update.Spec = spec
+		// Keep the instance-type-name label in sync with the spec being patched so it
+		// always names the type the CR was reconciled toward. The operator's feedback
+		// controller gates the running-type stamp on this label; updating it atomically
+		// with the spec prevents a requested resize from being billed before the CR
+		// actually carries the new configuration.
+		if instanceType := t.computeInstance.GetSpec().GetInstanceType(); instanceType != nil {
+			if update.Labels == nil {
+				update.Labels = map[string]string{}
+			}
+			update.Labels[labels.InstanceTypeName] = instanceType.GetName()
+		}
 		err = t.hubClient.Patch(ctx, update, clnt.MergeFrom(object))
 		if err != nil {
 			if err := controllers.HandleK8sWriteError(ctx, t.r.logger, err, t.setFailed); err != nil {
@@ -280,13 +398,64 @@ func (t *task) update(ctx context.Context) error {
 	return nil
 }
 
+func (t *task) reconcileDiskRegistrationForWorkload(ctx context.Context, workloadAbsent bool) (bool, error) {
+	reconcileRegistration := workloadAbsent && t.computeInstance.GetSpec().GetBootDisk() != nil
+	if !reconcileRegistration && len(t.computeInstance.GetStatus().GetVolumeRegistration()) > 0 {
+		prepared, err := prepareDiskRegistrations(t.computeInstance)
+		if err != nil {
+			return false, err
+		}
+		complete, err := diskRegistrationsComplete(t.computeInstance, prepared)
+		if err != nil {
+			return false, err
+		}
+		reconcileRegistration = !complete
+	}
+	if !reconcileRegistration {
+		return true, nil
+	}
+	registrationErr := ReconcileDiskRegistrations(
+		ctx, t.r.computeInstancesClient, t.r.volumesClient, t.computeInstance.GetId())
+	latest, err := getComputeInstanceForDiskRegistration(ctx, t.r.computeInstancesClient, t.computeInstance.GetId())
+	if err != nil {
+		t.updateCondition(privatev1.ComputeInstanceConditionType_COMPUTE_INSTANCE_CONDITION_TYPE_PROVISIONED,
+			privatev1.ConditionStatus_CONDITION_STATUS_FALSE, "VolumeRegistrationPending",
+			"Disk registration status is unavailable; retrying.")
+		return false, diskRegistrationRetry(err)
+	}
+	if !hasDiskRegistrationFinalizer(latest) || latest.GetMetadata().HasDeletionTimestamp() {
+		return false, nil
+	}
+	complete, reason, message, err := diskRegistrationProgress(latest)
+	if err != nil {
+		t.updateCondition(privatev1.ComputeInstanceConditionType_COMPUTE_INSTANCE_CONDITION_TYPE_PROVISIONED,
+			privatev1.ConditionStatus_CONDITION_STATUS_FALSE, "VolumeRegistrationPending",
+			"Disk registration status is unavailable; retrying.")
+		return false, diskRegistrationRetry(err)
+	}
+	// The registration helper commits IDs and conditions independently. Copy
+	// only the latest conditions so the outer field mask cannot resend stale
+	// registration state or Volume IDs.
+	t.computeInstance.GetStatus().SetConditions(proto.Clone(latest.GetStatus()).(*privatev1.ComputeInstanceStatus).GetConditions())
+	t.updateCondition(privatev1.ComputeInstanceConditionType_COMPUTE_INSTANCE_CONDITION_TYPE_PROVISIONED,
+		privatev1.ConditionStatus_CONDITION_STATUS_FALSE, reason, message)
+	if registrationErr != nil {
+		return false, diskRegistrationRetry(registrationErr)
+	}
+	if !complete {
+		return false, diskRegistrationRetry(nil)
+	}
+	t.registeredVolumes = latest.GetStatus().GetVolumes()
+	return true, nil
+}
+
 func (t *task) setDefaults() {
 	if !t.computeInstance.HasStatus() {
 		t.computeInstance.SetStatus(&privatev1.ComputeInstanceStatus{})
 	}
 	if t.computeInstance.GetStatus().GetState() == privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_UNSPECIFIED {
 		t.computeInstance.GetStatus().SetState(privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_STARTING)
-		t.computeInstance.GetStatus().SetStateTransitionTime(timestamppb.Now())
+		t.computeInstance.GetStatus().SetStateTransitionTime(controllers.NowTruncated())
 	}
 	for value := range privatev1.ComputeInstanceConditionType_name {
 		if value != 0 {
@@ -318,19 +487,43 @@ func (t *task) validateTenant() error {
 }
 
 func (t *task) delete(ctx context.Context) (err error) {
+	// ExternalIPAttachment must finish detaching before its ExternalIP can be released.
+	// Keep the ComputeInstance finalizer until both resources are absent, then continue
+	// with the Kubernetes ComputeInstance cleanup below.
+	cleanedUp, cleanupErr := t.cleanupAutoExternalIPResources(ctx)
+	if cleanupErr != nil {
+		return cleanupErr
+	}
+	if !cleanedUp {
+		return nil
+	}
+
 	// Do nothing if we don't know the hub yet:
 	t.hubId = t.computeInstance.GetStatus().GetHub()
 	if t.hubId == "" {
 		// No hub assigned, nothing to clean up on K8s side.
-		t.removeFinalizer()
-		return nil
+		if err = controllers.ReconcileWorkloadNetworkingCleanup(ctx, t.r.networkingCleanup, t.computeInstance.GetId()); err != nil {
+			return err
+		}
+		return t.releaseFinalizerAfterVolumeCleanup(ctx, t.removeFinalizer)
 	}
 	err = t.getHub(ctx)
 	if err != nil {
 		// Check if the hub has been decommissioned (deleted from database)
 		if errors.Is(err, controllers.ErrHubNotFound) {
-			controllers.RemoveFinalizerOnDecommissionedHub(ctx, t.r.logger, t.hubId, "compute_instance_id", t.computeInstance.GetId(), t.removeFinalizer)
-			return nil
+			if err = controllers.ReconcileWorkloadNetworkingCleanup(ctx, t.r.networkingCleanup, t.computeInstance.GetId()); err != nil {
+				return err
+			}
+			return t.releaseFinalizerAfterVolumeCleanup(ctx, func() {
+				controllers.RemoveFinalizerOnDecommissionedHub(
+					ctx,
+					t.r.logger,
+					t.hubId,
+					"compute_instance_id",
+					t.computeInstance.GetId(),
+					t.removeFinalizer,
+				)
+			})
 		}
 		// For transient errors (network, timeout, etc.), continue retrying
 		return
@@ -349,8 +542,10 @@ func (t *task) delete(ctx context.Context) (err error) {
 			"Compute instance doesn't exist",
 			slog.String("id", t.computeInstance.GetId()),
 		)
-		t.removeFinalizer()
-		return
+		if err = controllers.ReconcileWorkloadNetworkingCleanup(ctx, t.r.networkingCleanup, t.computeInstance.GetId()); err != nil {
+			return err
+		}
+		return t.releaseFinalizerAfterVolumeCleanup(ctx, t.removeFinalizer)
 	}
 
 	// Initiate K8s deletion if not already in progress:
@@ -375,11 +570,132 @@ func (t *task) delete(ctx context.Context) (err error) {
 	}
 
 	// Don't remove finalizer — K8s object still exists with finalizers being processed.
-	return
+	return controllers.RequeueAfterKubernetesDeletion("compute instance")
+}
+
+func computeInstanceExternalIPAttachmentFilter(ci *privatev1.ComputeInstance) string {
+	filter := fmt.Sprintf(
+		"this.metadata.tenant == %q && this.spec.compute_instance.id == %q",
+		ci.GetMetadata().GetTenant(), ci.GetId(),
+	)
+	if ci.GetMetadata().GetName() != "" {
+		filter += fmt.Sprintf(" || (this.metadata.tenant == %q && this.spec.compute_instance.name == %q)",
+			ci.GetMetadata().GetTenant(), ci.GetMetadata().GetName())
+	}
+	return filter
+}
+
+func autoCreatedExternalIPFilter(tenant, ciID string) string {
+	return fmt.Sprintf(
+		"this.metadata.tenant == %q && this.metadata.labels[%q] == %q && this.metadata.labels[%q] == %q",
+		tenant, labels.AutoCreated, "true", labels.AutoCreatedFor, ciID,
+	)
+}
+
+func (t *task) cleanupAutoExternalIPResources(ctx context.Context) (bool, error) {
+	ci := t.computeInstance
+	if !ci.GetSpec().GetAutoExternalIpAttachment() {
+		return true, nil
+	}
+	if t.r.externalIPAttachmentsClient == nil || t.r.externalIPsClient == nil {
+		return false, errors.New("ExternalIP clients are not configured")
+	}
+
+	attachmentFilter := computeInstanceExternalIPAttachmentFilter(ci)
+	attachments, err := t.r.externalIPAttachmentsClient.List(ctx, privatev1.ExternalIPAttachmentsListRequest_builder{
+		Filter: &attachmentFilter,
+		Limit:  new(int32(1000)),
+	}.Build())
+	if err != nil {
+		return false, fmt.Errorf("failed to list ExternalIPAttachments for ComputeInstance '%s': %w", ci.GetId(), err)
+	}
+	if int(attachments.GetTotal()) > len(attachments.GetItems()) {
+		return false, fmt.Errorf("ExternalIPAttachment list for ComputeInstance '%s' was incomplete", ci.GetId())
+	}
+	for _, attachment := range attachments.GetItems() {
+		if attachment.GetMetadata().GetLabels()[labels.AutoCreated] != "true" ||
+			attachment.GetMetadata().GetAnnotations()[annotations.OwnerReference] != ci.GetId() {
+			t.r.logger.WarnContext(ctx, "ComputeInstance deletion is waiting for a manually managed ExternalIPAttachment",
+				slog.String("compute_instance_id", ci.GetId()), slog.String("external_ip_attachment_id", attachment.GetId()))
+			return false, nil
+		}
+	}
+	waitingForAttachments := false
+	for _, attachment := range attachments.GetItems() {
+		if attachment.GetMetadata().HasDeletionTimestamp() {
+			waitingForAttachments = true
+			continue
+		}
+		_, deleteErr := t.r.externalIPAttachmentsClient.Delete(ctx, privatev1.ExternalIPAttachmentsDeleteRequest_builder{
+			Id: attachment.GetId(),
+		}.Build())
+		if status.Code(deleteErr) == codes.NotFound {
+			continue
+		}
+		if deleteErr != nil {
+			return false, fmt.Errorf("failed to delete ExternalIPAttachment '%s': %w", attachment.GetId(), deleteErr)
+		}
+		waitingForAttachments = true
+	}
+	if waitingForAttachments {
+		return false, nil
+	}
+
+	eipFilter := autoCreatedExternalIPFilter(ci.GetMetadata().GetTenant(), ci.GetId())
+	eips, err := t.r.externalIPsClient.List(ctx, privatev1.ExternalIPsListRequest_builder{
+		Filter: &eipFilter,
+		Limit:  new(int32(1000)),
+	}.Build())
+	if err != nil {
+		return false, fmt.Errorf("failed to list auto-created ExternalIPs for ComputeInstance '%s': %w", ci.GetId(), err)
+	}
+	if int(eips.GetTotal()) > len(eips.GetItems()) {
+		return false, fmt.Errorf("ExternalIP list for ComputeInstance '%s' was incomplete", ci.GetId())
+	}
+	waitingForEIPs := false
+	for _, eip := range eips.GetItems() {
+		if eip.GetMetadata().GetLabels()[labels.AutoCreated] != "true" ||
+			eip.GetMetadata().GetLabels()[labels.AutoCreatedFor] != ci.GetId() ||
+			eip.GetMetadata().GetAnnotations()[annotations.OwnerReference] != ci.GetId() {
+			return false, fmt.Errorf("auto-created ExternalIP '%s' is not owned by ComputeInstance '%s'", eip.GetId(), ci.GetId())
+		}
+		if eip.GetStatus().GetAttached() || eip.GetMetadata().HasDeletionTimestamp() {
+			waitingForEIPs = true
+			continue
+		}
+		_, deleteErr := t.r.externalIPsClient.Delete(ctx, privatev1.ExternalIPsDeleteRequest_builder{
+			Id: eip.GetId(),
+		}.Build())
+		if status.Code(deleteErr) == codes.NotFound {
+			continue
+		}
+		if deleteErr != nil {
+			return false, fmt.Errorf("failed to delete ExternalIP '%s': %w", eip.GetId(), deleteErr)
+		}
+		waitingForEIPs = true
+	}
+	if waitingForEIPs {
+		return false, nil
+	}
+	return true, nil
 }
 
 func (t *task) selectHub(ctx context.Context) error {
 	t.hubId = t.computeInstance.GetStatus().GetHub()
+	if len(t.computeInstance.GetSpec().GetNetworkAttachments()) > 0 {
+		if t.r.networkingHubReader == nil {
+			return controllers.ErrCanonicalHubUnavailable
+		}
+		resolution, err := controllers.ResolveResourceNetworkingHub(ctx, t.r.networkingHubReader, t.hubId)
+		if err != nil {
+			return err
+		}
+		t.hubId = resolution.HubID
+		t.hubNamespace = resolution.Namespace
+		t.hubClient = resolution.Client
+		t.r.logger.DebugContext(ctx, "Selected canonical networking hub", slog.String("id", t.hubId))
+		return nil
+	}
 	if t.hubId == "" {
 		response, err := t.r.hubsClient.List(ctx, privatev1.HubsListRequest_builder{}.Build())
 		if err != nil {
@@ -442,61 +758,6 @@ func (t *task) getKubeObject(ctx context.Context) (result *osacv1alpha1.ComputeI
 	return
 }
 
-// getSubnetCR looks up a Subnet CR in the hub cluster by its fulfillment UUID label.
-// Returns the Subnet CR if exactly one is found, nil if none found, or an error if multiple found.
-func (t *task) getSubnetCR(ctx context.Context, subnetID string) (*osacv1alpha1.Subnet, error) {
-	list := &osacv1alpha1.SubnetList{}
-	err := t.hubClient.List(
-		ctx, list,
-		clnt.InNamespace(t.hubNamespace),
-		clnt.MatchingLabels{
-			labels.SubnetUuid: subnetID,
-		},
-	)
-	if err != nil {
-		return nil, err
-	}
-	items := list.Items
-	count := len(items)
-	if count > 1 {
-		return nil, fmt.Errorf(
-			"expected at most one subnet with identifier '%s' but found %d",
-			subnetID, count,
-		)
-	}
-	if count == 0 {
-		return nil, nil
-	}
-	return &items[0], nil
-}
-
-// getSecurityGroupCR looks up a SecurityGroup CR in the hub cluster by its fulfillment UUID label.
-func (t *task) getSecurityGroupCR(ctx context.Context, securityGroupID string) (*osacv1alpha1.SecurityGroup, error) {
-	list := &osacv1alpha1.SecurityGroupList{}
-	err := t.hubClient.List(
-		ctx, list,
-		clnt.InNamespace(t.hubNamespace),
-		clnt.MatchingLabels{
-			labels.SecurityGroupUuid: securityGroupID,
-		},
-	)
-	if err != nil {
-		return nil, err
-	}
-	items := list.Items
-	count := len(items)
-	if count > 1 {
-		return nil, fmt.Errorf(
-			"expected at most one security group with identifier '%s' but found %d",
-			securityGroupID, count,
-		)
-	}
-	if count == 0 {
-		return nil, nil
-	}
-	return &items[0], nil
-}
-
 // addFinalizer adds the controller finalizer if it is not already present. Returns true if the finalizer was added,
 // false if it was already present.
 func (t *task) addFinalizer() bool {
@@ -538,6 +799,18 @@ func (t *task) setFailed(err error) {
 	)
 }
 
+func (t *task) setPending(err error) {
+	if !t.computeInstance.HasStatus() {
+		t.computeInstance.SetStatus(&privatev1.ComputeInstanceStatus{})
+	}
+	t.updateCondition(
+		privatev1.ComputeInstanceConditionType_COMPUTE_INSTANCE_CONDITION_TYPE_PROVISIONED,
+		privatev1.ConditionStatus_CONDITION_STATUS_FALSE,
+		"ResourcesUnavailable",
+		err.Error(),
+	)
+}
+
 // updateCondition updates or creates a condition with the specified type, status, reason, and message.
 func (t *task) updateCondition(conditionType privatev1.ComputeInstanceConditionType, status privatev1.ConditionStatus,
 	reason string, message string) {
@@ -567,18 +840,22 @@ func (t *task) updateCondition(conditionType privatev1.ComputeInstanceConditionT
 }
 
 func (t *task) setReconciliationFailed(err error) {
+	t.setReconciliationFailedWithReason(err, "ReconciliationFailed")
+}
+
+func (t *task) setReconciliationFailedWithReason(err error, reason string) {
 	if !t.computeInstance.HasStatus() {
 		t.computeInstance.SetStatus(&privatev1.ComputeInstanceStatus{})
 	}
 	if t.computeInstance.GetStatus().GetState() != privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_FAILED ||
 		t.computeInstance.GetStatus().GetStateTransitionTime() == nil {
-		t.computeInstance.GetStatus().SetStateTransitionTime(timestamppb.Now())
+		t.computeInstance.GetStatus().SetStateTransitionTime(controllers.NowTruncated())
 	}
 	t.computeInstance.GetStatus().SetState(privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_FAILED)
 	t.updateCondition(
 		privatev1.ComputeInstanceConditionType_COMPUTE_INSTANCE_CONDITION_TYPE_PROVISIONED,
 		privatev1.ConditionStatus_CONDITION_STATUS_FALSE,
-		"ReconciliationFailed",
+		reason,
 		err.Error(),
 	)
 }
@@ -586,6 +863,10 @@ func (t *task) setReconciliationFailed(err error) {
 // buildSpec constructs the spec for the Kubernetes ComputeInstance object based on the
 // compute instance from the database.
 func (t *task) buildSpec(ctx context.Context) (osacv1alpha1.ComputeInstanceSpec, error) {
+	return t.buildSpecWithNetworkAttachments(ctx, true)
+}
+
+func (t *task) buildSpecWithNetworkAttachments(ctx context.Context, includeNetworkAttachments bool) (osacv1alpha1.ComputeInstanceSpec, error) {
 	templateParameters, err := utils.ConvertTemplateParametersToJSON(t.computeInstance.GetSpec().GetTemplateParameters())
 	if err != nil {
 		return osacv1alpha1.ComputeInstanceSpec{}, err
@@ -606,85 +887,48 @@ func (t *task) buildSpec(ctx context.Context) (osacv1alpha1.ComputeInstanceSpec,
 		return osacv1alpha1.ComputeInstanceSpec{}, err
 	}
 
-	// Handle network_attachments (required)
-	err = t.buildSpecNetworkAttachments(ctx, &spec)
-	if err != nil {
-		return osacv1alpha1.ComputeInstanceSpec{}, err
+	if includeNetworkAttachments {
+		// Handle network_attachments (required)
+		err = t.buildSpecNetworkAttachments(ctx, &spec)
+		if err != nil {
+			return osacv1alpha1.ComputeInstanceSpec{}, err
+		}
 	}
 
 	return spec, nil
 }
 
-// buildSpecNetworkAttachments handles the network_attachments field.
-func (t *task) buildSpecNetworkAttachments(ctx context.Context, spec *osacv1alpha1.ComputeInstanceSpec) error {
-	ciSpec := t.computeInstance.GetSpec()
+func equalNetworkAttachments(left, right []osacv1alpha1.ComputeNetworkAttachment) bool {
+	if len(left) == 0 && len(right) == 0 {
+		return true
+	}
+	return apiequality.Semantic.DeepEqual(left, right)
+}
 
-	// Validate network_attachments structure before processing
+// buildSpecNetworkAttachments copies the network attachment field to the CR. The references hold the API IDs of the
+// Subnet and SecurityGroups.
+func (t *task) buildSpecNetworkAttachments(_ context.Context, spec *osacv1alpha1.ComputeInstanceSpec) error {
+	ciSpec := t.computeInstance.GetSpec()
 	err := computeinstancespec.ValidateNetworkAttachments(ciSpec.GetNetworkAttachments())
 	if err != nil {
-		return fmt.Errorf(
-			"invalid network_attachments in database: %w", err)
+		return fmt.Errorf("invalid network_attachments in database: %w", err)
 	}
-
 	networkAttachments := make([]osacv1alpha1.ComputeNetworkAttachment, 0, len(ciSpec.GetNetworkAttachments()))
-	for i, att := range ciSpec.GetNetworkAttachments() {
-		subnetID := att.GetSubnet()
-		// subnetID is guaranteed to be non-empty by ValidateNetworkAttachments
-
-		subnetCR, err := t.getSubnetCR(ctx, subnetID.GetId())
-		if err != nil {
-			return fmt.Errorf(
-				"failed to look up Subnet CR for network_attachments[%d] subnet %s: %w",
-				i, subnetID, err)
-		}
-		if subnetCR == nil {
-			return fmt.Errorf( //nolint:staticcheck // ST1005: Subnet is an API resource name
-				"Subnet CR not found for network_attachments[%d] subnet %s",
-				i, subnetID)
-		}
-		subnetRef := subnetCR.GetName()
-		t.r.logger.DebugContext(
-			ctx,
-			"Resolved subnetRef from Subnet CR",
-			slog.String("subnet_id", subnetID.GetId()),
-			slog.String("subnet_ref", subnetRef),
-		)
-
+	for _, att := range ciSpec.GetNetworkAttachments() {
 		sgRefs := make([]string, 0, len(att.GetSecurityGroups()))
-		for _, sgID := range att.GetSecurityGroups() {
-			if sgID == nil {
-				continue
+		for _, group := range att.GetSecurityGroups() {
+			if group != nil {
+				sgRefs = append(sgRefs, controllers.RefKeyStr(group))
 			}
-			sgCR, sgErr := t.getSecurityGroupCR(ctx, sgID.GetId())
-			if sgErr != nil {
-				return fmt.Errorf(
-					"failed to look up SecurityGroup CR for network_attachments[%d] security group %s: %w",
-					i, sgID, sgErr)
-			}
-			if sgCR == nil {
-				return fmt.Errorf(
-					"SecurityGroup CR not found for network_attachments[%d] security group %s",
-					i, sgID)
-			}
-			sgRefs = append(sgRefs, sgCR.GetName())
-			t.r.logger.DebugContext(
-				ctx,
-				"Resolved securityGroupRef from SecurityGroup CR",
-				slog.String("security_group_id", sgID.GetId()),
-				slog.String("security_group_ref", sgCR.GetName()),
-			)
 		}
-
 		networkAttachments = append(networkAttachments, osacv1alpha1.ComputeNetworkAttachment{
-			SubnetRef:         subnetRef,
+			SubnetRef:         controllers.RefKeyStr(att.GetSubnet()),
 			SecurityGroupRefs: sgRefs,
 		})
 	}
-
 	if len(networkAttachments) > 0 {
 		spec.NetworkAttachments = networkAttachments
 	}
-
 	return nil
 }
 
@@ -706,7 +950,7 @@ func (t *task) addExplicitFields(ctx context.Context, spec *osacv1alpha1.Compute
 		return fmt.Errorf("failed to resolve instance type '%s': %w", instanceTypeKey, err)
 	}
 	itSpec := response.GetObject().GetSpec()
-	spec.Cores = itSpec.GetCores()
+	spec.VCPUs = itSpec.GetVcpus()
 	spec.MemoryGiB = itSpec.GetMemoryGib()
 	if gpu := itSpec.GetGpu(); gpu != nil {
 		spec.Gpu = &osacv1alpha1.GpuSpec{
@@ -723,8 +967,16 @@ func (t *task) addExplicitFields(ctx context.Context, spec *osacv1alpha1.Compute
 			spec.RunStrategy = osacv1alpha1.RunStrategyHalted
 		}
 	}
-	if ciSpec.HasSshPublicKey() {
-		spec.SSHKey = ciSpec.GetSshPublicKey()
+	if sshKeyRef := ciSpec.GetSshKey(); sshKeyRef != nil {
+		if t.materializedSSHKey != "" {
+			spec.SSHKey = t.materializedSSHKey
+		} else {
+			publicKey, err := controllers.ResolveSSHKey(ctx, t.r.secretsClient, sshKeyRef)
+			if err != nil {
+				return err
+			}
+			spec.SSHKey = publicKey
+		}
 	}
 	if t.userDataSecretName != "" {
 		spec.UserDataSecretRef = &corev1.LocalObjectReference{
@@ -753,29 +1005,59 @@ func (t *task) addExplicitFields(ctx context.Context, spec *osacv1alpha1.Compute
 			StorageTier: ciSpec.GetBootDisk().GetStorageTier().GetName(),
 		}
 	}
-	if len(ciSpec.GetAdditionalDisks()) > 0 {
-		disks := make([]osacv1alpha1.DiskSpec, 0, len(ciSpec.GetAdditionalDisks()))
-		for _, disk := range ciSpec.GetAdditionalDisks() {
-			disks = append(disks, osacv1alpha1.DiskSpec{
+	if disks := ciSpec.GetAdditionalDisks().GetItems(); len(disks) > 0 {
+		operatorDisks := make([]osacv1alpha1.DiskSpec, 0, len(disks))
+		for _, disk := range disks {
+			operatorDisks = append(operatorDisks, osacv1alpha1.DiskSpec{
 				SizeGiB:     disk.GetSizeGib(),
 				StorageTier: disk.GetStorageTier().GetName(),
 			})
 		}
-		spec.AdditionalDisks = disks
+		spec.AdditionalDisks = operatorDisks
+	}
+	if err := t.addDiskVolumeIDs(spec); err != nil {
+		return err
 	}
 
+	return nil
+}
+
+func (t *task) addDiskVolumeIDs(spec *osacv1alpha1.ComputeInstanceSpec) error {
+	volumeEntries := t.computeInstance.GetStatus().GetVolumes()
+	if t.registeredVolumes != nil {
+		volumeEntries = t.registeredVolumes
+	}
+	volumes, err := diskVolumesByKey(volumeEntries)
+	if err != nil {
+		return err
+	}
+	if len(volumes) == 0 {
+		return nil
+	}
+
+	diskVolumeIDs := make(map[string]string, len(volumes))
+	for key, volume := range volumes {
+		if volume.GetVolumeId() == "" {
+			return fmt.Errorf("ComputeInstance '%s' disk '%s' has an empty persisted Volume ID", t.computeInstance.GetId(), key)
+		}
+		diskVolumeIDs[key] = volume.GetVolumeId()
+	}
+	spec.DiskVolumeIDs = diskVolumeIDs
 	return nil
 }
 
 // ensureUserDataSecret creates a Kubernetes Secret containing the cloud-init user data
 // provided via the fulfillment API. The Secret is owned by the ComputeInstance CR so that
 // Kubernetes garbage collection handles cleanup automatically on deletion.
-// The user data field is immutable, so the Secret is only created once.
 func (t *task) ensureUserDataSecret(ctx context.Context, owner *osacv1alpha1.ComputeInstance) error {
 	if t.userDataSecretName == "" {
 		return nil
 	}
 
+	userData, err := t.resolveUserData(ctx)
+	if err != nil {
+		return err
+	}
 	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: t.hubNamespace,
@@ -793,11 +1075,11 @@ func (t *task) ensureUserDataSecret(ctx context.Context, owner *osacv1alpha1.Com
 			},
 		},
 		StringData: map[string]string{
-			userDataSecretKey: t.computeInstance.GetSpec().GetUserData(),
+			userDataSecretKey: userData,
 		},
 	}
 
-	err := t.hubClient.Create(ctx, secret)
+	err = t.hubClient.Create(ctx, secret)
 	if apierrors.IsAlreadyExists(err) {
 		return nil
 	}
@@ -811,6 +1093,28 @@ func (t *task) ensureUserDataSecret(ctx context.Context, owner *osacv1alpha1.Com
 		slog.String("name", secret.GetName()),
 	)
 	return nil
+}
+
+func (t *task) resolveUserData(ctx context.Context) (string, error) {
+	ref := t.computeInstance.GetSpec().GetUserDataSource().GetSecret()
+	if ref == nil {
+		return t.computeInstance.GetSpec().GetUserDataSource().GetInline(), nil
+	}
+	if t.r.secretsClient == nil {
+		return "", errors.New("secrets client is required to resolve user_data_source.secret")
+	}
+	if ref.GetId() == "" {
+		return "", errors.New("user_data_source.secret must have an id")
+	}
+	response, err := t.r.secretsClient.Get(ctx, privatev1.SecretsGetRequest_builder{Id: ref.GetId()}.Build())
+	if err != nil {
+		return "", fmt.Errorf("failed to fetch user_data_source.secret: %w", err)
+	}
+	value, ok := response.GetObject().GetData()[userDataSecretKey]
+	if !ok || len(value) == 0 {
+		return "", fmt.Errorf("secret %q is missing non-empty data[%q]", ref.GetId(), userDataSecretKey)
+	}
+	return string(value), nil
 }
 
 func mapSourceType(st privatev1.SourceType) osacv1alpha1.ImageSourceType {

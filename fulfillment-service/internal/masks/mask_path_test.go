@@ -23,7 +23,7 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protoreflect"
 
-	testsv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/tests/v1"
+	testsv1 "github.com/osac-project/osac/proto/gen/osac/tests/v1"
 )
 
 var _ = Describe("Path", func() {
@@ -600,6 +600,26 @@ var _ = Describe("Path", func() {
 			value3, ok := key3Path.Get(object)
 			Expect(ok).To(BeTrue())
 			Expect(value3.String()).To(Equal("value3"))
+		})
+
+		It("Should ignore missing nested map entries", func() {
+			object := testsv1.Object_builder{
+				MyMap: map[string]*testsv1.Object{
+					"existing": testsv1.Object_builder{
+						MyString: "existing value",
+					}.Build(),
+				},
+			}.Build()
+
+			compiledPath, err := compiler.Compile("my_map.control-plane.my_string")
+			Expect(err).ToNot(HaveOccurred())
+			Expect(func() { compiledPath.Clear(object) }).ToNot(Panic())
+
+			existingPath, err := compiler.Compile("my_map.existing.my_string")
+			Expect(err).ToNot(HaveOccurred())
+			value, ok := existingPath.Get(object)
+			Expect(ok).To(BeTrue())
+			Expect(value.String()).To(Equal("existing value"))
 		})
 
 		It("Should set list elements to zero values", func() {

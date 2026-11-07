@@ -1,0 +1,5 @@
+---
+argument_specs:
+  main:
+    # This service role is intentionally a no-op compatibility entry point.
+    options: {}

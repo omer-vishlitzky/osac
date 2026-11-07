@@ -1,4 +1,29 @@
 # CaaS CI environment -- instance values for osac chart.
+# Hub CSI remains disabled in this profile. CaaS tenant CSI is installed by the
+# AAP storage-provider workflow on each remote tenant cluster (PR #832).
+
+# --- Service Enablement ---
+global:
+  osacDeploymentId: "ci/osac"
+  fulfillmentTrust:
+    enabled: false
+  networking:
+    provisioningEnabled: false
+    fabricManager: agentless_net
+    k8sManager: cudn_evpn
+  services:
+    caas:
+      enabled: true
+    # CaaS-over-BMaaS registers the RHCOS DiskImage through the VMaaS-owned
+    # DiskImages API even though it does not provision VMaaS instances.
+    vmaas:
+      enabled: true
+    # CaaS requires BMaaS API endpoints, and this profile runs the BMF
+    # operator with the Metal3 provider configured below.
+    bmaas:
+      enabled: true
+    maas:
+      enabled: false
 
 # --- Operator ---
 operator:
@@ -15,14 +40,28 @@ operator:
       key: token
   fulfillment:
     serverAddress: "fulfillment-internal-api:8001"
-    tokenFile: "/var/run/secrets/kubernetes.io/serviceaccount/token"
+    credentials:
+      secretName: fulfillment-controller-credentials
+      clientIdKey: client-id
+      clientSecretKey: client-secret
   controllers:
-    clusterOrder: true
     computeInstance: false
     tenant: true
     networking: true
     storage: true
+  # MCE's Assisted Service ignition URL uses the OpenShift ingress Route;
+  # trust its cluster-managed CA instead of bypassing TLS verification.
+  ignition:
+    trustIngressCA: true
   hubAccess:
+    enabled: true
+  # Network manager ConfigMaps are required for the Networking API dispatcher.
+  # The operator subchart defaults networkManagers.enabled=true, but the CaaS
+  # CI profile states it explicitly so CI values are self-documenting.
+  # Individual agentless_net manager enablement is auto-derived by the Helm
+  # facade from global.networking. The logical fabric manager is required for
+  # CaaS BMI validation even though provider networking is disabled.
+  networkManagers:
     enabled: true
   tenants:
   - name: shared
@@ -34,8 +73,14 @@ service:
   externalHostname: ""  # Set dynamically by make install-osac
   internalHostname: ""  # Set dynamically by make install-osac
   images:
-    service: ghcr.io/osac-project/fulfillment-service:main
-    envoy: ghcr.io/osac-project/envoy:v1.33.0
+    service:
+      repository: ghcr.io/osac-project/fulfillment-service
+      tag: main
+      pullPolicy: Always
+    envoy:
+      repository: ghcr.io/osac-project/envoy
+      tag: v1.33.0
+      pullPolicy: IfNotPresent
   certs:
     issuerRef:
       kind: ClusterIssuer
@@ -48,8 +93,6 @@ service:
     # install-osac sets --set global.clusterDomain=$(DOMAIN).
     emergencyServiceAccounts:
     - admin
-    - osac-operator
-    - osac-operator-controller-manager
     - template-publisher
     - osac-metering
     controllerCredentials:
@@ -135,7 +178,6 @@ aap:
     clusterFulfillment:
       enabled: true
       config:
-        NETWORK_STEPS_COLLECTION: "ci.steps"
         HOSTED_CLUSTER_CONTROLLER_AVAILABILITY_POLICY: "SingleReplica"
         HOSTED_CLUSTER_INFRASTRUCTURE_AVAILABILITY_POLICY: "SingleReplica"
     networkFulfillment:
@@ -145,13 +187,31 @@ aap:
 validation:
   enabled: true
 
+# --- Install preflight ---
+# vmaas is enabled above only for the DiskImages API; this profile's cluster
+# has no OpenShift Virtualization (infra.yaml: cnv.enabled=false), so the
+# VMaaS prerequisite check cannot pass here.
+preflight:
+  skip:
+    kubevirt-crds: "caas-ci enables vmaas for the DiskImages API only; no VMs are provisioned"
+
 # --- Bare Metal Fulfillment Operator ---
+# BMaaS is enabled; the BMF operator manages virtual BareMetalHost resources
+# created by osac-test-infra setup-virtual-bmh.sh in the host-inventory
+# namespace.  The operator allocates BMHs from the pool when the
+# baremetalworker controller creates BareMetalInstance CRs.
 bmf:
-  enabled: false
   image:
     repository: ghcr.io/osac-project/bare-metal-fulfillment-operator
     tag: latest
     pullPolicy: Always
+  env:
+    aapUrl: "http://osac-aap/api/controller"
+    aapInsecureSkipVerify: "true"
+  metal3:
+    enabled: true
+    namespace: host-inventory
+    hostClass: metal3
 
 # --- Cluster Versions ---
 clusterVersions:
@@ -162,6 +222,9 @@ clusterVersions:
   - version: "4.22.0"
     image: "quay.io/openshift-release-dev/ocp-release:4.22.0-multi"
     default: true
+    diskImage:
+      name: rhcos-4-22
+      sourceRef: oci://quay.io/osac-project/rhcos:4.22.0
 
 # --- Hub Access ---
 hubAccess:
@@ -169,9 +232,6 @@ hubAccess:
 
 # --- Metering ---
 metering:
-  enabled: true
-  reconciliation:
-    interval: "5m"
   echoAdapter:
     enabled: true
     image:
@@ -208,12 +268,3 @@ metering:
 # --- LVMS StorageBackend registration ---
 lvms:
   enabled: true
-
-# --- Bundled OpenBao (Vault-compatible secret store) ---
-bundledVault:
-  # Override podSecurityContext for OpenShift restricted-v2 SCC: omit numeric
-  # runAsUser/runAsGroup/fsGroup — the SCC allocates UIDs from the namespace UID
-  # range and resolves the named user automatically. A non-nil value here fully
-  # replaces the template default (runAsUser:100/runAsGroup:1000/fsGroup:1000).
-  podSecurityContext:
-    runAsNonRoot: true

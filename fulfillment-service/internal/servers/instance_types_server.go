@@ -23,10 +23,9 @@ import (
 	grpccodes "google.golang.org/grpc/codes"
 	grpcstatus "google.golang.org/grpc/status"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
-	publicv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/public/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
-	"github.com/osac-project/osac/fulfillment-service/internal/events"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
 
 // instanceTypeFilterDefaults defines per-field default predicates for public List requests.
@@ -43,7 +42,6 @@ var instanceTypeFilterDefaults = []filterDefault{
 
 type InstanceTypesServerBuilder struct {
 	logger            *slog.Logger
-	notifier          events.Notifier
 	attributionLogic  auth.AttributionLogic
 	tenancyLogic      auth.TenancyLogic
 	metricsRegisterer prometheus.Registerer
@@ -67,12 +65,6 @@ func NewInstanceTypesServer() *InstanceTypesServerBuilder {
 // SetLogger sets the logger to use. This is mandatory.
 func (b *InstanceTypesServerBuilder) SetLogger(value *slog.Logger) *InstanceTypesServerBuilder {
 	b.logger = value
-	return b
-}
-
-// SetNotifier sets the notifier to use. This is optional.
-func (b *InstanceTypesServerBuilder) SetNotifier(value events.Notifier) *InstanceTypesServerBuilder {
-	b.notifier = value
 	return b
 }
 
@@ -129,7 +121,6 @@ func (b *InstanceTypesServerBuilder) Build() (result *InstanceTypesServer, err e
 	// Create the private server to delegate to:
 	delegate, err := NewPrivateInstanceTypesServer().
 		SetLogger(b.logger).
-		SetNotifier(b.notifier).
 		SetAttributionLogic(b.attributionLogic).
 		SetTenancyLogic(b.tenancyLogic).
 		SetMetricsRegisterer(b.metricsRegisterer).
@@ -242,7 +233,7 @@ func (s *InstanceTypesServer) Create(ctx context.Context,
 			"Failed to map public instance type to private",
 			slog.Any("error", err),
 		)
-		err = grpcstatus.Errorf(grpccodes.Internal, "failed to process instance type")
+		err = publicInputMappingError(err, "failed to process instance type")
 		return
 	}
 
@@ -276,6 +267,11 @@ func (s *InstanceTypesServer) Create(ctx context.Context,
 
 func (s *InstanceTypesServer) Update(ctx context.Context,
 	request *publicv1.InstanceTypesUpdateRequest) (response *publicv1.InstanceTypesUpdateResponse, err error) {
+	ctx = withPublicAPIView(ctx)
+	if err := validatePublicObjectMetadata(request.GetObject()); err != nil {
+		return nil, err
+	}
+
 	// Validate the request:
 	publicInstanceType := request.GetObject()
 	if publicInstanceType == nil {
@@ -305,7 +301,7 @@ func (s *InstanceTypesServer) Update(ctx context.Context,
 			"Failed to map public instance type to private",
 			slog.Any("error", err),
 		)
-		err = grpcstatus.Errorf(grpccodes.Internal, "failed to process instance type")
+		err = publicInputMappingError(err, "failed to process instance type")
 		return
 	}
 

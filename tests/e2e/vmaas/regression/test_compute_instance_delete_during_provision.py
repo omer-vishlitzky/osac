@@ -4,13 +4,15 @@ import time
 
 import pytest
 
-from tests.e2e.catalog.conftest import unique_name
 from tests.e2e.core.grpc_client import GRPCClient
-from tests.e2e.core.helpers import wait_for_cr, wait_for_deletion, wait_for_grpc_removal
+from tests.e2e.core.helpers import unique_name, wait_for_cr, wait_for_deletion, wait_for_grpc_removal
 from tests.e2e.core.k8s_client import K8sClient
-from tests.e2e.core.metering import MeteringCollector
+from tests.e2e.core.metering import HEARTBEAT_TYPE, MeteringCollector
 from tests.e2e.core.osac_cli import OsacCLI
 from tests.e2e.core.runner import poll_until
+from tests.e2e.core.wait_kinds import WaitResourceKind
+
+pytestmark = pytest.mark.regression
 
 TERMINAL_JOB_STATES: tuple[str, ...] = ("Canceled", "Failed", "Succeeded")
 
@@ -28,6 +30,8 @@ def _wait_for_provision_termination(k8s: K8sClient, *, name: str) -> None:
         retries=60,
         delay=1,
         description=f"provision termination for {name}",
+        resource_kind=WaitResourceKind.COMPUTE_INSTANCE,
+        resource_id=name,
     )
 
 
@@ -38,6 +42,8 @@ def _wait_for_deprovision_completion(k8s: K8sClient, *, name: str) -> str:
         retries=120,
         delay=1,
         description=f"deprovision completion for {name}",
+        resource_kind=WaitResourceKind.COMPUTE_INSTANCE,
+        resource_id=name,
     )
     assert result != "Failed", f"Deprovision job failed for {name}"
     return result
@@ -61,15 +67,13 @@ def test_compute_instance_delete_during_provision(
     k8s_hub_client: K8sClient,
     k8s_virt_client: K8sClient,
     vm_template: str,
-    default_subnet: str,
+    default_network_attachment: dict[str, object],
     metering: MeteringCollector,
 ) -> None:
     name = unique_name("e2e-ci")
     uuid: str = cli.create_compute_instance(
-        name=name, template=vm_template, network_attachments=[{"subnet": default_subnet}]
+        name=name, template=vm_template, network_attachments=[default_network_attachment]
     )
-    metering.expect("osac.resource.created.v1", resource_id=uuid)
-
     ci_name: str = wait_for_cr(k8s=k8s_hub_client, uuid=uuid)
 
     poll_until(
@@ -78,6 +82,8 @@ def test_compute_instance_delete_during_provision(
         retries=30,
         delay=2,
         description=f"{ci_name} Starting",
+        resource_kind=WaitResourceKind.COMPUTE_INSTANCE,
+        resource_id=ci_name,
     )
     deprov_job_id: str = k8s_hub_client.get_compute_instance_latest_job_id(
         name=ci_name, job_type="deprovision", checked=False
@@ -85,7 +91,6 @@ def test_compute_instance_delete_during_provision(
     assert deprov_job_id == "", "No deprovision job should exist before deletion"
 
     cli.delete_compute_instance(uuid=uuid)
-    metering.expect("osac.resource.deleted.v1", resource_id=uuid)
 
     _wait_for_provision_termination(k8s_hub_client, name=ci_name)
     _wait_for_deprovision_completion(k8s_hub_client, name=ci_name)
@@ -93,6 +98,9 @@ def test_compute_instance_delete_during_provision(
 
     wait_for_deletion(k8s=k8s_hub_client, name=ci_name)
     wait_for_grpc_removal(grpc=grpc, uuid=uuid)
+
+    # The VM never reached a billable state, so no heartbeat may arrive for it.
+    metering.assert_no_events(HEARTBEAT_TYPE, resource_id=uuid, since="2000-01-01T00:00:00+00:00", within=30)
 
     orphan_count: int = k8s_virt_client.count_by_label_all_namespaces(
         resource="virtualmachine", label=f"osac.openshift.io/computeinstance={ci_name}"

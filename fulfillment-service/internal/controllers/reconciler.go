@@ -18,23 +18,84 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"regexp"
+	"sync"
 	"time"
 
 	"github.com/spf13/pflag"
 	"google.golang.org/grpc"
+	grpccodes "google.golang.org/grpc/codes"
 	healthv1 "google.golang.org/grpc/health/grpc_health_v1"
+	grpcstatus "google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/reflect/protoregistry"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/database/dao"
 	"github.com/osac-project/osac/fulfillment-service/internal/health"
 	"github.com/osac-project/osac/fulfillment-service/internal/work"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
 // ReconcilerFunction is a function that receives the current state of an object and reconciles it.
 type ReconcilerFunction[O dao.Object] func(ctx context.Context, object O) error
+
+// RequeueAfter marks an error as retryable and asks the reconciler to retry the
+// object after delay. The delay doubles after each failed retry, up to one
+// minute. The original error remains available through errors.Is and errors.As.
+func RequeueAfter(err error, delay time.Duration) error {
+	if err == nil || delay <= 0 {
+		return err
+	}
+	return &requeueAfterError{cause: err, delay: delay, exponentialBackoff: true}
+}
+
+// RequeueAtInterval marks an error as retryable and asks the reconciler to retry
+// the object at the same interval after each failed retry. The original error
+// remains available through errors.Is and errors.As.
+func RequeueAtInterval(err error, interval time.Duration) error {
+	if err == nil || interval <= 0 {
+		return err
+	}
+	return &requeueAfterError{cause: err, delay: interval}
+}
+
+// RequeueAfterKubernetesDeletion retries a resource after requesting deletion
+// of its Kubernetes object. Kubernetes finalizers complete asynchronously, and
+// the fulfillment event stream does not observe those Kubernetes changes.
+func RequeueAfterKubernetesDeletion(resource string) error {
+	return RequeueAtInterval(fmt.Errorf("kubernetes %s deletion is still in progress", resource), time.Second)
+}
+
+// RequeueAfterNetworkingCleanup retries a workload after automatic attachments
+// or ExternalIPs have been requested for deletion but still have finalizers.
+func RequeueAfterNetworkingCleanup() error {
+	return RequeueAtInterval(errors.New("automatic workload networking resources are still terminating"), time.Second)
+}
+
+// IsRequeueable reports whether err carries a reconciliation retry interval.
+func IsRequeueable(err error) bool {
+	var retryable interface{ RequeueAfter() time.Duration }
+	return errors.As(err, &retryable)
+}
+
+type requeueAfterError struct {
+	cause              error
+	delay              time.Duration
+	exponentialBackoff bool
+}
+
+func (e *requeueAfterError) Error() string               { return e.cause.Error() }
+func (e *requeueAfterError) Unwrap() error               { return e.cause }
+func (e *requeueAfterError) RequeueAfter() time.Duration { return e.delay }
+func (e *requeueAfterError) UseExponentialBackoff() bool { return e.exponentialBackoff }
+
+type scheduledRetry struct {
+	timer  *time.Timer
+	cancel chan struct{}
+}
+
+const maxRequeueDelay = time.Minute
 
 // ReconcilerBuilder contains the data and logic needed to create a controller. Don't create instances f this directly,
 // use the NewReconciler function instead.
@@ -45,6 +106,7 @@ type ReconcilerBuilder[O dao.Object] struct {
 	function       ReconcilerFunction[O]
 	eventFilter    string
 	objectFilter   string
+	sync           bool
 	syncInterval   time.Duration
 	watchInterval  time.Duration
 	grpcClient     *grpc.ClientConn
@@ -72,11 +134,15 @@ type Reconciler[O dao.Object] struct {
 	getResponse    proto.Message
 	objectChannel  chan O
 	eventsClient   privatev1.EventsClient
+	retryMu        sync.Mutex
+	retryTimers    map[string]*scheduledRetry
+	retryAttempts  map[string]uint8
 }
 
 // NewReconciler creates a builder that can then be used to configure and create a controller.
 func NewReconciler[O dao.Object]() *ReconcilerBuilder[O] {
 	return &ReconcilerBuilder[O]{
+		sync:          true,
 		syncInterval:  1 * time.Hour,
 		watchInterval: 10 * time.Second,
 	}
@@ -88,7 +154,9 @@ func (b *ReconcilerBuilder[O]) SetLogger(value *slog.Logger) *ReconcilerBuilder[
 	return b
 }
 
-// SetName sets the name of the reconciler. This is used for health reporting and logging.
+// SetName sets the name of the reconciler. This is used for health reporting, logging and the event consumer group.
+// It must be an RFC 1123 DNS label with at most 52 characters, leaving room for the event group's -reconciler suffix.
+// Replicas of the same reconciler must use the same name; reconcilers with different filters must use different names.
 func (b *ReconcilerBuilder[O]) SetName(value string) *ReconcilerBuilder[O] {
 	b.name = value
 	return b
@@ -121,8 +189,15 @@ func (b *ReconcilerBuilder[O]) SetObjectFilter(value string) *ReconcilerBuilder[
 	return b
 }
 
-// SetSyncInterval sets how often the reconciler will fetch and reconcile again all the objects. This is optional, and
-// the default is one hour.
+// SetSync enables or disables startup, periodic and watch-restart synchronization. This is optional, and the default
+// is true. Event-driven reconciliation remains enabled, including full scans triggered by related-resource events.
+func (b *ReconcilerBuilder[O]) SetSync(value bool) *ReconcilerBuilder[O] {
+	b.sync = value
+	return b
+}
+
+// SetSyncInterval sets how often the reconciler will fetch and reconcile again all the objects when sync is enabled.
+// This is optional, and the default is one hour.
 func (b *ReconcilerBuilder[O]) SetSyncInterval(value time.Duration) *ReconcilerBuilder[O] {
 	b.syncInterval = value
 	return b
@@ -159,6 +234,17 @@ func (b *ReconcilerBuilder[O]) Build() (result *Reconciler[O], err error) {
 		err = errors.New("name is mandatory")
 		return
 	}
+	if !reconcilerNameRE.MatchString(b.name) {
+		err = errors.New("name must be a valid RFC 1123 DNS label")
+		return
+	}
+	maxNameLength := 63 - len(reconcilerGroupSuffix)
+	if len(b.name) > maxNameLength {
+		err = fmt.Errorf(
+			"name must be at most %d characters to allow the '%s' group suffix",
+			maxNameLength, reconcilerGroupSuffix)
+		return
+	}
 	if b.grpcClient == nil {
 		err = errors.New("gRPC client is mandatory")
 		return
@@ -167,7 +253,7 @@ func (b *ReconcilerBuilder[O]) Build() (result *Reconciler[O], err error) {
 		err = errors.New("function is mandatory")
 		return
 	}
-	if b.syncInterval <= 0 {
+	if b.sync && b.syncInterval <= 0 {
 		err = fmt.Errorf("sync interval should be positive, but it is %s", b.syncInterval)
 		return
 	}
@@ -230,18 +316,22 @@ func (b *ReconcilerBuilder[O]) Build() (result *Reconciler[O], err error) {
 		getResponse:    getResponse,
 		objectChannel:  make(chan O),
 		eventsClient:   eventsClient,
+		retryTimers:    make(map[string]*scheduledRetry),
+		retryAttempts:  make(map[string]uint8),
 	}
 
-	// Create the sync loop:
-	reconciler.syncLoop, err = work.NewLoop().
-		SetLogger(b.logger).
-		SetName("sync").
-		SetInterval(b.syncInterval).
-		SetWorkFunc(reconciler.syncObjects).
-		Build()
-	if err != nil {
-		err = fmt.Errorf("failed to create sync loop: %w", err)
-		return
+	// Create the sync loop if enabled:
+	if b.sync {
+		reconciler.syncLoop, err = work.NewLoop().
+			SetLogger(b.logger).
+			SetName("sync").
+			SetInterval(b.syncInterval).
+			SetWorkFunc(reconciler.syncObjects).
+			Build()
+		if err != nil {
+			err = fmt.Errorf("failed to create sync loop: %w", err)
+			return
+		}
 	}
 
 	// Create the watch loop:
@@ -426,17 +516,21 @@ func (c *Reconciler[O]) getObject(ctx context.Context, id string) (result O, err
 
 // Start starts the controller. To stop it cancel the context.
 func (c *Reconciler[O]) Start(ctx context.Context) error {
+	defer c.stopRetries()
+
 	// Start the watch and sync loops:
 	go func() {
 		if err := c.watchLoop.Run(ctx); err != nil {
 			c.logger.ErrorContext(ctx, "Watch loop failed", slog.Any("error", err))
 		}
 	}()
-	go func() {
-		if err := c.syncLoop.Run(ctx); err != nil {
-			c.logger.ErrorContext(ctx, "Sync loop failed", slog.Any("error", err))
-		}
-	}()
+	if c.syncLoop != nil {
+		go func() {
+			if err := c.syncLoop.Run(ctx); err != nil {
+				c.logger.ErrorContext(ctx, "Sync loop failed", slog.Any("error", err))
+			}
+		}()
+	}
 
 	// Run the reconcile loop:
 	for {
@@ -445,6 +539,9 @@ func (c *Reconciler[O]) Start(ctx context.Context) error {
 			return context.Canceled
 		case object := <-c.objectChannel:
 			fresh, err := c.getObject(ctx, object.GetId())
+			if grpcstatus.Code(err) == grpccodes.NotFound {
+				continue
+			}
 			if err != nil {
 				c.logger.ErrorContext(
 					ctx,
@@ -465,15 +562,143 @@ func (c *Reconciler[O]) Start(ctx context.Context) error {
 					"Reconciliation failed",
 					slog.Any("error", err),
 				)
+				c.requeue(ctx, fresh, err)
+			} else {
+				c.cancelRetry(fresh.GetId())
 			}
 		}
 	}
 }
 
+func (c *Reconciler[O]) requeue(ctx context.Context, object O, err error) {
+	if ctx.Err() != nil {
+		return
+	}
+	var retryable interface{ RequeueAfter() time.Duration }
+	if !errors.As(err, &retryable) {
+		return
+	}
+	useBackoff := true
+	var policy interface{ UseExponentialBackoff() bool }
+	if errors.As(err, &policy) {
+		useBackoff = policy.UseExponentialBackoff()
+	}
+	c.scheduleRetry(ctx, object, retryable.RequeueAfter(), useBackoff)
+}
+
+func (c *Reconciler[O]) scheduleRetry(ctx context.Context, object O, requestedDelay time.Duration, useBackoff bool) {
+	if requestedDelay <= 0 || ctx.Err() != nil {
+		return
+	}
+	id := object.GetId()
+	c.retryMu.Lock()
+	if c.retryTimers == nil {
+		c.retryTimers = make(map[string]*scheduledRetry)
+	}
+	if c.retryAttempts == nil {
+		c.retryAttempts = make(map[string]uint8)
+	}
+	if !useBackoff {
+		delete(c.retryAttempts, id)
+	}
+	if _, exists := c.retryTimers[id]; exists {
+		c.retryMu.Unlock()
+		return
+	}
+	delay := requestedDelay
+	if useBackoff {
+		attempt := c.retryAttempts[id]
+		delay = requeueDelay(requestedDelay, attempt)
+		if attempt < ^uint8(0) {
+			c.retryAttempts[id] = attempt + 1
+		}
+	}
+	retry := &scheduledRetry{timer: time.NewTimer(delay), cancel: make(chan struct{})}
+	c.retryTimers[id] = retry
+	c.retryMu.Unlock()
+
+	go c.waitForRetry(ctx, id, object, retry)
+}
+
+func requeueDelay(requested time.Duration, attempt uint8) time.Duration {
+	delay := requested
+	for i := uint8(0); i < attempt && delay < maxRequeueDelay; i++ {
+		if delay > maxRequeueDelay/2 {
+			return maxRequeueDelay
+		}
+		delay *= 2
+	}
+	if delay > maxRequeueDelay {
+		return maxRequeueDelay
+	}
+	return delay
+}
+
+func (c *Reconciler[O]) waitForRetry(ctx context.Context, id string, object O, retry *scheduledRetry) {
+	select {
+	case <-retry.timer.C:
+		c.retryMu.Lock()
+		if c.retryTimers[id] != retry {
+			c.retryMu.Unlock()
+			return
+		}
+		delete(c.retryTimers, id)
+		c.retryMu.Unlock()
+		select {
+		case c.objectChannel <- object:
+		case <-ctx.Done():
+		}
+	case <-retry.cancel:
+		retry.timer.Stop()
+	case <-ctx.Done():
+		retry.timer.Stop()
+		c.retryMu.Lock()
+		if c.retryTimers[id] == retry {
+			delete(c.retryTimers, id)
+		}
+		c.retryMu.Unlock()
+	}
+}
+
+func (c *Reconciler[O]) cancelRetry(id string) {
+	c.retryMu.Lock()
+	retry := c.retryTimers[id]
+	delete(c.retryTimers, id)
+	delete(c.retryAttempts, id)
+	c.retryMu.Unlock()
+	if retry != nil {
+		close(retry.cancel)
+	}
+}
+
+func (c *Reconciler[O]) stopRetries() {
+	c.retryMu.Lock()
+	retries := make([]*scheduledRetry, 0, len(c.retryTimers))
+	for _, retry := range c.retryTimers {
+		retries = append(retries, retry)
+	}
+	c.retryTimers = make(map[string]*scheduledRetry)
+	c.retryAttempts = make(map[string]uint8)
+	c.retryMu.Unlock()
+	for _, retry := range retries {
+		close(retry.cancel)
+	}
+}
+
 func (c *Reconciler[O]) watchEvents(ctx context.Context) error {
-	c.syncLoop.Kick()
+	if c.syncLoop != nil {
+		c.syncLoop.Kick()
+	}
+	group := c.name + reconcilerGroupSuffix
+
+	// Close the stream on every return. An abandoned stream keeps its server handler in the consumer group, and
+	// that handler goes on taking partitions and committing offsets for events that nobody reads.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	stream, err := c.eventsClient.Watch(ctx, &privatev1.EventsWatchRequest{
 		Filter: &c.eventFilter,
+		Group:  &group,
 	})
 	if err != nil {
 		c.reportHealth(ctx, healthv1.HealthCheckResponse_NOT_SERVING)
@@ -496,6 +721,8 @@ func (c *Reconciler[O]) watchEvents(ctx context.Context) error {
 			object := event.Get(c.payloadField).Message().Interface().(O)
 			c.objectChannel <- object
 		} else {
+			// A related resource changed. Reconcilers subscribe to these events to retry dependent objects, so
+			// they must still be processed when the background sync loop is disabled.
 			c.logger.DebugContext(
 				ctx,
 				"Received event without the expected payload, will trigger a full sync",
@@ -532,3 +759,10 @@ func (c *Reconciler[O]) reportHealth(ctx context.Context, status healthv1.Health
 		c.healthReporter.Report(ctx, c.healthName, status)
 	}
 }
+
+// reconcilerGroupSuffix is the suffix added to the reconciler names to build the 'group' parameter passed to the
+// events watch operation.
+const reconcilerGroupSuffix = "-reconciler"
+
+// reconcilerNameRE is the regular expression used to validate names of reconcilers, which must be valid DNS labels.
+var reconcilerNameRE = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)

@@ -22,16 +22,14 @@ import (
 	grpccodes "google.golang.org/grpc/codes"
 	grpcstatus "google.golang.org/grpc/status"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
-	publicv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/public/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
-	"github.com/osac-project/osac/fulfillment-service/internal/events"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
 
 // RoleBindingsServerBuilder is a builder for creating instances of RoleBindingsServer.
 type RoleBindingsServerBuilder struct {
 	logger            *slog.Logger
-	notifier          events.Notifier
 	attributionLogic  auth.AttributionLogic
 	tenancyLogic      auth.TenancyLogic
 	metricsRegisterer prometheus.Registerer
@@ -57,12 +55,6 @@ func NewRoleBindingsServer() *RoleBindingsServerBuilder {
 // SetLogger sets the logger to use. This is mandatory.
 func (b *RoleBindingsServerBuilder) SetLogger(value *slog.Logger) *RoleBindingsServerBuilder {
 	b.logger = value
-	return b
-}
-
-// SetNotifier sets the notifier to use. This is optional.
-func (b *RoleBindingsServerBuilder) SetNotifier(value events.Notifier) *RoleBindingsServerBuilder {
-	b.notifier = value
 	return b
 }
 
@@ -113,7 +105,6 @@ func (b *RoleBindingsServerBuilder) Build() (result *RoleBindingsServer, err err
 
 	delegate, err := NewPrivateRoleBindingsServer().
 		SetLogger(b.logger).
-		SetNotifier(b.notifier).
 		SetAttributionLogic(b.attributionLogic).
 		SetTenancyLogic(b.tenancyLogic).
 		SetMetricsRegisterer(b.metricsRegisterer).
@@ -212,7 +203,7 @@ func (s *RoleBindingsServer) Create(ctx context.Context,
 			"Failed to map public role binding to private",
 			slog.Any("error", err),
 		)
-		err = grpcstatus.Errorf(grpccodes.Internal, "failed to process role binding")
+		err = publicInputMappingError(err, "failed to process role binding")
 		return
 	}
 
@@ -243,6 +234,11 @@ func (s *RoleBindingsServer) Create(ctx context.Context,
 
 func (s *RoleBindingsServer) Update(ctx context.Context,
 	request *publicv1.RoleBindingsUpdateRequest) (response *publicv1.RoleBindingsUpdateResponse, err error) {
+	ctx = withPublicAPIView(ctx)
+	if err := validatePublicObjectMetadata(request.GetObject()); err != nil {
+		return nil, err
+	}
+
 	publicRoleBinding := request.GetObject()
 	if publicRoleBinding == nil {
 		err = grpcstatus.Errorf(grpccodes.InvalidArgument, "object is mandatory")
@@ -261,7 +257,7 @@ func (s *RoleBindingsServer) Update(ctx context.Context,
 			"Failed to map public role binding to private",
 			slog.Any("error", err),
 		)
-		err = grpcstatus.Errorf(grpccodes.Internal, "failed to process role binding")
+		err = publicInputMappingError(err, "failed to process role binding")
 		return
 	}
 

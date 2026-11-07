@@ -17,6 +17,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"maps"
 
 	"github.com/prometheus/client_golang/prometheus"
 	grpccodes "google.golang.org/grpc/codes"
@@ -26,14 +27,12 @@ import (
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
-	"github.com/osac-project/osac/fulfillment-service/internal/events"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
 type PrivateInstanceTypesServerBuilder struct {
 	logger            *slog.Logger
-	notifier          events.Notifier
 	attributionLogic  auth.AttributionLogic
 	tenancyLogic      auth.TenancyLogic
 	metricsRegisterer prometheus.Registerer
@@ -55,11 +54,6 @@ func NewPrivateInstanceTypesServer() *PrivateInstanceTypesServerBuilder {
 
 func (b *PrivateInstanceTypesServerBuilder) SetLogger(value *slog.Logger) *PrivateInstanceTypesServerBuilder {
 	b.logger = value
-	return b
-}
-
-func (b *PrivateInstanceTypesServerBuilder) SetNotifier(value events.Notifier) *PrivateInstanceTypesServerBuilder {
-	b.notifier = value
 	return b
 }
 
@@ -102,7 +96,6 @@ func (b *PrivateInstanceTypesServerBuilder) Build() (result *PrivateInstanceType
 	generic, err := NewGenericServer[*privatev1.InstanceType]().
 		SetLogger(b.logger).
 		SetService(privatev1.InstanceTypes_ServiceDesc.ServiceName).
-		SetNotifier(b.notifier).
 		SetAttributionLogic(b.attributionLogic).
 		SetTenancyLogic(b.tenancyLogic).
 		SetMetricsRegisterer(b.metricsRegisterer).
@@ -202,8 +195,10 @@ func (s *PrivateInstanceTypesServer) Update(ctx context.Context,
 		mask.Paths = append(mask.Paths, "spec.deprecation")
 	}
 
-	// Set the merged spec back into the request for the generic update:
-	request.GetObject().SetSpec(merged.GetSpec())
+	// set merged object back into request for the generic update
+	clientVersion := request.GetObject().GetMetadata().GetVersion()
+	request.SetObject(merged)
+	request.GetObject().GetMetadata().SetVersion(clientVersion)
 
 	err = s.generic.Update(ctx, request, &response)
 	return
@@ -236,6 +231,10 @@ func applyInstanceTypeUpdate(base, update *privatev1.InstanceType, mask *fieldma
 	}
 	for _, path := range mask.GetPaths() {
 		switch path {
+		case "metadata.labels":
+			base.GetMetadata().SetLabels(maps.Clone(update.GetMetadata().GetLabels()))
+		case "metadata.annotations":
+			base.GetMetadata().SetAnnotations(maps.Clone(update.GetMetadata().GetAnnotations()))
 		case "spec.description":
 			base.GetSpec().SetDescription(update.GetSpec().GetDescription())
 		case "spec.state":
@@ -272,10 +271,10 @@ func applyInstanceTypeUpdate(base, update *privatev1.InstanceType, mask *fieldma
 
 // validateInstanceTypeImmutability checks that immutable fields have not been changed.
 func validateInstanceTypeImmutability(merged, existing *privatev1.InstanceType) error {
-	if merged.GetSpec().GetCores() != existing.GetSpec().GetCores() {
+	if merged.GetSpec().GetVcpus() != existing.GetSpec().GetVcpus() {
 		return grpcstatus.Errorf(grpccodes.InvalidArgument,
-			"field 'spec.cores' is immutable and cannot be changed from '%d' to '%d'",
-			existing.GetSpec().GetCores(), merged.GetSpec().GetCores())
+			"field 'spec.vcpus' is immutable and cannot be changed from '%d' to '%d'",
+			existing.GetSpec().GetVcpus(), merged.GetSpec().GetVcpus())
 	}
 	if merged.GetSpec().GetMemoryGib() != existing.GetSpec().GetMemoryGib() {
 		return grpcstatus.Errorf(grpccodes.InvalidArgument,

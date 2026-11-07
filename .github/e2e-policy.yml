@@ -1,0 +1,67 @@
+# Which full-install E2E suites a change needs. Read by e2e-pr.yml (pull requests) and e2e-queue.yml (merge queue)
+# through osac-ci; the path filters are the shared .github/filters/ci-filters.yml. e2e-pr.yml reads this file from the
+# default branch, never from the pull request, so a pull request cannot change which suites its own change needs.
+#
+# A suite is needed when ALL of its `filters` hold and at least ONE of its `filters_any` holds, so a suite for one area
+# (networking, say) has filters that only that area matches and does not run for any other change. `suite` is the id
+# e2e-suite.yml uses to pick the workflow (e2e-<suite>-full-install.yml); `check` is the name of the suite's line on the
+# pull request, which follows the suite's job while it waits, runs and ends. See .github/CI.md for adding a suite.
+version: 1
+repo: osac-project/osac
+
+path_filters:
+  mode: enforce
+  file: filters/ci-filters.yml
+
+jobs:
+  e2e-vmaas:
+    kind: e2e
+    check: "E2E / VMaaS Full Install"
+    suite: vmaas
+    workflow: e2e-pr-vmaas.yml  # a run of its own, started by the decision (see CI.md)
+    filters: [vmaas-outside-known-safe]
+    filters_any: [e2e-code, e2e-suite]
+  e2e-caas:
+    kind: e2e
+    check: "E2E / CaaS Full Install"
+    suite: caas
+    workflow: e2e-pr-caas.yml  # a run of its own, started by the decision (see CI.md)
+    filters: [caas-outside-known-safe]
+    filters_any: [e2e-code, e2e-suite]
+  # A second box for the CaaS suite, for someone adding or changing a regression test: it starts the same suite, on the same
+  # line (so the `E2E` check counts it like the suite), with the regression tests as well as the sanity tests. Never
+  # chosen by the decision and not used by the merge queue. See .github/CI.md.
+  e2e-caas-full:
+    kind: e2e
+    check: "E2E / CaaS Full Install"
+    suite: caas-full
+    manual_only: true
+    variant_of: caas
+    tier: full
+    label: "CaaS Full Install · sanity + regression"
+  e2e-bmaas:
+    kind: e2e
+    check: "E2E / BMaaS Full Install"
+    suite: bmaas
+    workflow: e2e-pr-bmaas.yml  # a run of its own, started by the decision (see CI.md)
+    filters: [bmaas-outside-known-safe]
+    filters_any: [e2e-code, e2e-suite]
+  # Netris suites use a real lab, so they are started only by hand and do not block the E2E check.
+  e2e-bmaas-netris:
+    kind: e2e
+    check: "E2E / BMaaS Netris Full Install"
+    suite: bmaas-netris
+    workflow: e2e-pr-bmaas-netris.yml
+    manual_only: true
+  e2e-vmaas-netris:
+    kind: e2e
+    check: "E2E / VMaaS Netris Full Install"
+    suite: vmaas-netris
+    workflow: e2e-pr-vmaas-netris.yml
+    manual_only: true
+  e2e-stretched-netris:
+    kind: e2e
+    check: "E2E / Stretched Netris Full Install"
+    suite: stretched-netris
+    workflow: e2e-pr-stretched-netris.yml
+    manual_only: true

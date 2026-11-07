@@ -15,7 +15,6 @@ package controller
 
 import (
 	"context"
-	"crypto/x509"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -38,24 +37,28 @@ import (
 	"k8s.io/klog/v2"
 	crlog "sigs.k8s.io/controller-runtime/pkg/log"
 
-	_ "github.com/osac-project/osac/fulfillment-service/internal/api/cleanapi"
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
+	"github.com/osac-project/osac/fulfillment-service/internal/cmd/service/start/idpclient"
 	"github.com/osac-project/osac/fulfillment-service/internal/controllers"
+	"github.com/osac-project/osac/fulfillment-service/internal/controllers/autoexternalipattachment"
 	"github.com/osac-project/osac/fulfillment-service/internal/controllers/baremetalinstance"
 	"github.com/osac-project/osac/fulfillment-service/internal/controllers/cluster"
 	"github.com/osac-project/osac/fulfillment-service/internal/controllers/computeinstance"
+	"github.com/osac-project/osac/fulfillment-service/internal/controllers/defaultnetworking"
 	"github.com/osac-project/osac/fulfillment-service/internal/controllers/externalip"
 	"github.com/osac-project/osac/fulfillment-service/internal/controllers/externalipattachment"
 	"github.com/osac-project/osac/fulfillment-service/internal/controllers/externalippool"
+	"github.com/osac-project/osac/fulfillment-service/internal/controllers/fabricdomain"
 	"github.com/osac-project/osac/fulfillment-service/internal/controllers/identityprovider"
 	"github.com/osac-project/osac/fulfillment-service/internal/controllers/natgateway"
+	"github.com/osac-project/osac/fulfillment-service/internal/controllers/networkclass"
 	"github.com/osac-project/osac/fulfillment-service/internal/controllers/onboarding"
 	"github.com/osac-project/osac/fulfillment-service/internal/controllers/project"
 	"github.com/osac-project/osac/fulfillment-service/internal/controllers/projectmembership"
 	"github.com/osac-project/osac/fulfillment-service/internal/controllers/role"
 	"github.com/osac-project/osac/fulfillment-service/internal/controllers/rolebinding"
 	"github.com/osac-project/osac/fulfillment-service/internal/controllers/securitygroup"
+	"github.com/osac-project/osac/fulfillment-service/internal/controllers/serviceaccount"
 	"github.com/osac-project/osac/fulfillment-service/internal/controllers/subnet"
 	"github.com/osac-project/osac/fulfillment-service/internal/controllers/tenant"
 	"github.com/osac-project/osac/fulfillment-service/internal/controllers/user"
@@ -66,10 +69,14 @@ import (
 	hubscheme "github.com/osac-project/osac/fulfillment-service/internal/kubernetes/scheme"
 	"github.com/osac-project/osac/fulfillment-service/internal/logging"
 	"github.com/osac-project/osac/fulfillment-service/internal/network"
+	"github.com/osac-project/osac/fulfillment-service/internal/networking"
 	"github.com/osac-project/osac/fulfillment-service/internal/oauth"
 	shtdwn "github.com/osac-project/osac/fulfillment-service/internal/shutdown"
+	"github.com/osac-project/osac/fulfillment-service/internal/trust"
 	"github.com/osac-project/osac/fulfillment-service/internal/vault"
 	"github.com/osac-project/osac/fulfillment-service/internal/version"
+	_ "github.com/osac-project/osac/proto/gen/cleanapi"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
 // Cmd creates and returns the `start controllers` command.
@@ -84,6 +91,12 @@ func Cmd() *cobra.Command {
 		RunE:                  runner.run,
 	}
 	flags := command.Flags()
+	flags.BoolVar(
+		&runner.args.sync,
+		"sync",
+		true,
+		syncFlagHelp,
+	)
 	flags.StringArrayVar(
 		&runner.args.caFiles,
 		"ca-file",
@@ -163,6 +176,19 @@ func Cmd() *cobra.Command {
 		"",
 		idpClientSecretFlagHelp,
 	)
+	flags.BoolVar(
+		&runner.args.networkingProvisioningEnabled,
+		"networking-provisioning-enabled",
+		true,
+		"Value of global.networking.provisioningEnabled: whether OSAC runs provider networking jobs.",
+	)
+	flags.StringSliceVar(
+		&runner.args.networkingExcludedIPv4CIDRs,
+		"networking-excluded-ipv4-cidrs",
+		nil,
+		"Value of global.networking.excludedIpv4Cidrs. The controllers accept it for symmetry with the "+
+			"gRPC server, which checks it.",
+	)
 	vault.AddBaseFlags(flags)
 	vault.AddLifecycleFlags(flags)
 	network.AddGrpcClientFlags(flags, network.GrpcClientName, network.DefaultGrpcAddress)
@@ -176,6 +202,7 @@ type runnerContext struct {
 	logger *slog.Logger
 	flags  *pflag.FlagSet
 	args   struct {
+		sync                 bool
 		caFiles              []string
 		authIssuerUrl        string
 		authIssuerUrlFile    string
@@ -191,9 +218,16 @@ type runnerContext struct {
 		idpClientSecretFile  string
 		vaultBase            vault.BaseConfig
 		vaultLifecycle       vault.LifecycleConfig
+
+		networkingProvisioningEnabled bool
+		networkingExcludedIPv4CIDRs   []string
 	}
 	client *grpc.ClientConn
 }
+
+const serviceAccountEventFilter = "has(event.service_account)"
+
+const fabricDomainEventFilter = "has(event.fabric_domain) || (has(event.virtual_network) && event.type == EVENT_TYPE_OBJECT_UPDATED && ((has(event.virtual_network.status) && event.virtual_network.status.hub != '') || (has(event.virtual_network.metadata) && has(event.virtual_network.metadata.deletion_timestamp))))"
 
 // run runs the `start controllers` command.
 func (r *runnerContext) run(cmd *cobra.Command, argv []string) error { //nolint:gocyclo
@@ -224,12 +258,6 @@ func (r *runnerContext) run(cmd *cobra.Command, argv []string) error { //nolint:
 	if r.args.authClientSecret != "" && r.args.authClientSecretFile != "" {
 		return fmt.Errorf("flags '--auth-client-secret' and '--auth-client-secret-file' are mutually exclusive")
 	}
-	if r.args.idpClientId != "" && r.args.idpClientIdFile != "" {
-		return fmt.Errorf("flags '--idp-client-id' and '--idp-client-id-file' are mutually exclusive")
-	}
-	if r.args.idpClientSecret != "" && r.args.idpClientSecretFile != "" {
-		return fmt.Errorf("flags '--idp-client-secret' and '--idp-client-secret-file' are mutually exclusive")
-	}
 	if r.args.authIssuerUrl == "" && r.args.authIssuerUrlFile == "" {
 		return fmt.Errorf("flag '--auth-issuer-url' or '--auth-issuer-url-file' is required")
 	}
@@ -256,7 +284,7 @@ func (r *runnerContext) run(cmd *cobra.Command, argv []string) error { //nolint:
 
 	// Load the trusted CA certificates:
 	r.logger.InfoContext(ctx, "Loading trusted CA certificates")
-	caPool, err := network.NewCertPool().
+	caPool, err := trust.NewCertPool().
 		SetLogger(r.logger).
 		AddFiles(r.args.caFiles...).
 		Build()
@@ -264,6 +292,37 @@ func (r *runnerContext) run(cmd *cobra.Command, argv []string) error { //nolint:
 		return fmt.Errorf("failed to load trusted CA certificates: %w", err)
 	}
 
+	// Read the vault flags:
+	r.args.vaultBase, err = vault.BaseConfigFromFlags(r.flags)
+	if err != nil {
+		return fmt.Errorf("failed to read vault flags: %w", err)
+	}
+	if err = vault.ValidateBaseConfig(r.args.vaultBase); err != nil {
+		return fmt.Errorf("invalid vault configuration: %w", err)
+	}
+
+	// Create the vault lifecycle client:
+	r.args.vaultLifecycle, err = vault.LifecycleConfigFromFlags(r.flags)
+	if err != nil {
+		return fmt.Errorf("failed to read vault lifecycle flags: %w", err)
+	}
+	vaultCaPool := caPool
+	if r.args.vaultBase.CaCertFile != "" {
+		vaultCaPool, err = trust.NewCertPool().
+			SetLogger(r.logger).
+			AddFiles(r.args.caFiles...).
+			AddFile(r.args.vaultBase.CaCertFile).
+			Build()
+		if err != nil {
+			return fmt.Errorf("failed to load vault CA certificates: %w", err)
+		}
+	}
+	vaultLifecycleClient, err := vault.NewLifecycleClientFromConfig(
+		r.logger, r.args.vaultBase, r.args.vaultLifecycle, vaultCaPool,
+	)
+	if err != nil {
+		return err
+	}
 	// Create the token source:
 	r.logger.InfoContext(ctx, "Creating token source")
 	tokenSource, err := r.createTokenSource(ctx, caPool)
@@ -288,6 +347,11 @@ func (r *runnerContext) run(cmd *cobra.Command, argv []string) error { //nolint:
 		Build()
 	if err != nil {
 		return fmt.Errorf("failed to create gRPC client: %w", err)
+	}
+	if err := networking.CheckRemoteInstallationProvisioning(
+		ctx, privatev1.NewInstallationSettingsClient(r.client), r.args.networkingProvisioningEnabled,
+	); err != nil {
+		return err
 	}
 
 	// Create the gRPC server:
@@ -362,6 +426,19 @@ func (r *runnerContext) run(cmd *cobra.Command, argv []string) error { //nolint:
 		return fmt.Errorf("failed to create hub cache: %w", err)
 	}
 
+	// Create the shared default-networking manager. Tenant reconciliation uses
+	// it to ensure resources asynchronously; project reconciliation uses the
+	// same manager to clean them up during root-project deletion.
+	r.logger.InfoContext(ctx, "Creating default networking manager")
+	defaultNetworking, err := defaultnetworking.NewManager().
+		SetLogger(r.logger).
+		SetProvisioningEnabled(r.args.networkingProvisioningEnabled).
+		SetConnection(r.client).
+		Build()
+	if err != nil {
+		return fmt.Errorf("failed to create default networking manager: %w", err)
+	}
+
 	// Create the IDP client:
 	idpClient, err := r.createIDPClient(ctx, caPool)
 	if err != nil {
@@ -399,6 +476,7 @@ func (r *runnerContext) run(cmd *cobra.Command, argv []string) error { //nolint:
 		return fmt.Errorf("failed to create cluster reconciler function: %w", err)
 	}
 	clusterReconciler, err := controllers.NewReconciler[*privatev1.Cluster]().
+		SetSync(r.args.sync).
 		SetLogger(r.logger).
 		SetName("cluster").
 		SetClient(r.client).
@@ -436,11 +514,12 @@ func (r *runnerContext) run(cmd *cobra.Command, argv []string) error { //nolint:
 		return fmt.Errorf("failed to create compute instance reconciler function: %w", err)
 	}
 	computeInstanceReconciler, err := controllers.NewReconciler[*privatev1.ComputeInstance]().
+		SetSync(r.args.sync).
 		SetLogger(r.logger).
-		SetName("compute_instance").
+		SetName("compute-instance").
 		SetClient(r.client).
 		SetFunction(computeInstanceReconcilerFunction).
-		SetEventFilter("has(event.compute_instance) || (has(event.hub) && event.type == EVENT_TYPE_OBJECT_CREATED)").
+		SetEventFilter("has(event.compute_instance) || has(event.external_ip) || has(event.external_ip_attachment) || (has(event.hub) && event.type == EVENT_TYPE_OBJECT_CREATED)").
 		SetHealthReporter(healthAggregator).
 		Build()
 	if err != nil {
@@ -473,8 +552,9 @@ func (r *runnerContext) run(cmd *cobra.Command, argv []string) error { //nolint:
 		return fmt.Errorf("failed to create bare metal instance reconciler function: %w", err)
 	}
 	bareMetalInstanceReconciler, err := controllers.NewReconciler[*privatev1.BareMetalInstance]().
+		SetSync(r.args.sync).
 		SetLogger(r.logger).
-		SetName("bare_metal_instance").
+		SetName("bare-metal-instance").
 		SetClient(r.client).
 		SetFunction(bareMetalInstanceReconcilerFunction).
 		SetEventFilter("has(event.bare_metal_instance) || (has(event.hub) && event.type == EVENT_TYPE_OBJECT_CREATED)").
@@ -499,6 +579,45 @@ func (r *runnerContext) run(cmd *cobra.Command, argv []string) error { //nolint:
 		}
 	}()
 
+	// Create the NetworkClass reconciler:
+	r.logger.InfoContext(ctx, "Creating NetworkClass reconciler")
+	networkClassReconcilerFunction, err := networkclass.NewFunction().
+		SetLogger(r.logger).
+		SetConnection(r.client).
+		SetHubCache(hubCache).
+		Build()
+	if err != nil {
+		return fmt.Errorf("failed to create NetworkClass reconciler function: %w", err)
+	}
+	networkClassReconciler, err := controllers.NewReconciler[*privatev1.NetworkClass]().
+		SetSync(r.args.sync).
+		SetLogger(r.logger).
+		SetName("network-class").
+		SetClient(r.client).
+		SetFunction(networkClassReconcilerFunction).
+		SetSyncInterval(10 * time.Second).
+		SetEventFilter("has(event.network_class) || has(event.hub)").
+		SetHealthReporter(healthAggregator).
+		Build()
+	if err != nil {
+		return fmt.Errorf("failed to create NetworkClass reconciler: %w", err)
+	}
+
+	// Start the NetworkClass reconciler:
+	r.logger.InfoContext(ctx, "Starting NetworkClass reconciler")
+	go func() {
+		err := networkClassReconciler.Start(ctx)
+		if err == nil || errors.Is(err, context.Canceled) {
+			r.logger.InfoContext(ctx, "NetworkClass reconciler finished")
+		} else {
+			r.logger.InfoContext(
+				ctx,
+				"NetworkClass reconciler failed",
+				slog.Any("error", err),
+			)
+		}
+	}()
+
 	// Create the subnet reconciler:
 	r.logger.InfoContext(ctx, "Creating subnet reconciler")
 	subnetReconcilerFunction, err := subnet.NewFunction().
@@ -510,6 +629,7 @@ func (r *runnerContext) run(cmd *cobra.Command, argv []string) error { //nolint:
 		return fmt.Errorf("failed to create subnet reconciler function: %w", err)
 	}
 	subnetReconciler, err := controllers.NewReconciler[*privatev1.Subnet]().
+		SetSync(r.args.sync).
 		SetLogger(r.logger).
 		SetName("subnet").
 		SetClient(r.client).
@@ -547,11 +667,12 @@ func (r *runnerContext) run(cmd *cobra.Command, argv []string) error { //nolint:
 		return fmt.Errorf("failed to create virtual network reconciler function: %w", err)
 	}
 	virtualNetworkReconciler, err := controllers.NewReconciler[*privatev1.VirtualNetwork]().
+		SetSync(r.args.sync).
 		SetLogger(r.logger).
-		SetName("virtual_network").
+		SetName("virtual-network").
 		SetClient(r.client).
 		SetFunction(virtualNetworkReconcilerFunction).
-		SetEventFilter("has(event.virtual_network) || (has(event.hub) && event.type == EVENT_TYPE_OBJECT_CREATED)").
+		SetEventFilter("has(event.virtual_network) || has(event.network_class) || has(event.hub)").
 		SetHealthReporter(healthAggregator).
 		Build()
 	if err != nil {
@@ -573,6 +694,38 @@ func (r *runnerContext) run(cmd *cobra.Command, argv []string) error { //nolint:
 		}
 	}()
 
+	// Create the fabric domain reconciler. VirtualNetwork changes wake domains waiting for hub placement.
+	r.logger.InfoContext(ctx, "Creating fabric domain reconciler")
+	fabricDomainReconcilerFunction, err := fabricdomain.NewFunction().
+		SetLogger(r.logger).
+		SetConnection(r.client).
+		SetHubCache(hubCache).
+		Build()
+	if err != nil {
+		return fmt.Errorf("failed to create fabric domain reconciler function: %w", err)
+	}
+	fabricDomainReconciler, err := controllers.NewReconciler[*privatev1.FabricDomain]().
+		SetLogger(r.logger).
+		SetName("fabric-domain").
+		SetSync(r.args.sync).
+		SetClient(r.client).
+		SetFunction(fabricDomainReconcilerFunction).
+		SetEventFilter(fabricDomainEventFilter).
+		SetHealthReporter(healthAggregator).
+		Build()
+	if err != nil {
+		return fmt.Errorf("failed to create fabric domain reconciler: %w", err)
+	}
+	r.logger.InfoContext(ctx, "Starting fabric domain reconciler")
+	go func() {
+		err := fabricDomainReconciler.Start(ctx)
+		if err == nil || errors.Is(err, context.Canceled) {
+			r.logger.InfoContext(ctx, "Fabric domain reconciler finished")
+		} else {
+			r.logger.ErrorContext(ctx, "Fabric domain reconciler failed", slog.Any("error", err))
+		}
+	}()
+
 	// Create the security group reconciler:
 	r.logger.InfoContext(ctx, "Creating security group reconciler")
 	securityGroupReconcilerFunction, err := securitygroup.NewFunction().
@@ -584,8 +737,9 @@ func (r *runnerContext) run(cmd *cobra.Command, argv []string) error { //nolint:
 		return fmt.Errorf("failed to create security group reconciler function: %w", err)
 	}
 	securityGroupReconciler, err := controllers.NewReconciler[*privatev1.SecurityGroup]().
+		SetSync(r.args.sync).
 		SetLogger(r.logger).
-		SetName("security_group").
+		SetName("security-group").
 		SetClient(r.client).
 		SetFunction(securityGroupReconcilerFunction).
 		SetEventFilter("has(event.security_group) || (has(event.hub) && event.type == EVENT_TYPE_OBJECT_CREATED) || (has(event.virtual_network) && event.type == EVENT_TYPE_OBJECT_UPDATED)").
@@ -621,8 +775,9 @@ func (r *runnerContext) run(cmd *cobra.Command, argv []string) error { //nolint:
 		return fmt.Errorf("failed to create external IP pool reconciler function: %w", err)
 	}
 	externalIPPoolReconciler, err := controllers.NewReconciler[*privatev1.ExternalIPPool]().
+		SetSync(r.args.sync).
 		SetLogger(r.logger).
-		SetName("external_ip_pool").
+		SetName("external-ip-pool").
 		SetClient(r.client).
 		SetFunction(externalIPPoolReconcilerFunction).
 		SetEventFilter("has(event.external_ip_pool) || (has(event.hub) && event.type == EVENT_TYPE_OBJECT_CREATED)").
@@ -658,8 +813,9 @@ func (r *runnerContext) run(cmd *cobra.Command, argv []string) error { //nolint:
 		return fmt.Errorf("failed to create external IP reconciler function: %w", err)
 	}
 	externalIPReconciler, err := controllers.NewReconciler[*privatev1.ExternalIP]().
+		SetSync(r.args.sync).
 		SetLogger(r.logger).
-		SetName("external_ip").
+		SetName("external-ip").
 		SetClient(r.client).
 		SetFunction(externalIPReconcilerFunction).
 		SetEventFilter("has(event.external_ip) || (has(event.hub) && event.type == EVENT_TYPE_OBJECT_CREATED)").
@@ -684,6 +840,35 @@ func (r *runnerContext) run(cmd *cobra.Command, argv []string) error { //nolint:
 		}
 	}()
 
+	r.logger.InfoContext(ctx, "Creating deferred automatic ExternalIP attachment reconciler")
+	autoAttachmentFunction, buildErr := autoexternalipattachment.NewFunction().
+		SetLogger(r.logger).
+		SetConnection(r.client).
+		Build()
+	if buildErr != nil {
+		return fmt.Errorf("failed to create deferred automatic ExternalIP attachment reconciler function: %w", buildErr)
+	}
+	autoAttachmentReconciler, buildErr := controllers.NewReconciler[*privatev1.ExternalIP]().
+		SetLogger(r.logger).
+		SetName("deferred-auto-external-ip-attachment").
+		SetClient(r.client).
+		SetFunction(autoAttachmentFunction).
+		SetEventFilter("has(event.external_ip) || has(event.compute_instance) || has(event.cluster) || has(event.bare_metal_instance) || (has(event.hub) && event.type == EVENT_TYPE_OBJECT_CREATED)").
+		SetHealthReporter(healthAggregator).
+		Build()
+	if buildErr != nil {
+		return fmt.Errorf("failed to create deferred automatic ExternalIP attachment reconciler: %w", buildErr)
+	}
+	r.logger.InfoContext(ctx, "Starting deferred automatic ExternalIP attachment reconciler")
+	go func() {
+		err := autoAttachmentReconciler.Start(ctx)
+		if err == nil || errors.Is(err, context.Canceled) {
+			r.logger.InfoContext(ctx, "Deferred automatic ExternalIP attachment reconciler finished")
+		} else {
+			r.logger.ErrorContext(ctx, "Deferred automatic ExternalIP attachment reconciler failed", slog.Any("error", err))
+		}
+	}()
+
 	// Create the external IP attachment reconciler:
 	r.logger.InfoContext(ctx, "Creating external IP attachment reconciler")
 	externalIPAttachmentReconcilerFunction, err := externalipattachment.NewFunction().
@@ -695,8 +880,9 @@ func (r *runnerContext) run(cmd *cobra.Command, argv []string) error { //nolint:
 		return fmt.Errorf("failed to create external IP attachment reconciler function: %w", err)
 	}
 	externalIPAttachmentReconciler, err := controllers.NewReconciler[*privatev1.ExternalIPAttachment]().
+		SetSync(r.args.sync).
 		SetLogger(r.logger).
-		SetName("external_ip_attachment").
+		SetName("external-ip-attachment").
 		SetClient(r.client).
 		SetFunction(externalIPAttachmentReconcilerFunction).
 		SetEventFilter("has(event.external_ip_attachment) || (has(event.hub) && event.type == EVENT_TYPE_OBJECT_CREATED)").
@@ -732,8 +918,9 @@ func (r *runnerContext) run(cmd *cobra.Command, argv []string) error { //nolint:
 		return fmt.Errorf("failed to create NAT gateway reconciler function: %w", err)
 	}
 	natGatewayReconciler, err := controllers.NewReconciler[*privatev1.NATGateway]().
+		SetSync(r.args.sync).
 		SetLogger(r.logger).
-		SetName("nat_gateway").
+		SetName("nat-gateway").
 		SetClient(r.client).
 		SetFunction(natGatewayReconcilerFunction).
 		SetEventFilter("has(event.nat_gateway) || (has(event.hub) && event.type == EVENT_TYPE_OBJECT_CREATED) || (has(event.virtual_network) && event.type == EVENT_TYPE_OBJECT_UPDATED)").
@@ -769,6 +956,7 @@ func (r *runnerContext) run(cmd *cobra.Command, argv []string) error { //nolint:
 		return fmt.Errorf("failed to create volume reconciler function: %w", err)
 	}
 	volumeReconciler, err := controllers.NewReconciler[*privatev1.Volume]().
+		SetSync(r.args.sync).
 		SetLogger(r.logger).
 		SetName("volume").
 		SetClient(r.client).
@@ -805,6 +993,7 @@ func (r *runnerContext) run(cmd *cobra.Command, argv []string) error { //nolint:
 		return fmt.Errorf("failed to create role reconciler function: %w", err)
 	}
 	roleReconciler, err := controllers.NewReconciler[*privatev1.Role]().
+		SetSync(r.args.sync).
 		SetLogger(r.logger).
 		SetName("role").
 		SetClient(r.client).
@@ -842,8 +1031,9 @@ func (r *runnerContext) run(cmd *cobra.Command, argv []string) error { //nolint:
 		return fmt.Errorf("failed to create role binding reconciler function: %w", err)
 	}
 	roleBindingReconciler, err := controllers.NewReconciler[*privatev1.RoleBinding]().
+		SetSync(r.args.sync).
 		SetLogger(r.logger).
-		SetName("role_binding").
+		SetName("role-binding").
 		SetClient(r.client).
 		SetFunction(roleBindingReconcilerFunction.Run).
 		SetEventFilter("has(event.role_binding)").
@@ -868,50 +1058,59 @@ func (r *runnerContext) run(cmd *cobra.Command, argv []string) error { //nolint:
 		}
 	}()
 
-	// Read the vault flags:
-	r.args.vaultBase, err = vault.BaseConfigFromFlags(r.flags)
+	// Create the service account reconciler:
+	r.logger.InfoContext(ctx, "Creating service account reconciler")
+	serviceAccountReconcilerFunction, err := serviceaccount.NewFunction().
+		SetLogger(r.logger).
+		SetConnection(r.client).
+		SetIdpClient(idpClient).
+		Build()
 	if err != nil {
-		return fmt.Errorf("failed to read vault flags: %w", err)
+		return fmt.Errorf("failed to create service account reconciler function: %w", err)
+	}
+	serviceAccountReconciler, err := controllers.NewReconciler[*privatev1.ServiceAccount]().
+		SetSync(r.args.sync).
+		SetLogger(r.logger).
+		SetName("service-account").
+		SetClient(r.client).
+		SetFunction(serviceAccountReconcilerFunction.Run).
+		SetEventFilter(serviceAccountEventFilter).
+		SetHealthReporter(healthAggregator).
+		Build()
+	if err != nil {
+		return fmt.Errorf("failed to create service account reconciler: %w", err)
 	}
 
-	// Create the vault lifecycle client:
-	var vaultLifecycleClient vault.LifecycleClient
-	if r.args.vaultBase.Endpoint != "" {
-		r.args.vaultLifecycle, err = vault.LifecycleConfigFromFlags(r.flags)
-		if err != nil {
-			return fmt.Errorf("failed to read vault lifecycle flags: %w", err)
+	// Start the service account reconciler:
+	r.logger.InfoContext(ctx, "Starting service account reconciler")
+	go func() {
+		err := serviceAccountReconciler.Start(ctx)
+		if err == nil || errors.Is(err, context.Canceled) {
+			r.logger.InfoContext(ctx, "Service account reconciler finished")
+		} else {
+			r.logger.InfoContext(
+				ctx,
+				"Service account reconciler failed",
+				slog.Any("error", err),
+			)
 		}
-		vaultCaPool := caPool
-		if r.args.vaultBase.CaCertFile != "" {
-			vaultCaPool, err = network.NewCertPool().
-				SetLogger(r.logger).
-				AddFiles(r.args.caFiles...).
-				AddFile(r.args.vaultBase.CaCertFile).
-				Build()
-			if err != nil {
-				return fmt.Errorf("failed to load vault CA certificates: %w", err)
-			}
-		}
-		vaultLifecycleClient, err = vault.NewLifecycleClientFromConfig(
-			r.logger, r.args.vaultBase, r.args.vaultLifecycle, vaultCaPool,
-		)
-		if err != nil {
-			return err
-		}
-	}
+	}()
 
 	// Create the tenant reconciler:
 	r.logger.InfoContext(ctx, "Creating tenant reconciler")
 	tenantReconcilerFunction, err := tenant.NewFunction().
+		SetHubCache(hubCache).
 		SetLogger(r.logger).
 		SetConnection(r.client).
 		SetIdpManager(idpManager).
 		SetVaultLifecycle(vaultLifecycleClient).
+		SetDefaultNetworking(defaultNetworking).
+		SetProvisioningEnabled(r.args.networkingProvisioningEnabled).
 		Build()
 	if err != nil {
 		return fmt.Errorf("failed to create tenant reconciler function: %w", err)
 	}
-	tenantEventFilter := "has(event.tenant)"
+	tenantEventFilter := "has(event.tenant) || has(event.network_class) || has(event.hub)"
 	for _, resource := range []string{"virtual_network", "subnet", "security_group", "nat_gateway", "external_ip"} {
 		// Subscribe only to non-CREATE events for default-labeled resources. The tenant
 		// reconciler needs these events to detect when default networking resources
@@ -926,6 +1125,7 @@ func (r *runnerContext) run(cmd *cobra.Command, argv []string) error { //nolint:
 		)
 	}
 	tenantReconciler, err := controllers.NewReconciler[*privatev1.Tenant]().
+		SetSync(r.args.sync).
 		SetLogger(r.logger).
 		SetName("tenant").
 		SetClient(r.client).
@@ -963,6 +1163,7 @@ func (r *runnerContext) run(cmd *cobra.Command, argv []string) error { //nolint:
 		return fmt.Errorf("failed to create user reconciler function: %w", err)
 	}
 	userReconciler, err := controllers.NewReconciler[*privatev1.User]().
+		SetSync(r.args.sync).
 		SetLogger(r.logger).
 		SetName("user").
 		SetClient(r.client).
@@ -1000,6 +1201,7 @@ func (r *runnerContext) run(cmd *cobra.Command, argv []string) error { //nolint:
 		return fmt.Errorf("failed to create onboarding reconciler function: %w", err)
 	}
 	onboardingReconciler, err := controllers.NewReconciler[*privatev1.Tenant]().
+		SetSync(r.args.sync).
 		SetLogger(r.logger).
 		SetName("onboarding").
 		SetClient(r.client).
@@ -1032,11 +1234,13 @@ func (r *runnerContext) run(cmd *cobra.Command, argv []string) error { //nolint:
 		SetLogger(r.logger).
 		SetConnection(r.client).
 		SetProjectGroupManager(projectGroupManager).
+		SetDefaultNetworking(defaultNetworking).
 		Build()
 	if err != nil {
 		return fmt.Errorf("failed to create project reconciler function: %w", err)
 	}
 	projectReconciler, err := controllers.NewReconciler[*privatev1.Project]().
+		SetSync(r.args.sync).
 		SetLogger(r.logger).
 		SetName("project").
 		SetClient(r.client).
@@ -1074,8 +1278,9 @@ func (r *runnerContext) run(cmd *cobra.Command, argv []string) error { //nolint:
 		return fmt.Errorf("failed to build project membership reconciler function: %w", err)
 	}
 	projectMembershipReconciler, err := controllers.NewReconciler[*privatev1.ProjectMembership]().
+		SetSync(r.args.sync).
 		SetLogger(r.logger).
-		SetName("project_membership").
+		SetName("project-membership").
 		SetClient(r.client).
 		SetFunction(projectMembershipReconcilerFunction.Run).
 		SetEventFilter("has(event.project_membership)").
@@ -1111,8 +1316,9 @@ func (r *runnerContext) run(cmd *cobra.Command, argv []string) error { //nolint:
 		return fmt.Errorf("failed to create identity provider reconciler function: %w", err)
 	}
 	identityProviderReconciler, err := controllers.NewReconciler[*privatev1.IdentityProvider]().
+		SetSync(r.args.sync).
 		SetLogger(r.logger).
-		SetName("identity_provider").
+		SetName("identity-provider").
 		SetClient(r.client).
 		SetFunction(identityProviderReconcilerFunction.Run).
 		SetEventFilter("has(event.identity_provider)").
@@ -1208,7 +1414,7 @@ func (r *runnerContext) waitForServer(ctx context.Context) error {
 
 // createTokenSource creates the token source used to authenticate the controller when it acts as a client of other
 // services.
-func (r *runnerContext) createTokenSource(ctx context.Context, caPool *x509.CertPool) (result auth.TokenSource,
+func (r *runnerContext) createTokenSource(ctx context.Context, caPool *trust.CertPool) (result auth.TokenSource,
 	err error) {
 	// Get the values of the flags:
 	issuerUrl := r.args.authIssuerUrl
@@ -1279,44 +1485,7 @@ func (r *runnerContext) createTokenSource(ctx context.Context, caPool *x509.Cert
 }
 
 // createIDPClient creates the IDP client. The IDP URL and credentials are mandatory.
-func (r *runnerContext) createIDPClient(ctx context.Context, caPool *x509.CertPool) (*idp.Client, error) {
-	if r.args.idpURL == "" {
-		return nil, fmt.Errorf("flag '--idp-url' is required")
-	}
-	if r.args.idpClientId == "" && r.args.idpClientIdFile == "" {
-		return nil, fmt.Errorf("flag '--idp-client-id' or '--idp-client-id-file' is required")
-	}
-	if r.args.idpClientSecret == "" && r.args.idpClientSecretFile == "" {
-		return nil, fmt.Errorf("flag '--idp-client-secret' or '--idp-client-secret-file' is required")
-	}
-
-	// Get the client ID
-	idpClientId := r.args.idpClientId
-	if idpClientId == "" && r.args.idpClientIdFile != "" {
-		var err error
-		idpClientId, err = r.readTrimmedFile(r.args.idpClientIdFile)
-		if err != nil {
-			return nil, fmt.Errorf(
-				"failed to read IDP client identifier from file '%s': %w",
-				r.args.idpClientIdFile, err,
-			)
-		}
-	}
-
-	// Get the client secret
-	idpClientSecret := r.args.idpClientSecret
-	if idpClientSecret == "" && r.args.idpClientSecretFile != "" {
-		var err error
-		idpClientSecret, err = r.readTrimmedFile(r.args.idpClientSecretFile)
-		if err != nil {
-			return nil, fmt.Errorf(
-				"failed to read IDP client secret from file '%s': %w",
-				r.args.idpClientSecretFile, err,
-			)
-		}
-	}
-
-	// Get the issuer URL (same as auth issuer URL)
+func (r *runnerContext) createIDPClient(ctx context.Context, caPool *trust.CertPool) (*idp.Client, error) {
 	issuerUrl := r.args.authIssuerUrl
 	if issuerUrl == "" && r.args.authIssuerUrlFile != "" {
 		var err error
@@ -1329,52 +1498,16 @@ func (r *runnerContext) createIDPClient(ctx context.Context, caPool *x509.CertPo
 		}
 	}
 
-	r.logger.DebugContext(
-		ctx,
-		"IDP credentials from flags",
-		slog.String("issuer_url", issuerUrl),
-		slog.String("!client_id", idpClientId),
-		slog.String("!client_secret", idpClientSecret),
-	)
-
-	// Create a token store that saves the token in memory
-	idpTokenStore, err := auth.NewMemoryTokenStore().
-		SetLogger(r.logger).
-		Build()
-	if err != nil {
-		return nil, fmt.Errorf("failed to create IDP token store: %w", err)
-	}
-
-	// Create OAuth token source for IDP authentication
-	r.logger.InfoContext(ctx, "Creating IDP token source")
-	idpTokenSource, err := oauth.NewTokenSource().
-		SetLogger(r.logger).
-		SetStore(idpTokenStore).
-		SetCaPool(caPool).
-		SetIssuer(issuerUrl).
-		SetFlow(oauth.CredentialsFlow).
-		SetClientId(idpClientId).
-		SetClientSecret(idpClientSecret).
-		Build()
-	if err != nil {
-		return nil, fmt.Errorf("failed to create IDP token source: %w", err)
-	}
-
-	// Create Keycloak IDP client:
-	r.logger.InfoContext(ctx, "Creating Keycloak IDP client")
-
-	idpClient, err := idp.NewClient().
+	return idpclient.NewClient().
 		SetLogger(r.logger).
 		SetBaseURL(r.args.idpURL).
-		SetTokenSource(idpTokenSource).
+		SetIssuerURL(issuerUrl).
+		SetClientID(r.args.idpClientId).
+		SetClientIDFile(r.args.idpClientIdFile).
+		SetClientSecret(r.args.idpClientSecret).
+		SetClientSecretFile(r.args.idpClientSecretFile).
 		SetCaPool(caPool).
 		Build()
-	if err != nil {
-		return nil, fmt.Errorf("failed to create Keycloak client: %w", err)
-	}
-
-	r.logger.InfoContext(ctx, "Keycloak IDP client created successfully")
-	return idpClient, nil
 }
 
 // readTrimmedFile reads the content of the given file and returns it with all leading and trailing whitespace removed.
@@ -1394,6 +1527,11 @@ const shortHelp = `Starts the controller`
 
 const longHelp = `
 Starts the controller.
+`
+
+const syncFlagHelp = `
+Enable startup, periodic and watch-restart synchronization for all controllers. Defaults to true.
+Event-driven reconciliation, including reconciliation of dependent objects, remains enabled when false.
 `
 
 const caFileFlagHelp = `

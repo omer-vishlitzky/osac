@@ -31,13 +31,32 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/controllers"
 	"github.com/osac-project/osac/fulfillment-service/internal/controllers/finalizers"
 	"github.com/osac-project/osac/fulfillment-service/internal/kubernetes/labels"
 	"github.com/osac-project/osac/fulfillment-service/internal/masks"
 	osacv1alpha1 "github.com/osac-project/osac/osac-operator/api/v1alpha1"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
+
+type fakeNetworkingHubReader struct {
+	result controllers.NetworkingHubResolution
+	err    error
+	calls  int
+}
+
+func (f *fakeNetworkingHubReader) Resolve(context.Context) (controllers.NetworkingHubResolution, error) {
+	f.calls++
+	return f.result, f.err
+}
+
+func readyNetworkingHubReader(id, namespace string, client clnt.Client) *fakeNetworkingHubReader {
+	return &fakeNetworkingHubReader{result: controllers.NetworkingHubResolution{
+		NetworkingHub: controllers.NetworkingHub{ID: id, Namespace: namespace, Client: client},
+		HubID:         id,
+		State:         privatev1.NetworkClassState_NETWORK_CLASS_STATE_READY,
+	}}
+}
 
 // newAttachmentCR creates a typed ExternalIPAttachment CR for use with the fake client.
 func newAttachmentCR(id, namespace, name string, deletionTimestamp *metav1.Time) *osacv1alpha1.ExternalIPAttachment {
@@ -353,7 +372,8 @@ var _ = Describe("delete", func() {
 		}.Build()
 
 		f := &function{
-			logger: logger,
+			logger:              logger,
+			networkingHubReader: &fakeNetworkingHubReader{err: controllers.ErrNoNetworkingHubs},
 		}
 
 		t := &task{
@@ -584,148 +604,234 @@ var _ = Describe("removeFinalizer", func() {
 })
 
 var _ = Describe("selectHub", func() {
-	var (
-		ctx  context.Context
-		ctrl *gomock.Controller
+	It("uses the canonical Hub for empty and sticky assignments and never falls back", func() {
+		ctx := context.Background()
+		kubeClient := fake.NewClientBuilder().Build()
+		resolver := readyNetworkingHubReader("hub-a", "hub-a-ns", kubeClient)
+		f := &function{logger: logger, networkingHubReader: resolver}
+		newAttachment := func(hubID string) *privatev1.ExternalIPAttachment {
+			return privatev1.ExternalIPAttachment_builder{
+				Id: "eia-canonical-hub",
+				Spec: privatev1.ExternalIPAttachmentSpec_builder{
+					ExternalIp: privatev1.ExternalIPLocalReference_builder{Id: "eip-uuid-1"}.Build(),
+				}.Build(),
+				Status: privatev1.ExternalIPAttachmentStatus_builder{Hub: hubID}.Build(),
+			}.Build()
+		}
+
+		for _, assignedHubID := range []string{"", "hub-a"} {
+			t := &task{r: f, externalIPAttachment: newAttachment(assignedHubID)}
+			Expect(t.selectHub(ctx)).To(Succeed())
+			Expect(t.hubId).To(Equal("hub-a"))
+			Expect(t.hubNamespace).To(Equal("hub-a-ns"))
+			Expect(t.hubClient).To(BeIdenticalTo(kubeClient))
+		}
+		Expect(resolver.calls).To(Equal(2))
+
+		conflict := &task{r: f, externalIPAttachment: newAttachment("hub-b")}
+		Expect(conflict.selectHub(ctx)).To(MatchError(ContainSubstring(controllers.ErrResourceHubConflict.Error())))
+		Expect(conflict.hubClient).To(BeNil())
+
+		for _, resolutionErr := range []error{
+			controllers.ErrNoNetworkingHubs,
+			controllers.ErrMultipleNetworkingHubs,
+			controllers.ErrCanonicalHubUnavailable,
+		} {
+			resolver.err = resolutionErr
+			t := &task{r: f, externalIPAttachment: newAttachment("hub-a")}
+			Expect(t.selectHub(ctx)).To(MatchError(resolutionErr))
+			Expect(t.hubClient).To(BeNil())
+		}
+	})
+})
+
+var _ = Describe("hub persistence", func() {
+	const (
+		attachmentID = "test-attachment-hub"
+		hubID        = "test-hub-123"
+		hubNamespace = "hub-123-ns"
 	)
 
-	BeforeEach(func() {
-		ctx = context.Background()
-		ctrl = gomock.NewController(GinkgoT())
+	It("creates the ExternalIPAttachment CR and persists the selected hub in the same reconcile", func() {
+		ctx := context.Background()
+		ctrl := gomock.NewController(GinkgoT())
 		DeferCleanup(ctrl.Finish)
-	})
 
-	It("should use existing hub from status", func() {
-		hubCache := controllers.NewMockHubCache(ctrl)
-		hubCache.EXPECT().
-			Get(gomock.Any(), "hub-1").
-			Return(&controllers.HubEntry{
-				Namespace: "hub-ns",
-				Client:    fake.NewClientBuilder().Build(),
-			}, nil)
+		scheme := runtime.NewScheme()
+		Expect(osacv1alpha1.AddToScheme(scheme)).To(Succeed())
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+		resolver := readyNetworkingHubReader(hubID, hubNamespace, fakeClient)
+
+		attachmentsClient := NewMockExternalIPAttachmentsClient(ctrl)
+		attachmentsClient.EXPECT().
+			Update(gomock.Any(), gomock.Any(), gomock.Any()).
+			DoAndReturn(func(ctx context.Context, req *privatev1.ExternalIPAttachmentsUpdateRequest, opts ...grpc.CallOption) (*privatev1.ExternalIPAttachmentsUpdateResponse, error) {
+				return &privatev1.ExternalIPAttachmentsUpdateResponse{Object: req.GetObject()}, nil
+			}).AnyTimes()
 
 		attachment := privatev1.ExternalIPAttachment_builder{
-			Id: "eia-uuid-existing-hub",
+			Id: attachmentID,
+			Metadata: privatev1.Metadata_builder{
+				Finalizers: []string{finalizers.Controller},
+				Tenant:     "test-tenant",
+			}.Build(),
 			Spec: privatev1.ExternalIPAttachmentSpec_builder{
-				ExternalIp: privatev1.ExternalIPLocalReference_builder{Id: "eip-uuid-1"}.Build(),
+				ExternalIp: privatev1.ExternalIPLocalReference_builder{Id: "eip-123"}.Build(),
+				Cluster:    privatev1.ClusterLocalReference_builder{Id: "cluster-123"}.Build(),
 			}.Build(),
 			Status: privatev1.ExternalIPAttachmentStatus_builder{
-				Hub: "hub-1",
+				State: privatev1.ExternalIPAttachmentState_EXTERNAL_IP_ATTACHMENT_STATE_PENDING,
 			}.Build(),
 		}.Build()
 
 		f := &function{
-			logger:   logger,
-			hubCache: hubCache,
+			logger:                      logger,
+			externalIPAttachmentsClient: attachmentsClient,
+			networkingHubReader:         resolver,
+			maskCalculator:              masks.NewCalculator().Build(),
 		}
 
-		t := &task{
-			r:                    f,
-			externalIPAttachment: attachment,
-		}
+		Expect(f.run(ctx, attachment)).To(Succeed())
+		Expect(attachment.GetStatus().GetHub()).To(Equal(hubID))
 
-		err := t.selectHub(ctx)
-		Expect(err).ToNot(HaveOccurred())
-		Expect(t.hubId).To(Equal("hub-1"))
-		Expect(t.hubNamespace).To(Equal("hub-ns"))
+		list := &osacv1alpha1.ExternalIPAttachmentList{}
+		Expect(fakeClient.List(ctx, list)).To(Succeed())
+		Expect(list.Items).To(HaveLen(1))
+
+		// The next reconcile adopts the CR instead of creating another one:
+		Expect(f.run(ctx, attachment)).To(Succeed())
+		Expect(fakeClient.List(ctx, list)).To(Succeed())
+		Expect(list.Items).To(HaveLen(1))
+		Expect(list.Items[0].Namespace).To(Equal(hubNamespace))
 	})
 
-	It("should select hub randomly when status hub is empty", func() {
-		hubsClient := controllers.NewMockHubsClient(ctrl)
-		hubsClient.EXPECT().
-			List(gomock.Any(), gomock.Any()).
-			Return(&privatev1.HubsListResponse{
-				Items: []*privatev1.Hub{privatev1.Hub_builder{Id: "hub-random"}.Build()},
-			}, nil)
+	It("finds the CR on delete when persisting the selected hub failed after its creation", func() {
+		ctx := context.Background()
+		ctrl := gomock.NewController(GinkgoT())
+		DeferCleanup(ctrl.Finish)
 
-		hubCache := controllers.NewMockHubCache(ctrl)
-		hubCache.EXPECT().
-			Get(gomock.Any(), "hub-random").
-			Return(&controllers.HubEntry{
-				Namespace: "hub-random-ns",
-				Client:    fake.NewClientBuilder().Build(),
-			}, nil)
+		scheme := runtime.NewScheme()
+		Expect(osacv1alpha1.AddToScheme(scheme)).To(Succeed())
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+		resolver := readyNetworkingHubReader(hubID, hubNamespace, fakeClient)
+
+		attachmentsClient := NewMockExternalIPAttachmentsClient(ctrl)
+		attachmentsClient.EXPECT().
+			Update(gomock.Any(), gomock.Any(), gomock.Any()).
+			Return(nil, errors.New("Fulfillment status update failed"))
 
 		attachment := privatev1.ExternalIPAttachment_builder{
-			Id: "eia-uuid-derive-hub",
+			Id: attachmentID,
+			Metadata: privatev1.Metadata_builder{
+				Finalizers: []string{finalizers.Controller},
+				Tenant:     "test-tenant",
+			}.Build(),
 			Spec: privatev1.ExternalIPAttachmentSpec_builder{
-				ExternalIp: privatev1.ExternalIPLocalReference_builder{Id: "eip-uuid-1"}.Build(),
+				ExternalIp: privatev1.ExternalIPLocalReference_builder{Id: "eip-123"}.Build(),
+				Cluster:    privatev1.ClusterLocalReference_builder{Id: "cluster-123"}.Build(),
+			}.Build(),
+			Status: privatev1.ExternalIPAttachmentStatus_builder{
+				State: privatev1.ExternalIPAttachmentState_EXTERNAL_IP_ATTACHMENT_STATE_PENDING,
 			}.Build(),
 		}.Build()
 
 		f := &function{
-			logger:     logger,
-			hubCache:   hubCache,
-			hubsClient: hubsClient,
+			logger:                      logger,
+			externalIPAttachmentsClient: attachmentsClient,
+			networkingHubReader:         resolver,
+			maskCalculator:              masks.NewCalculator().Build(),
 		}
+		Expect(f.run(ctx, attachment)).To(MatchError(ContainSubstring("Fulfillment status update failed")))
 
-		t := &task{
-			r:                    f,
-			externalIPAttachment: attachment,
-		}
+		list := &osacv1alpha1.ExternalIPAttachmentList{}
+		Expect(fakeClient.List(ctx, list)).To(Succeed())
+		Expect(list.Items).To(HaveLen(1))
 
-		err := t.selectHub(ctx)
-		Expect(err).ToNot(HaveOccurred())
-		Expect(t.hubId).To(Equal("hub-random"))
-		Expect(t.hubNamespace).To(Equal("hub-random-ns"))
+		// A later delete read from Fulfillment has no persisted hub. It looks the CR up in the canonical hub,
+		// deletes it, and keeps the finalizer until the CR is gone:
+		attachment.GetStatus().SetHub("")
+		deleteTask := &task{r: f, externalIPAttachment: attachment}
+		_ = deleteTask.delete(ctx)
+		Expect(hasFinalizer(attachment)).To(BeTrue())
+		Expect(fakeClient.List(ctx, list)).To(Succeed())
+		Expect(list.Items).To(BeEmpty())
+		deleteTask = &task{r: f, externalIPAttachment: attachment}
+		Expect(deleteTask.delete(ctx)).To(Succeed())
+		Expect(hasFinalizer(attachment)).To(BeFalse())
 	})
+})
 
-	It("should return error when no hubs available", func() {
-		hubsClient := controllers.NewMockHubsClient(ctrl)
-		hubsClient.EXPECT().
-			List(gomock.Any(), gomock.Any()).
-			Return(&privatev1.HubsListResponse{
-				Items: []*privatev1.Hub{},
-			}, nil)
+var _ = Describe("Kubernetes lifecycle label projection", func() {
+	It("projects trusted auto-created ownership labels without arbitrary metadata labels", func() {
+		const (
+			attachmentID = "eia-label-test"
+			hubID        = "hub-label-test"
+			hubNamespace = "hub-label-test-ns"
+			tenantName   = "tenant-label-test"
+		)
+		ctx := context.Background()
+		ctrl := gomock.NewController(GinkgoT())
+		DeferCleanup(ctrl.Finish)
+
+		scheme := runtime.NewScheme()
+		Expect(osacv1alpha1.AddToScheme(scheme)).To(Succeed())
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+		resolver := readyNetworkingHubReader(hubID, hubNamespace, fakeClient)
+
+		attachmentsClient := NewMockExternalIPAttachmentsClient(ctrl)
+		attachmentsClient.EXPECT().
+			Update(gomock.Any(), gomock.Any(), gomock.Any()).
+			DoAndReturn(func(ctx context.Context, req *privatev1.ExternalIPAttachmentsUpdateRequest, opts ...grpc.CallOption) (*privatev1.ExternalIPAttachmentsUpdateResponse, error) {
+				return &privatev1.ExternalIPAttachmentsUpdateResponse{Object: req.GetObject()}, nil
+			}).AnyTimes()
 
 		attachment := privatev1.ExternalIPAttachment_builder{
-			Id: "eia-uuid-no-hubs",
+			Id: attachmentID,
+			Metadata: privatev1.Metadata_builder{
+				Finalizers: []string{finalizers.Controller},
+				Tenant:     tenantName,
+				Creator:    "system",
+				Labels: map[string]string{
+					"osac.openshift.io/auto-created":     "true",
+					"osac.openshift.io/auto-created-for": "cluster-123",
+					"example.com/user-label":             "do-not-project",
+				},
+			}.Build(),
 			Spec: privatev1.ExternalIPAttachmentSpec_builder{
-				ExternalIp: privatev1.ExternalIPLocalReference_builder{Id: "eip-uuid-1"}.Build(),
+				ExternalIp: privatev1.ExternalIPLocalReference_builder{Id: "eip-123"}.Build(),
+				Cluster:    privatev1.ClusterLocalReference_builder{Id: "cluster-123"}.Build(),
+			}.Build(),
+			Status: privatev1.ExternalIPAttachmentStatus_builder{
+				State: privatev1.ExternalIPAttachmentState_EXTERNAL_IP_ATTACHMENT_STATE_PENDING,
+				Hub:   hubID,
 			}.Build(),
 		}.Build()
 
 		f := &function{
-			logger:     logger,
-			hubsClient: hubsClient,
+			logger:                      logger,
+			externalIPAttachmentsClient: attachmentsClient,
+			networkingHubReader:         resolver,
+			maskCalculator:              masks.NewCalculator().Build(),
 		}
+		Expect(f.run(ctx, attachment)).To(Succeed())
 
-		t := &task{
-			r:                    f,
-			externalIPAttachment: attachment,
-		}
+		list := &osacv1alpha1.ExternalIPAttachmentList{}
+		Expect(fakeClient.List(ctx, list)).To(Succeed())
+		Expect(list.Items).To(HaveLen(1))
+		Expect(list.Items[0].Labels).To(HaveKeyWithValue("osac.openshift.io/auto-created", "true"))
+		Expect(list.Items[0].Labels).To(HaveKeyWithValue("osac.openshift.io/auto-created-for", "cluster-123"))
+		Expect(list.Items[0].Labels).To(HaveKeyWithValue(labels.ExternalIPAttachmentUuid, attachmentID))
+		Expect(list.Items[0].Labels).ToNot(HaveKey("example.com/user-label"))
 
-		err := t.selectHub(ctx)
-		Expect(err).To(HaveOccurred())
-		Expect(err.Error()).To(ContainSubstring("no hubs"))
-	})
-
-	It("should return error when hub listing fails", func() {
-		hubsClient := controllers.NewMockHubsClient(ctrl)
-		hubsClient.EXPECT().
-			List(gomock.Any(), gomock.Any()).
-			Return(nil, errors.New("hub list failed"))
-
-		attachment := privatev1.ExternalIPAttachment_builder{
-			Id: "eia-uuid-hub-error",
-			Spec: privatev1.ExternalIPAttachmentSpec_builder{
-				ExternalIp: privatev1.ExternalIPLocalReference_builder{Id: "eip-uuid-missing"}.Build(),
-			}.Build(),
-		}.Build()
-
-		f := &function{
-			logger:     logger,
-			hubsClient: hubsClient,
-		}
-
-		t := &task{
-			r:                    f,
-			externalIPAttachment: attachment,
-		}
-
-		err := t.selectHub(ctx)
-		Expect(err).To(HaveOccurred())
-		Expect(err.Error()).To(ContainSubstring("hub list failed"))
+		// Existing CRs from before these labels were projected must be repaired on reconcile.
+		legacy := list.Items[0].DeepCopy()
+		legacy.Labels = map[string]string{labels.ExternalIPAttachmentUuid: attachmentID}
+		Expect(fakeClient.Update(ctx, legacy)).To(Succeed())
+		Expect(f.run(ctx, attachment)).To(Succeed())
+		Expect(fakeClient.List(ctx, list)).To(Succeed())
+		Expect(list.Items).To(HaveLen(1))
+		Expect(list.Items[0].Labels).To(HaveKeyWithValue("osac.openshift.io/auto-created", "true"))
+		Expect(list.Items[0].Labels).To(HaveKeyWithValue("osac.openshift.io/auto-created-for", "cluster-123"))
 	})
 })
 
@@ -757,11 +863,7 @@ var _ = Describe("Kubernetes validation error handling", func() {
 			}).
 			Build()
 
-		hubCache := controllers.NewMockHubCache(ctrl)
-		hubCache.EXPECT().
-			Get(gomock.Any(), "hub-1").
-			Return(&controllers.HubEntry{Namespace: "test-ns", Client: fakeClient}, nil).
-			AnyTimes()
+		resolver := readyNetworkingHubReader("hub-1", "test-ns", fakeClient)
 
 		externalIPAttachmentsClient := NewMockExternalIPAttachmentsClient(ctrl)
 		externalIPAttachmentsClient.EXPECT().
@@ -788,8 +890,8 @@ var _ = Describe("Kubernetes validation error handling", func() {
 
 		f := &function{
 			logger:                      logger,
-			hubCache:                    hubCache,
 			externalIPAttachmentsClient: externalIPAttachmentsClient,
+			networkingHubReader:         resolver,
 			maskCalculator:              masks.NewCalculator().Build(),
 		}
 

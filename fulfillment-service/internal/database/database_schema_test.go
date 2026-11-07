@@ -50,4 +50,51 @@ var _ = Describe("Schema", Ordered, func() {
 		err = tool.CheckSchema(ctx)
 		Expect(err).ToNot(HaveOccurred())
 	})
+
+	It("Reports object tables that are missing the enqueue_change trigger", func() {
+		url, err := db.Url(ctx)
+		Expect(err).ToNot(HaveOccurred())
+		tool, err := NewTool().
+			SetLogger(logger).
+			SetURL(url).
+			Build()
+		Expect(err).ToNot(HaveOccurred())
+
+		pool, err := db.Pool(ctx)
+		Expect(err).ToNot(HaveOccurred())
+		DeferCleanup(pool.Close)
+		_, err = pool.Exec(ctx, "drop trigger enqueue_change on projects")
+		Expect(err).ToNot(HaveOccurred())
+
+		err = tool.CheckSchema(ctx)
+		Expect(err).To(MatchError(ContainSubstring("found")))
+		Expect(err).To(MatchError(ContainSubstring("issues in the database schema")))
+	})
+
+	It("Reports object tables that are missing the owner-reference triggers", func() {
+		url, err := db.Url(ctx)
+		Expect(err).ToNot(HaveOccurred())
+		tool, err := NewTool().
+			SetLogger(logger).
+			SetURL(url).
+			Build()
+		Expect(err).ToNot(HaveOccurred())
+
+		pool, err := db.Pool(ctx)
+		Expect(err).ToNot(HaveOccurred())
+		DeferCleanup(pool.Close)
+		_, err = pool.Exec(ctx, "drop trigger check_owner_reference on bare_metal_instances")
+		Expect(err).ToNot(HaveOccurred())
+
+		err = tool.CheckSchema(ctx)
+		Expect(err).To(MatchError(ContainSubstring("found")))
+		Expect(err).To(MatchError(ContainSubstring("issues in the database schema")))
+
+		_, err = pool.Exec(ctx, "drop trigger check_owner_reference_not_in_use on clusters")
+		Expect(err).ToNot(HaveOccurred())
+
+		err = tool.CheckSchema(ctx)
+		Expect(err).To(MatchError(ContainSubstring("found")))
+		Expect(err).To(MatchError(ContainSubstring("issues in the database schema")))
+	})
 })

@@ -1,8 +1,27 @@
 # VMaaS CI environment -- instance values for osac chart.
 
-# --- CSI Driver ---
-csiDriver:
-  enabled: true
+# --- Service Enablement ---
+global:
+  osacDeploymentId: "ci/osac"
+  fulfillmentTrust:
+    enabled: false
+  services:
+    caas:
+      enabled: false
+    vmaas:
+      enabled: true
+    bmaas:
+      enabled: false
+    maas:
+      enabled: false
+  # Provider networking disabled: networking resources become READY without
+  # provider work. The osac chart renders the Netris Fabric Manager and
+  # cudn_evpn Kubernetes Manager registrations from fabricManager and
+  # k8sManager; no Netris connection settings are needed.
+  networking:
+    provisioningEnabled: false
+    fabricManager: netris
+    k8sManager: cudn_evpn
 
 # --- Operator ---
 operator:
@@ -12,6 +31,8 @@ operator:
     pullPolicy: Always
   provisioning:
     provider: "aap"
+  vendorControllers:
+    lvms: none
   aap:
     insecureSkipVerify: "true"
     tokenSecret:
@@ -19,10 +40,11 @@ operator:
       key: token
   fulfillment:
     serverAddress: "fulfillment-internal-api:8001"
-    tokenFile: "/var/run/secrets/kubernetes.io/serviceaccount/token"
+    credentials:
+      secretName: fulfillment-controller-credentials
+      clientIdKey: client-id
+      clientSecretKey: client-secret
   controllers:
-    clusterOrder: false
-    computeInstance: true
     tenant: true
     networking: true
     storage: true
@@ -31,15 +53,6 @@ operator:
   tenants:
   - name: shared
   - name: osac-e2e-ci
-  # VMaaS has no physical fabric. Register k8s_only so the dispatcher can
-  # stamp ExternalIP/VN/SG onto the composite role (CUDN + NetworkPolicy +
-  # MetalLB L2) instead of fabricManager cudn_net, which cannot provision
-  # ExternalIP pools.
-  networkManagers:
-    k8sManagers:
-      k8s_only:
-        enabled: true
-        capabilities: "ipv4,ipv6,dualStack"
 
 # --- Fulfillment Service ---
 service:
@@ -47,8 +60,14 @@ service:
   internalHostname: ""  # Set dynamically by make install-osac
   variant: openshift
   images:
-    service: ghcr.io/osac-project/fulfillment-service:main
-    envoy: ghcr.io/osac-project/envoy:v1.33.0
+    service:
+      repository: ghcr.io/osac-project/fulfillment-service
+      tag: latest
+      pullPolicy: Always
+    envoy:
+      repository: ghcr.io/osac-project/envoy
+      tag: v1.33.0
+      pullPolicy: IfNotPresent
   certs:
     issuerRef:
       kind: ClusterIssuer
@@ -61,8 +80,6 @@ service:
     # install-osac sets --set global.clusterDomain=$(DOMAIN).
     emergencyServiceAccounts:
     - admin
-    - osac-operator
-    - osac-operator-controller-manager
     - template-publisher
     - osac-metering
     controllerCredentials:
@@ -126,13 +143,15 @@ service:
 ui:
   enabled: true
   images:
-    ui: ghcr.io/osac-project/osac-ui:v0.0.5
+    ui: ghcr.io/osac-project/osac-ui:latest
   api:
     fulfillment:
       certs:
         caBundle:
           configMap: ca-bundle
   auth:
+    # oidcIssuerURL defaults to match service.auth.issuerUrl -- set automatically
+    # by install-osac via --set ui.auth.oidcIssuerURL when global.clusterDomain is set.
     certs:
       caBundle:
         configMap: ca-bundle
@@ -167,19 +186,12 @@ aap:
 validation:
   enabled: true
 
-# --- Bare Metal Fulfillment Operator ---
-bmf:
-  enabled: false
-
 # --- Hub Access ---
 hubAccess:
   enabled: true
 
 # --- Metering ---
 metering:
-  enabled: true
-  reconciliation:
-    interval: "5m"
   # Echo adapter -- test/development tool only. Consumes metering events from
   # Kafka and exposes them via HTTP for E2E test assertions.
   echoAdapter:
@@ -218,25 +230,3 @@ metering:
 # --- LVMS StorageBackend registration ---
 lvms:
   enabled: true
-
-# Default NetworkClass for VMaaS-without-fabric (create-network-class hook).
-# Must clear fabricManager — chart defaults leave cudn_net, and Helm merge
-# would stamp both managers
-networkClass:
-  enabled: true
-  title: "K8s-only networking"
-  description: >-
-    VMaaS overlay without a physical fabric. VirtualNetwork/Subnet use CUDN,
-    SecurityGroup uses NetworkPolicy, ExternalIP uses MetalLB L2.
-  fabricManager: ""
-  k8sManager: "k8s_only"
-  isDefault: true
-
-# --- Bundled OpenBao (Vault-compatible secret store) ---
-bundledVault:
-  # Override podSecurityContext for OpenShift restricted-v2 SCC: omit numeric
-  # runAsUser/runAsGroup/fsGroup — the SCC allocates UIDs from the namespace UID
-  # range and resolves the named user automatically. A non-nil value here fully
-  # replaces the template default (runAsUser:100/runAsGroup:1000/fsGroup:1000).
-  podSecurityContext:
-    runAsNonRoot: true

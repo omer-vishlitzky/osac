@@ -23,9 +23,9 @@ import (
 	grpcstatus "google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
-	publicv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/public/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/uuid"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
 
 var _ = Describe("DiskImage tenant isolation", func() {
@@ -151,6 +151,11 @@ var _ = Describe("DiskImage tenant isolation", func() {
 		}.Build())
 		Expect(err).ToNot(HaveOccurred())
 		Expect(getResp.GetObject().GetId()).To(Equal(diId))
+		ownImages, err := diClientA.List(ctx, publicv1.DiskImagesListRequest_builder{
+			Filter: new(fmt.Sprintf("this.metadata.name == %q", getResp.GetObject().GetMetadata().GetName())),
+		}.Build())
+		Expect(err).ToNot(HaveOccurred())
+		Expect(containsId(ownImages.GetItems(), diId)).To(BeTrue())
 
 		By("Verifying tenant-B cannot see tenant-A's DiskImage via List")
 		diClientB := publicv1.NewDiskImagesClient(extConnB)

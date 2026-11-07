@@ -1,28 +1,119 @@
 ---
-# Subnet deletion - removes V-Net first, then IPAM subnet
+# Delete the Netris objects of a Subnet: the V-Net (frees the L2 VNI), then the
+# IPAM subnet. An object that is already gone is a success. The VPC is looked
+# up only to scope the ownership checks; without the VirtualNetwork snapshot
+# or the VPC, the unique object names and the tenant identify the objects.
+- name: Delete the Subnet from Netris
+  block:
+    - name: Check the settings
+      ansible.builtin.include_tasks: _settings.yaml
+      vars:
+        netris_require: [controller, credentials, site, tenant]
 
-- name: Extract Subnet name
-  ansible.builtin.set_fact:
-    subnet_name: "{{ subnet.metadata.name }}"
+    - name: Check the task input
+      ansible.builtin.include_tasks: _input.yaml
 
-- name: Display deletion information
-  ansible.builtin.debug:
-    msg: "Deleting Netris V-Net + IPAM subnet for Subnet '{{ subnet_name }}'"
+    - name: Build the object names
+      ansible.builtin.include_tasks: _names.yaml
 
-- name: Delete V-Net from Netris controller
-  ansible.builtin.include_role:
-    name: netris.controller.vnet
-    tasks_from: delete
-  vars:
-    vnet_name: "{{ subnet_name }}"
+    - name: Look up the VPC of the VirtualNetwork
+      ansible.builtin.include_role:
+        name: netris.controller.vpc
+        tasks_from: read
+      vars:
+        vpc_name: "{{ netris_names.vpc }}"
+        vpc_tenant_id: "{{ netris_tenant_id | int }}"
+      when: netris_names.vpc | length > 0
 
-- name: Delete IPAM subnet from Netris controller
-  ansible.builtin.include_role:
-    name: netris.controller.ipam
-    tasks_from: delete_subnet
-  vars:
-    ipam_name: "{{ subnet_name }}"
+    - name: Set the ownership fields of the objects
+      ansible.builtin.set_fact:
+        _netris_vpc_id: "{{ netris_vpc.id if (netris_vpc | default(none)) is mapping else '' }}"
 
-- name: Display deletion result
-  ansible.builtin.debug:
-    msg: "V-Net + IPAM subnet '{{ subnet_name }}' deletion completed"
+    - name: List the V-Nets with the name of the Subnet
+      ansible.builtin.include_role:
+        name: netris.controller.vnet
+        tasks_from: read
+      vars:
+        vnet_name: "{{ netris_names.vnet }}"
+
+    # A V-Net with our name in another tenant or VPC is never touched: it
+    # counts as absent, and the IPAM subnet of the Subnet is still deleted. A
+    # list entry without its tenant (or VPC, when known) is read by ID; if the
+    # owner is still unknown the V-Net is not deleted either, and the task
+    # fails unless the IPAM subnet was proven ours and deleted.
+    - name: Sort the V-Nets with the name of the Subnet by known owner
+      vars:
+        _same: "{{ netris_vnets | selectattr('name', 'equalto', netris_names.vnet) | list }}"
+        _known: >-
+          {{ _same | selectattr('tenant.id', 'defined') | list
+             if _netris_vpc_id | string | length == 0
+             else _same | selectattr('tenant.id', 'defined') | selectattr('vpc.id', 'defined') | list }}
+      ansible.builtin.set_fact:
+        _netris_vnets_known: "{{ _known }}"
+        _netris_vnets_unknown: "{{ _same | difference(_known) }}"
+
+    - name: Read the V-Nets whose list entry omits the owner
+      ansible.builtin.include_tasks: _read_vnet_detail.yaml
+      vars:
+        _netris_vnet_read_id: "{{ item.id }}"
+        _netris_vnet_gone_ok: true
+      loop: "{{ _netris_vnets_unknown }}"
+      loop_control:
+        label: "{{ item.id }}"
+
+    - name: Classify the V-Nets by owner
+      vars:
+        _found: "{{ _netris_vnet_details | default([]) }}"
+        _all: "{{ _netris_vnets_known + _found }}"
+        _decided: >-
+          {{ _all | selectattr('tenant.id', 'defined') | list
+             if _netris_vpc_id | string | length == 0
+             else _all | selectattr('tenant.id', 'defined') | selectattr('vpc.id', 'defined') | list }}
+        _mine_tenant: "{{ _decided | selectattr('tenant.id', 'equalto', netris_tenant_id | int) | list }}"
+        _mine: >-
+          {{ _mine_tenant
+             if _netris_vpc_id | string | length == 0
+             else _mine_tenant | selectattr('vpc.id', 'equalto', _netris_vpc_id | int) | list }}
+      ansible.builtin.set_fact:
+        _netris_vnet_is_ours: "{{ _mine | length > 0 }}"
+        _netris_vnet_unproven: "{{ (_all | difference(_decided)) | length > 0 }}"
+
+    - name: Delete the V-Net
+      when: _netris_vnet_is_ours
+      ansible.builtin.include_role:
+        name: netris.controller.vnet
+        tasks_from: delete
+      vars:
+        vnet_name: "{{ netris_names.vnet }}"
+        vnet_tenant_id: "{{ netris_tenant_id | int }}"
+        vnet_expected_fields: >-
+          {{ {'tenant.id': netris_tenant_id | int, 'sites.ids': [netris_site_id | int]}
+             | combine({'vpc.id': _netris_vpc_id} if _netris_vpc_id | string | length > 0 else {}) }}
+
+    - name: Delete the IPAM subnet
+      ansible.builtin.include_role:
+        name: netris.controller.ipam
+        tasks_from: delete_subnet
+      vars:
+        ipam_name: "{{ netris_names.subnet_ipam }}"
+        ipam_tenant_id: "{{ netris_tenant_id | int }}"
+        ipam_expected_fields: >-
+          {{ {'purpose': 'common', 'tenant.id': netris_tenant_id | int, 'sites.ids': [netris_site_id | int]}
+             | combine({'vpc.id': _netris_vpc_id} if _netris_vpc_id | string | length > 0 else {}) }}
+
+    - name: Stop when a V-Net with the name is unproven and nothing else is ours
+      vars:
+        netris_fail:
+          message: >-
+            Netris V-Net {{ netris_names.vnet }} exists but its owner is not reported, and the
+            IPAM subnet of the Subnet was not found; nothing can be proven ours.
+            The V-Net was not deleted. OSAC does not retry.
+          retryable: false
+      when:
+        - _netris_vnet_unproven
+        - not _netris_vnet_is_ours
+        - _existing_ipam_subnet is not mapping
+      ansible.builtin.include_tasks: _fail.yaml
+  rescue:
+    - name: Report the error
+      ansible.builtin.include_tasks: _rescue.yaml

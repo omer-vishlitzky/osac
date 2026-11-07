@@ -13,18 +13,29 @@ custom resources and reconciles them to their desired state:
   Planes](https://docs.redhat.com/en/documentation/openshift_container_platform/4.18/html/hosted_control_planes/hosted-control-planes-overview).
 - **ComputeInstance** (`ci`) — provisions virtual machines via
   [KubeVirt](https://kubevirt.io/).
-- **Tenant** — creates a namespace and an [OVN-Kubernetes
-  UserDefinedNetwork](https://github.com/ovn-org/ovn-kubernetes/blob/master/go-controller/pkg/crd/userdefinednetwork/v1/network.go)
-  (layer-2, persistent IPAM) for tenant isolation.
+- **Tenant** — tracks the tenant lifecycle without requiring a tenant namespace
+  on the workload cluster; leaves `status.namespace` unset rather than reporting
+  a namespace that may not exist. VMs with a subnet use the subnet namespace;
+  VMs without one fall back to the tenant name when locating a VM.
 - **VirtualNetwork** (`vnet`) — represents a cloud virtual network / VPC with
-  IPv4/IPv6 CIDR blocks and a NetworkClass.
+  an IPv4 CIDR block.
 - **Subnet** (`subnet`) — represents a subnet within a VirtualNetwork.
 - **SecurityGroup** (`sg`) — defines network security (firewall) rules with
   ingress/egress rules, protocols, port ranges, and CIDR blocks.
+- **NetworkClass**, **NetworkAttachment**, **ExternalIPPool**, **ExternalIP**,
+  **ExternalIPAttachment**, **NATGateway**, **FabricDomain** — the other
+  networking resources. Networking CRs report the `Ready` condition and their
+  network manager jobs in `status.jobs` (see `internal/networktask/doc.go`).
 - **Volume** (`vol`) — provisions block storage on vendor arrays via the
   VendorProvisioner interface (vendor CSI controllers).
 
 ## Configuration
+
+When connected to Fulfillment, the operator compares
+`global.networking.provisioningEnabled` with the saved installation value
+before reconciliation. Set `fulfillment.serverAddress` to the private gRPC
+endpoint and provide the matching credentials and CA bundle. The operator can
+also run without Fulfillment for standalone tests.
 
 Configuration is supplied via environment variables (e.g. from a Secret mounted
 into the manager deployment). The following are supported:
@@ -36,8 +47,9 @@ and networking resources) integrate with Ansible Automation Platform over the RE
 API. The operator launches job/workflow templates and polls AAP for job status.
 
 Tenant storage provisioning is optional when AAP credentials or templates are not
-configured; the Tenant reconciler still manages namespace and UDN lifecycle. Feedback
-controllers sync state to the fulfillment service over gRPC only (no AAP integration).
+configured; the Tenant reconciler tracks tenant lifecycle without checking for a
+workload-cluster tenant namespace. Feedback controllers sync state to the
+fulfillment service over gRPC only (no AAP integration).
 
 - `OSAC_AAP_URL` — AAP server URL (required).
 - `OSAC_AAP_TOKEN` — AAP authentication token (required).
@@ -46,8 +58,13 @@ controllers sync state to the fulfillment service over gRPC only (no AAP integra
 - `OSAC_AAP_DEPROVISION_TEMPLATE` — default AAP template name for
   deprovisioning (optional).
 - `OSAC_AAP_TEMPLATE_PREFIX` — prefix for convention-based template name
-  resolution (default: `"osac"`). Used by networking controllers to derive
-  template names (e.g. `osac-create-virtual-network`).
+  resolution (default: `"osac"`). Networking controllers launch
+  `{prefix}-{task with dashes}` (e.g. `osac-create-virtual-network`).
+- `OSAC_AAP_ORGANIZATION` — AAP organization (name or ID) where networking job
+  labels are created (default: `osac`).
+- `OSAC_PROVISIONING_ENABLED` — provider networking (default: `true`). When
+  `false`, no networking job runs and networking resources become Ready with
+  reason `ProvisioningDisabled`.
 - `OSAC_AAP_STATUS_POLL_INTERVAL` — job status polling interval (default:
   `30s`). Duration string, e.g. `30s`, `1m`.
 - `OSAC_AAP_INSECURE_SKIP_VERIFY` — skip TLS verification for AAP (default:
@@ -59,9 +76,22 @@ defaults):
 - `OSAC_CLUSTER_AAP_PROVISION_TEMPLATE` /
   `OSAC_CLUSTER_AAP_DEPROVISION_TEMPLATE` — override for ClusterOrder.
 
-Networking controllers derive template names from the prefix:
-`{prefix}-{action}-{kind}` (e.g. `osac-create-subnet`,
-`osac-delete-security-group`).
+Networking controllers launch one job template per network manager task:
+`{prefix}-{task with dashes}` (e.g. `osac-create-subnet`,
+`osac-apply-network-attachment`), all running the generic playbook
+`playbook_osac_network_task.yml`. See `internal/networktask/doc.go`.
+
+### Assisted Service discovery ignition TLS
+
+- `OSAC_IGNITION_TRUST_INGRESS_CA` — when `true`, load
+  `openshift-config-managed/default-ingress-cert` (`ca-bundle.crt`) at startup
+  and add its certificates to the system trust store for discovery ignition
+  downloads. The Helm value `ignition.trustIngressCA` enables this and grants
+  read-only access to that ConfigMap. Use it on OpenShift clusters whose
+  Assisted Service HTTPS Route uses the cluster-generated ingress CA; leave it
+  disabled elsewhere. Missing or invalid bundles prevent controller startup
+  rather than disabling TLS verification. Restart the operator after an ingress
+  CA rotation so it loads the new bundle.
 
 ### Namespaces
 
@@ -76,8 +106,9 @@ Networking controllers derive template names from the prefix:
 ### Remote cluster
 
 - `OSAC_REMOTE_CLUSTER_KUBECONFIG` — path to kubeconfig for the remote cluster
-  used by Tenant and ComputeInstance controllers (optional). Not supported when
-  ClusterOrder controller is enabled.
+  used by Tenant, ComputeInstance, Storage, and Networking controllers
+  (optional). Not supported when the ClusterOrder or BareMetalInstance
+  controller is enabled.
 
 ### Job history
 
@@ -87,8 +118,54 @@ Networking controllers derive template names from the prefix:
 ### Fulfillment service (gRPC)
 
 - `OSAC_FULFILLMENT_SERVER_ADDRESS` — fulfillment service gRPC address
-  (e.g. `fulfillment-service:50051`).
-- `OSAC_FULFILLMENT_TOKEN_FILE` — path to file containing the gRPC auth token.
+  (e.g. `fulfillment-internal-api:8001`). When unset, the Fulfillment client
+  and installation setting check are disabled.
+- `OSAC_FULFILLMENT_ISSUER_URL` — Keycloak realm issuer URL used for OIDC
+  discovery and client-credentials token requests.
+- `OSAC_FULFILLMENT_CLIENT_ID` and `OSAC_FULFILLMENT_CLIENT_SECRET` — Keycloak
+  service-account credentials. When the fulfillment client is enabled, Helm
+  reads these from the `fulfillment-controller-credentials` Secret by default
+  (keys `client-id` and `client-secret`). The `osac-infra` chart provisions
+  this Secret for bundled Keycloak. External Keycloak deployments must provide
+  the same Secret contract for the configured `osac-controller` client.
+- `OSAC_FULFILLMENT_ENDPOINT` — externally reachable fulfillment service gRPC
+  address passed to tenant-cluster CSI provisioning (e.g.
+  `fulfillment-api.example.com:443`).
+
+When the operator is enabled, the umbrella chart renders
+`osac-fulfillment-config` in the release namespace. It contains the Keycloak
+issuer URL and, when configured, the externally reachable Fulfillment endpoint.
+It also contains names and keys, but not credential values, for the
+`fulfillment-controller-credentials` Secret used by installer AAP auth helpers.
+The operator reads that same Secret for its OAuth client-credentials calls to
+Fulfillment, and passes the non-secret endpoint and issuer to AAP provisioning
+jobs that configure tenant-cluster CSI.
+The `global.fulfillmentTrust.enabled` setting controls trust reconciliation
+separately. The OSAC chart does not deploy the CSI meta-driver or create a hub
+CSI credentials Secret; tenant CSI credentials are managed separately.
+
+### LVMS development/CI volumes
+
+The LVMS CSI path supports single-node development/CI environments and accepts
+`ReadWriteOnce` and `ReadWriteOncePod`. Multi-node access modes are rejected.
+
+The provisioner uses LVMS/TopoLVM's configured default device class by omitting
+`LogicalVolume.spec.deviceClass`. OSAC's infrastructure chart configures `vg1`
+with `default: true`. Preinstalled LVMS must have one device class marked
+`default: true` in its `LVMCluster`; its name need not be `vg1`. This setting is
+distinct from the Kubernetes default StorageClass annotation.
+
+All OSAC local-tier CSI volumes use that default pool. Keep the default class
+unchanged while these volumes exist. Device-class selection is not exposed in
+the OSAC Volume API or tenant CSI StorageClass parameters. The legacy direct
+TopoLVM path retains its explicit device-class configuration.
+
+LogicalVolume resource names are generated by Kubernetes and recorded with
+their UIDs in the Volume's vendor context. Normal retries resume that resource;
+a retry without recorded context creates a new name rather than adopting an
+existing CR or waiting for a terminating one. A crash before context is saved
+can leave an untracked LogicalVolume; the volume-UID label and owner/tenant
+annotations preserve its identity for cleanup.
 
 ### Controller enable flags
 
@@ -101,8 +178,49 @@ enabled.
 - `OSAC_ENABLE_COMPUTE_INSTANCE_CONTROLLER` — enable ComputeInstance controller
   (truthy/falsy).
 - `OSAC_ENABLE_TENANT_CONTROLLER` — enable Tenant controller (truthy/falsy).
+- `OSAC_ENABLE_STORAGE_CONTROLLER` — enable Storage controller (truthy/falsy).
+- `OSAC_ENABLE_VOLUME_CONTROLLER` — enable Volume controller (truthy/falsy).
 - `OSAC_ENABLE_NETWORKING_CONTROLLER` — enable networking controllers
   (VirtualNetwork, Subnet, SecurityGroup) (truthy/falsy).
+- `OSAC_ENABLE_BAREMETAL_INSTANCE_CONTROLLER` — enable BareMetalInstance
+  controller (truthy/falsy).
+
+### Fulfillment trust reconciliation
+
+`OSAC_ENABLE_FULFILLMENT_TRUST_RECONCILER` registers the additional
+ClusterOrder trust reconciler only when the ClusterOrder controller is enabled.
+When `global.fulfillmentTrust.enabled` is true, it processes tenant-scoped
+ClusterOrders in the configured ClusterOrder namespace; there is no per-order
+opt-in annotation. Development and CI profiles can disable reconciliation
+with `global.fulfillmentTrust.enabled`.
+`global.fulfillmentTrust.tenantNamespace` sets the tenant CSI namespace
+(`OSAC_FULFILLMENT_TRUST_TENANT_NAMESPACE`). An individual order must also have
+the `osac.openshift.io/tenant` annotation. The reconciler reads `bundle.pem`
+from the management namespace's `ca-bundle` ConfigMap and reports
+`FulfillmentTrustReady` independently of the ordinary ClusterOrder controller.
+Fulfillment-service and installer-hook TLS verification remains enabled even
+when this trust feature flag is false.
+
+For each eligible order, the reconciler follows its `ClusterReference` to the
+HostedControlPlane kubeconfig Secret. The kubeconfig is used only in the
+operator process to request short-lived tokens for the preinstalled observer,
+publisher, and trust-sync service accounts. The admin kubeconfig and returned
+tokens are never written to a management Secret, status field, or AAP job.
+The observer verifies the exact CA ConfigMap and CSI rollout; the publisher
+updates the admission service's bounded expected-bundle record; and the sync
+identity applies only the approved ConfigMap and CSI pod-template hash. The
+tenant admission webhook validates both writes. Tokens are renewed before
+expiry, the expected record is refreshed on retries, obsolete bundle records
+are revoked after rollout, and records expire automatically if cleanup cannot
+reach a deleting cluster.
+
+The tenant workload bootstrap must install the CSI trust admission chart with
+the ClusterOrder UID and tenant annotations before trust can become ready. If
+the trust identities, admission service, or a trust-enabled CSI controller are
+not available, the reconciler reports a false condition and retries. It never
+hands an admin kubeconfig to AAP. The separately published AAP trust-sync
+template remains an optional manual repair mechanism and is not used by the
+automatic reconciler.
 
 See `config/samples/osac-config-secret.yaml` for a complete configuration
 example.

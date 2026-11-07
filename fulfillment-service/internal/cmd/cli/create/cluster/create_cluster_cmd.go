@@ -33,14 +33,16 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
-	publicv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/public/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/cmd/cli/create/fieldutil"
+	"github.com/osac-project/osac/fulfillment-service/internal/cmd/cli/create/metautil"
 	"github.com/osac-project/osac/fulfillment-service/internal/cmd/cli/create/netutil"
+	"github.com/osac-project/osac/fulfillment-service/internal/cmd/cli/lookup"
 	"github.com/osac-project/osac/fulfillment-service/internal/config"
 	"github.com/osac-project/osac/fulfillment-service/internal/exit"
 	"github.com/osac-project/osac/fulfillment-service/internal/logging"
 	"github.com/osac-project/osac/fulfillment-service/internal/reflection"
 	"github.com/osac-project/osac/fulfillment-service/internal/terminal"
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
 
 //go:embed templates
@@ -99,16 +101,10 @@ func Cmd() *cobra.Command {
 		pullSecretFlagHelp,
 	)
 	flags.StringVar(
-		&runner.args.sshPublicKey,
-		"ssh-public-key",
+		&runner.args.sshKey,
+		"ssh-key",
 		"",
-		sshPublicKeyFlagHelp,
-	)
-	flags.StringVar(
-		&runner.args.sshPublicKeyFile,
-		"ssh-public-key-file",
-		"",
-		sshPublicKeyFileFlagHelp,
+		sshKeyFlagHelp,
 	)
 	flags.StringVar(
 		&runner.args.version,
@@ -146,6 +142,18 @@ func Cmd() *cobra.Command {
 		false,
 		externalIPAttachmentFlagHelp,
 	)
+	flags.StringArrayVar(
+		&runner.args.nodeSets,
+		"node-set",
+		nil,
+		nodeSetFlagHelp,
+	)
+	flags.StringArrayVar(
+		&runner.args.addOnOperators,
+		"add-on-operator",
+		nil,
+		addOnOperatorFlagHelp,
+	)
 	result.MarkFlagsMutuallyExclusive("catalog-item", "template")
 	result.MarkFlagsOneRequired("catalog-item", "template")
 	return result
@@ -160,18 +168,20 @@ type runnerContext struct {
 		templateParameterFiles  []string
 		setFields               []string
 		pullSecret              string
-		sshPublicKey            string
-		sshPublicKeyFile        string
+		sshKey                  string
 		version                 string
 		podCIDR                 string
 		serviceCIDR             string
 		networkAttachment       string
+		nodeSets                []string
+		addOnOperators          []string
 		externalIPAttachment    bool
 	}
 	logger                *slog.Logger
 	console               *terminal.Console
 	settings              *config.Settings
 	templatesClient       publicv1.ClusterTemplatesClient
+	catalogItemsClient    publicv1.ClusterCatalogItemsClient
 	clustersClient        publicv1.ClustersClient
 	clusterVersionsClient publicv1.ClusterVersionsClient
 }
@@ -230,6 +240,7 @@ func (c *runnerContext) run(cmd *cobra.Command, args []string) error {
 		SetConnection(conn).
 		AddPackages(c.settings.Packages()).
 		SetTenantFunc(config.TenantFromContext).
+		SetProjectFunc(config.ProjectFromContext).
 		Build()
 	if err != nil {
 		return fmt.Errorf("failed to create reflection tool: %w", err)
@@ -238,14 +249,9 @@ func (c *runnerContext) run(cmd *cobra.Command, args []string) error {
 
 	// Create the gRPC clients:
 	c.templatesClient = publicv1.NewClusterTemplatesClient(conn)
+	c.catalogItemsClient = publicv1.NewClusterCatalogItemsClient(conn)
 	c.clustersClient = publicv1.NewClustersClient(conn)
 	c.clusterVersionsClient = publicv1.NewClusterVersionsClient(conn)
-
-	// Resolve the SSH public key before branching (used in both catalog-item and template paths):
-	sshPublicKey, err := c.resolveSSHPublicKey()
-	if err != nil {
-		return err
-	}
 
 	// Resolve the version reference to a ClusterVersion metadata.name:
 	if c.args.version != "" {
@@ -257,11 +263,27 @@ func (c *runnerContext) run(cmd *cobra.Command, args []string) error {
 	}
 
 	if c.args.catalogItem != "" {
-		// Catalog item path: skip template lookup entirely (per D-04).
-		specBuilder := publicv1.ClusterSpec_builder{
-			CatalogItem: &publicv1.ClusterCatalogItemReference{Name: c.args.catalogItem},
+		// Catalog item path: resolve an ID or visible name, then skip template lookup (per D-04).
+		catalogItem, err := lookup.Find(c.args.catalogItem, "cluster catalog item",
+			func(filter string, limit int32) ([]*publicv1.ClusterCatalogItem, error) {
+				response, err := c.catalogItemsClient.List(ctx, publicv1.ClusterCatalogItemsListRequest_builder{
+					Filter: proto.String(filter),
+					Limit:  proto.Int32(limit),
+				}.Build())
+				if err != nil {
+					return nil, fmt.Errorf("failed to list catalog items: %w", err)
+				}
+				return response.GetItems(), nil
+			})
+		if err != nil {
+			return err
 		}
-		c.applyOptionalSpecFields(&specBuilder, sshPublicKey)
+		specBuilder := publicv1.ClusterSpec_builder{
+			CatalogItem: &publicv1.ClusterCatalogItemReference{Id: catalogItem.GetId()},
+		}
+		if err := c.applyOptionalSpecFields(&specBuilder); err != nil {
+			return err
+		}
 		if cmd.Flags().Changed("external-ip-attachment") {
 			specBuilder.AutoExternalIpAttachment = proto.Bool(c.args.externalIPAttachment)
 		}
@@ -303,7 +325,9 @@ func (c *runnerContext) run(cmd *cobra.Command, args []string) error {
 		Template:           &publicv1.ClusterTemplateReference{Id: template.GetId()},
 		TemplateParameters: templateParameterValues,
 	}
-	c.applyOptionalSpecFields(&specBuilder, sshPublicKey)
+	if err := c.applyOptionalSpecFields(&specBuilder); err != nil {
+		return err
+	}
 	if cmd.Flags().Changed("external-ip-attachment") {
 		specBuilder.AutoExternalIpAttachment = proto.Bool(c.args.externalIPAttachment)
 	}
@@ -313,32 +337,22 @@ func (c *runnerContext) run(cmd *cobra.Command, args []string) error {
 	return c.createCluster(ctx, specBuilder.Build())
 }
 
-// resolveSSHPublicKey reads the SSH public key from a file when specified.
-func (c *runnerContext) resolveSSHPublicKey() (sshPublicKey string, err error) {
-	sshPublicKey = c.args.sshPublicKey
-	if c.args.sshPublicKeyFile != "" {
-		data, readErr := os.ReadFile(c.args.sshPublicKeyFile)
-		if readErr != nil {
-			err = fmt.Errorf("failed to read SSH public key file '%s': %w", c.args.sshPublicKeyFile, readErr)
-			return
-		}
-		sshPublicKey = strings.TrimSpace(string(data))
-	}
-	return
-}
-
-// applyOptionalSpecFields sets pull secret, SSH public key, version, and network CIDRs
+// applyOptionalSpecFields sets pull secret, SSH key, version, network CIDRs, and node sets
 // on the spec builder when their corresponding flags are provided.
 func (c *runnerContext) applyOptionalSpecFields(
-	specBuilder *publicv1.ClusterSpec_builder, sshPublicKey string,
-) {
+	specBuilder *publicv1.ClusterSpec_builder,
+) error {
 	if c.args.pullSecret != "" {
 		specBuilder.PullSecretSecret = publicv1.SecretLocalReference_builder{
 			Name: c.args.pullSecret,
 		}.Build()
 	}
-	if sshPublicKey != "" {
-		specBuilder.SshPublicKey = &sshPublicKey
+	if c.args.sshKey != "" {
+		sshKeyRef, err := fieldutil.ParseSSHKeyFlag(c.args.sshKey)
+		if err != nil {
+			return err
+		}
+		specBuilder.SshKey = sshKeyRef
 	}
 	if c.args.version != "" {
 		specBuilder.Version = &publicv1.ClusterVersionReference{Name: c.args.version}
@@ -353,16 +367,36 @@ func (c *runnerContext) applyOptionalSpecFields(
 		}
 		specBuilder.Network = networkBuilder.Build()
 	}
+	if len(c.args.nodeSets) > 0 {
+		if specBuilder.NodeSets == nil {
+			specBuilder.NodeSets = map[string]*publicv1.ClusterNodeSet{}
+		}
+		for _, nsArg := range c.args.nodeSets {
+			name, ns, err := parseClusterNodeSetFlag(nsArg)
+			if err != nil {
+				return err
+			}
+			specBuilder.NodeSets[name] = ns
+		}
+	}
+	if len(c.args.addOnOperators) > 0 {
+		for _, operatorName := range c.args.addOnOperators {
+			operatorName = strings.TrimSpace(operatorName)
+			if operatorName == "" {
+				return fmt.Errorf("empty --add-on-operator value")
+			}
+			specBuilder.AddOnOperators = append(specBuilder.AddOnOperators,
+				publicv1.AddOnOperatorReference_builder{Name: operatorName}.Build())
+		}
+	}
+	return nil
 }
 
 // createCluster creates a cluster with the given spec and prints the result.
 func (c *runnerContext) createCluster(ctx context.Context, spec *publicv1.ClusterSpec) error {
 	cluster := publicv1.Cluster_builder{
-		Metadata: publicv1.Metadata_builder{
-			Name:   c.args.name,
-			Tenant: c.settings.Tenant(),
-		}.Build(),
-		Spec: spec,
+		Metadata: metautil.ForCreate(ctx, c.args.name).Build(),
+		Spec:     spec,
 	}.Build()
 	response, err := c.clustersClient.Create(ctx, publicv1.ClustersCreateRequest_builder{
 		Object: cluster,
@@ -375,8 +409,7 @@ func (c *runnerContext) createCluster(ctx context.Context, spec *publicv1.Cluste
 	return nil
 }
 
-// findTemplate finds a cluster template by identifier or name. It tries to find by identifier first, and if that fails
-// it searches for templates matching the value as either an identifier or name using a server-side filter. If there is
+// findTemplate finds a cluster template by identifier or name using a server-side filter. If there is
 // exactly one match it returns it. If there are multiple matches it displays them to the user and returns an error. If
 // there are no matches it displays available templates and returns an error.
 func (c *runnerContext) findTemplate(ctx context.Context) (result *publicv1.ClusterTemplate, err error) {
@@ -921,6 +954,69 @@ func parseClusterSubnetRef(s string) (string, error) {
 	return s, nil
 }
 
+// parseClusterNodeSetFlag parses one --node-set value as comma-separated key=value assignments.
+func parseClusterNodeSetFlag(s string) (string, *publicv1.ClusterNodeSet, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "", nil, fmt.Errorf("empty --node-set value")
+	}
+
+	values := make(map[string]string)
+	for _, pair := range strings.Split(s, ",") {
+		key, value, ok := strings.Cut(strings.TrimSpace(pair), "=")
+		key = strings.ToLower(strings.TrimSpace(key))
+		value = strings.TrimSpace(value)
+		if !ok || strings.Count(pair, "=") != 1 || key == "" || value == "" {
+			return "", nil, fmt.Errorf("invalid --node-set assignment %q: expected key=value", strings.TrimSpace(pair))
+		}
+		switch key {
+		case "name", "size", "baremetal-instance-type":
+			values[key] = value
+		default:
+			return "", nil, fmt.Errorf("unknown --node-set key %q", key)
+		}
+	}
+
+	name := values["name"]
+	if name == "" {
+		return "", nil, fmt.Errorf("--node-set name is required")
+	}
+
+	builder := publicv1.ClusterNodeSet_builder{}
+	if sizeValue, ok := values["size"]; ok {
+		size, err := strconv.ParseInt(sizeValue, 10, 32)
+		if err != nil {
+			return "", nil, fmt.Errorf("node set size must be a 32-bit integer in %q", s)
+		}
+		builder.Size = proto.Int32(int32(size))
+	}
+
+	if bmitName := values["baremetal-instance-type"]; bmitName != "" {
+		builder.BaremetalInstanceType = publicv1.BareMetalInstanceTypeReference_builder{
+			Name: bmitName,
+		}.Build()
+	}
+
+	return name, builder.Build(), nil
+}
+
+const nodeSetFlagHelp = `
+_NODE_SET_ - Node set configuration for worker pools as comma-separated key=value pairs.
+Supported keys are {{ bt }}name{{ bt }}, {{ bt }}size{{ bt }}, and {{ bt }}baremetal-instance-type{{ bt }}.
+The {{ bt }}name{{ bt }} key is required.
+Can be specified multiple times for multiple worker pools.
+Example:
+  {{ bt }}--node-set name=workers,size=2,baremetal-instance-type=ci-worker-bm{{ bt }}
+`
+
+const addOnOperatorFlagHelp = `
+_NAME_ - Add-on operator name. The operator must be published to install it on the cluster.
+Can be specified multiple times for multiple operators. Operator dependencies
+are added automatically by the service.
+Example:
+  {{ bt }}--add-on-operator cert-manager{{ bt }}
+`
+
 const shortHelp = `Create a cluster`
 
 const longHelp = `
@@ -933,11 +1029,13 @@ _NAME_ - Name of the cluster.
 
 const templateFlagHelp = `
 _TEMPLATE_ - Template identifier or name. Mutually exclusive with
-{{ bt }}--catalog-item{{ bt }}.
+{{ bt }}--catalog-item{{ bt }}. If a name matches more than one visible template,
+use its identifier.
 `
 
 const catalogItemFlagHelp = `
-_ID_ - Catalog item identifier. Mutually exclusive with
+_ID_OR_NAME_ - Catalog item identifier or name. If a name matches more than
+one visible item, use its identifier. Mutually exclusive with
 {{ bt }}--template{{ bt }}.
 `
 
@@ -958,13 +1056,11 @@ The secret must exist in the same tenant. See also
 {{ bt }}osac create secret{{ bt }}.
 `
 
-const sshPublicKeyFlagHelp = `
-_KEY_ - SSH public key to install on cluster worker nodes, provided as an
-inline value. See also {{ bt }}--ssh-public-key-file{{ bt }}.
-`
-
-const sshPublicKeyFileFlagHelp = `
-_FILE_ - Path to a file containing the SSH public key.
+const sshKeyFlagHelp = `
+_REFERENCE_ - Registered SSH public-key Secret to install on cluster worker
+nodes. Use a bare Secret name for the tenant's default project, or
+{{ bt }}name=<name>,project=<project>{{ bt }}. Register one with {{ bt }}osac
+create secret --type ssh-public-key{{ bt }}.
 `
 
 const versionFlagHelp = `

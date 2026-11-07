@@ -14,16 +14,22 @@ language governing permissions and limitations under the License.
 package servers
 
 import (
+	"context"
 	"errors"
+	"strings"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"google.golang.org/grpc"
 	grpccodes "google.golang.org/grpc/codes"
 	grpcstatus "google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
+	"github.com/osac-project/osac/fulfillment-service/internal/controllers/finalizers"
 	"github.com/osac-project/osac/fulfillment-service/internal/database/dao"
+	"github.com/osac-project/osac/fulfillment-service/internal/validation"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
 var _ = Describe("Private tenants server (Tenant API)", func() {
@@ -43,7 +49,7 @@ var _ = Describe("Private tenants server (Tenant API)", func() {
 			Build()
 		Expect(err).ToNot(HaveOccurred())
 
-		// Create server (without notifier for testing):
+		// Create server:
 		tenantsServer, err = NewPrivateTenantsServer().
 			SetLogger(logger).
 			SetAttributionLogic(attribution).
@@ -201,6 +207,48 @@ var _ = Describe("Private tenants server (Tenant API)", func() {
 			Id: createResp.Object.Id,
 		}.Build())
 		Expect(err).ToNot(HaveOccurred())
+	})
+
+	It("archives a tenant only after both cleanup barriers are removed and rejects stale locked updates", func() {
+		created, err := tenantsServer.Create(ctx, privatev1.TenantsCreateRequest_builder{
+			Object: privatev1.Tenant_builder{
+				Metadata: privatev1.Metadata_builder{
+					Name:       "barrier-tenant",
+					Finalizers: []string{finalizers.TenantLifecycle, finalizers.TenantOnboarding},
+				}.Build(),
+			}.Build(),
+		}.Build())
+		Expect(err).NotTo(HaveOccurred())
+		id := created.GetObject().GetId()
+		projects, err := projectsServer.List(ctx, privatev1.ProjectsListRequest_builder{
+			Filter: new("this.metadata.tenant == 'barrier-tenant'"),
+		}.Build())
+		Expect(err).NotTo(HaveOccurred())
+		for _, project := range projects.GetItems() {
+			_, err = projectsServer.Delete(ctx, privatev1.ProjectsDeleteRequest_builder{Id: project.GetId()}.Build())
+			Expect(err).NotTo(HaveOccurred())
+		}
+		_, err = tenantsServer.Delete(ctx, privatev1.TenantsDeleteRequest_builder{Id: id}.Build())
+		Expect(err).NotTo(HaveOccurred())
+		deleting, err := tenantsServer.Get(ctx, privatev1.TenantsGetRequest_builder{Id: id}.Build())
+		Expect(err).NotTo(HaveOccurred())
+		stale := proto.Clone(deleting.GetObject()).(*privatev1.Tenant)
+		first := proto.Clone(stale).(*privatev1.Tenant)
+		first.GetMetadata().SetFinalizers([]string{finalizers.TenantOnboarding})
+		mask := &fieldmaskpb.FieldMask{Paths: []string{"metadata.finalizers"}}
+		_, err = tenantsServer.Update(ctx, privatev1.TenantsUpdateRequest_builder{Object: first, UpdateMask: mask, Lock: true}.Build())
+		Expect(err).NotTo(HaveOccurred())
+		remaining, err := tenantsServer.Get(ctx, privatev1.TenantsGetRequest_builder{Id: id}.Build())
+		Expect(err).NotTo(HaveOccurred())
+		Expect(remaining.GetObject().GetMetadata().GetFinalizers()).To(ConsistOf(finalizers.TenantOnboarding))
+		stale.GetMetadata().SetFinalizers(nil)
+		_, err = tenantsServer.Update(ctx, privatev1.TenantsUpdateRequest_builder{Object: stale, UpdateMask: mask, Lock: true}.Build())
+		Expect(grpcstatus.Code(err)).To(Equal(grpccodes.Aborted))
+		remaining.GetObject().GetMetadata().SetFinalizers(nil)
+		_, err = tenantsServer.Update(ctx, privatev1.TenantsUpdateRequest_builder{Object: remaining.GetObject(), UpdateMask: mask, Lock: true}.Build())
+		Expect(err).NotTo(HaveOccurred())
+		_, err = tenantsServer.Get(ctx, privatev1.TenantsGetRequest_builder{Id: id}.Build())
+		Expect(grpcstatus.Code(err)).To(Equal(grpccodes.NotFound))
 	})
 
 	It("Updates a tenant", func() {
@@ -484,92 +532,171 @@ var _ = Describe("Private tenants server (Tenant API)", func() {
 		Expect(err).ToNot(HaveOccurred())
 	})
 
-	Context("with default networking provisioner", func() {
-		var (
-			provisionerServer *PrivateTenantsServer
-			provisioner       *DefaultNetworkingProvisioner
-		)
+	Describe("External billing id", func() {
+		createTenant := func(name, billingID string) *privatev1.Tenant {
+			GinkgoHelper()
+			spec := &privatev1.TenantSpec{}
+			if billingID != "" {
+				spec.SetExternalBillingId(billingID)
+			}
+			response, err := tenantsServer.Create(ctx, privatev1.TenantsCreateRequest_builder{
+				Object: privatev1.Tenant_builder{
+					Metadata: privatev1.Metadata_builder{Name: name}.Build(),
+					Spec:     spec,
+				}.Build(),
+			}.Build())
+			Expect(err).NotTo(HaveOccurred())
+			return response.GetObject()
+		}
 
-		BeforeEach(func() {
-			var err error
-			provisioner, err = NewDefaultNetworkingProvisioner().
-				SetLogger(logger).
-				SetTenancyLogic(tenancy).
-				Build()
-			Expect(err).ToNot(HaveOccurred())
+		It("Stores the id on create and returns it from Get and List", func() {
+			created := createTenant("billing-tenant", "acct-1")
+			Expect(created.GetSpec().GetExternalBillingId()).To(Equal("acct-1"))
 
-			provisionerServer, err = NewPrivateTenantsServer().
-				SetLogger(logger).
-				SetAttributionLogic(attribution).
-				SetTenancyLogic(tenancy).
-				SetDefaultNetworkingProvisioner(provisioner).
-				Build()
-			Expect(err).ToNot(HaveOccurred())
+			var stored *string
+			err := suiteTx.QueryRow(ctx, `
+				select data #>> '{spec,external_billing_id}'
+				from tenants
+				where name = $1
+			`, "billing-tenant").Scan(&stored)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(stored).NotTo(BeNil())
+			Expect(*stored).To(Equal("acct-1"))
+
+			got, err := tenantsServer.Get(ctx, privatev1.TenantsGetRequest_builder{
+				Id: created.GetId(),
+			}.Build())
+			Expect(err).NotTo(HaveOccurred())
+			Expect(got.GetObject().GetSpec().GetExternalBillingId()).To(Equal("acct-1"))
+
+			listed, err := tenantsServer.List(ctx, &privatev1.TenantsListRequest{
+				Filter: new("this.metadata.name == 'billing-tenant'"),
+			})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(listed.GetItems()).To(HaveLen(1))
+			Expect(listed.GetItems()[0].GetSpec().GetExternalBillingId()).To(Equal("acct-1"))
 		})
 
-		It("creates default networking resources when NetworkClass defaults exist", func() {
-			ncDao := provisioner.networkClassDao
-			nc := privatev1.NetworkClass_builder{
-				Metadata: privatev1.Metadata_builder{
-					Name:   "test-nc",
-					Tenant: "system",
-				}.Build(),
-				IsDefault:     new(true),
-				FabricManager: new("netris"),
-				Spec: privatev1.NetworkClassSpec_builder{
-					Defaults: privatev1.NetworkDefaults_builder{
-						VirtualNetworkIpv4Cidr: "10.0.0.0/16",
-						SubnetIpv4Cidr:         "10.0.1.0/24",
-					}.Build(),
-				}.Build(),
-				Status: privatev1.NetworkClassStatus_builder{
-					State: privatev1.NetworkClassState_NETWORK_CLASS_STATE_READY,
-				}.Build(),
-			}.Build()
-			_, err := ncDao.Create().SetObject(nc).Do(ctx)
-			Expect(err).ToNot(HaveOccurred())
+		It("Creates a tenant when the id is omitted", func() {
+			created := createTenant("billing-tenant", "")
+			Expect(created.GetSpec().HasExternalBillingId()).To(BeFalse())
 
-			request := privatev1.TenantsCreateRequest_builder{
-				Object: privatev1.Tenant_builder{
-					Metadata: privatev1.Metadata_builder{
-						Name: "net-tenant",
-					}.Build(),
-				}.Build(),
-			}.Build()
-
-			response, err := provisionerServer.Create(ctx, request)
-			Expect(err).ToNot(HaveOccurred())
-			Expect(response).ToNot(BeNil())
-
-			vnList, err := provisioner.virtualNetworkDao.List().
-				SetFilter("this.metadata.tenant == 'net-tenant'").
-				Do(ctx)
-			Expect(err).ToNot(HaveOccurred())
-			Expect(vnList.GetItems()).To(HaveLen(1))
-			Expect(vnList.GetItems()[0].GetMetadata().GetLabels()).To(
-				HaveKeyWithValue("osac.openshift.io/default", "true"))
+			got, err := tenantsServer.Get(ctx, privatev1.TenantsGetRequest_builder{
+				Id: created.GetId(),
+			}.Build())
+			Expect(err).NotTo(HaveOccurred())
+			Expect(got.GetObject().GetSpec().HasExternalBillingId()).To(BeFalse())
 		})
 
-		It("creates tenant without default networking when no NetworkClass exists", func() {
-			request := privatev1.TenantsCreateRequest_builder{
-				Object: privatev1.Tenant_builder{
-					Metadata: privatev1.Metadata_builder{
-						Name: "plain-tenant",
+		It("Replaces the id when an update sends a new value", func() {
+			created := createTenant("billing-tenant", "acct-1")
+			updated := proto.Clone(created).(*privatev1.Tenant)
+			updated.GetSpec().SetExternalBillingId("acct-2")
+			_, err := tenantsServer.Update(ctx, privatev1.TenantsUpdateRequest_builder{
+				Object: updated,
+			}.Build())
+			Expect(err).NotTo(HaveOccurred())
+
+			got, err := tenantsServer.Get(ctx, privatev1.TenantsGetRequest_builder{
+				Id: created.GetId(),
+			}.Build())
+			Expect(err).NotTo(HaveOccurred())
+			Expect(got.GetObject().GetSpec().GetExternalBillingId()).To(Equal("acct-2"))
+		})
+
+		It("Keeps the id when an update sends the same value", func() {
+			created := createTenant("billing-tenant", "acct-1")
+			_, err := tenantsServer.Update(ctx, privatev1.TenantsUpdateRequest_builder{
+				Object: proto.Clone(created).(*privatev1.Tenant),
+			}.Build())
+			Expect(err).NotTo(HaveOccurred())
+
+			got, err := tenantsServer.Get(ctx, privatev1.TenantsGetRequest_builder{
+				Id: created.GetId(),
+			}.Build())
+			Expect(err).NotTo(HaveOccurred())
+			Expect(got.GetObject().GetSpec().GetExternalBillingId()).To(Equal("acct-1"))
+		})
+
+		It("Keeps the id when an update mask does not name it", func() {
+			created := createTenant("billing-tenant", "acct-1")
+			updated := proto.Clone(created).(*privatev1.Tenant)
+			updated.GetSpec().ClearExternalBillingId()
+			_, err := tenantsServer.Update(ctx, privatev1.TenantsUpdateRequest_builder{
+				Object: updated,
+				UpdateMask: &fieldmaskpb.FieldMask{
+					Paths: []string{"metadata.finalizers"},
+				},
+			}.Build())
+			Expect(err).NotTo(HaveOccurred())
+
+			got, err := tenantsServer.Get(ctx, privatev1.TenantsGetRequest_builder{
+				Id: created.GetId(),
+			}.Build())
+			Expect(err).NotTo(HaveOccurred())
+			Expect(got.GetObject().GetSpec().GetExternalBillingId()).To(Equal("acct-1"))
+		})
+
+		It("Clears the id when an update omits it", func() {
+			created := createTenant("billing-tenant", "acct-1")
+			updated := proto.Clone(created).(*privatev1.Tenant)
+			updated.GetSpec().ClearExternalBillingId()
+			_, err := tenantsServer.Update(ctx, privatev1.TenantsUpdateRequest_builder{
+				Object: updated,
+			}.Build())
+			Expect(err).NotTo(HaveOccurred())
+
+			got, err := tenantsServer.Get(ctx, privatev1.TenantsGetRequest_builder{
+				Id: created.GetId(),
+			}.Build())
+			Expect(err).NotTo(HaveOccurred())
+			Expect(got.GetObject().GetSpec().HasExternalBillingId()).To(BeFalse())
+		})
+
+		It("Accepts an id of 256 characters and rejects a longer one", func() {
+			interceptor, err := validation.NewProtovalidateInterceptor().SetLogger(logger).Build()
+			Expect(err).NotTo(HaveOccurred())
+			create := func(name, billingID string) error {
+				spec := &privatev1.TenantSpec{}
+				spec.SetExternalBillingId(billingID)
+				request := privatev1.TenantsCreateRequest_builder{
+					Object: privatev1.Tenant_builder{
+						Metadata: privatev1.Metadata_builder{Name: name}.Build(),
+						Spec:     spec,
 					}.Build(),
-				}.Build(),
-			}.Build()
+				}.Build()
+				_, err := interceptor.UnaryServer(ctx, request, &grpc.UnaryServerInfo{
+					FullMethod: "/osac.private.v1.Tenants/Create",
+				}, func(ctx context.Context, req any) (any, error) {
+					return tenantsServer.Create(ctx, req.(*privatev1.TenantsCreateRequest))
+				})
+				return err
+			}
 
-			response, err := provisionerServer.Create(ctx, request)
-			Expect(err).ToNot(HaveOccurred())
-			Expect(response).ToNot(BeNil())
+			Expect(create("billing-ok", strings.Repeat("a", 256))).To(Succeed())
+			err = create("billing-long", strings.Repeat("a", 257))
+			Expect(grpcstatus.Code(err)).To(Equal(grpccodes.InvalidArgument))
+			_, err = tenantsServer.Get(ctx, privatev1.TenantsGetRequest_builder{Id: "billing-long"}.Build())
+			Expect(grpcstatus.Code(err)).To(Equal(grpccodes.NotFound))
 
-			vnList, err := provisioner.virtualNetworkDao.List().
-				SetFilter("this.metadata.tenant == 'plain-tenant'").
-				Do(ctx)
-			Expect(err).ToNot(HaveOccurred())
-			Expect(vnList.GetItems()).To(BeEmpty())
+			created := createTenant("billing-update", "acct-1")
+			updated := proto.Clone(created).(*privatev1.Tenant)
+			updated.GetSpec().SetExternalBillingId(strings.Repeat("b", 257))
+			_, err = tenantsServer.Update(ctx, privatev1.TenantsUpdateRequest_builder{
+				Object: updated,
+				UpdateMask: &fieldmaskpb.FieldMask{
+					Paths: []string{"spec.external_billing_id"},
+				},
+			}.Build())
+			Expect(grpcstatus.Code(err)).To(Equal(grpccodes.InvalidArgument))
+			got, err := tenantsServer.Get(ctx, privatev1.TenantsGetRequest_builder{
+				Id: created.GetId(),
+			}.Build())
+			Expect(err).NotTo(HaveOccurred())
+			Expect(got.GetObject().GetSpec().GetExternalBillingId()).To(Equal("acct-1"))
 		})
 	})
+
 })
 
 var _ = Describe("Break-glass credentials secret reference", func() {
@@ -643,7 +770,8 @@ var _ = Describe("Break-glass credentials secret reference", func() {
 			Build()
 		Expect(err).ToNot(HaveOccurred())
 		_, err = secretsDao.Create().SetObject(privatev1.Secret_builder{
-			Id: "existing-bg-secret",
+			Id:   "existing-bg-secret",
+			Type: privatev1.SecretType_SECRET_TYPE_OPAQUE,
 			Metadata: privatev1.Metadata_builder{
 				Name:   "existing-bg",
 				Tenant: testTenant,
@@ -690,7 +818,8 @@ var _ = Describe("Break-glass credentials secret reference", func() {
 			Build()
 		Expect(err).ToNot(HaveOccurred())
 		_, err = secretsDao.Create().SetObject(privatev1.Secret_builder{
-			Id: "tenant-bg-secret",
+			Id:   "tenant-bg-secret",
+			Type: privatev1.SecretType_SECRET_TYPE_OPAQUE,
 			Metadata: privatev1.Metadata_builder{
 				Name:   breakGlassCredentialsSecretName,
 				Tenant: "secret-blocked-tenant",
@@ -746,7 +875,8 @@ var _ = Describe("Break-glass credentials secret reference", func() {
 			Build()
 		Expect(err).ToNot(HaveOccurred())
 		_, err = secretsDao.Create().SetObject(privatev1.Secret_builder{
-			Id: "predeleted-bg-secret",
+			Id:   "predeleted-bg-secret",
+			Type: privatev1.SecretType_SECRET_TYPE_OPAQUE,
 			Metadata: privatev1.Metadata_builder{
 				Name:   breakGlassCredentialsSecretName,
 				Tenant: "predeleted-secret-tenant",
@@ -799,7 +929,8 @@ var _ = Describe("Break-glass credentials secret reference", func() {
 			Build()
 		Expect(err).ToNot(HaveOccurred())
 		_, err = secretsDao.Create().SetObject(privatev1.Secret_builder{
-			Id: "stale-bg-secret",
+			Id:   "stale-bg-secret",
+			Type: privatev1.SecretType_SECRET_TYPE_OPAQUE,
 			Metadata: privatev1.Metadata_builder{
 				Name:   breakGlassCredentialsSecretName,
 				Tenant: "stale-ref-tenant",

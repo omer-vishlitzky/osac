@@ -20,11 +20,12 @@ import (
 	"github.com/spf13/cobra"
 	"google.golang.org/protobuf/proto"
 
-	publicv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/public/v1"
+	"github.com/osac-project/osac/fulfillment-service/internal/cmd/cli/create/metautil"
 	"github.com/osac-project/osac/fulfillment-service/internal/cmd/cli/create/netutil"
 	"github.com/osac-project/osac/fulfillment-service/internal/config"
 	"github.com/osac-project/osac/fulfillment-service/internal/logging"
 	"github.com/osac-project/osac/fulfillment-service/internal/terminal"
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
 
 func Cmd() *cobra.Command {
@@ -52,12 +53,6 @@ func Cmd() *cobra.Command {
 		"",
 		ipv4CidrFlagHelp,
 	)
-	flags.StringVar(
-		&runner.args.ipv6Cidr,
-		"ipv6-cidr",
-		"",
-		ipv6CidrFlagHelp,
-	)
 	return result
 }
 
@@ -65,7 +60,6 @@ type runnerContext struct {
 	args struct {
 		name     string
 		ipv4Cidr string
-		ipv6Cidr string
 	}
 	logger   *slog.Logger
 	console  *terminal.Console
@@ -83,7 +77,7 @@ func (c *runnerContext) run(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("there is no configuration, run the 'login' command")
 	}
 
-	if err := netutil.ValidateCIDRs(c.args.ipv4Cidr, c.args.ipv6Cidr); err != nil {
+	if err := netutil.ValidateIPv4CIDR(c.args.ipv4Cidr); err != nil {
 		return err
 	}
 
@@ -99,15 +93,9 @@ func (c *runnerContext) run(cmd *cobra.Command, args []string) error {
 	if c.args.ipv4Cidr != "" {
 		spec.Ipv4Cidr = &c.args.ipv4Cidr
 	}
-	if c.args.ipv6Cidr != "" {
-		spec.Ipv6Cidr = &c.args.ipv6Cidr
-	}
 	vn := publicv1.VirtualNetwork_builder{
-		Metadata: publicv1.Metadata_builder{
-			Name:   c.args.name,
-			Tenant: c.settings.Tenant(),
-		}.Build(),
-		Spec: spec.Build(),
+		Metadata: metautil.ForCreate(ctx, c.args.name).Build(),
+		Spec:     spec.Build(),
 	}.Build()
 
 	response, err := client.Create(ctx, publicv1.VirtualNetworksCreateRequest_builder{Object: vn}.Build())
@@ -123,20 +111,13 @@ func (c *runnerContext) run(cmd *cobra.Command, args []string) error {
 const shortHelp = `Create a virtual network`
 
 const longHelp = `
-Create a virtual network with the specified IP addressing configuration. At
-least one of {{ bt }}--ipv4-cidr{{ bt }} or {{ bt }}--ipv6-cidr{{ bt }} must
-be provided.
+Create an IPv4 virtual network. The {{ bt }}--ipv4-cidr{{ bt }} flag is
+required.
 
-To create an IPv4-only virtual network:
+To create a virtual network:
 
 {{ bt 3 }}shell
 {{ binary }} create virtualnetwork --name my-network --ipv4-cidr 10.0.0.0/16
-{{ bt 3 }}
-
-To create a dual-stack virtual network:
-
-{{ bt 3 }}shell
-{{ binary }} create virtualnetwork --name my-network --ipv4-cidr 10.0.0.0/16 --ipv6-cidr fd00::/64
 {{ bt 3 }}
 `
 
@@ -147,9 +128,4 @@ _NAME_ - Name of the virtual network.
 const ipv4CidrFlagHelp = `
 _CIDR_ - IPv4 CIDR block for this network, for example
 {{ bt }}10.0.0.0/16{{ bt }}.
-`
-
-const ipv6CidrFlagHelp = `
-_CIDR_ - IPv6 CIDR block for this network, for example
-{{ bt }}fd00::/64{{ bt }}.
 `

@@ -1,0 +1,90 @@
+# BMaaS-NetBox CI overlay — applied on top of bmaas-ci/infra.yaml.
+# Contains only the values that differ from the bmaas-ci base profile.
+#
+# NetBox stores its data in the shared PostgreSQL deployed by this chart's
+# bundledPostgres (the "postgres" service) instead of the subchart's own
+# Bitnami PostgreSQL. The bundled server accepts certificate-only client
+# authentication: osac-infra issues the postgres-client-cert-netbox secret
+# and its bootstrap script creates the matching "netbox" user and database,
+# so NetBox connects with TLS client-certificate options and no password.
+# The NetBox subchart still manages its own secret_key and superuser
+# credentials automatically. apiTokenPeppers is configured here so
+# NetBox 4.7 can create v2 HMAC tokens. The post-install seed Job creates
+# the API token via /api/users/tokens/provision/ and writes it to
+# "netbox-api-token" in the osac namespace for the operator.
+
+netbox:
+  enabled: true
+  superuser:
+    enabled: true
+    name: admin
+    email: admin@osac.local
+  # Required by NetBox 4.7 for v2 HMAC token operations.
+  # A fixed CI pepper is acceptable here; this is a test-only deployment.
+  apiTokenPeppers:
+    1: "osac-bmaas-netbox-ci-pepper-for-testing-only-do-not-use-in-production"
+  # Reuse the shared PostgreSQL deployed by bundledPostgres; the subchart's
+  # own Bitnami PostgreSQL stays undeployed.
+  postgresql:
+    enabled: false
+  externalDatabase:
+    host: postgres
+    port: 5432
+    database: netbox
+    username: netbox
+    # Certificate-only authentication on the bundled PostgreSQL -- no
+    # password is involved.
+    password: ""
+    options:
+      sslmode: verify-full
+      sslrootcert: /secrets/database-client/ca.crt
+      sslcert: /secrets/database-client/tls.crt
+      sslkey: /secrets/database-client/tls.key
+  # Client certificate for the shared PostgreSQL, issued by osac-infra as
+  # postgres-client-netbox. defaultMode 288 (0o440) keeps the private key
+  # readable only through the subchart's fsGroup, which libpq requires.
+  extraVolumes:
+  - name: database-client-cert
+    secret:
+      secretName: postgres-client-cert-netbox
+      defaultMode: 288
+  extraVolumeMounts:
+  - name: database-client-cert
+    mountPath: /secrets/database-client
+    readOnly: true
+  valkey:
+    enabled: true
+    resources:
+      limits:
+        cpu: 250m
+        memory: 256Mi
+      requests:
+        cpu: 25m
+        memory: 64Mi
+  resources:
+    limits:
+      cpu: 1000m
+      memory: 2Gi
+    requests:
+      cpu: 100m
+      memory: 512Mi
+  worker:
+    resources:
+      limits:
+        cpu: 500m
+        memory: 1Gi
+      requests:
+        cpu: 50m
+        memory: 256Mi
+    extraVolumes:
+    - name: database-client-cert
+      secret:
+        secretName: postgres-client-cert-netbox
+        defaultMode: 288
+    extraVolumeMounts:
+    - name: database-client-cert
+      mountPath: /secrets/database-client
+      readOnly: true
+  persistence:
+    enabled: true
+    size: 5Gi

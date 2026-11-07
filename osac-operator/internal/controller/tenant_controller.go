@@ -18,12 +18,9 @@ package controller
 
 import (
 	"context"
-	"fmt"
 
-	ovnv1 "github.com/ovn-org/ovn-kubernetes/go-controller/pkg/crd/userdefinednetwork/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -35,7 +32,6 @@ import (
 	mcbuilder "sigs.k8s.io/multicluster-runtime/pkg/builder"
 	mchandler "sigs.k8s.io/multicluster-runtime/pkg/handler"
 	mcmanager "sigs.k8s.io/multicluster-runtime/pkg/manager"
-	mc "sigs.k8s.io/multicluster-runtime/pkg/multicluster"
 	mcreconcile "sigs.k8s.io/multicluster-runtime/pkg/reconcile"
 
 	"github.com/osac-project/osac/osac-operator/api/v1alpha1"
@@ -44,15 +40,13 @@ import (
 const tenantFinalizer = "osac.openshift.io/tenant"
 
 // TenantReconciler reconciles a Tenant object.
-// Tracks namespace readiness and tenant lifecycle (Phase, finalizer).
+// Tracks tenant lifecycle (Phase, finalizer).
 // Storage provisioning is handled by the OSAC Storage Controller.
 type TenantReconciler struct {
 	client.Client
 	Scheme          *runtime.Scheme
 	Recorder        events.EventRecorder
 	tenantNamespace string
-	mgr             mcmanager.Manager
-	targetCluster   mc.ClusterName
 }
 
 // +kubebuilder:rbac:groups=osac.openshift.io,resources=tenants,verbs=get;list;watch;create;update;patch;delete
@@ -60,12 +54,10 @@ type TenantReconciler struct {
 // +kubebuilder:rbac:groups=osac.openshift.io,resources=tenants/finalizers,verbs=update
 // +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
-// +kubebuilder:rbac:groups=k8s.ovn.org,resources=userdefinednetworks,verbs=get;list;watch;create;update;patch;delete
 
 func NewTenantReconciler(
 	mgr mcmanager.Manager,
 	tenantNamespace string,
-	targetCluster mc.ClusterName,
 ) *TenantReconciler {
 	if mgr == nil {
 		panic("mgr must not be nil")
@@ -76,8 +68,6 @@ func NewTenantReconciler(
 		Scheme:          mgr.GetLocalManager().GetScheme(),
 		Recorder:        mgr.GetLocalManager().GetEventRecorder(tenantControllerName),
 		tenantNamespace: tenantNamespace,
-		mgr:             mgr,
-		targetCluster:   targetCluster,
 	}
 }
 
@@ -124,29 +114,7 @@ func (r *TenantReconciler) handleUpdate(ctx context.Context, req reconcile.Reque
 		}
 	}
 
-	instance.Status.Phase = v1alpha1.TenantPhaseProgressing
 	instance.Status.Namespace = ""
-
-	targetClient, err := getTargetClient(ctx, r.mgr, r.targetCluster)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-
-	var namespace corev1.Namespace
-	if err = targetClient.Get(ctx, client.ObjectKey{Name: instance.GetName()}, &namespace); err != nil {
-		instance.SetStatusCondition(v1alpha1.TenantConditionNamespaceReady,
-			metav1.ConditionFalse,
-			v1alpha1.TenantReasonNotFound,
-			fmt.Sprintf("Namespace %q not found on target cluster", instance.GetName()))
-		return ctrl.Result{}, err
-	}
-
-	instance.SetStatusCondition(v1alpha1.TenantConditionNamespaceReady,
-		metav1.ConditionTrue,
-		v1alpha1.TenantReasonFound,
-		fmt.Sprintf("Namespace %q found on target cluster", instance.GetName()))
-
-	instance.Status.Namespace = namespace.GetName()
 	instance.Status.Phase = v1alpha1.TenantPhaseReady
 	return ctrl.Result{}, nil
 }
@@ -209,11 +177,6 @@ func (r *TenantReconciler) SetupWithManager(mgr mcmanager.Manager) error {
 		Named("tenant").
 		Watches(
 			&corev1.Namespace{},
-			mchandler.EnqueueRequestsFromMapFunc(r.mapObjectToTenant),
-			mcbuilder.WithPredicates(tenantLabelPredicate),
-		).
-		Watches(
-			&ovnv1.UserDefinedNetwork{},
 			mchandler.EnqueueRequestsFromMapFunc(r.mapObjectToTenant),
 			mcbuilder.WithPredicates(tenantLabelPredicate),
 		).

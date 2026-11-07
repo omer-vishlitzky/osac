@@ -1,0 +1,28 @@
+import { Stack, StackItem, Title } from '@patternfly/react-core';
+
+import NameField from '@osac/ui-components/components/Form/NameField';
+import OsacForm from '@osac/ui-components/components/Form/OsacForm';
+import ProjectField from '@osac/ui-components/components/Form/ProjectField';
+import { useTranslation } from '@osac/ui-components/hooks/useTranslation';
+
+const ExternalIpGeneralStep = () => {
+  const { t } = useTranslation();
+
+  return (
+    <Stack hasGutter>
+      <StackItem>
+        <Title headingLevel="h2" size="lg">
+          {t('General')}
+        </Title>
+      </StackItem>
+      <StackItem>
+        <OsacForm>
+          <ProjectField />
+          <NameField />
+        </OsacForm>
+      </StackItem>
+    </Stack>
+  );
+};
+
+export default ExternalIpGeneralStep;

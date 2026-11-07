@@ -17,6 +17,32 @@ import rego.v1
 
 default allow := false
 
+# A managed-client marker suppresses all legacy JWT role and group grants. The
+# marker is based on signed claims; policy grants require a current database
+# resolution by the authorization evaluator.
+default is_managed_service_account_candidate := false
+is_managed_service_account_candidate if {
+  input.auth.identity.managed_service_account_candidate == true
+}
+
+default is_managed_service_account_valid := false
+is_managed_service_account_valid if {
+  is_managed_service_account_candidate
+  input.auth.identity.authnMethod == "jwt"
+  input.auth.identity.managed_service_account_claims_valid == true
+  input.auth.identity.managed_service_account_valid == true
+}
+
+allow if {
+  not is_managed_service_account_candidate
+  legacy_allow
+}
+
+allow if {
+  is_managed_service_account_valid
+  managed_service_account_grant
+}
+
 # Emergency service accounts are Kubernetes service accounts that are allowed to act as administrators in case of
 # emergency situations where it isn't possible to get a valid JWT token from the identity provider. The full service
 # account names are provided via the external data passed to the policy.
@@ -72,12 +98,14 @@ default subject_tenants = []
 # Extract tenant names from organization array (simple format: ["org-name"])
 subject_tenants = input.auth.identity.organization if {
   input.auth.identity.authnMethod == "jwt"
+  not is_managed_service_account_candidate
   is_array(input.auth.identity.organization)
 }
 
 # Extract tenant names from organization object (Keycloak format: {"org-name": {"groups": [...]}})
 subject_tenants = [org_name | input.auth.identity.organization[org_name]] if {
   input.auth.identity.authnMethod == "jwt"
+  not is_managed_service_account_candidate
   is_object(input.auth.identity.organization)
 }
 
@@ -86,12 +114,28 @@ subject_tenants = subject_groups if {
   input.auth.identity.authnMethod == "serviceaccount"
 }
 
+subject_tenants = [input.auth.identity.managed_service_account_tenant] if {
+  is_managed_service_account_valid
+}
+
 # Get the subject's realm roles from JWT
 default subject_realm_roles = []
 subject_realm_roles = input.auth.identity.realm_access.roles if {
   input.auth.identity.authnMethod == "jwt"
+  not is_managed_service_account_candidate
   input.auth.identity.realm_access
   input.auth.identity.realm_access.roles
+}
+
+# Reader roles receive a restricted subset of the public API.
+reader_roles := {
+  "tenant-reader",
+  "cloud-provider-reader",
+}
+default is_reader = false
+is_reader if {
+  some role in subject_realm_roles
+  role in reader_roles
 }
 
 # Organization dictionary extraction
@@ -100,6 +144,7 @@ default subject_org_groups = {}
 # If organization is an object with groups, use it directly
 subject_org_groups := input.auth.identity.organization if {
   input.auth.identity.authnMethod == "jwt"
+  not is_managed_service_account_candidate
   is_object(input.auth.identity.organization)
 }
 
@@ -109,6 +154,7 @@ subject_org_groups := {tenant: {"groups": input.auth.identity.groups} |
   some tenant in input.auth.identity.organization
 } if {
   input.auth.identity.authnMethod == "jwt"
+  not is_managed_service_account_candidate
   is_array(input.auth.identity.organization)
   input.auth.identity.groups
 }
@@ -116,12 +162,15 @@ subject_org_groups := {tenant: {"groups": input.auth.identity.groups} |
 # Check if an account is an admin account:
 default is_admin = false
 is_admin if {
+  not is_managed_service_account_candidate
   subject_name in emergency_service_accounts
 }
 is_admin if {
+  not is_managed_service_account_candidate
   subject_name in admin_service_accounts
 }
 is_admin if {
+  not is_managed_service_account_candidate
   some group in subject_groups
   group in admin_groups
 }
@@ -163,6 +212,16 @@ is_csi if {
   role in csi_client_roles
 }
 
+# Reader restrictions apply only when no other role grants access.
+default is_reader_only = false
+is_reader_only if {
+  is_reader
+  not is_admin
+  not is_tenant_admin
+  not is_tenant_idp_manager
+  not is_csi
+}
+
 # Check if an account is a regular client (no admin, tenant management, or CSI roles):
 default is_client = false
 is_client if {
@@ -170,6 +229,7 @@ is_client if {
   not is_tenant_admin
   not is_tenant_idp_manager
   not is_csi
+  not is_reader
 }
 
 # Check if account has client-level permissions (clients, tenant admins, or IdP managers):
@@ -184,21 +244,30 @@ has_client_permissions if {
   is_tenant_idp_manager
 }
 
-# Allow metadata, reflection and health to everyone:
-allow if {
+# Check if the request has a validated JWT identity (e.g. osac-ui-backend via client credentials):
+default is_authenticated = false
+is_authenticated if {
+  input.auth.identity.authnMethod == "jwt"
+}
+
+legacy_allow if {
+  not is_reader_only
   startswith(grpc_method, "/metadata.")
 }
-allow if {
+legacy_allow if {
+  not is_reader_only
+  is_authenticated
   startswith(grpc_method, "/grpc.reflection.")
 }
-allow if {
+legacy_allow if {
+  not is_reader_only
   startswith(grpc_method, "/grpc.health.")
 }
 
 # Allow specific methods to clients (and tenant admins/IdP managers who inherit client permissions):
-allow if {
-  has_client_permissions
-  grpc_method in {
+client_permission_methods := {
+    "/osac.public.v1.AddOnOperators/Get",
+    "/osac.public.v1.AddOnOperators/List",
     "/osac.public.v1.BareMetalInstanceCatalogItems/Get",
     "/osac.public.v1.BareMetalInstanceCatalogItems/List",
     "/osac.public.v1.BareMetalInstanceTemplates/Get",
@@ -237,22 +306,20 @@ allow if {
     "/osac.public.v1.DiskImages/Update",
     "/osac.public.v1.ConsoleSessions/Create",
     "/osac.public.v1.Events/Watch",
-    "/osac.public.v1.HostTypes/Get",
-    "/osac.public.v1.HostTypes/List",
     "/osac.public.v1.InstanceTypes/Get",
     "/osac.public.v1.InstanceTypes/List",
+    "/osac.public.v1.SelfSubjectAccessReviews/Create",
     "/osac.public.v1.StorageTiers/Get",
     "/osac.public.v1.StorageTiers/List",
+    "/osac.public.v1.Tenants/List",
     "/osac.public.v1.Subnets/Create",
     "/osac.public.v1.Subnets/Delete",
     "/osac.public.v1.Subnets/Get",
     "/osac.public.v1.Subnets/List",
-    "/osac.public.v1.Subnets/Update",
     "/osac.public.v1.VirtualNetworks/Create",
     "/osac.public.v1.VirtualNetworks/Delete",
     "/osac.public.v1.VirtualNetworks/Get",
     "/osac.public.v1.VirtualNetworks/List",
-    "/osac.public.v1.VirtualNetworks/Update",
     "/osac.public.v1.SecurityGroups/Create",
     "/osac.public.v1.SecurityGroups/Delete",
     "/osac.public.v1.SecurityGroups/Get",
@@ -262,19 +329,20 @@ allow if {
     "/osac.public.v1.ExternalIPAttachments/Delete",
     "/osac.public.v1.ExternalIPAttachments/Get",
     "/osac.public.v1.ExternalIPAttachments/List",
-    "/osac.public.v1.ExternalIPAttachments/Update",
     "/osac.public.v1.ExternalIPPools/Get",
     "/osac.public.v1.ExternalIPPools/List",
     "/osac.public.v1.ExternalIPs/Create",
     "/osac.public.v1.ExternalIPs/Delete",
     "/osac.public.v1.ExternalIPs/Get",
     "/osac.public.v1.ExternalIPs/List",
-    "/osac.public.v1.ExternalIPs/Update",
+    # Phase 1 trusts platform admins to supply eligible Netris hostnames.
+    # Tenant visibility is allowed, but writes require the existing is_admin rule.
+    "/osac.public.v1.FabricDomains/Get",
+    "/osac.public.v1.FabricDomains/List",
     "/osac.public.v1.NATGateways/Create",
     "/osac.public.v1.NATGateways/Delete",
     "/osac.public.v1.NATGateways/Get",
     "/osac.public.v1.NATGateways/List",
-    "/osac.public.v1.NATGateways/Update",
     "/osac.public.v1.Roles/Get",
     "/osac.public.v1.Roles/List",
     "/osac.public.v1.RoleBindings/Get",
@@ -284,13 +352,153 @@ allow if {
     "/osac.public.v1.Secrets/Get",
     "/osac.public.v1.Secrets/List",
     "/osac.public.v1.Secrets/Update",
+    "/osac.public.v1.Volumes/Create",
+    "/osac.public.v1.Volumes/Delete",
+    "/osac.public.v1.Volumes/Get",
+    "/osac.public.v1.Volumes/List",
+    "/osac.public.v1.Volumes/Update",
+}
+
+# Service-account grants use a deliberately bounded copy of the current public
+# client methods. Private methods and methods with broader information exposure
+# are excluded; adding a new API method does not grant it automatically.
+managed_automation_methods := {method |
+  some method in client_permission_methods
+  startswith(method, "/osac.public.v1.")
+  not method in {
+    "/osac.public.v1.Secrets/Get",
+    "/osac.public.v1.Events/Watch",
+    "/osac.public.v1.ConsoleSessions/Create",
   }
+} | {
+  "/osac.public.v1.Projects/Get",
+  "/osac.public.v1.Projects/List",
+  "/osac.public.v1.ProjectMemberships/List",
+  "/osac.public.v1.SelfSubjectAccessReviews/Create",
+}
+
+managed_idp_manager_methods := {
+  "/osac.public.v1.IdentityProviders/Create",
+  "/osac.public.v1.IdentityProviders/Get",
+  "/osac.public.v1.IdentityProviders/List",
+  "/osac.public.v1.IdentityProviders/Update",
+  "/osac.public.v1.IdentityProviders/Delete",
+  "/osac.public.v1.Users/Get",
+  "/osac.public.v1.Users/List",
+  "/osac.public.v1.Roles/Get",
+  "/osac.public.v1.Roles/List",
+  "/osac.public.v1.RoleBindings/Get",
+  "/osac.public.v1.RoleBindings/List",
+}
+
+managed_tenant_admin_methods := {
+  "/osac.public.v1.BareMetalInstanceCatalogItems/Create",
+  "/osac.public.v1.BareMetalInstanceCatalogItems/Update",
+  "/osac.public.v1.BareMetalInstanceCatalogItems/Delete",
+  "/osac.public.v1.ClusterCatalogItems/Create",
+  "/osac.public.v1.ClusterCatalogItems/Update",
+  "/osac.public.v1.ClusterCatalogItems/Delete",
+  "/osac.public.v1.ComputeInstanceCatalogItems/Create",
+  "/osac.public.v1.ComputeInstanceCatalogItems/Update",
+  "/osac.public.v1.ComputeInstanceCatalogItems/Delete",
+  "/osac.public.v1.IdentityProviders/Create",
+  "/osac.public.v1.IdentityProviders/Get",
+  "/osac.public.v1.IdentityProviders/List",
+  "/osac.public.v1.IdentityProviders/Update",
+  "/osac.public.v1.IdentityProviders/Delete",
+  "/osac.public.v1.Users/Create",
+  "/osac.public.v1.Users/Get",
+  "/osac.public.v1.Users/List",
+  "/osac.public.v1.Users/Update",
+  "/osac.public.v1.Users/Delete",
+  "/osac.public.v1.Projects/Create",
+  "/osac.public.v1.Projects/Update",
+  "/osac.public.v1.Projects/Delete",
+  "/osac.public.v1.ProjectMemberships/Create",
+  "/osac.public.v1.ProjectMemberships/Get",
+  "/osac.public.v1.ProjectMemberships/Update",
+  "/osac.public.v1.ProjectMemberships/Delete",
+  "/osac.public.v1.Roles/Get",
+  "/osac.public.v1.Roles/List",
+  "/osac.public.v1.RoleBindings/Create",
+  "/osac.public.v1.RoleBindings/Get",
+  "/osac.public.v1.RoleBindings/List",
+  "/osac.public.v1.RoleBindings/Update",
+  "/osac.public.v1.RoleBindings/Delete",
+  "/osac.public.v1.ServiceAccounts/Create",
+  "/osac.public.v1.ServiceAccounts/Get",
+  "/osac.public.v1.ServiceAccounts/List",
+  "/osac.public.v1.ServiceAccounts/Update",
+  "/osac.public.v1.ServiceAccounts/Delete",
+  "/osac.public.v1.ServiceAccounts/RegenerateSecret",
+  "/osac.public.v1.Secrets/Get",
+}
+
+managed_csi_methods := {
+  "/osac.private.v1.Volumes/Create",
+  "/osac.private.v1.Volumes/Get",
+  "/osac.private.v1.Volumes/List",
+  "/osac.private.v1.Volumes/Delete",
+}
+
+managed_service_account_has_role(role) if {
+  some assigned_role in input.auth.identity.managed_service_account_roles
+  assigned_role == role
+}
+
+managed_service_account_grant if {
+  some role in {"tenant-automation", "tenant-idp-manager", "tenant-admin"}
+  managed_service_account_has_role(role)
+  grpc_method in managed_automation_methods
+}
+
+managed_service_account_grant if {
+  managed_service_account_has_role("tenant-idp-manager")
+  grpc_method in managed_idp_manager_methods
+}
+
+managed_service_account_grant if {
+  managed_service_account_has_role("tenant-admin")
+  grpc_method in managed_tenant_admin_methods
+}
+
+managed_service_account_grant if {
+  managed_service_account_has_role("osac-csi-driver")
+  grpc_method in managed_csi_methods
+}
+
+legacy_allow if {
+  has_client_permissions
+  grpc_method in client_permission_methods
+}
+
+# Reader access is the reviewed read-only subset of existing client grants.
+reader_client_methods := {method |
+  some method in client_permission_methods
+  parts := split(method, "/")
+  count(parts) == 3
+  startswith(parts[1], "osac.public.v1.")
+  parts[2] in {"Get", "List", "Watch"}
+}
+reader_scoped_list_methods := {
+  # These client list grants are declared separately for scoped filtering.
+  "/osac.public.v1.Projects/List",
+  "/osac.public.v1.ProjectMemberships/List",
+}
+reader_permission_methods := reader_client_methods | reader_scoped_list_methods
+legacy_allow if {
+  is_reader
+  grpc_method in reader_permission_methods
+}
+legacy_allow if {
+  is_reader
+  grpc_method == "/osac.public.v1.SelfSubjectAccessReviews/Create"
 }
 
 # Tenant admins can manage catalog items, users, identity providers,
 # projects, project memberships, and rolebindings within their tenant. The application layer
 # (generic server) enforces resource-level authorization via tenant field validation.
-allow if {
+legacy_allow if {
   is_tenant_admin
   grpc_method in {
     "/osac.public.v1.BareMetalInstanceCatalogItems/Create",
@@ -332,8 +540,21 @@ allow if {
   }
 }
 
+# Tenant admins manage machine identities within their tenant.
+legacy_allow if {
+  is_tenant_admin
+  grpc_method in {
+    "/osac.public.v1.ServiceAccounts/Create",
+    "/osac.public.v1.ServiceAccounts/Get",
+    "/osac.public.v1.ServiceAccounts/List",
+    "/osac.public.v1.ServiceAccounts/Update",
+    "/osac.public.v1.ServiceAccounts/Delete",
+    "/osac.public.v1.ServiceAccounts/RegenerateSecret",
+  }
+}
+
 # Tenant IdP managers can manage identity providers and assign users to roles
-allow if {
+legacy_allow if {
   is_tenant_idp_manager
   grpc_method in {
     "/osac.public.v1.IdentityProviders/Create",
@@ -354,7 +575,7 @@ allow if {
 }
 
 # Allow everything to admins:
-allow if {
+legacy_allow if {
   is_admin
 }
 
@@ -362,7 +583,7 @@ allow if {
 # (OSAC-3279). Tenant scoping is enforced by the application layer via the identity's
 # organization claim; this rule only gates the permitted method set. Publish/unpublish on
 # the internal Storage Control Plane API is handled separately (OSAC-3278).
-allow if {
+legacy_allow if {
   is_csi
   grpc_method in {
     "/osac.private.v1.Volumes/Create",
@@ -375,13 +596,13 @@ allow if {
 # Project authorization
 # All authenticated users with client permissions can list projects
 # (application layer filters results based on actual project memberships)
-allow if {
+legacy_allow if {
   has_client_permissions
   grpc_method == "/osac.public.v1.Projects/List"
 }
 
 # Project Get authorization - allow viewers or managers
-allow if {
+legacy_allow if {
   grpc_method == "/osac.public.v1.Projects/Get"
   tenant := input.context.context_extensions.tenant
   name := input.context.context_extensions.name
@@ -394,7 +615,7 @@ allow if {
 }
 
 # Project Update/Delete authorization via organization groups
-allow if {
+legacy_allow if {
   grpc_method in {
     "/osac.public.v1.Projects/Update",
     "/osac.public.v1.Projects/Delete",
@@ -408,7 +629,7 @@ allow if {
 
 # All authenticated users with client permissions can list project memberships
 # (application layer filters results based on actual project memberships)
-allow if {
+legacy_allow if {
   has_client_permissions
   grpc_method == "/osac.public.v1.ProjectMemberships/List"
 }
@@ -416,7 +637,7 @@ allow if {
 # Project managers can create memberships for their project.
 # For Create, only the project name is available from the request body (no DB lookup),
 # so we iterate over the user's tenants to find a matching manager group.
-allow if {
+legacy_allow if {
   grpc_method == "/osac.public.v1.ProjectMemberships/Create"
   input.auth.identity.authnMethod == "jwt"
   project := input.context.context_extensions.project
@@ -427,7 +648,7 @@ allow if {
 
 # Project managers can get, update, and delete memberships for their project.
 # Uses DB-authoritative tenant and project name from context extensions.
-allow if {
+legacy_allow if {
   grpc_method in {
     "/osac.public.v1.ProjectMemberships/Get",
     "/osac.public.v1.ProjectMemberships/Update",
@@ -441,14 +662,33 @@ allow if {
 }
 
 # Subject construction:
+subject_user = input.auth.identity.managed_service_account_client_id if {
+  is_managed_service_account_valid
+}
 subject_user = input.auth.identity.username if {
   input.auth.identity.authnMethod == "jwt"
+  not is_managed_service_account_candidate
 }
 subject_user = split(input.auth.identity.user.username, ":")[3] if {
   input.auth.identity.authnMethod == "serviceaccount"
 }
 subject_tenant_result = ["*"] if {
   is_admin
+}
+
+default subject_managed_service_account := false
+subject_managed_service_account := true if {
+  is_managed_service_account_valid
+}
+
+subject_tenant_result = [input.auth.identity.managed_service_account_tenant] if {
+  is_managed_service_account_valid
+  not managed_service_account_has_role("osac-csi-driver")
+}
+# The system-scoped CSI role gives the platform CSI account volume access across tenants.
+subject_tenant_result = ["*"] if {
+  is_managed_service_account_valid
+  managed_service_account_has_role("osac-csi-driver")
 }
 
 # TEMPORARY (shared CSI model, OSAC-4109): the CSI driver currently authenticates with a
@@ -465,6 +705,7 @@ subject_tenant_result = subject_tenants if {
   not is_admin
   not is_csi
   input.auth.identity.authnMethod == "jwt"
+  not is_managed_service_account_candidate
 }
 subject_tenant_result = [split(input.auth.identity.user.username, ":")[2]] if {
   not is_admin

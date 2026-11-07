@@ -253,6 +253,10 @@ func (m *mockClient) CreateIdentityProvider(ctx context.Context, tenantName stri
 	return idp, nil
 }
 
+func (m *mockClient) UpdateIdentityProvider(ctx context.Context, tenantName string, idp *IdentityProvider) (*IdentityProvider, error) {
+	return idp, nil
+}
+
 func (m *mockClient) GetIdentityProvider(ctx context.Context, tenantName, alias string) (*IdentityProvider, error) {
 	return nil, nil
 }
@@ -689,6 +693,23 @@ var _ = Describe("TenantManager", func() {
 })
 
 // Stub methods to satisfy ClientInterface (not used in manager tests)
+
+func (m *mockClient) CreateServiceAccountClient(ctx context.Context, clientID, tenantID string) (string, string, string, error) {
+	return "", "", "", fmt.Errorf("not implemented in test mock")
+}
+
+func (m *mockClient) RotateServiceAccountClientSecret(ctx context.Context, clientID, clientUUID,
+	registrationAccessToken, clientSecret string) (string, error) {
+	return "", fmt.Errorf("not implemented in test mock")
+}
+
+func (m *mockClient) FindServiceAccountClient(ctx context.Context, clientID, tenantID string) (string, bool, error) {
+	return "", false, fmt.Errorf("not implemented in test mock")
+}
+
+func (m *mockClient) DeleteServiceAccountClient(ctx context.Context, clientID, clientUUID, registrationAccessToken string) error {
+	return fmt.Errorf("not implemented in test mock")
+}
 
 func (m *mockClient) AddUserToOrganization(ctx context.Context, tenantName string, userID string) error {
 	return fmt.Errorf("not implemented in test mock")

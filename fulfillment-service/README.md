@@ -1,7 +1,7 @@
 # Fulfillment service
 
 This project contains the code for the fulfillment service. For instructions on how to install it
-in a production environment see the [installation guide](docs/INSTALL.md). For a guided walkthrough
+in a deployed environment see the [installation guide](docs/INSTALL.md). For a guided walkthrough
 of how a request flows through the service — the shared data model, the transaction/event
 mechanism, and the end-to-end path from a `Create` call to a Kubernetes custom resource — see
 [docs/CODEWALK.md](docs/CODEWALK.md).
@@ -9,8 +9,8 @@ mechanism, and the end-to-end path from a `Create` call to a Kubernetes custom r
 The API is defined using protocol buffers in the [`proto`](proto) directory. An OpenAPI
 specification is generated automatically from those definitions and published as raw YAML at
 [openapi/v3/public.yaml](https://osac-project.github.io/osac/openapi/v3/public.yaml).
-The same documentation is also available with a more convenient UI at
-[osac-project.github.io/osac](https://osac-project.github.io/osac/).
+The same documentation is also available with a more convenient Swagger UI at
+[osac-project.github.io/osac/openapi](https://osac-project.github.io/osac/openapi/).
 
 ## Required development tools
 
@@ -40,40 +40,33 @@ The API is defined using protocol buffers in the [`proto`](proto) directory.
 
 ### Editing Proto Files
 
-**IMPORTANT**: Only edit proto files in `proto/private/`. The `proto/public/` directory contains generated files and must never be edited manually.
+**IMPORTANT**: The proto contract lives in the **top-level `proto/` module**
+, not here. Edit service definitions in `proto/private/` and
+test-only definitions in `proto/tests/`. `proto/public/` and `proto/gen/` are
+generated and must never be edited manually.
 
-After making changes to `.proto` files in `proto/private/`, you must regenerate the public protos and Go code:
+For any proto change, regenerate ONCE from `proto/`:
 
 ```bash
-# From the fulfillment-service/ directory:
-$ uv run dev.py build protos
+make -C ../proto generate   # dev.py build protos (public) + buf generate (Go)
+make -C ../proto lint       # buf lint
 ```
-
-This command performs three steps:
-1. **Generates the public API from the private API**
-2. Lints the proto files
-3. Generates Go code from the proto definitions
 
 ### Generated Code
 
-The following directories contain generated code and must never be edited manually:
-- `proto/public/` - Public API proto files (generated from `proto/private/`)
-- `internal/api/` - Generated Go code (generated from all proto files)
+The single generated Go tree at `proto/gen/` is imported by every module as
+`github.com/osac-project/osac/proto/gen/...` — there are no more per-component
+`internal/api/` copies. Commit, for a proto change:
 
-**Important**: You must commit **all three** changes when modifying protos:
-1. Your edits to `.proto` files in `proto/private/`
-2. The generated public protos in `proto/public/`
-3. The generated Go code in `internal/api/`
+1. Your edits to `.proto` files in `proto/private/` (or `proto/tests/`)
+2. The regenerated `proto/public/` (not needed for test-only changes)
+3. The regenerated `proto/gen/`
+
+CI (`Check generated code (proto)`) fails the PR if `proto/gen/` or
+`proto/public/` is stale. Run `go generate ./...` here afterward if a proto
+change altered a mocked gRPC interface, and `go mod tidy` after module changes.
 
 A CI check (`check-generated-code.yaml`) runs on every PR to verify that the generated code is up to date. If the check fails, it means you forgot to regenerate or commit the generated code.
-
-### Incremental Builds
-
-For incremental builds (skipping public proto generation, only regenerating Go code):
-
-```bash
-$ buf generate
-```
 
 See [docs/CLEANAPI.md](docs/CLEANAPI.md) for a complete guide on using cleanapi annotations, best practices, and common workflows. See [AGENTS.md](AGENTS.md) for build commands and development workflow.
 
@@ -92,6 +85,32 @@ To build the `osac` binary:
 ```bash
 $ go build ./cmd/osac
 ```
+
+## CSP-managed storage backends
+
+Cloud Provider Admins can register a backend with `spec.cspManaged: true` when they manage its
+storage resources. This applies to any provider. Endpoint and credentials can be omitted:
+
+```json
+{
+  "metadata": {"name": "netapp-prod"},
+  "spec": {"provider": "netapp", "cspManaged": true}
+}
+```
+
+After logging in to the private API, the equivalent CLI command is:
+
+```bash
+osac create storagebackend --name netapp-prod --provider netapp --csp-managed
+```
+
+Omitting `cspManaged` defaults to `false` and preserves the requirement for an endpoint, username,
+and exactly one password source (inline password or an OSAC Secret reference). Supplied
+credentials are validated in either mode. Ownership is immutable after creation; partial updates
+to other fields preserve it. No VMaaS cluster or TridentBackendConfig reference is required.
+
+This API change records ownership only. Operator provisioning and readiness behavior for
+CSP-managed backends will be implemented separately.
 
 ## Running unit tests
 
@@ -141,7 +160,8 @@ To run the the gRPC server use a command like this:
     --log-headers=true \
     --log-bodies=true \
     --grpc-listener-address=localhost:8000 \
-    --db-url=postgres://user:pass@localhost:5432/db
+    --db-url=postgres://user:pass@localhost:5432/db \
+    --kafka-properties-file=/path/to/kafka/properties
 
 To run the the REST gateway use a command like this:
 
@@ -153,11 +173,21 @@ To run the the REST gateway use a command like this:
     --grpc-server-address=localhost:8000 \
     --grpc-server-plaintext
 
-You may need to adjust the commands to use your database details.
+You may need to adjust the commands to use your database and Kafka details. The Kafka properties
+file can also be a directory containing `brokers`, `user`, and `password` files.
 
-To verify that the gRPC server is working use `grpcurl`. For example, to list the available gRPC services:
+To verify that the gRPC server is working use `grpcurl`. gRPC reflection requires an authenticated
+JWT; pass it with the `-H` flag after logging in.
 
-    $ grpcurl -plaintext localhost:8000 list
+The local examples below use `-plaintext` because the `start grpc-server` command above listens on
+loopback without TLS. **Use `-plaintext` only for loopback local development** (for example
+`localhost` or `127.0.0.1`). Do not use `-plaintext` with non-loopback endpoints.
+
+**Local development (loopback, no TLS):**
+
+To list the available gRPC services:
+
+    $ grpcurl -plaintext -H "Authorization: Bearer ${TOKEN}" localhost:8000 list
     osac.public.v1.ClusterOrders
     osac.public.v1.ClusterTemplates
     osac.public.v1.Clusters
@@ -167,13 +197,13 @@ To verify that the gRPC server is working use `grpcurl`. For example, to list th
 
 To list the methods available in a service, for example in the `ClusterTemplates` service:
 
-    $ grpcurl -plaintext localhost:8000 list osac.public.v1.ClusterTemplates
+    $ grpcurl -plaintext -H "Authorization: Bearer ${TOKEN}" localhost:8000 list osac.public.v1.ClusterTemplates
     osac.public.v1.ClusterTemplates.Get
     osac.public.v1.ClusterTemplates.List
 
 To invoke a method, for example the `List` method of the `ClusterTemplates` service:
 
-    $ grpcurl -plaintext localhost:8000 osac.public.v1.ClusterTemplates/List
+    $ grpcurl -plaintext -H "Authorization: Bearer ${TOKEN}" localhost:8000 osac.public.v1.ClusterTemplates/List
     {
       "size": 2,
       "total": 2,
@@ -190,6 +220,17 @@ To invoke a method, for example the `List` method of the `ClusterTemplates` serv
         }
       ]
     }
+
+**Remote endpoints (TLS):**
+
+Omit `-plaintext` and pass a trusted CA bundle with `-cacert` (for example `bundle.pem` from the
+installation CA ConfigMap; see [INSTALL.md](docs/INSTALL.md)):
+
+    $ grpcurl -cacert bundle.pem -H "Authorization: Bearer ${TOKEN}" fulfillment-api.example.com:443 list
+
+    $ grpcurl -cacert bundle.pem -H "Authorization: Bearer ${TOKEN}" fulfillment-api.example.com:443 list osac.public.v1.ClusterTemplates
+
+    $ grpcurl -cacert bundle.pem -H "Authorization: Bearer ${TOKEN}" fulfillment-api.example.com:443 osac.public.v1.ClusterTemplates/List
 
 To verify that the REST gateway is working use `curl`. For example, to get the list of templates:
 
@@ -245,9 +286,10 @@ $ make -C ../osac-installer test PLATFORM=kind PROFILE=dev NS=osac SUITE=fulfill
 $ make -C ../osac-installer uninstall PLATFORM=kind PROFILE=dev NS=osac
 ```
 
-The integration tests use TLS with SNI (_Server Name Indication_) routing through the Envoy Gateway.
-This means that the services are accessed using their Kubernetes internal host names, but routed
-through `127.0.0.1:8000` which is exposed by the Kind cluster.
+The integration tests use TLS with SNI (_Server Name Indication_) routing through the Envoy Gateway
+on the Kind HTTPS port (default `8443`). With `PROFILE=dev`, Keycloak's TLS route uses
+`keycloak.keycloak.svc.cluster.local`; Fulfillment uses its internal service hostnames because those
+are the hostnames configured on its TLS routes.
 
 For the tests to work correctly, the following host names must resolve to `127.0.0.1`:
 

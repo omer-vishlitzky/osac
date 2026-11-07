@@ -11,30 +11,40 @@ Unless required by applicable law or agreed to in writing, software distributed 
 language governing permissions and limitations under the License.
 */
 
-//go:generate mockgen -source=../../api/osac/private/v1/projects_service_grpc.pb.go -destination=projects_client_mock.go -package=project ProjectsClient
-//go:generate mockgen -source=../../api/osac/private/v1/tenants_service_grpc.pb.go -destination=tenants_client_mock.go -package=project TenantsClient
-//go:generate mockgen -source=../../api/osac/private/v1/users_service_grpc.pb.go -destination=users_client_mock.go -package=project UsersClient
-//go:generate mockgen -source=../../api/osac/private/v1/project_memberships_service_grpc.pb.go -destination=project_memberships_client_mock.go -package=project ProjectMembershipsClient
+//go:generate mockgen -destination=projects_client_mock.go -package=project github.com/osac-project/osac/proto/gen/osac/private/v1 ProjectsClient
+//go:generate mockgen -destination=tenants_client_mock.go -package=project github.com/osac-project/osac/proto/gen/osac/private/v1 TenantsClient
+//go:generate mockgen -destination=users_client_mock.go -package=project github.com/osac-project/osac/proto/gen/osac/private/v1 UsersClient
+//go:generate mockgen -destination=project_memberships_client_mock.go -package=project github.com/osac-project/osac/proto/gen/osac/private/v1 ProjectMembershipsClient
 
 package project
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
 	"slices"
 	"strings"
+	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
+	"github.com/osac-project/osac/fulfillment-service/internal/controllers"
+	"github.com/osac-project/osac/fulfillment-service/internal/controllers/defaultnetworking"
 	"github.com/osac-project/osac/fulfillment-service/internal/controllers/finalizers"
 	"github.com/osac-project/osac/fulfillment-service/internal/idp"
 	"github.com/osac-project/osac/fulfillment-service/internal/masks"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
+)
+
+const (
+	defaultNetworkingDeleteRetryDelay = time.Second
+	projectGroupRetryDelay            = 10 * time.Second
 )
 
 // FunctionBuilder contains the data needed to build instances of the reconciler function.
@@ -42,7 +52,7 @@ type FunctionBuilder struct {
 	logger              *slog.Logger
 	connection          *grpc.ClientConn
 	projectGroupManager *idp.ProjectGroupManager
-	usersClient         privatev1.UsersClient
+	defaultNetwork      defaultnetworking.Manager
 }
 
 // NewFunction creates a builder that can be used to configure and create reconciler functions.
@@ -68,9 +78,10 @@ func (b *FunctionBuilder) SetProjectGroupManager(value *idp.ProjectGroupManager)
 	return b
 }
 
-// SetUsersClient sets the users client that the reconciler will use to look up user information.
-func (b *FunctionBuilder) SetUsersClient(value privatev1.UsersClient) *FunctionBuilder {
-	b.usersClient = value
+// SetDefaultNetworking sets the controller-owned manager used to clean up
+// system-created networking when a tenant root project is deleted.
+func (b *FunctionBuilder) SetDefaultNetworking(value defaultnetworking.Manager) *FunctionBuilder {
+	b.defaultNetwork = value
 	return b
 }
 
@@ -89,18 +100,13 @@ func (b *FunctionBuilder) Build() (result *function, err error) {
 		return
 	}
 
-	usersClient := b.usersClient
-	if usersClient == nil {
-		usersClient = privatev1.NewUsersClient(b.connection)
-	}
-
 	result = &function{
 		logger:                   b.logger,
 		projectsClient:           privatev1.NewProjectsClient(b.connection),
 		tenantsClient:            privatev1.NewTenantsClient(b.connection),
-		usersClient:              usersClient,
 		projectMembershipsClient: privatev1.NewProjectMembershipsClient(b.connection),
 		projectGroupManager:      b.projectGroupManager,
+		defaultNetwork:           b.defaultNetwork,
 		maskCalculator:           masks.NewCalculator().Build(),
 	}
 	return
@@ -111,9 +117,9 @@ type function struct {
 	logger                   *slog.Logger
 	projectsClient           privatev1.ProjectsClient
 	tenantsClient            privatev1.TenantsClient
-	usersClient              privatev1.UsersClient
 	projectMembershipsClient privatev1.ProjectMembershipsClient
 	projectGroupManager      *idp.ProjectGroupManager
+	defaultNetwork           defaultnetworking.Manager
 	maskCalculator           *masks.Calculator
 }
 
@@ -143,9 +149,48 @@ func (r *function) Run(ctx context.Context, project *privatev1.Project) error {
 			Object:     project,
 			UpdateMask: updateMask,
 		}.Build())
+		if err != nil {
+			if project.HasMetadata() &&
+				project.GetMetadata().HasDeletionTimestamp() &&
+				status.Code(err) == codes.FailedPrecondition {
+				if strings.Contains(err.Error(), "still referenced by other objects") {
+					// Keep the controller finalizer and persist the failure status so
+					// deletion can retry after the blocking reference is removed.
+					project.GetMetadata().SetFinalizers(oldProject.GetMetadata().GetFinalizers())
+					if !project.HasStatus() {
+						project.SetStatus(&privatev1.ProjectStatus{})
+					}
+					project.GetStatus().SetState(privatev1.ProjectState_PROJECT_STATE_DELETE_FAILED)
+					project.GetStatus().SetMessage(err.Error())
+
+					failureMask := r.maskCalculator.Calculate(oldProject, project)
+					if len(failureMask.GetPaths()) > 0 {
+						_, statusErr := r.projectsClient.Update(ctx, privatev1.ProjectsUpdateRequest_builder{
+							Object:     project,
+							UpdateMask: failureMask,
+						}.Build())
+						if statusErr != nil {
+							err = errors.Join(err, statusErr)
+						}
+					}
+				}
+				return controllers.RequeueAfter(err, defaultNetworkingDeleteRetryDelay)
+			}
+			return err
+		}
 	}
 
-	return err
+	// Updating a deleting project with no finalizers archives it. Signal the
+	// tenant only after that update succeeds so tenant deletion waits until the
+	// project's tenant foreign-key reference is gone.
+	if oldProject.HasMetadata() &&
+		oldProject.GetMetadata().HasDeletionTimestamp() &&
+		slices.Contains(oldProject.GetMetadata().GetFinalizers(), finalizers.Controller) &&
+		!slices.Contains(project.GetMetadata().GetFinalizers(), finalizers.Controller) {
+		task.signalTenant(ctx)
+	}
+
+	return nil
 }
 
 // task contains the data needed to reconcile a single project.
@@ -220,8 +265,7 @@ func (t *task) validateAndActivate(ctx context.Context) error {
 	projectPath := strings.ReplaceAll(projectName, ".", "/")
 
 	// Create Keycloak groups for project authorization
-	// Returns the system:managers group ID to avoid timing issues with group lookup
-	managersGroupID, err := t.r.projectGroupManager.CreateProjectGroups(ctx, projectTenant, projectPath)
+	_, err := t.r.projectGroupManager.CreateProjectGroups(ctx, projectTenant, projectPath)
 	if err != nil {
 		t.updateCondition(
 			privatev1.ProjectConditionType_PROJECT_CONDITION_TYPE_KEYCLOAK_SYNC,
@@ -243,61 +287,18 @@ func (t *task) validateAndActivate(ctx context.Context) error {
 				)
 			}
 		}
-		return fmt.Errorf("failed to create Keycloak groups: %w", err)
+		return controllers.RequeueAfter(
+			fmt.Errorf("failed to create Keycloak groups: %w", err),
+			projectGroupRetryDelay,
+		)
 	}
 
-	// Add the project creator to the system:managers group using the ID from creation
-	// This avoids timing issues where the group isn't immediately visible in searches
-	creatorUsername := t.project.GetMetadata().GetCreator()
-	if creatorUsername != "" {
-		// Look up the user to get their Keycloak user ID
-		userResponse, err := t.r.usersClient.Get(ctx, privatev1.UsersGetRequest_builder{
-			Id: creatorUsername,
-		}.Build())
-		if err != nil {
-			if status.Code(err) == codes.NotFound {
-				t.r.logger.WarnContext(ctx, "Creator user not found, cannot add to managers group",
-					slog.String("project", t.project.GetMetadata().GetName()),
-					slog.String("!creator", creatorUsername),
-				)
-			} else {
-				t.r.logger.WarnContext(ctx, "Failed to look up creator user",
-					slog.String("project", t.project.GetMetadata().GetName()),
-					slog.String("!creator", creatorUsername),
-					slog.Any("error", err),
-				)
-			}
-			// Don't fail the reconciliation if this fails - the groups are still created
-			// The user can be added manually later
-		} else {
-			user := userResponse.GetObject()
-			keycloakUserID := user.GetStatus().GetKeycloakUserId()
-			if keycloakUserID == "" {
-				t.r.logger.WarnContext(ctx, "Creator user has no Keycloak user ID, cannot add to managers group",
-					slog.String("project", t.project.GetMetadata().GetName()),
-					slog.String("!creator", creatorUsername),
-				)
-			} else {
-				if err := t.r.projectGroupManager.AddUserToGroupByID(ctx,
-					t.project.GetMetadata().GetTenant(),
-					keycloakUserID,
-					managersGroupID); err != nil {
-					t.r.logger.WarnContext(ctx, "Failed to add creator to managers group",
-						slog.String("project", t.project.GetMetadata().GetName()),
-						slog.String("!creator", creatorUsername),
-						slog.String("managers_group_id", managersGroupID),
-						slog.Any("error", err),
-					)
-					// Don't fail the reconciliation if this fails - the groups are still created
-					// The user can be added manually later
-				} else {
-					t.r.logger.InfoContext(ctx, "Added creator to project managers group",
-						slog.String("project", t.project.GetMetadata().GetName()),
-						slog.String("!creator", creatorUsername),
-						slog.String("managers_group_id", managersGroupID),
-					)
-				}
-			}
+	// Create a ProjectMembership for the project creator with manager role.
+	// The ProjectMembership reconciler will handle adding the user to the Keycloak group.
+	creatorID := t.project.GetMetadata().GetCreator()
+	if creatorID != "" {
+		if err := t.createProjectMembershipForCreator(ctx, creatorID); err != nil {
+			return fmt.Errorf("failed to create ProjectMembership for creator: %w", err)
 		}
 	}
 
@@ -337,6 +338,81 @@ func (t *task) findProjectByName(ctx context.Context, name string) (*privatev1.P
 	return items[0], nil
 }
 
+// createProjectMembershipForCreator creates a ProjectMembership record for the project creator
+// with the manager role. This keeps the database in sync with Keycloak groups and ensures
+// creators can immediately see projects they create in membership queries.
+func (t *task) createProjectMembershipForCreator(ctx context.Context, creatorID string) error {
+	// Generate a deterministic, DNS-compatible name from tenant and project identity
+	// Hash the full identity to ensure uniqueness and DNS compliance (max 63 chars)
+	tenant := t.project.GetMetadata().GetTenant()
+	projectName := t.project.GetMetadata().GetName()
+	identity := fmt.Sprintf("%s/%s", tenant, projectName)
+	hash := sha256.Sum256([]byte(identity))
+	hashStr := hex.EncodeToString(hash[:])[:16] // Use first 16 hex chars (8 bytes)
+	membershipName := fmt.Sprintf("creator-%s", hashStr)
+
+	// Create the membership - creatorID is the user ID
+	userRef := privatev1.UserReference_builder{
+		Id: creatorID,
+	}.Build()
+
+	membership := privatev1.ProjectMembership_builder{
+		Metadata: privatev1.Metadata_builder{
+			Name:    membershipName,
+			Tenant:  tenant,
+			Project: projectName,
+		}.Build(),
+		Spec: privatev1.ProjectMembershipSpec_builder{
+			Role:  privatev1.ProjectMembershipRole_PROJECT_MEMBERSHIP_ROLE_MANAGER,
+			Users: []*privatev1.UserReference{userRef},
+		}.Build(),
+	}.Build()
+
+	_, err := t.r.projectMembershipsClient.Create(ctx, privatev1.ProjectMembershipsCreateRequest_builder{
+		Object: membership,
+	}.Build())
+	if err != nil {
+		// Check if it's a duplicate error - the database trigger will catch duplicate (tenant, project, user) tuples
+		if status.Code(err) == codes.AlreadyExists {
+			t.r.logger.DebugContext(ctx, "ProjectMembership already exists for creator",
+				slog.String("project", t.project.GetMetadata().GetName()),
+				slog.String("!creator", creatorID),
+			)
+			listResp, listErr := t.r.projectMembershipsClient.List(ctx, privatev1.ProjectMembershipsListRequest_builder{
+				Filter: new(fmt.Sprintf("this.metadata.tenant == %q && this.metadata.project == %q", tenant, projectName)),
+			}.Build())
+			if listErr != nil {
+				return fmt.Errorf("failed to query for project memberships: %w", listErr)
+			}
+			for _, membership := range listResp.GetItems() {
+				if membership.GetSpec().Role == privatev1.ProjectMembershipRole_PROJECT_MEMBERSHIP_ROLE_MANAGER {
+					for _, user := range membership.GetSpec().Users {
+						if user.Id == creatorID {
+							return nil
+						}
+					}
+				}
+			}
+
+			t.r.logger.DebugContext(ctx, "ProjectMembership already exists for creator but not as a manager",
+				slog.String("project", t.project.GetMetadata().GetName()),
+				slog.String("!creator", creatorID),
+				slog.String("membership_name", membershipName),
+			)
+			return fmt.Errorf("ProjectMembership already exists for creator but not as a manager: %w", err)
+		}
+		return fmt.Errorf("failed to create ProjectMembership: %w", err)
+	}
+
+	t.r.logger.InfoContext(ctx, "Created ProjectMembership for creator",
+		slog.String("project", t.project.GetMetadata().GetName()),
+		slog.String("!creator", creatorID),
+		slog.String("membership_name", membershipName),
+	)
+
+	return nil
+}
+
 // delete performs the deletion cleanup for a project.
 func (t *task) delete(ctx context.Context) error {
 	// Check for child projects before deletion
@@ -353,24 +429,64 @@ func (t *task) delete(ctx context.Context) error {
 		return fmt.Errorf("failed to query for child projects: %w", err)
 	}
 
-	// Block deletion if children exist
+	// Parent projects cannot be archived while child projects still reference them.
 	if listResp.GetTotal() > 0 {
+		activeChildFilter := listFilter + " && this.metadata.deletion_timestamp == null"
+		limit := int32(1)
+		activeChildren, err := t.r.projectsClient.List(ctx, privatev1.ProjectsListRequest_builder{
+			Filter: &activeChildFilter,
+			Limit:  &limit,
+		}.Build())
+		if err != nil {
+			return fmt.Errorf("failed to query for child projects not pending deletion: %w", err)
+		}
+		allChildrenDeleting := activeChildren.GetTotal() == 0
+
 		if !t.project.HasStatus() {
 			t.project.SetStatus(&privatev1.ProjectStatus{})
 		}
-		t.project.GetStatus().SetState(privatev1.ProjectState_PROJECT_STATE_DELETE_FAILED)
-		t.project.GetStatus().SetMessage(fmt.Sprintf("Cannot delete project with %d child project(s). Delete children first.", listResp.GetTotal()))
+
+		if allChildrenDeleting {
+			t.project.GetStatus().SetState(privatev1.ProjectState_PROJECT_STATE_DELETING)
+			t.project.GetStatus().SetMessage(fmt.Sprintf(
+				"Waiting for %d child project(s) to be deleted.", listResp.GetTotal()))
+		} else {
+			t.project.GetStatus().SetState(privatev1.ProjectState_PROJECT_STATE_DELETE_FAILED)
+			t.project.GetStatus().SetMessage(fmt.Sprintf(
+				"Cannot delete project with %d child project(s) that are not deleting. Delete children first.",
+				listResp.GetTotal()))
+		}
 		t.r.logger.WarnContext(ctx, "Cannot delete project with children",
 			slog.String("project_id", t.project.GetId()),
 			slog.Int("child_count", int(listResp.GetTotal())),
 		)
-		// Don't remove finalizer - deletion is blocked
+		// Keep the finalizer until all child projects have been archived.
 		return nil
 	}
 
 	// Cascade-delete ProjectMemberships scoped to this project
 	existingMemberships, err := t.deleteProjectMemberships(ctx)
 	if err != nil {
+		t.r.logger.ErrorContext(ctx, "ProjectMembership deletion failed",
+			slog.String("project_id", t.project.GetId()),
+			slog.Any("error", err),
+		)
+		oldProject := proto.Clone(t.project).(*privatev1.Project)
+		if !t.project.HasStatus() {
+			t.project.SetStatus(&privatev1.ProjectStatus{})
+		}
+		t.project.GetStatus().SetState(privatev1.ProjectState_PROJECT_STATE_DELETE_FAILED)
+		t.project.GetStatus().SetMessage(
+			"ProjectMembership deletion failed while deleting project.")
+		updateMask := t.r.maskCalculator.Calculate(oldProject, t.project)
+		if len(updateMask.GetPaths()) > 0 {
+			if _, updateErr := t.r.projectsClient.Update(ctx, privatev1.ProjectsUpdateRequest_builder{
+				Object:     t.project,
+				UpdateMask: updateMask,
+			}.Build()); updateErr != nil {
+				return errors.Join(err, fmt.Errorf("failed to persist project deletion status: %w", updateErr))
+			}
+		}
 		return err
 	}
 
@@ -381,6 +497,19 @@ func (t *task) delete(ctx context.Context) error {
 		t.project.GetStatus().SetState(privatev1.ProjectState_PROJECT_STATE_DELETING)
 		t.project.GetStatus().SetMessage("Pending ProjectMembership deletion prior to project deletion")
 		return nil
+	}
+
+	// Default networking belongs to the tenant root project. The controller
+	// removes those resources through the authenticated controller identity;
+	// ordinary API callers remain blocked by the system-managed protection.
+	if t.project.GetMetadata().GetName() == "" && t.r.defaultNetwork != nil {
+		if err := t.r.defaultNetwork.Delete(ctx, t.project.GetMetadata().GetTenant()); err != nil {
+			wrapped := fmt.Errorf("failed to delete default networking resources: %w", err)
+			if errors.Is(err, defaultnetworking.ErrResourcesDeleting) {
+				return controllers.RequeueAtInterval(wrapped, defaultNetworkingDeleteRetryDelay)
+			}
+			return wrapped
+		}
 	}
 
 	// Clean up Keycloak groups
@@ -394,17 +523,13 @@ func (t *task) delete(ctx context.Context) error {
 			slog.String("project_name", t.project.GetMetadata().GetName()),
 			slog.Any("error", err),
 		)
-		return fmt.Errorf("failed to delete Keycloak groups: %w", err)
+		return controllers.RequeueAfter(
+			fmt.Errorf("failed to delete Keycloak groups: %w", err),
+			projectGroupRetryDelay,
+		)
 	}
 
 	t.removeFinalizer()
-
-	// When the root project (empty name) is deleted, signal the parent tenant
-	// so it re-reconciles and can proceed with its own deletion.
-	if t.project.GetMetadata().GetName() == "" {
-		t.signalTenant(ctx)
-	}
-
 	return nil
 }
 
@@ -518,8 +643,7 @@ func (t *task) removeFinalizer() {
 }
 
 // signalTenant looks up the parent tenant by name and signals it so that the
-// tenant reconciler re-runs. This is used when the root project is deleted to
-// unblock the tenant's own deletion.
+// tenant reconciler re-runs after this project has been archived.
 func (t *task) signalTenant(ctx context.Context) {
 	tenantName := t.project.GetMetadata().GetTenant()
 	listResp, err := t.r.tenantsClient.List(ctx, privatev1.TenantsListRequest_builder{
@@ -541,7 +665,7 @@ func (t *task) signalTenant(ctx context.Context) {
 		Id: items[0].GetId(),
 	}.Build())
 	if err != nil {
-		t.r.logger.WarnContext(ctx, "Failed to signal tenant after root project deletion",
+		t.r.logger.WarnContext(ctx, "Failed to signal tenant after project deletion",
 			slog.String("tenant_id", items[0].GetId()),
 			slog.Any("error", err),
 		)

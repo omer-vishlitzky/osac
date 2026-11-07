@@ -10,6 +10,7 @@ metadata:
     "helm.sh/hook": post-install,post-upgrade
     "helm.sh/hook-weight": "20"
     "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+    "helm.sh/hook-output-log-policy": hook-failed
 spec:
   backoffLimit: 6
   activeDeadlineSeconds: 1300
@@ -116,6 +117,13 @@ spec:
       volumes:
       - name: tmp
         emptyDir: {}
+      # The wait-for-fulfillment init container uses this bundle to verify the API.
+      - name: ca-bundle
+        configMap:
+          name: {{ .Values.service.certs.caBundle.configMap | required "service.certs.caBundle.configMap is required" }}
+          items:
+          - key: bundle.pem
+            path: bundle.pem
       serviceAccountName: {{ .Values.aap.serviceAccounts.osacSa }}
       restartPolicy: Never
 {{- end }}

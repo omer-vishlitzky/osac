@@ -16,11 +16,12 @@ package onboarding
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-	osacv1alpha1 "github.com/osac-project/osac/osac-operator/api/v1alpha1"
 	"go.uber.org/mock/gomock"
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -31,15 +32,17 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
+	osacv1alpha1 "github.com/osac-project/osac/osac-operator/api/v1alpha1"
+
 	"github.com/osac-project/osac/fulfillment-service/internal/controllers"
 	"github.com/osac-project/osac/fulfillment-service/internal/controllers/finalizers"
 	"github.com/osac-project/osac/fulfillment-service/internal/kubernetes/labels"
 	"github.com/osac-project/osac/fulfillment-service/internal/masks"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
 func hasFinalizer(tenant *privatev1.Tenant) bool {
-	return slices.Contains(tenant.GetMetadata().GetFinalizers(), finalizers.Controller)
+	return slices.Contains(tenant.GetMetadata().GetFinalizers(), finalizers.TenantOnboarding)
 }
 
 func newTenantCR(tenantID, namespace, name string, deletionTimestamp *metav1.Time) *osacv1alpha1.Tenant {
@@ -48,7 +51,8 @@ func newTenantCR(tenantID, namespace, name string, deletionTimestamp *metav1.Tim
 			Namespace: namespace,
 			Name:      name,
 			Labels: map[string]string{
-				labels.TenantUuid: tenantID,
+				labels.TenantUuid: name,
+				labels.TenantID:   tenantID,
 			},
 		},
 	}
@@ -117,7 +121,7 @@ var _ = Describe("addFinalizer", func() {
 		t := &task{
 			tenant: privatev1.Tenant_builder{
 				Metadata: privatev1.Metadata_builder{
-					Finalizers: []string{finalizers.Controller},
+					Finalizers: []string{finalizers.TenantLifecycle, finalizers.TenantOnboarding},
 				}.Build(),
 			}.Build(),
 		}
@@ -126,8 +130,8 @@ var _ = Describe("addFinalizer", func() {
 
 		Expect(added).To(BeFalse())
 		finalizerList := t.tenant.GetMetadata().GetFinalizers()
-		Expect(finalizerList).To(HaveLen(1))
-		Expect(finalizerList[0]).To(Equal(finalizers.Controller))
+		Expect(finalizerList).To(HaveLen(2))
+		Expect(finalizerList).To(ContainElement(finalizers.TenantOnboarding))
 	})
 })
 
@@ -136,7 +140,7 @@ var _ = Describe("removeFinalizer", func() {
 		t := &task{
 			tenant: privatev1.Tenant_builder{
 				Metadata: privatev1.Metadata_builder{
-					Finalizers: []string{finalizers.Controller, "other-finalizer"},
+					Finalizers: []string{finalizers.TenantOnboarding, "other-finalizer"},
 				}.Build(),
 			}.Build(),
 		}
@@ -266,8 +270,8 @@ var _ = Describe("run", func() {
 				tenant := privatev1.Tenant_builder{
 					Id: tenantID,
 					Metadata: privatev1.Metadata_builder{
-						Name:       tenantID,
-						Finalizers: []string{finalizers.Controller},
+						Name:       tenantName,
+						Finalizers: []string{finalizers.TenantLifecycle, finalizers.TenantOnboarding},
 						Tenant:     tenantName,
 					}.Build(),
 				}.Build()
@@ -280,23 +284,27 @@ var _ = Describe("run", func() {
 				list1 := &osacv1alpha1.TenantList{}
 				Expect(fakeClient1.List(ctx, list1)).To(Succeed())
 				Expect(list1.Items).To(HaveLen(1))
-				Expect(list1.Items[0].Labels[labels.TenantUuid]).To(Equal(tenantID))
+				Expect(list1.Items[0].Name).To(Equal(tenantName))
+				Expect(list1.Items[0].Labels[labels.TenantUuid]).To(Equal(tenantName))
+				Expect(list1.Items[0].Labels[labels.TenantID]).To(Equal(tenantID))
 				Expect(list1.Items[0].Namespace).To(Equal(namespace1))
 
 				list2 := &osacv1alpha1.TenantList{}
 				Expect(fakeClient2.List(ctx, list2)).To(Succeed())
 				Expect(list2.Items).To(HaveLen(1))
-				Expect(list2.Items[0].Labels[labels.TenantUuid]).To(Equal(tenantID))
+				Expect(list2.Items[0].Name).To(Equal(tenantName))
+				Expect(list2.Items[0].Labels[labels.TenantUuid]).To(Equal(tenantName))
+				Expect(list2.Items[0].Labels[labels.TenantID]).To(Equal(tenantID))
 				Expect(list2.Items[0].Namespace).To(Equal(namespace2))
 
 				ns1 := &corev1.Namespace{}
-				Expect(fakeClient1.Get(ctx, clnt.ObjectKey{Name: tenantID}, ns1)).To(Succeed())
-				Expect(ns1.Labels[labels.TenantRef]).To(Equal(tenantID))
+				Expect(fakeClient1.Get(ctx, clnt.ObjectKey{Name: tenantName}, ns1)).To(Succeed())
+				Expect(ns1.Labels[labels.TenantRef]).To(Equal(tenantName))
 				Expect(ns1.Labels[labels.Project]).To(Equal(namespace1))
 
 				ns2 := &corev1.Namespace{}
-				Expect(fakeClient2.Get(ctx, clnt.ObjectKey{Name: tenantID}, ns2)).To(Succeed())
-				Expect(ns2.Labels[labels.TenantRef]).To(Equal(tenantID))
+				Expect(fakeClient2.Get(ctx, clnt.ObjectKey{Name: tenantName}, ns2)).To(Succeed())
+				Expect(ns2.Labels[labels.TenantRef]).To(Equal(tenantName))
 				Expect(ns2.Labels[labels.Project]).To(Equal(namespace2))
 			})
 		})
@@ -333,7 +341,7 @@ var _ = Describe("run", func() {
 					Id: tenantID,
 					Metadata: privatev1.Metadata_builder{
 						Name:       tenantID,
-						Finalizers: []string{finalizers.Controller},
+						Finalizers: []string{finalizers.TenantLifecycle, finalizers.TenantOnboarding},
 						Tenant:     tenantName,
 					}.Build(),
 				}.Build()
@@ -390,7 +398,7 @@ var _ = Describe("run", func() {
 					Id: tenantID,
 					Metadata: privatev1.Metadata_builder{
 						Name:       tenantID,
-						Finalizers: []string{finalizers.Controller},
+						Finalizers: []string{finalizers.TenantLifecycle, finalizers.TenantOnboarding},
 						Tenant:     tenantName,
 					}.Build(),
 				}.Build()
@@ -406,6 +414,7 @@ var _ = Describe("run", func() {
 					Name:      tenantID,
 				}, patched)).To(Succeed())
 				Expect(patched.Labels).To(HaveKeyWithValue(labels.TenantUuid, tenantID))
+				Expect(patched.Labels).To(HaveKeyWithValue(labels.TenantID, tenantID))
 			})
 		})
 
@@ -449,7 +458,7 @@ var _ = Describe("run", func() {
 					Id: tenantID,
 					Metadata: privatev1.Metadata_builder{
 						Name:       tenantID,
-						Finalizers: []string{finalizers.Controller},
+						Finalizers: []string{finalizers.TenantLifecycle, finalizers.TenantOnboarding},
 						Tenant:     tenantName,
 					}.Build(),
 				}.Build()
@@ -505,7 +514,7 @@ var _ = Describe("run", func() {
 					Id: tenantID,
 					Metadata: privatev1.Metadata_builder{
 						Name:       tenantID,
-						Finalizers: []string{finalizers.Controller},
+						Finalizers: []string{finalizers.TenantLifecycle, finalizers.TenantOnboarding},
 						Tenant:     tenantName,
 					}.Build(),
 				}.Build()
@@ -532,7 +541,7 @@ var _ = Describe("run", func() {
 				tenant := privatev1.Tenant_builder{
 					Id: tenantID,
 					Metadata: privatev1.Metadata_builder{
-						Finalizers: []string{finalizers.Controller},
+						Finalizers: []string{finalizers.TenantLifecycle, finalizers.TenantOnboarding},
 						Tenant:     tenantName,
 					}.Build(),
 				}.Build()
@@ -566,7 +575,7 @@ var _ = Describe("run", func() {
 					Id: tenantID,
 					Metadata: privatev1.Metadata_builder{
 						Name:       tenantID,
-						Finalizers: []string{finalizers.Controller},
+						Finalizers: []string{finalizers.TenantLifecycle, finalizers.TenantOnboarding},
 						Tenant:     tenantName,
 					}.Build(),
 				}.Build()
@@ -610,7 +619,7 @@ var _ = Describe("run", func() {
 					Id: tenantID,
 					Metadata: privatev1.Metadata_builder{
 						Name:       tenantID,
-						Finalizers: []string{finalizers.Controller},
+						Finalizers: []string{finalizers.TenantLifecycle, finalizers.TenantOnboarding},
 						Tenant:     tenantName,
 					}.Build(),
 				}.Build()
@@ -624,6 +633,7 @@ var _ = Describe("run", func() {
 				Expect(fakeClient.List(ctx, list)).To(Succeed())
 				Expect(list.Items).To(HaveLen(1))
 				Expect(list.Items[0].Labels[labels.TenantUuid]).To(Equal(tenantID))
+				Expect(list.Items[0].Labels[labels.TenantID]).To(Equal(tenantID))
 
 				ns := &corev1.Namespace{}
 				Expect(fakeClient.Get(ctx, clnt.ObjectKey{Name: tenantID}, ns)).To(Succeed())
@@ -667,7 +677,7 @@ var _ = Describe("run", func() {
 					Id: tenantID,
 					Metadata: privatev1.Metadata_builder{
 						Name:       tenantID,
-						Finalizers: []string{finalizers.Controller},
+						Finalizers: []string{finalizers.TenantLifecycle, finalizers.TenantOnboarding},
 						Tenant:     tenantName,
 					}.Build(),
 				}.Build()
@@ -729,7 +739,7 @@ var _ = Describe("run", func() {
 					Id: tenantID,
 					Metadata: privatev1.Metadata_builder{
 						Name:       tenantID,
-						Finalizers: []string{finalizers.Controller},
+						Finalizers: []string{finalizers.TenantLifecycle, finalizers.TenantOnboarding},
 						Tenant:     tenantName,
 					}.Build(),
 				}.Build()
@@ -780,7 +790,7 @@ var _ = Describe("run", func() {
 					Id: tenantID,
 					Metadata: privatev1.Metadata_builder{
 						Name:       tenantID,
-						Finalizers: []string{finalizers.Controller},
+						Finalizers: []string{finalizers.TenantLifecycle, finalizers.TenantOnboarding},
 						Tenant:     tenantName,
 					}.Build(),
 					Status: privatev1.TenantStatus_builder{
@@ -829,7 +839,7 @@ var _ = Describe("run", func() {
 					Id: tenantID,
 					Metadata: privatev1.Metadata_builder{
 						Name:       tenantID,
-						Finalizers: []string{finalizers.Controller},
+						Finalizers: []string{finalizers.TenantLifecycle, finalizers.TenantOnboarding},
 						Tenant:     tenantName,
 					}.Build(),
 					Status: privatev1.TenantStatus_builder{
@@ -885,7 +895,7 @@ var _ = Describe("run", func() {
 					Id: tenantID,
 					Metadata: privatev1.Metadata_builder{
 						Name:              tenantID,
-						Finalizers:        []string{finalizers.Controller},
+						Finalizers:        []string{finalizers.TenantLifecycle, finalizers.TenantOnboarding},
 						DeletionTimestamp: timestamppb.Now(),
 						Tenant:            tenantName,
 					}.Build(),
@@ -895,6 +905,9 @@ var _ = Describe("run", func() {
 				err := f.run(ctx, tenant)
 
 				Expect(err).To(MatchError(ContainSubstring("tenant CR still present")))
+				var retryable interface{ RequeueAfter() time.Duration }
+				Expect(errors.As(err, &retryable)).To(BeTrue())
+				Expect(retryable.RequeueAfter()).To(Equal(time.Second))
 				Expect(hasFinalizer(tenant)).To(BeTrue())
 			})
 		})
@@ -932,7 +945,7 @@ var _ = Describe("run", func() {
 					Id: tenantID,
 					Metadata: privatev1.Metadata_builder{
 						Name:              tenantID,
-						Finalizers:        []string{finalizers.Controller},
+						Finalizers:        []string{finalizers.TenantLifecycle, finalizers.TenantOnboarding},
 						DeletionTimestamp: timestamppb.Now(),
 						Tenant:            tenantName,
 					}.Build(),
@@ -970,7 +983,7 @@ var _ = Describe("run", func() {
 					Id: tenantID,
 					Metadata: privatev1.Metadata_builder{
 						Name:              tenantID,
-						Finalizers:        []string{finalizers.Controller},
+						Finalizers:        []string{finalizers.TenantLifecycle, finalizers.TenantOnboarding},
 						DeletionTimestamp: timestamppb.Now(),
 						Tenant:            tenantName,
 					}.Build(),
@@ -980,6 +993,9 @@ var _ = Describe("run", func() {
 				err := f.run(ctx, tenant)
 
 				Expect(err).To(MatchError(ContainSubstring("tenant CR still present")))
+				var retryable interface{ RequeueAfter() time.Duration }
+				Expect(errors.As(err, &retryable)).To(BeTrue())
+				Expect(retryable.RequeueAfter()).To(Equal(time.Second))
 				Expect(hasFinalizer(tenant)).To(BeTrue())
 			})
 		})
@@ -1010,7 +1026,7 @@ var _ = Describe("run", func() {
 					Id: tenantID,
 					Metadata: privatev1.Metadata_builder{
 						Name:              tenantID,
-						Finalizers:        []string{finalizers.Controller},
+						Finalizers:        []string{finalizers.TenantLifecycle, finalizers.TenantOnboarding},
 						DeletionTimestamp: timestamppb.Now(),
 						Tenant:            tenantName,
 					}.Build(),
@@ -1046,7 +1062,7 @@ var _ = Describe("run", func() {
 					Id: tenantID,
 					Metadata: privatev1.Metadata_builder{
 						Name:              tenantID,
-						Finalizers:        []string{finalizers.Controller},
+						Finalizers:        []string{finalizers.TenantLifecycle, finalizers.TenantOnboarding},
 						DeletionTimestamp: timestamppb.Now(),
 						Tenant:            tenantName,
 					}.Build(),
@@ -1070,7 +1086,7 @@ var _ = Describe("run", func() {
 				tenant := privatev1.Tenant_builder{
 					Id: tenantID,
 					Metadata: privatev1.Metadata_builder{
-						Finalizers:        []string{finalizers.Controller},
+						Finalizers:        []string{finalizers.TenantLifecycle, finalizers.TenantOnboarding},
 						DeletionTimestamp: timestamppb.Now(),
 						Tenant:            tenantName,
 					}.Build(),
@@ -1114,7 +1130,7 @@ var _ = Describe("run", func() {
 					Id: tenantID,
 					Metadata: privatev1.Metadata_builder{
 						Name:              tenantID,
-						Finalizers:        []string{finalizers.Controller},
+						Finalizers:        []string{finalizers.TenantLifecycle, finalizers.TenantOnboarding},
 						DeletionTimestamp: timestamppb.Now(),
 						Tenant:            tenantName,
 					}.Build(),
@@ -1125,6 +1141,169 @@ var _ = Describe("run", func() {
 
 				Expect(err).To(MatchError(expectedErr))
 				Expect(hasFinalizer(tenant)).To(BeTrue())
+			})
+		})
+
+		When("projects remain for the tenant during delete", func() {
+			It("does not delete hub Tenant CR or Namespace while projects remain for the tenant", func() {
+				existing := newTenantCR(tenantID, namespace1, tenantID, nil)
+				existingNS := &corev1.Namespace{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: tenantID,
+					},
+				}
+				fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(existing, existingNS).Build()
+
+				projectsMock := NewMockProjectsClient(ctrl)
+				projectsMock.EXPECT().
+					List(gomock.Any(), gomock.Any()).
+					DoAndReturn(func(_ context.Context, req *privatev1.ProjectsListRequest, _ ...grpc.CallOption) (*privatev1.ProjectsListResponse, error) {
+						Expect(req.GetFilter()).To(Equal(fmt.Sprintf("this.metadata.tenant == %q", tenantID)))
+						Expect(req.GetLimit()).To(Equal(int32(0)))
+						return privatev1.ProjectsListResponse_builder{Total: 1}.Build(), nil
+					})
+
+				tenant := privatev1.Tenant_builder{
+					Id: tenantID,
+					Metadata: privatev1.Metadata_builder{
+						Name:              tenantID,
+						Finalizers:        []string{finalizers.TenantLifecycle, finalizers.TenantOnboarding},
+						DeletionTimestamp: timestamppb.Now(),
+						Tenant:            tenantName,
+					}.Build(),
+				}.Build()
+
+				f := newFunction(mockHubCache, mockHubs, mockTenants, projectsMock)
+				err := f.run(ctx, tenant)
+
+				Expect(err).To(MatchError(ContainSubstring("tenant still has 1 project(s) pending deletion")))
+				var retryable interface{ RequeueAfter() time.Duration }
+				Expect(errors.As(err, &retryable)).To(BeTrue())
+				Expect(retryable.RequeueAfter()).To(Equal(time.Second))
+				var backoff interface{ UseExponentialBackoff() bool }
+				Expect(errors.As(err, &backoff)).To(BeTrue())
+				Expect(backoff.UseExponentialBackoff()).To(BeTrue())
+				Expect(hasFinalizer(tenant)).To(BeTrue())
+
+				gotCR := &osacv1alpha1.Tenant{}
+				Expect(fakeClient.Get(ctx, clnt.ObjectKey{Namespace: namespace1, Name: tenantID}, gotCR)).To(Succeed())
+				Expect(gotCR.DeletionTimestamp).To(BeNil())
+
+				gotNS := &corev1.Namespace{}
+				Expect(fakeClient.Get(ctx, clnt.ObjectKey{Name: tenantID}, gotNS)).To(Succeed())
+				Expect(gotNS.DeletionTimestamp).To(BeNil())
+			})
+
+			It("returns error without listing hubs when querying remaining projects fails", func() {
+				projectsMock := NewMockProjectsClient(ctrl)
+				projectsMock.EXPECT().
+					List(gomock.Any(), gomock.Any()).
+					Return(nil, errors.New("projects db error"))
+
+				tenant := privatev1.Tenant_builder{
+					Id: tenantID,
+					Metadata: privatev1.Metadata_builder{
+						Name:              tenantID,
+						Finalizers:        []string{finalizers.TenantLifecycle, finalizers.TenantOnboarding},
+						DeletionTimestamp: timestamppb.Now(),
+						Tenant:            tenantName,
+					}.Build(),
+				}.Build()
+
+				f := newFunction(mockHubCache, mockHubs, mockTenants, projectsMock)
+				err := f.run(ctx, tenant)
+
+				Expect(err).To(MatchError(ContainSubstring("failed to query for remaining projects: projects db error")))
+				var retryable interface{ RequeueAfter() time.Duration }
+				Expect(errors.As(err, &retryable)).To(BeTrue())
+				Expect(retryable.RequeueAfter()).To(Equal(time.Second))
+				var backoff interface{ UseExponentialBackoff() bool }
+				Expect(errors.As(err, &backoff)).To(BeTrue())
+				Expect(backoff.UseExponentialBackoff()).To(BeTrue())
+				Expect(hasFinalizer(tenant)).To(BeTrue())
+			})
+
+			It("converges across reconciles from remaining projects to hub CR deletion to finalizer removal", func() {
+				existing := newTenantCR(tenantID, namespace1, tenantID, nil)
+				existing.Finalizers = []string{"osac.openshift.io/storage"}
+				existingNS := &corev1.Namespace{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: tenantID,
+					},
+				}
+				fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(existing, existingNS).Build()
+
+				projectsMock := NewMockProjectsClient(ctrl)
+				gomock.InOrder(
+					projectsMock.EXPECT().
+						List(gomock.Any(), gomock.Any()).
+						Return(privatev1.ProjectsListResponse_builder{Total: 1}.Build(), nil),
+					projectsMock.EXPECT().
+						List(gomock.Any(), gomock.Any()).
+						Return(privatev1.ProjectsListResponse_builder{Total: 0}.Build(), nil),
+					projectsMock.EXPECT().
+						List(gomock.Any(), gomock.Any()).
+						Return(privatev1.ProjectsListResponse_builder{Total: 0}.Build(), nil),
+				)
+
+				mockHubs.EXPECT().
+					List(gomock.Any(), gomock.Any()).
+					Return(&privatev1.HubsListResponse{
+						Size:  1,
+						Total: 1,
+						Items: []*privatev1.Hub{
+							privatev1.Hub_builder{Id: hub1ID}.Build(),
+						},
+					}, nil).
+					Times(2)
+
+				mockHubCache.EXPECT().
+					Get(gomock.Any(), hub1ID).
+					Return(&controllers.HubEntry{Namespace: namespace1, Client: fakeClient}, nil).
+					Times(2)
+
+				mockTenants.EXPECT().
+					Update(gomock.Any(), gomock.Any(), gomock.Any()).
+					DoAndReturn(func(_ context.Context, req *privatev1.TenantsUpdateRequest, _ ...grpc.CallOption) (*privatev1.TenantsUpdateResponse, error) {
+						return &privatev1.TenantsUpdateResponse{Object: req.GetObject()}, nil
+					}).
+					Times(1)
+
+				tenant := privatev1.Tenant_builder{
+					Id: tenantID,
+					Metadata: privatev1.Metadata_builder{
+						Name:              tenantID,
+						Finalizers:        []string{finalizers.TenantLifecycle, finalizers.TenantOnboarding},
+						DeletionTimestamp: timestamppb.Now(),
+						Tenant:            tenantName,
+					}.Build(),
+				}.Build()
+
+				f := newFunction(mockHubCache, mockHubs, mockTenants, projectsMock)
+
+				// Step 1: Project still exists -> hub Tenant CR and Namespace are untouched.
+				err := f.run(ctx, tenant)
+				Expect(err).To(MatchError(ContainSubstring("tenant still has 1 project(s) pending deletion")))
+				Expect(hasFinalizer(tenant)).To(BeTrue())
+				gotCR := &osacv1alpha1.Tenant{}
+				Expect(fakeClient.Get(ctx, clnt.ObjectKey{Namespace: namespace1, Name: tenantID}, gotCR)).To(Succeed())
+				Expect(gotCR.DeletionTimestamp).To(BeNil())
+
+				// Step 2: Project archived -> hub Tenant CR has DeletionTimestamp set (held by storage finalizer), requeues at 1s.
+				err = f.run(ctx, tenant)
+				Expect(err).To(MatchError(ContainSubstring("tenant CR still present")))
+				Expect(hasFinalizer(tenant)).To(BeTrue())
+				Expect(fakeClient.Get(ctx, clnt.ObjectKey{Namespace: namespace1, Name: tenantID}, gotCR)).To(Succeed())
+				Expect(gotCR.DeletionTimestamp).NotTo(BeNil())
+
+				// Simulate StorageReconciler removing its finalizer once workloads and storage teardown complete.
+				gotCR.Finalizers = nil
+				Expect(fakeClient.Update(ctx, gotCR)).To(Succeed())
+
+				// Step 3: Hub Tenant CR is gone -> TenantOnboarding finalizer is removed.
+				err = f.run(ctx, tenant)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(hasFinalizer(tenant)).To(BeFalse())
 			})
 		})
 	})

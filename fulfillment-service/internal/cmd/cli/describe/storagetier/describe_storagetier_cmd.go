@@ -22,10 +22,10 @@ import (
 	"github.com/spf13/cobra"
 	"google.golang.org/protobuf/proto"
 
-	publicv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/public/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/cmd/cli/lookup"
 	"github.com/osac-project/osac/fulfillment-service/internal/config"
 	"github.com/osac-project/osac/fulfillment-service/internal/terminal"
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
 
 // Cmd creates the command to describe a storage tier.
@@ -111,9 +111,6 @@ func renderStorageTier(w io.Writer, st *publicv1.StorageTier) {
 	fmt.Fprintf(writer, "Name:\t%s\n", name)
 	fmt.Fprintf(writer, "Description:\t%s\n", description)
 	fmt.Fprintf(writer, "Protocol:\t%s\n", protocol)
-	fmt.Fprintf(writer, "Max Read BW (MB/s):\t%d\n", st.GetSpec().GetMaxReadBandwidthMbs())
-	fmt.Fprintf(writer, "Max Write BW (MB/s):\t%d\n", st.GetSpec().GetMaxWriteBandwidthMbs())
-	fmt.Fprintf(writer, "Encryption Enabled:\t%t\n", st.GetSpec().GetEncryptionEnabled())
 	fmt.Fprintf(writer, "State:\t%s\n", state)
 	fmt.Fprintf(writer, "Message:\t%s\n", message)
 
@@ -125,8 +122,7 @@ const shortHelp = `Describe a storage tier`
 const longHelp = `
 Describe a storage tier.
 
-Displays detailed information about a storage tier, including protocol, QoS settings (bandwidth
-limits), and encryption configuration.
+Displays detailed information about a storage tier, including protocol and current state.
 
 To describe a storage tier by name:
 

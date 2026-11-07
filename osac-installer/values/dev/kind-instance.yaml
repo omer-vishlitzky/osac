@@ -1,5 +1,31 @@
 # Kind dev environment -- instance values for osac chart.
 
+# --- Service Enablement ---
+global:
+  fulfillmentTrust:
+    enabled: false
+  # Provider networking disabled: networking resources become READY without
+  # provider work. The osac chart renders the Netris Fabric Manager and
+  # cudn_evpn Kubernetes Manager registrations from fabricManager and
+  # k8sManager; no Netris connection settings are needed.
+  networking:
+    provisioningEnabled: false
+    fabricManager: netris
+    k8sManager: cudn_evpn
+    # TEST-NET-1 (RFC 5737): the fulfillment it/ specs assert that VirtualNetwork
+    # and ExternalIPPool creates overlapping it are rejected.
+    excludedIpv4Cidrs:
+      - 192.0.2.0/24
+  services:
+    caas:
+      enabled: true
+    vmaas:
+      enabled: true
+    bmaas:
+      enabled: true
+    maas:
+      enabled: false
+
 # --- Operator ---
 operator:
   image:
@@ -16,13 +42,13 @@ operator:
       key: token
   fulfillment:
     serverAddress: "fulfillment-internal-api:8001"
-    tokenFile: "/var/run/secrets/kubernetes.io/serviceaccount/token"
+    credentials:
+      secretName: fulfillment-controller-credentials
+      clientIdKey: client-id
+      clientSecretKey: client-secret
   controllers:
-    clusterOrder: true
-    computeInstance: true
     tenant: true
     networking: true
-    bareMetalInstance: true
   certs:
     issuerRef:
       name: default-ca
@@ -33,11 +59,17 @@ operator:
 service:
   variant: kind
   consoleProxy:
-    disabled: true
+    disabled: false
   externalHostname: fulfillment-api.osac.svc.cluster.local
   internalHostname: fulfillment-internal-api.osac.svc.cluster.local
+  mcp:
+    exchangeClientId: https://mcp.osac.localhost:8443/
+    exchangeCredentialsSecret: osac-mcp-exchange-credentials
   images:
-    service: ghcr.io/osac-project/fulfillment-service:latest
+    service:
+      repository: ghcr.io/osac-project/fulfillment-service
+      tag: latest
+      pullPolicy: IfNotPresent
   certs:
     issuerRef:
       kind: ClusterIssuer
@@ -48,8 +80,6 @@ service:
     issuerUrl: https://keycloak.keycloak.svc.cluster.local:8443/realms/osac
     emergencyServiceAccounts:
       - admin
-      - osac-operator
-      - osac-operator-controller-manager
     controllerCredentials:
       - secret:
           name: fulfillment-controller-credentials
@@ -88,7 +118,6 @@ service:
   log:
     level: debug
   vault:
-    endpoint: "https://openbao.osac.svc.cluster.local:8200"
     namespace: osac
     kvMountPath: secret
     lifecycleRole: lifecycle
@@ -118,9 +147,11 @@ aap:
     publishTemplates:
       enabled: false
 
-# --- Bare Metal Fulfillment (disabled) ---
+# --- Bare Metal Fulfillment (no Metal3 in Kind — deploy chart but 0 replicas) ---
 bmf:
-  enabled: false
+  replicaCount: 0
+  secretAPI:
+    issuerUrl: https://keycloak.keycloak.svc.cluster.local:8443/realms/osac
   secrets:
     inventoryConfig: osac-inventory-config-metal3-test
     managementConfig: osac-management-config-metal3-test
@@ -140,24 +171,8 @@ validation:
 dbMigrate:
   enabled: false
 
-# --- Instance Groups (disabled) ---
-instanceGroups:
-  enabled: false
-
-# --- Cluster/Network/Storage Fulfillment (disabled) ---
-clusterFulfillment:
-  enabled: false
-networkFulfillment:
-  enabled: false
-storageFulfillment:
-  enabled: false
-
 # --- UI (disabled -- uses OpenShift Route, run via pnpm dev instead) ---
 ui:
-  enabled: false
-
-# --- MetalLB (disabled) ---
-metallb:
   enabled: false
 
 # --- CAPI Provider (disabled) ---
@@ -167,8 +182,3 @@ capiProvider:
 kafka:
   enabled: true
   replicas: 1
-
-# --- Vault compatible secret store (OpenBao) ---
-bundledVault:
-  enabled: true
-  devRootToken: "dev-root-token"

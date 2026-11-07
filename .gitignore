@@ -1,3 +1,6 @@
+# Agentic-CI sandbox toolchain directory (downloaded by .agentic-ci/config.yml setup)
+.agentic-ci-tools/
+
 # AI workflows and skills (installed by tools/bootstrap.sh)
 skills/
 .ai-workflows/
@@ -5,13 +8,15 @@ skills/
 # this path and drop the ignore.
 .osac-ai-skills/
 
-# Skill-relative sibling checkouts (tools/bootstrap.sh). osac-docs is
-# osac-project/docs — do not ignore docs/ (in-tree ARCHITECTURE/CONVENTIONS).
-# osac-test-infra/ is kept so leftover clones from older bootstrap runs
-# are not committed; bootstrap no longer creates it (E2E is tests/e2e/).
+# Skill-relative sibling checkouts (tools/bootstrap.sh).
+# osac-test-infra/ and osac-docs/ are kept so leftover clones from older
+# bootstrap runs are not committed; bootstrap no longer creates either
+# (E2E is tests/e2e/; docs content is in-tree under docs/). osac-ui/ was
+# removed from this list once it stopped being a sibling checkout and
+# became real tracked content in this repo -- this entry would otherwise
+# silently gitignore any new file created under it.
 enhancement-proposals/
 osac-ux/
-osac-ui/
 osac-test-infra/
 osac-docs/
 
@@ -26,6 +31,7 @@ osac-docs/
 .claude/hooks/README.md
 .cursor/
 .gemini/
+.opencode/
 # Codex skill-discovery umbrella (.agents/skills -> ../skills), materialized by
 # tools/link-agent-skills.sh --codex; generated output, never committed.
 .agents/
@@ -97,9 +103,14 @@ Thumbs.db
 *.crt
 
 # Local dev artifacts
+.worktrees/
 .artifacts
 .artifacts/
 __pycache__
+
+# proto (shared proto sources + generated Go)
+/proto/.buf
+/proto/bin
 
 # fulfillment-service
 /fulfillment-service/bin
@@ -231,7 +242,13 @@ cython_debug/
 **/dockerconfig.json
 **/*pull-secret.json
 [lL]icense.zip
+[mM]360-api-key
 **/osac-aap-secrets.env
 **/server-ssh-key
 **/server-ssh-bastion-key
+osac-installer/values/*/netris-runtime.yaml
 osac-installer/charts/osac/tmpcharts*/
+m360-local.yaml
+
+# Task coverage runs of the osac-aap make targets
+osac-aap/tests/coverage/.runs/

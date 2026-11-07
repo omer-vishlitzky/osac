@@ -22,8 +22,25 @@ readonly NIGHTLY_CHART_SLACK_ORDER=(
     osac
 )
 
+# Every umbrella dependency, mapped "<Chart.yaml dependency name>:<owning
+# component>" -- the owning component is what COMPONENT_VERSIONS (nightly-
+# build.yaml's per-release-cut version map) is keyed by.
+# osac-operator-crds and bare-metal-fulfillment-operator-crds share their
+# owning component's version with their non-crds sibling chart; they have no
+# independent release cadence of their own.
+readonly MONO_REPO_UMBRELLA_DEPENDENCIES=(
+    "osac-operator-crds:osac-operator"
+    "osac-operator:osac-operator"
+    "fulfillment-service:fulfillment-service"
+    "osac-aap:osac-aap"
+    "bare-metal-fulfillment-operator-crds:bare-metal-fulfillment-operator"
+    "bare-metal-fulfillment-operator:bare-metal-fulfillment-operator"
+    "osac-metering:osac-metering"
+    "osac-ui:osac-ui"
+)
+
 # CI overlay values files with their own separate floating image tag
-# overrides for mono-repo components (operator/aap/bmf/metering/csiDriver),
+# overrides for mono-repo components (operator/aap/bmf/metering),
 # on top of the umbrella chart's own values.yaml. Not every file overrides
 # every component -- see stamp_ci_overlay_if_present.
 readonly NIGHTLY_CI_OVERLAY_VALUES=(
@@ -31,6 +48,7 @@ readonly NIGHTLY_CI_OVERLAY_VALUES=(
     osac-installer/values/vmaas-ci/instance.yaml
     osac-installer/values/bmaas-ci/instance.yaml
     osac-installer/values/full-ci/instance.yaml
+    osac-installer/values/full-ci/netris.yaml
 )
 
 # Usage: append_chart_source <manifest_file> <chart_name> <version> [short_sha] [full_sha]
@@ -43,61 +61,6 @@ append_chart_source() {
     else
         printf '%s %s\n' "${chart_name}" "${version}" >> "${manifest_file}"
     fi
-}
-
-# Usage: check_osac_ui_image [repo_name]
-# Resolve osac-ui@main HEAD and verify ghcr.io/osac-project/<repo>:sha-<7> exists.
-# Prints the full commit SHA on stdout; fails if the image is not published yet.
-check_osac_ui_image() {
-    local repo="${1:-osac-ui}"
-    local sha tag token safe_repo safe_sha attempt
-
-    if [[ ! "${repo}" =~ ^[a-zA-Z0-9._-]+$ ]]; then
-        safe_repo=$(_gha_sanitize_for_message "${repo}")
-        echo "::error::Invalid osac-ui repo name '${safe_repo}' — must match [a-zA-Z0-9._-]+" >&2
-        return 1
-    fi
-
-    for attempt in 1 2 3; do
-        if sha=$(git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=10 \
-            ls-remote "https://github.com/osac-project/${repo}.git" refs/heads/main | cut -f1); then
-            [[ -n "${sha}" ]] && break
-        fi
-        if (( attempt < 3 )); then
-            echo "  check_osac_ui_image: git ls-remote attempt ${attempt}/3 failed, retrying in 5s..." >&2
-            sleep 5
-        fi
-    done
-
-    if [[ -z "${sha}" || ! "${sha}" =~ ^[0-9a-f]{40}$ ]]; then
-        safe_sha=$(_gha_sanitize_for_message "${sha}")
-        safe_repo=$(_gha_sanitize_for_message "${repo}")
-        echo "::error::Could not resolve ${safe_repo} main HEAD SHA (got: '${safe_sha}')" >&2
-        return 1
-    fi
-
-    tag="sha-${sha:0:7}"
-    safe_repo=$(_gha_sanitize_for_message "${repo}")
-    if ! token=$(http_json "Could not obtain GHCR token to verify ${safe_repo}:${tag}" 3 5 '.token' \
-        "https://ghcr.io/token?scope=repository:osac-project/${repo}:pull"); then
-        echo "::error::Could not obtain GHCR token to verify ${safe_repo}:${tag}" >&2
-        return 1
-    fi
-    if [[ -z "${token}" || "${token}" == "null" ]]; then
-        echo "::error::GHCR token is empty or null for ${safe_repo}:${tag}" >&2
-        return 1
-    fi
-
-    if ! http_retry "${safe_repo} main HEAD ${sha:0:7} has no published image (tag ${tag})" 3 5 \
-        -s -o /dev/null \
-        -H "Authorization: Bearer ${token}" \
-        -H "Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json" \
-        "https://ghcr.io/v2/osac-project/${repo}/manifests/${tag}"; then
-        echo "::error::${safe_repo} main HEAD ${sha:0:7} has no published image (tag ${tag})" >&2
-        return 1
-    fi
-
-    echo "${sha}"
 }
 
 # Usage: retag_component_image <image_repo> <source_short_sha> <target_version>
@@ -168,14 +131,47 @@ stamp_component_image_refs() {
             stamp_umbrella_nested_field "${umbrella_values}" bmf image tag "${tag_value}"
             ;;
         fulfillment-service)
-            IMAGE_REF="ghcr.io/osac-project/fulfillment-service:${tag_value}" \
-                yq -i '.images.service = strenv(IMAGE_REF)' "fulfillment-service/charts/service/values.yaml"
-            stamp_umbrella_nested_field "${umbrella_values}" service images service "ghcr.io/osac-project/fulfillment-service:${tag_value}"
+            TAG_VALUE="${tag_value}" \
+                yq -i '.images.service.tag = strenv(TAG_VALUE)' "fulfillment-service/charts/service/values.yaml"
+            # Stamp tag in the umbrella values (4-level path: service.images.service.tag).
+            # Uses awk (same rationale as stamp_umbrella_nested_field) to preserve
+            # formatting -- yq -i reformats the file and breaks ct-lint's yamllint.
+            local _tmp; _tmp="$(mktemp)"
+            if ! awk -v val="${tag_value}" '
+                BEGIN { depth=0; stamped=0 }
+                /^service:/ { depth=1; print; next }
+                depth==1 && /^  images:/ { depth=2; print; next }
+                depth==2 && /^    service:/ { depth=3; print; next }
+                depth==3 && /^      tag:/ {
+                    match($0, /^[[:space:]]+/)
+                    pfx = substr($0, RSTART, RLENGTH)
+                    print pfx "tag: " val
+                    depth=0; stamped=1; next
+                }
+                /^[^ #\t]/ && depth > 0 { depth=0 }
+                { print }
+                END { exit(stamped ? 0 : 1) }
+            ' "${umbrella_values}" > "${_tmp}"; then
+                rm -f "${_tmp}"
+                echo "::error::service.images.service.tag not found in ${umbrella_values}" >&2
+                return 1
+            fi
+            chmod --reference="${umbrella_values}" "${_tmp}"
+            mv "${_tmp}" "${umbrella_values}"
             ;;
         osac-aap)
             IMAGE_REF="ghcr.io/osac-project/osac-aap:${tag_value}" \
                 yq -i '.bootstrap.image = strenv(IMAGE_REF)' "osac-aap/charts/aap/values.yaml"
             stamp_umbrella_nested_field "${umbrella_values}" aap bootstrap image "ghcr.io/osac-project/osac-aap:${tag_value}"
+            # configAsCode.eeImage is the execution-environment image AAP's
+            # config-as-code sync uses (osac-aap/charts/aap/templates/config-as-code-secret.yaml)
+            # -- the same osac-aap image as bootstrap.image above, just a
+            # separate values.yaml field. Previously left at its committed
+            # "" placeholder in every published chart until this was fixed
+            # in OSAC-5183.
+            IMAGE_REF="ghcr.io/osac-project/osac-aap:${tag_value}" \
+                yq -i '.configAsCode.eeImage = strenv(IMAGE_REF)' "osac-aap/charts/aap/values.yaml"
+            stamp_umbrella_nested_field "${umbrella_values}" aap configAsCode eeImage "ghcr.io/osac-project/osac-aap:${tag_value}"
             ;;
         osac-metering)
             TAG_VALUE="${tag_value}" yq -i '.image.tag = strenv(TAG_VALUE)' "osac-metering/charts/osac-metering/values.yaml"
@@ -192,7 +188,15 @@ stamp_component_image_refs() {
             ;;
         osac-csi-driver)
             TAG_VALUE="${tag_value}" yq -i '.image.tag = strenv(TAG_VALUE)' "osac-csi-driver/charts/csi-driver/values.yaml"
-            stamp_umbrella_nested_field "${umbrella_values}" csiDriver image tag "${tag_value}"
+            ;;
+        osac-ui)
+            # osac-ui/charts/ui/templates/deployment.yaml reads .Values.images.ui.
+            # Image tags are bare SemVer, matching other components. Mono-repo
+            # promote-and-publish retags sha-* to ${SUB_VERSION} without a v-prefix.
+            # Do not reintroduce a v-prefix special case.
+            IMAGE_REF="ghcr.io/osac-project/osac-ui:${tag_value}" \
+                yq -i '.images.ui = strenv(IMAGE_REF)' "osac-ui/charts/ui/values.yaml"
+            stamp_umbrella_nested_field "${umbrella_values}" ui images ui "ghcr.io/osac-project/osac-ui:${tag_value}"
             ;;
         *)
             echo "::error::stamp_component_image_refs: unknown component '${component}'" >&2
@@ -240,6 +244,67 @@ read_validated_chart_name() {
         return 1
     fi
     echo "${chart_name}"
+}
+
+# Usage: push_and_sign_chart <chart_tgz_path> <chart_name> <oci_repo>
+# Pushes a packaged chart to <oci_repo> (no oci:// prefix) and signs the
+# resulting OCI artifact keylessly with cosign, using the calling workflow's
+# GitHub Actions OIDC identity (Fulcio/Rekor). Requires cosign already
+# installed on PATH and the calling job to grant permissions: id-token: write.
+# Digest is parsed straight from `helm push`'s own stdout ("Digest:
+# sha256:...") -- skopeo/crane-style inspection doesn't support Helm's OCI
+# artifact media type, so there's no simpler way to resolve it.
+push_and_sign_chart() {
+    local chart_tgz="$1" chart_name="$2" oci_repo="$3"
+    local output digest status=0
+    local output_file
+    output_file=$(mktemp)
+    trap 'rm -f "${output_file}"' RETURN
+
+    # GHCR has been observed to fail the final "Tag" step of an OCI push
+    # with "not found" for a digest it was just handed -- a propagation
+    # delay on the registry side (confirmed live: the identical push
+    # succeeded for every other chart in the same job seconds earlier, and
+    # the next nightly run's identical push succeeded outright). Retry a
+    # few times via the shared retry_command helper before giving up.
+    #
+    # helm's output goes to a file rather than a `local output=$(...)`
+    # capture so retry_command can drive the retry loop itself: a bare
+    # assignment like that makes its exit status the exit status of the
+    # command substitution, which under set -e would abort the function
+    # right here on a failed push, before the "echo output" below ever
+    # runs, silently discarding the one place helm's real error text lives
+    # (confirmed live: a real push failure produced zero diagnostic output,
+    # just "Process completed with exit code 1").
+    retry_command 60 10 bash -c 'helm push "$1" "oci://$2" > "$3" 2>&1' _ \
+        "${chart_tgz}" "${oci_repo}" "${output_file}" || status=$?
+    output=$(cat "${output_file}")
+    echo "${output}"
+    if [[ "${status}" -ne 0 ]]; then
+        echo "::error::helm push failed for ${chart_name} (exit ${status}) -- see output above" >&2
+        return "${status}"
+    fi
+
+    digest=$(grep -oE '^Digest: sha256:[0-9a-f]+' <<<"${output}" | cut -d' ' -f2)
+    if [[ -z "${digest}" ]]; then
+        echo "::error::Could not parse digest from helm push output for ${chart_name}" >&2
+        return 1
+    fi
+
+    # `|| status=$?` (not `if ! cosign ...; then status=$?`) for two
+    # reasons: `!` inverts $? itself, so a `then`-block `status=$?` would
+    # capture the inverted 0/1 boolean, not cosign's real exit code
+    # (confirmed live: that form reported a real signing failure as
+    # status 0); and leaving this as a bare last statement is aborted by
+    # errexit without ever running the RETURN trap above (also confirmed
+    # live -- unlike an explicit `return`, errexit on a function's last
+    # command skips RETURN traps entirely), which would leak output_file.
+    retry_command 60 10 cosign sign --yes "${oci_repo}/${chart_name}@${digest}" || status=$?
+    if [[ "${status}" -ne 0 ]]; then
+        echo "::error::cosign sign failed for ${chart_name} (exit ${status})" >&2
+        rm -f "${output_file}"
+        return "${status}"
+    fi
 }
 
 # Usage: compute_nightly_chart_version <base_tag> <nightly_suffix>
@@ -318,12 +383,12 @@ stamp_umbrella_nested_field() {
 
 # Usage: stamp_ci_overlay_if_present <values_yaml> <yq_path> <new_value>
 # Stamps an arbitrary-depth field (e.g. .metering.echoAdapter.image.tag) in a
-# CI overlay file (osac-installer/values/*/instance.yaml), only if that path
+# CI overlay file (osac-installer/values/*/instance.yaml or netris.yaml), only if that path
 # already resolves to a non-null value in the file -- `yq -e <path> <file>`
 # exits non-zero when the path is absent/null, which we use purely as an
 # existence check (its own stdout/stderr is discarded). This avoids yq -i's
 # default auto-vivification behavior, which would otherwise silently create
-# a whole new key structure (e.g. add a `csiDriver:` block) in overlay files
+# a whole new key structure in overlay files
 # that don't already configure that component. Unlike
 # stamp_umbrella_nested_field, this uses yq -i directly (not awk): these CI
 # overlay files are not yamllint/ct-lint-checked anywhere in this pipeline,
@@ -483,43 +548,58 @@ _build_slack_charts_table() {
     printf '%s' "${table}"
 }
 
-# Usage: rewrite_umbrella_osac_ui_dependency <chart_yaml> <ui_version> <oci_repo>
+# Usage: rewrite_umbrella_dependency <chart_yaml> <dep_name> <version> <oci_repo>
 # yamllint is not performed on Chart.yaml. Hence, use of yq is safe here.
-rewrite_umbrella_osac_ui_dependency() {
-    local chart_yaml="$1" ui_version="$2" oci_repo="$3"
+rewrite_umbrella_dependency() {
+    local chart_yaml="$1" dep_name="$2" version="$3" oci_repo="$4"
     local safe_chart_yaml
     if [[ ! -f "${chart_yaml}" ]]; then
         safe_chart_yaml=$(_gha_sanitize_for_message "${chart_yaml}")
         echo "::error::Chart manifest not found: ${safe_chart_yaml}" >&2
         return 1
     fi
-    UI_VERSION="${ui_version}" yq -i \
-        '(.dependencies[] | select(.name == "osac-ui")).version = strenv(UI_VERSION)' \
+    DEP_NAME="${dep_name}" DEP_VERSION="${version}" yq -i \
+        '(.dependencies[] | select(.name == strenv(DEP_NAME))).version = strenv(DEP_VERSION)' \
         "${chart_yaml}"
-    UI_REPO="${oci_repo}" yq -i \
-        '(.dependencies[] | select(.name == "osac-ui")).repository = strenv(UI_REPO)' \
+    DEP_NAME="${dep_name}" DEP_REPO="${oci_repo}" yq -i \
+        '(.dependencies[] | select(.name == strenv(DEP_NAME))).repository = strenv(DEP_REPO)' \
         "${chart_yaml}"
 }
 
-# Usage: rewrite_umbrella_osac_ui_dependency_and_rebuild <chart_yaml> <ui_version> <oci_repo>
-rewrite_umbrella_osac_ui_dependency_and_rebuild() {
-    local chart_yaml="$1" ui_version="$2" oci_repo="$3"
-    local chart_dir
-    chart_dir=$(dirname "${chart_yaml}")
+# Usage: rewrite_umbrella_mono_repo_dependencies <chart_yaml> <oci_repo> <component_versions_json> [skipped_file]
+# Rewrite every umbrella dependency (see MONO_REPO_UMBRELLA_DEPENDENCIES)
+# from its committed file:// path to a pinned oci:// reference, for every
+# dependency whose owning
+# component has a resolved version in component_versions_json (a JSON map
+# of component name -> version, same shape as nightly-build.yaml's
+# COMPONENT_VERSIONS output). A dependency whose owning component has no
+# resolved version is left on its committed file:// path -- mirrors how the
+# nightly build already skips packaging/publishing that component's
+# sub-chart entirely when it has no release tag yet, so there is nothing to
+# point the umbrella at. That's an expected, non-error state (e.g. a
+# brand-new component with no release cut yet), so it's still a ::warning::
+# here, not a failure -- but a raw log warning is easy to miss on an
+# otherwise-green nightly run, so also record it (one "<dep_name> (<component>:
+# no resolved version this run)" line per skip) to skipped_file when given,
+# so a caller can surface it somewhere a human actually looks (see
+# build_slack_skipped_umbrella_dependencies_summary).
+rewrite_umbrella_mono_repo_dependencies() {
+    local chart_yaml="$1" oci_repo="$2" component_versions_json="$3" skipped_file="${4:-}"
+    local entry dep_name component version
 
-    rewrite_umbrella_osac_ui_dependency "${chart_yaml}" "${ui_version}" "${oci_repo}"
-    rm -f "${chart_dir}/Chart.lock"
-    helm dependency build "${chart_dir}/"
-}
-
-# Usage: stamp_osac_ui_chart <chart_dir> <sub_version> <image_ref>
-# The subchart is not subject to yamllinting. Hence, safe to use yq here.
-stamp_osac_ui_chart() {
-    local chart_dir="$1" sub_version="$2" image_ref="$3"
-    # osac-ui/charts/ui/templates/deployment.yaml reads .Values.images.ui
-    SUB_VERSION="${sub_version}" yq -i '.version = strenv(SUB_VERSION)' "${chart_dir}/Chart.yaml"
-    SUB_VERSION="${sub_version}" yq -i '.appVersion = strenv(SUB_VERSION)' "${chart_dir}/Chart.yaml"
-    IMAGE_REF="${image_ref}" yq -i '.images.ui = strenv(IMAGE_REF)' "${chart_dir}/values.yaml"
+    for entry in "${MONO_REPO_UMBRELLA_DEPENDENCIES[@]}"; do
+        dep_name="${entry%%:*}"
+        component="${entry#*:}"
+        version=$(jq -r --arg k "${component}" '.[$k] // empty' <<<"${component_versions_json}")
+        if [[ -z "${version}" ]]; then
+            echo "::warning::Skipping OCI rewrite for ${dep_name} — no resolved version for ${component} this run (stays on its committed file:// path)" >&2
+            if [[ -n "${skipped_file}" ]]; then
+                printf '%s (%s: no resolved version this run)\n' "${dep_name}" "${component}" >> "${skipped_file}"
+            fi
+            continue
+        fi
+        rewrite_umbrella_dependency "${chart_yaml}" "${dep_name}" "${version}" "${oci_repo}"
+    done
 }
 
 # Usage: chart_version_url <chart_name> <version> <repo_owner>
@@ -618,6 +698,28 @@ build_slack_images_published_summary() {
     fi
 
     printf '*Images published:*\n```\n%s\n```' "${content}"
+}
+
+# Usage: build_slack_skipped_umbrella_dependencies_summary <skipped_file>
+# Surface any umbrella dependency that stayed on its committed file:// path
+# this run (no resolved release tag yet for its owning component -- see
+# rewrite_umbrella_mono_repo_dependencies) in the same Slack message every
+# other nightly success is already posted to, since nothing about a green
+# nightly run otherwise prompts anyone to go looking for this in the raw
+# job logs. Unlike build_slack_images_published_summary, a missing or empty
+# skipped_file is the expected common case (every mono-repo component
+# already has a release tag most nights) -- not a warning, just an empty
+# string so the caller omits this Slack block entirely.
+build_slack_skipped_umbrella_dependencies_summary() {
+    local skipped_file="$1"
+    local content
+
+    if [[ ! -s "${skipped_file}" ]]; then
+        return 0
+    fi
+
+    content=$(<"${skipped_file}")
+    printf ':warning: *Umbrella dependencies still on `file://` this run (no release tag yet):*\n```\n%s\n```' "${content}"
 }
 
 # Usage: build_slack_charts_published_summary <manifest_file> <repo_owner>

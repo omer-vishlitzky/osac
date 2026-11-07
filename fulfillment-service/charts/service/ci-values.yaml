@@ -24,6 +24,14 @@ certs:
 externalHostname: fulfillment-api.ci.example.com
 internalHostname: fulfillment-internal-api.ci.example.com
 
+# Exercise the opt-in MCP templates in the existing chart lint/render job.
+mcp:
+  enabled: true
+  externalHostname: mcp.default.localhost
+  externalPort: 443
+  exchangeClientId: https://mcp.default.localhost/
+  exchangeCredentialsSecret: ci-mcp-exchange-credentials
+
 auth:
   issuerUrl: https://issuer.ci.example.com
   controllerCredentials:
@@ -56,3 +64,27 @@ database:
       items:
       - key: uri
         param: url
+
+kafka:
+  connection:
+  - secret:
+      name: ci-kafka
+      items:
+      - key: brokers
+        param: brokers
+      - key: user
+        param: user
+      - key: password
+        param: password
+
+vault:
+  endpoint: https://vault.ci.example.com
+  lifecycleRole: ci-lifecycle
+  keycloakClientId: ci-vault-client
+  keycloakIssuerUrl: https://idp.ci.example.com/realms/osac
+  credentials:
+  - secret:
+      name: ci-vault-credentials
+      items:
+      - key: client-secret
+        param: client-secret

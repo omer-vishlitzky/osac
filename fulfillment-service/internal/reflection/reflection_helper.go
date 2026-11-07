@@ -25,14 +25,17 @@ import (
 	"github.com/gobuffalo/flect"
 	"golang.org/x/exp/maps"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	grpcstatus "google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/reflect/protoregistry"
+	"google.golang.org/protobuf/types/known/fieldmaskpb"
 
 	// This is needed to ensure that the types and services are loaded into the protocol buffers registry, otherwise
 	// they will be visible only if they are explicitly used in some part of the code.
-	_ "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
-	_ "github.com/osac-project/osac/fulfillment-service/internal/api/osac/public/v1"
+	_ "github.com/osac-project/osac/proto/gen/osac/private/v1"
+	_ "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
 
 // Helper simplifies use of the protocol buffers reflection facility. It knows how to extract from the descriptors the
@@ -71,12 +74,17 @@ type ObjectHelper interface {
 	GetName(object proto.Message) string
 	GetMetadata(object proto.Message) Metadata
 	Create(ctx context.Context, object proto.Message) (proto.Message, error)
-	Update(ctx context.Context, object proto.Message) (proto.Message, error)
+	IsUpdatable() bool
+	Update(ctx context.Context, object proto.Message) (UpdateResult, error)
+	UpdateWithMask(ctx context.Context, original, edited proto.Message) (UpdateResult, error)
 	Delete(ctx context.Context, id string) error
 	FindObject(ctx context.Context, ref string, console Renderer) (proto.Message, error)
 	SetTenant(object proto.Message, tenant string)
 	GetTenant(object proto.Message) string
 	IsTenantScoped() bool
+	SetProject(object proto.Message, project string)
+	GetProject(object proto.Message) string
+	IsProjectScoped() bool
 	UseGetForStructuredOutput() bool
 }
 
@@ -88,6 +96,7 @@ type HelperBuilder struct {
 	connection                  *grpc.ClientConn
 	packages                    map[string]int
 	tenantFunc                  any
+	projectFunc                 any
 	getForStructuredOutputTypes map[protoreflect.Name]bool
 }
 
@@ -99,6 +108,7 @@ type helper struct {
 	scanOnce                    *sync.Once
 	helpers                     []objectHelper
 	tenantFunc                  func(context.Context) (string, error)
+	projectFunc                 func(context.Context) (string, error)
 	getForStructuredOutputTypes map[protoreflect.Name]bool
 }
 
@@ -156,6 +166,21 @@ func (b *HelperBuilder) SetTenantFunc(value any) *HelperBuilder {
 	return b
 }
 
+// SetProjectFunc sets the function that returns the project. When this is set the helper will call the function to
+// obtain the project, and if it isn't empty, it will use it to automatically filter the results by project, as well
+// as to set the project on new objects. The function can be of the following types:
+//
+//   - func() string
+//   - func(context.Context) string
+//   - func() (string, error)
+//   - func(context.Context) (string, error)
+//
+// The Build method will verify that the function matches one of these signatures.
+func (b *HelperBuilder) SetProjectFunc(value any) *HelperBuilder {
+	b.projectFunc = value
+	return b
+}
+
 // UseGetForStructuredOutput marks the given proto message types as requiring the Get RPC instead
 // of List when fetching specific objects for structured output (yaml/json). Callers pass generated
 // proto message pointers so that a proto rename produces a compile error rather than a silent
@@ -195,6 +220,15 @@ func (b *HelperBuilder) Build() (result Helper, err error) {
 		}
 	}
 
+	// Normalize the project function to a canonical signature:
+	var projectFunc func(context.Context) (string, error)
+	if b.projectFunc != nil {
+		projectFunc, err = NormalizeFunc[string](b.projectFunc)
+		if err != nil {
+			return
+		}
+	}
+
 	// Prepare the set of packages:
 	packages := make(map[protoreflect.FullName]int, len(b.packages))
 	for name, order := range b.packages {
@@ -209,6 +243,7 @@ func (b *HelperBuilder) Build() (result Helper, err error) {
 		scanOnce:                    &sync.Once{},
 		helpers:                     []objectHelper{},
 		tenantFunc:                  tenantFunc,
+		projectFunc:                 projectFunc,
 		getForStructuredOutputTypes: b.getForStructuredOutputTypes,
 	}
 	return
@@ -259,7 +294,8 @@ func (h *helper) scanFile(fileDesc protoreflect.FileDescriptor) bool {
 }
 
 func (h *helper) scanService(serviceDesc protoreflect.ServiceDescriptor) {
-	// The service must have the get, list, update and delete method:
+	// The service must have the get, list, create and delete methods. Update is optional because some
+	// resources are intentionally immutable through the public API.
 	h.logger.Debug(
 		"Scanning service",
 		slog.String("service", string(serviceDesc.FullName())),
@@ -278,9 +314,6 @@ func (h *helper) scanService(serviceDesc protoreflect.ServiceDescriptor) {
 		return
 	}
 	updateDesc := methodDescs.ByName(updateMethodName)
-	if updateDesc == nil {
-		return
-	}
 	deleteDesc := methodDescs.ByName(deleteMethodName)
 	if deleteDesc == nil {
 		return
@@ -333,20 +366,23 @@ func (h *helper) scanService(serviceDesc protoreflect.ServiceDescriptor) {
 		return
 	}
 
-	// The request and response of the `Update` method must have an `object` message field:
-	updateRequestObjectFieldDesc := h.getObjectField(updateDesc.Input())
-	if updateRequestObjectFieldDesc == nil {
-		return
-	}
-	if updateRequestObjectFieldDesc.Message() != objectDesc {
-		return
-	}
-	updateResponseObjectFieldDesc := h.getObjectField(updateDesc.Output())
-	if updateResponseObjectFieldDesc == nil {
-		return
-	}
-	if updateResponseObjectFieldDesc.Message() != objectDesc {
-		return
+	var updateRequestObjectFieldDesc, updateResponseObjectFieldDesc protoreflect.FieldDescriptor
+	if updateDesc != nil {
+		// The request and response of the `Update` method must have an `object` message field:
+		updateRequestObjectFieldDesc = h.getObjectField(updateDesc.Input())
+		if updateRequestObjectFieldDesc == nil {
+			return
+		}
+		if updateRequestObjectFieldDesc.Message() != objectDesc {
+			return
+		}
+		updateResponseObjectFieldDesc = h.getObjectField(updateDesc.Output())
+		if updateResponseObjectFieldDesc == nil {
+			return
+		}
+		if updateResponseObjectFieldDesc.Message() != objectDesc {
+			return
+		}
 	}
 
 	// The request of the `Delete` method must have an `id` string field:
@@ -362,7 +398,10 @@ func (h *helper) scanService(serviceDesc protoreflect.ServiceDescriptor) {
 	getRequestTemplate, getResponseTemplate := h.makeMethodTemplates(getDesc)
 	listRequestTemplate, listResponseTemplate := h.makeMethodTemplates(listDesc)
 	createRequestTemplate, createResponseTemplate := h.makeMethodTemplates(createDesc)
-	updateRequestTemplate, updateResponseTemplate := h.makeMethodTemplates(updateDesc)
+	var updateRequestTemplate, updateResponseTemplate proto.Message
+	if updateDesc != nil {
+		updateRequestTemplate, updateResponseTemplate = h.makeMethodTemplates(updateDesc)
+	}
 	deleteRequestTemplate, deleteResponseTemplate := h.makeMethodTemplates(deleteDesc)
 
 	// Calculate the singular and pluran names:
@@ -375,6 +414,19 @@ func (h *helper) scanService(serviceDesc protoreflect.ServiceDescriptor) {
 	idFieldDesc := objectFields.ByName(idFieldName)
 	metadataFieldDesc := objectFields.ByName(metadataFieldName)
 
+	// Determine if the object is project-scoped by checking if its metadata has a "project" field.
+	// Platform-scoped types (e.g. Tenant, Role) share the same Metadata message but are not
+	// conceptually project-scoped — exclude them so that List does not inject a project filter
+	// that would hide these resources when a project is selected.
+	projectScoped := false
+	if metadataFieldDesc != nil && !platformScopedTypes[objectDesc.Name()] &&
+		!nonProjectScopedTypes[objectDesc.Name()] {
+		metadataMsg := metadataFieldDesc.Message()
+		if metadataMsg != nil && metadataMsg.Fields().ByName(projectFieldName) != nil {
+			projectScoped = true
+		}
+	}
+
 	// This is a supported object type:
 	helper := objectHelper{
 		parent:                    h,
@@ -384,6 +436,7 @@ func (h *helper) scanService(serviceDesc protoreflect.ServiceDescriptor) {
 		singular:                  objectNameSingular,
 		plural:                    objectNamePlural,
 		tenantScoped:              !platformScopedTypes[objectDesc.Name()],
+		projectScoped:             projectScoped,
 		useGetForStructuredOutput: h.getForStructuredOutputTypes[objectDesc.Name()],
 		template:                  objectTemplate,
 		get: getInfo{
@@ -415,15 +468,6 @@ func (h *helper) scanService(serviceDesc protoreflect.ServiceDescriptor) {
 			in:  createRequestObjectFieldDesc,
 			out: createResponseObjectFieldDesc,
 		},
-		update: updateInfo{
-			methodInfo: methodInfo{
-				path:     h.makeMethodPath(updateDesc),
-				request:  updateRequestTemplate,
-				response: updateResponseTemplate,
-			},
-			in:  updateRequestObjectFieldDesc,
-			out: updateResponseObjectFieldDesc,
-		},
 		delete: deleteInfo{
 			methodInfo: methodInfo{
 				path:     h.makeMethodPath(deleteDesc),
@@ -432,6 +476,17 @@ func (h *helper) scanService(serviceDesc protoreflect.ServiceDescriptor) {
 			},
 			id: deleteRequestIdFieldDesc,
 		},
+	}
+	if updateDesc != nil {
+		helper.update = updateInfo{
+			methodInfo: methodInfo{
+				path:     h.makeMethodPath(updateDesc),
+				request:  updateRequestTemplate,
+				response: updateResponseTemplate,
+			},
+			in:  updateRequestObjectFieldDesc,
+			out: updateResponseObjectFieldDesc,
+		}
 	}
 	h.helpers = append(h.helpers, helper)
 }
@@ -593,6 +648,7 @@ type objectHelper struct {
 	singular                  string
 	plural                    string
 	tenantScoped              bool
+	projectScoped             bool
 	useGetForStructuredOutput bool
 	template                  proto.Message
 	list                      listInfo
@@ -675,6 +731,11 @@ type ListResult struct {
 	Total int32
 }
 
+type UpdateResult struct {
+	Object   proto.Message
+	Warnings []string
+}
+
 func (h *objectHelper) List(ctx context.Context, options ListOptions) (result ListResult, err error) {
 	filter := options.Filter
 
@@ -691,6 +752,23 @@ func (h *objectHelper) List(ctx context.Context, options ListOptions) (result Li
 				filter = fmt.Sprintf("%s && (%s)", tenantFilter, filter)
 			} else {
 				filter = tenantFilter
+			}
+		}
+	}
+
+	// Inject project filter from project function if needed:
+	if h.IsProjectScoped() && h.parent.projectFunc != nil {
+		var project string
+		project, err = h.parent.projectFunc(ctx)
+		if err != nil {
+			return
+		}
+		if project != "" {
+			projectFilter := fmt.Sprintf("this.metadata.project == %q", project)
+			if filter != "" {
+				filter = fmt.Sprintf("%s && (%s)", projectFilter, filter)
+			} else {
+				filter = projectFilter
 			}
 		}
 	}
@@ -756,15 +834,62 @@ func (h *objectHelper) Create(ctx context.Context, object proto.Message) (result
 	return
 }
 
-func (h *objectHelper) Update(ctx context.Context, object proto.Message) (result proto.Message, err error) {
+func (h *objectHelper) IsUpdatable() bool {
+	return h.update.path != ""
+}
+
+func (h *objectHelper) Update(ctx context.Context, object proto.Message) (result UpdateResult, err error) {
+	if !h.IsUpdatable() {
+		err = grpcstatus.Errorf(codes.FailedPrecondition, "object type %q is immutable; updates are not supported", h.FullName())
+		return
+	}
 	request := proto.Clone(h.update.request)
 	h.setObject(request, h.update.in, object)
 	response := proto.Clone(h.update.response)
 	err = h.parent.connection.Invoke(ctx, h.update.path, request, response)
 	if err != nil {
 		err = fmt.Errorf("failed to update object: %w", err)
+		return
 	}
-	result = h.getObject(response, h.update.out)
+	result.Object = h.getObject(response, h.update.out)
+	if warningResponse, ok := response.(interface{ GetWarnings() []string }); ok {
+		result.Warnings = warningResponse.GetWarnings()
+	}
+	return
+}
+
+func (h *objectHelper) UpdateWithMask(ctx context.Context, original, edited proto.Message) (result UpdateResult, err error) {
+	if !h.IsUpdatable() {
+		err = grpcstatus.Errorf(codes.FailedPrecondition, "object type %q is immutable; updates are not supported", h.FullName())
+		return
+	}
+
+	// Compute the diff and build the update mask
+	mask, err := computeUpdateMask(original, edited)
+	if err != nil {
+		err = fmt.Errorf("failed to compute update mask: %w", err)
+		return
+	}
+
+	request := proto.Clone(h.update.request)
+	h.setObject(request, h.update.in, edited)
+
+	// Set the update_mask field
+	maskField := request.ProtoReflect().Descriptor().Fields().ByName("update_mask")
+	if maskField != nil && maskField.Kind() == protoreflect.MessageKind {
+		request.ProtoReflect().Set(maskField, protoreflect.ValueOfMessage(mask.ProtoReflect()))
+	}
+
+	response := proto.Clone(h.update.response)
+	err = h.parent.connection.Invoke(ctx, h.update.path, request, response)
+	if err != nil {
+		err = fmt.Errorf("failed to update object: %w", err)
+		return
+	}
+	result.Object = h.getObject(response, h.update.out)
+	if warningResponse, ok := response.(interface{ GetWarnings() []string }); ok {
+		result.Warnings = warningResponse.GetWarnings()
+	}
 	return
 }
 
@@ -796,6 +921,29 @@ func (h *objectHelper) GetTenant(object proto.Message) string {
 // IsTenantScoped returns true if this resource type is scoped to a tenant.
 func (h *objectHelper) IsTenantScoped() bool {
 	return h.tenantScoped
+}
+
+// projectFieldName is the name of the project field in the metadata message.
+const projectFieldName = protoreflect.Name("project")
+
+// SetProject sets the project field on the object's metadata. If the metadata submessage does not
+// exist it is created.
+func (h *objectHelper) SetProject(object proto.Message, project string) {
+	metadata := object.ProtoReflect().Mutable(h.metadataField).Message()
+	field := metadata.Descriptor().Fields().ByName(projectFieldName)
+	if field != nil {
+		metadata.Set(field, protoreflect.ValueOfString(project))
+	}
+}
+
+// GetProject returns the project field from the object's metadata.
+func (h *objectHelper) GetProject(object proto.Message) string {
+	return ResolveFieldPathOr(object, "metadata.project", "")
+}
+
+// IsProjectScoped returns true if this resource type has a project field in its metadata.
+func (h *objectHelper) IsProjectScoped() bool {
+	return h.projectScoped
 }
 
 // UseGetForStructuredOutput returns true if the Get RPC should be used instead of List when
@@ -835,6 +983,92 @@ const (
 	totalFieldName    = protoreflect.Name("total")
 )
 
+// computeUpdateMask compares two proto messages and returns a FieldMask containing the paths
+// of all fields that differ between them.
+func computeUpdateMask(original, edited proto.Message) (*fieldmaskpb.FieldMask, error) {
+	var paths []string
+	collectChangedPaths(original.ProtoReflect(), edited.ProtoReflect(), nil, &paths)
+	return &fieldmaskpb.FieldMask{Paths: paths}, nil
+}
+
+// collectChangedPaths recursively compares two messages and collects paths of changed fields.
+func collectChangedPaths(original, edited protoreflect.Message, pathPrefix []string, paths *[]string) {
+	edited.Range(func(fd protoreflect.FieldDescriptor, editedVal protoreflect.Value) bool {
+		fieldPath := append(pathPrefix, string(fd.Name()))
+
+		if !original.Has(fd) {
+			// Field is set in edited but not in original
+			*paths = append(*paths, strings.Join(fieldPath, "."))
+			return true
+		}
+
+		originalVal := original.Get(fd)
+
+		// Compare values based on field kind
+		if fd.IsList() {
+			if !equalLists(originalVal.List(), editedVal.List(), fd) {
+				*paths = append(*paths, strings.Join(fieldPath, "."))
+			}
+		} else if fd.IsMap() {
+			if !equalMaps(originalVal.Map(), editedVal.Map(), fd) {
+				*paths = append(*paths, strings.Join(fieldPath, "."))
+			}
+		} else if fd.Kind() == protoreflect.MessageKind {
+			// Recursively compare nested messages
+			collectChangedPaths(originalVal.Message(), editedVal.Message(), fieldPath, paths)
+		} else {
+			// Scalar field - compare values
+			if !originalVal.Equal(editedVal) {
+				*paths = append(*paths, strings.Join(fieldPath, "."))
+			}
+		}
+
+		return true
+	})
+
+	// Check for fields that were cleared (present in original but not in edited)
+	original.Range(func(fd protoreflect.FieldDescriptor, _ protoreflect.Value) bool {
+		if !edited.Has(fd) {
+			fieldPath := append(pathPrefix, string(fd.Name()))
+			*paths = append(*paths, strings.Join(fieldPath, "."))
+		}
+		return true
+	})
+}
+
+// equalLists compares two protoreflect lists for equality.
+func equalLists(a, b protoreflect.List, fd protoreflect.FieldDescriptor) bool {
+	if a.Len() != b.Len() {
+		return false
+	}
+	for i := 0; i < a.Len(); i++ {
+		if !a.Get(i).Equal(b.Get(i)) {
+			return false
+		}
+	}
+	return true
+}
+
+// equalMaps compares two protoreflect maps for equality.
+func equalMaps(a, b protoreflect.Map, fd protoreflect.FieldDescriptor) bool {
+	if a.Len() != b.Len() {
+		return false
+	}
+	equal := true
+	a.Range(func(k protoreflect.MapKey, v protoreflect.Value) bool {
+		if !b.Has(k) {
+			equal = false
+			return false
+		}
+		if !v.Equal(b.Get(k)) {
+			equal = false
+			return false
+		}
+		return true
+	})
+	return equal
+}
+
 // platformScopedTypes lists the resource types that are NOT scoped to a tenant. Types not listed
 // here default to tenant-scoped, which means they get automatic tenant filter injection on List,
 // automatic tenant field setting on generic Create, and the TENANT column in table output. Keyed
@@ -844,7 +1078,6 @@ var platformScopedTypes = map[protoreflect.Name]bool{
 	"ClusterVersion":   true,
 	"ConsoleSession":   true,
 	"ExternalIPPool":   true,
-	"HostType":         true,
 	"Hub":              true,
 	"IdentityProvider": true,
 	"InstanceType":     true,
@@ -854,4 +1087,10 @@ var platformScopedTypes = map[protoreflect.Name]bool{
 	"StorageTier":      true,
 	"Tenant":           true,
 	"User":             true,
+}
+
+// nonProjectScopedTypes are tenant-scoped resources whose metadata still has a project field,
+// but which are not associated with any project.
+var nonProjectScopedTypes = map[protoreflect.Name]bool{
+	"ServiceAccount": true,
 }

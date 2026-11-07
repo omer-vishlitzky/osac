@@ -17,11 +17,13 @@ import (
 	"context"
 	"errors"
 	"slices"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"go.uber.org/mock/gomock"
 	"google.golang.org/grpc"
+	"google.golang.org/protobuf/proto"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -31,109 +33,63 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/controllers"
 	"github.com/osac-project/osac/fulfillment-service/internal/controllers/finalizers"
 	"github.com/osac-project/osac/fulfillment-service/internal/kubernetes/labels"
 	"github.com/osac-project/osac/fulfillment-service/internal/masks"
 	osacv1alpha1 "github.com/osac-project/osac/osac-operator/api/v1alpha1"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
 var _ = Describe("buildSpec", func() {
-	It("Includes all fields when IPv4 and IPv6 are present with capabilities", func() {
+	It("Copies the IPv4 CIDR", func() {
 		ipv4 := "10.0.0.0/16"
-		ipv6 := "2001:db8::/48"
-		region := "us-east-1"
-		networkClass := "cudn-net"
 
 		task := &task{
 			virtualNetwork: privatev1.VirtualNetwork_builder{
 				Id: "vnet-test-123",
 				Spec: privatev1.VirtualNetworkSpec_builder{
-					Region:       region,
-					NetworkClass: privatev1.NetworkClassReference_builder{Name: networkClass}.Build(),
-					Ipv4Cidr:     &ipv4,
-					Ipv6Cidr:     &ipv6,
+					Ipv4Cidr: &ipv4,
 				}.Build(),
 			}.Build(),
 		}
 
 		spec := task.buildSpec()
 
-		Expect(spec.Region).To(Equal(region))
-		Expect(spec.NetworkClass).To(Equal(networkClass))
 		Expect(spec.IPv4CIDR).To(Equal(ipv4))
-		Expect(spec.IPv6CIDR).To(Equal(ipv6))
 	})
 
 	It("Includes only IPv4 when IPv6 is not present", func() {
 		ipv4 := "192.168.0.0/16"
-		region := "eu-west-1"
-		networkClass := "phys-net"
 
 		task := &task{
 			virtualNetwork: privatev1.VirtualNetwork_builder{
 				Id: "vnet-test-456",
 				Spec: privatev1.VirtualNetworkSpec_builder{
-					Region:       region,
-					NetworkClass: privatev1.NetworkClassReference_builder{Name: networkClass}.Build(),
-					Ipv4Cidr:     &ipv4,
+					Ipv4Cidr: &ipv4,
 				}.Build(),
 			}.Build(),
 		}
 
 		spec := task.buildSpec()
 
-		Expect(spec.Region).To(Equal(region))
-		Expect(spec.NetworkClass).To(Equal(networkClass))
 		Expect(spec.IPv4CIDR).To(Equal(ipv4))
-		Expect(spec.IPv6CIDR).To(BeEmpty())
-	})
-
-	It("Includes only IPv6 when IPv4 is not present", func() {
-		ipv6 := "fd00:1234::/32"
-		region := "ap-south-1"
-		networkClass := "ovn-kubernetes"
-
-		task := &task{
-			virtualNetwork: privatev1.VirtualNetwork_builder{
-				Id: "vnet-test-789",
-				Spec: privatev1.VirtualNetworkSpec_builder{
-					Region:       region,
-					NetworkClass: privatev1.NetworkClassReference_builder{Name: networkClass}.Build(),
-					Ipv6Cidr:     &ipv6,
-				}.Build(),
-			}.Build(),
-		}
-
-		spec := task.buildSpec()
-
-		Expect(spec.Region).To(Equal(region))
-		Expect(spec.NetworkClass).To(Equal(networkClass))
-		Expect(spec.IPv4CIDR).To(BeEmpty())
-		Expect(spec.IPv6CIDR).To(Equal(ipv6))
 	})
 
 	It("Handles missing capabilities field", func() {
 		ipv4 := "172.16.0.0/12"
-		region := "us-west-2"
-		networkClass := "cudn-net"
 
 		task := &task{
 			virtualNetwork: privatev1.VirtualNetwork_builder{
 				Id: "vnet-test-no-caps",
 				Spec: privatev1.VirtualNetworkSpec_builder{
-					Region:       region,
-					NetworkClass: privatev1.NetworkClassReference_builder{Name: networkClass}.Build(),
-					Ipv4Cidr:     &ipv4,
+					Ipv4Cidr: &ipv4,
 				}.Build(),
 			}.Build(),
 		}
 
 		spec := task.buildSpec()
 
-		Expect(spec.Region).To(Equal(region))
-		Expect(spec.NetworkClass).To(Equal(networkClass))
 		Expect(spec.IPv4CIDR).To(Equal(ipv4))
 	})
 })
@@ -161,6 +117,15 @@ func hasFinalizer(virtualNetwork *privatev1.VirtualNetwork) bool {
 	return slices.Contains(virtualNetwork.GetMetadata().GetFinalizers(), finalizers.Controller)
 }
 
+func expectDeletionRetry(err error) {
+	var retryable interface{ RequeueAfter() time.Duration }
+	Expect(errors.As(err, &retryable)).To(BeTrue())
+	Expect(retryable.RequeueAfter()).To(Equal(time.Second))
+	var backoff interface{ UseExponentialBackoff() bool }
+	Expect(errors.As(err, &backoff)).To(BeTrue())
+	Expect(backoff.UseExponentialBackoff()).To(BeFalse())
+}
+
 // newTaskForDelete creates a task configured for testing delete() with hub-dependent paths.
 func newTaskForDelete(virtualNetworkID, hubID string, hubCache controllers.HubCache) *task {
 	virtualNetwork := privatev1.VirtualNetwork_builder{
@@ -174,14 +139,30 @@ func newTaskForDelete(virtualNetworkID, hubID string, hubCache controllers.HubCa
 	}.Build()
 
 	f := &function{
-		logger:   logger,
-		hubCache: hubCache,
+		logger:              logger,
+		hubCache:            hubCache,
+		networkingHubReader: &fakeNetworkingHubReader{err: controllers.ErrNoNetworkingHubs},
 	}
 
 	return &task{
 		r:              f,
 		virtualNetwork: virtualNetwork,
 	}
+}
+
+type fakeNetworkingHubReader struct {
+	result controllers.NetworkingHub
+	err    error
+	calls  int
+}
+
+func (f *fakeNetworkingHubReader) Resolve(context.Context) (controllers.NetworkingHubResolution, error) {
+	f.calls++
+	return controllers.NetworkingHubResolution{
+		NetworkingHub: f.result,
+		HubID:         f.result.ID,
+		State:         privatev1.NetworkClassState_NETWORK_CLASS_STATE_READY,
+	}, f.err
 }
 
 var _ = Describe("delete", func() {
@@ -213,8 +194,8 @@ var _ = Describe("delete", func() {
 		ctrl.Finish()
 	})
 
-	When("hub is not yet assigned", func() {
-		It("removes the finalizer immediately", func() {
+	When("hub is not yet assigned and no hub can hold the CR", func() {
+		It("removes the finalizer", func() {
 			task := newTaskForDelete(virtualNetworkID, "", mockHubCache)
 			task.virtualNetwork.GetStatus().SetHub("")
 
@@ -306,7 +287,7 @@ var _ = Describe("delete", func() {
 
 			err := task.delete(ctx)
 
-			Expect(err).ToNot(HaveOccurred())
+			expectDeletionRetry(err)
 			Expect(deleteCalled).To(BeTrue(), "Delete should have been called")
 			Expect(hasFinalizer(task.virtualNetwork)).To(BeTrue(), "finalizer should remain until K8s object is fully deleted")
 		})
@@ -332,7 +313,7 @@ var _ = Describe("delete", func() {
 
 			err := task.delete(ctx)
 
-			Expect(err).ToNot(HaveOccurred())
+			expectDeletionRetry(err)
 			Expect(hasFinalizer(task.virtualNetwork)).To(BeTrue(), "finalizer should remain while K8s finalizers process")
 		})
 	})
@@ -569,24 +550,17 @@ var _ = Describe("hub persistence", func() {
 		DeferCleanup(ctrl.Finish)
 	})
 
-	It("should select hub and return without creating VirtualNetwork CR", func() {
+	It("should persist the hub and then create the VirtualNetwork CR in the same reconcile", func() {
 		scheme := runtime.NewScheme()
 		Expect(osacv1alpha1.AddToScheme(scheme)).To(Succeed())
 
 		fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
 
-		hubCache := controllers.NewMockHubCache(ctrl)
-		hubCache.EXPECT().
-			Get(gomock.Any(), hubID).
-			Return(&controllers.HubEntry{Namespace: hubNamespace, Client: fakeClient}, nil).
-			AnyTimes()
-
-		hubsClient := controllers.NewMockHubsClient(ctrl)
-		hubsClient.EXPECT().
-			List(gomock.Any(), gomock.Any()).
-			Return(&privatev1.HubsListResponse{
-				Items: []*privatev1.Hub{privatev1.Hub_builder{Id: hubID}.Build()},
-			}, nil)
+		resolver := &fakeNetworkingHubReader{result: controllers.NetworkingHub{
+			ID:        hubID,
+			Namespace: hubNamespace,
+			Client:    fakeClient,
+		}}
 
 		vnClient := NewMockVirtualNetworksClient(ctrl)
 		vnClient.EXPECT().
@@ -601,10 +575,7 @@ var _ = Describe("hub persistence", func() {
 				Finalizers: []string{finalizers.Controller},
 				Tenant:     tenantName,
 			}.Build(),
-			Spec: privatev1.VirtualNetworkSpec_builder{
-				Region:       "us-east-1",
-				NetworkClass: privatev1.NetworkClassReference_builder{Name: "cudn-net"}.Build(),
-			}.Build(),
+			Spec: privatev1.VirtualNetworkSpec_builder{}.Build(),
 			Status: privatev1.VirtualNetworkStatus_builder{
 				State: privatev1.VirtualNetworkState_VIRTUAL_NETWORK_STATE_PENDING,
 				Hub:   "",
@@ -613,20 +584,20 @@ var _ = Describe("hub persistence", func() {
 
 		f := &function{
 			logger:                logger,
-			hubCache:              hubCache,
 			virtualNetworksClient: vnClient,
-			hubsClient:            hubsClient,
+			networkingHubReader:   resolver,
 			maskCalculator:        masks.NewCalculator().Build(),
 		}
 
 		err := f.run(ctx, vn)
 		Expect(err).ToNot(HaveOccurred())
+		Expect(resolver.calls).To(Equal(1))
 		Expect(vn.GetStatus().GetHub()).To(Equal(hubID))
 
 		list := &osacv1alpha1.VirtualNetworkList{}
 		err = fakeClient.List(ctx, list)
 		Expect(err).ToNot(HaveOccurred())
-		Expect(list.Items).To(BeEmpty())
+		Expect(list.Items).To(HaveLen(1))
 	})
 
 	It("should not create CR when no hubs available", func() {
@@ -635,16 +606,14 @@ var _ = Describe("hub persistence", func() {
 
 		fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
 
-		hubCache := controllers.NewMockHubCache(ctrl)
-
-		hubsClient := controllers.NewMockHubsClient(ctrl)
-		hubsClient.EXPECT().
-			List(gomock.Any(), gomock.Any()).
-			Return(&privatev1.HubsListResponse{
-				Items: []*privatev1.Hub{},
-			}, nil)
+		resolver := &fakeNetworkingHubReader{err: controllers.ErrNoNetworkingHubs}
 
 		vnClient := NewMockVirtualNetworksClient(ctrl)
+		vnClient.EXPECT().
+			Update(gomock.Any(), gomock.Any(), gomock.Any()).
+			DoAndReturn(func(ctx context.Context, req *privatev1.VirtualNetworksUpdateRequest, opts ...grpc.CallOption) (*privatev1.VirtualNetworksUpdateResponse, error) {
+				return &privatev1.VirtualNetworksUpdateResponse{Object: req.GetObject()}, nil
+			})
 
 		vn := privatev1.VirtualNetwork_builder{
 			Id: virtualNetworkID,
@@ -652,10 +621,7 @@ var _ = Describe("hub persistence", func() {
 				Finalizers: []string{finalizers.Controller},
 				Tenant:     tenantName,
 			}.Build(),
-			Spec: privatev1.VirtualNetworkSpec_builder{
-				Region:       "us-east-1",
-				NetworkClass: privatev1.NetworkClassReference_builder{Name: "cudn-net"}.Build(),
-			}.Build(),
+			Spec: privatev1.VirtualNetworkSpec_builder{}.Build(),
 			Status: privatev1.VirtualNetworkStatus_builder{
 				State: privatev1.VirtualNetworkState_VIRTUAL_NETWORK_STATE_PENDING,
 				Hub:   "",
@@ -664,15 +630,19 @@ var _ = Describe("hub persistence", func() {
 
 		f := &function{
 			logger:                logger,
-			hubCache:              hubCache,
 			virtualNetworksClient: vnClient,
-			hubsClient:            hubsClient,
+			networkingHubReader:   resolver,
 			maskCalculator:        masks.NewCalculator().Build(),
 		}
 
 		err := f.run(ctx, vn)
-		Expect(err).To(HaveOccurred())
-		Expect(err.Error()).To(ContainSubstring("there are no hubs"))
+		Expect(errors.Is(err, controllers.ErrNoNetworkingHubs)).To(BeTrue())
+		Expect(vn.GetStatus().GetState()).To(Equal(privatev1.VirtualNetworkState_VIRTUAL_NETWORK_STATE_PENDING))
+		Expect(vn.GetStatus().GetHub()).To(BeEmpty())
+		Expect(vn.GetStatus().GetMessage()).To(ContainSubstring(controllers.ErrNoNetworkingHubs.Error()))
+		var retryable interface{ RequeueAfter() time.Duration }
+		Expect(errors.As(err, &retryable)).To(BeTrue())
+		Expect(retryable.RequeueAfter()).To(Equal(hubResolutionRetryDelay))
 
 		list := &osacv1alpha1.VirtualNetworkList{}
 		err = fakeClient.List(ctx, list)
@@ -685,14 +655,11 @@ var _ = Describe("hub persistence", func() {
 		Expect(osacv1alpha1.AddToScheme(scheme)).To(Succeed())
 
 		fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
-
-		hubCache := controllers.NewMockHubCache(ctrl)
-		hubCache.EXPECT().
-			Get(gomock.Any(), hubID).
-			Return(&controllers.HubEntry{Namespace: hubNamespace, Client: fakeClient}, nil).
-			AnyTimes()
-
-		hubsClient := controllers.NewMockHubsClient(ctrl)
+		resolver := &fakeNetworkingHubReader{result: controllers.NetworkingHub{
+			ID:        hubID,
+			Namespace: hubNamespace,
+			Client:    fakeClient,
+		}}
 
 		vnClient := NewMockVirtualNetworksClient(ctrl)
 		vnClient.EXPECT().
@@ -708,10 +675,7 @@ var _ = Describe("hub persistence", func() {
 				Finalizers: []string{finalizers.Controller},
 				Tenant:     tenantName,
 			}.Build(),
-			Spec: privatev1.VirtualNetworkSpec_builder{
-				Region:       "us-east-1",
-				NetworkClass: privatev1.NetworkClassReference_builder{Name: "cudn-net"}.Build(),
-			}.Build(),
+			Spec: privatev1.VirtualNetworkSpec_builder{}.Build(),
 			Status: privatev1.VirtualNetworkStatus_builder{
 				State: privatev1.VirtualNetworkState_VIRTUAL_NETWORK_STATE_PENDING,
 				Hub:   hubID,
@@ -720,14 +684,14 @@ var _ = Describe("hub persistence", func() {
 
 		f := &function{
 			logger:                logger,
-			hubCache:              hubCache,
 			virtualNetworksClient: vnClient,
-			hubsClient:            hubsClient,
+			networkingHubReader:   resolver,
 			maskCalculator:        nil,
 		}
 
 		err := f.run(ctx, vn)
 		Expect(err).ToNot(HaveOccurred())
+		Expect(resolver.calls).To(Equal(1))
 
 		list := &osacv1alpha1.VirtualNetworkList{}
 		err = fakeClient.List(ctx, list)
@@ -736,31 +700,31 @@ var _ = Describe("hub persistence", func() {
 		Expect(list.Items[0].Namespace).To(Equal(hubNamespace))
 	})
 
-	It("should create CR on second reconcile after hub is persisted", func() {
+	DescribeTable("creates the CR, persists the hub and preserves subsequent READY feedback", func(initialStatus *privatev1.VirtualNetworkStatus, expectedMask string) {
 		scheme := runtime.NewScheme()
 		Expect(osacv1alpha1.AddToScheme(scheme)).To(Succeed())
 
 		fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
 
-		hubCache := controllers.NewMockHubCache(ctrl)
-		hubCache.EXPECT().
-			Get(gomock.Any(), hubID).
-			Return(&controllers.HubEntry{Namespace: hubNamespace, Client: fakeClient}, nil).
-			AnyTimes()
-
-		hubsClient := controllers.NewMockHubsClient(ctrl)
-		hubsClient.EXPECT().
-			List(gomock.Any(), gomock.Any()).
-			Return(&privatev1.HubsListResponse{
-				Items: []*privatev1.Hub{privatev1.Hub_builder{Id: hubID}.Build()},
-			}, nil)
-
+		resolver := &fakeNetworkingHubReader{result: controllers.NetworkingHub{
+			ID:        hubID,
+			Namespace: hubNamespace,
+			Client:    fakeClient,
+		}}
+		updates := 0
 		vnClient := NewMockVirtualNetworksClient(ctrl)
 		vnClient.EXPECT().
 			Update(gomock.Any(), gomock.Any(), gomock.Any()).
 			DoAndReturn(func(ctx context.Context, req *privatev1.VirtualNetworksUpdateRequest, opts ...grpc.CallOption) (*privatev1.VirtualNetworksUpdateResponse, error) {
+				updates++
+				if updates > 1 {
+					return &privatev1.VirtualNetworksUpdateResponse{Object: req.GetObject()}, nil
+				}
+				Expect(req.GetUpdateMask().GetPaths()).To(Equal([]string{expectedMask}))
+				Expect(req.GetObject().GetStatus().GetState()).To(Equal(privatev1.VirtualNetworkState_VIRTUAL_NETWORK_STATE_PENDING))
+				Expect(req.GetObject().GetStatus().GetHub()).To(Equal(hubID))
 				return &privatev1.VirtualNetworksUpdateResponse{Object: req.GetObject()}, nil
-			}).AnyTimes()
+			}).MinTimes(1)
 
 		vn := privatev1.VirtualNetwork_builder{
 			Id: virtualNetworkID,
@@ -768,43 +732,68 @@ var _ = Describe("hub persistence", func() {
 				Finalizers: []string{finalizers.Controller},
 				Tenant:     tenantName,
 			}.Build(),
-			Spec: privatev1.VirtualNetworkSpec_builder{
-				Region:       "us-east-1",
-				NetworkClass: privatev1.NetworkClassReference_builder{Name: "cudn-net"}.Build(),
-			}.Build(),
-			Status: privatev1.VirtualNetworkStatus_builder{
-				State: privatev1.VirtualNetworkState_VIRTUAL_NETWORK_STATE_PENDING,
-				Hub:   "",
-			}.Build(),
+			Spec:   privatev1.VirtualNetworkSpec_builder{}.Build(),
+			Status: proto.CloneOf(initialStatus),
 		}.Build()
 
 		f := &function{
 			logger:                logger,
-			hubCache:              hubCache,
 			virtualNetworksClient: vnClient,
-			hubsClient:            hubsClient,
+			networkingHubReader:   resolver,
 			maskCalculator:        masks.NewCalculator().Build(),
 		}
 
-		// First reconcile: hub is empty, should select hub and return without creating CR
+		// The CR is created or adopted by label first, so a restart before the status write finds it again; the hub is
+		// then persisted with the final status write:
 		err := f.run(ctx, vn)
 		Expect(err).ToNot(HaveOccurred())
 
 		list := &osacv1alpha1.VirtualNetworkList{}
 		err = fakeClient.List(ctx, list)
 		Expect(err).ToNot(HaveOccurred())
-		Expect(list.Items).To(BeEmpty())
-
-		// Second reconcile: hub already set, should create CR
-		vn.GetStatus().SetHub(hubID)
-
-		err = f.run(ctx, vn)
-		Expect(err).ToNot(HaveOccurred())
-
-		err = fakeClient.List(ctx, list)
-		Expect(err).ToNot(HaveOccurred())
 		Expect(list.Items).To(HaveLen(1))
 		Expect(list.Items[0].Namespace).To(Equal(hubNamespace))
+
+		vn.GetStatus().SetState(privatev1.VirtualNetworkState_VIRTUAL_NETWORK_STATE_READY)
+		Expect(f.run(ctx, vn)).To(Succeed())
+		Expect(vn.GetStatus().GetState()).To(Equal(privatev1.VirtualNetworkState_VIRTUAL_NETWORK_STATE_READY))
+	},
+		Entry("missing status requires a whole-status initialization write", nil, "status"),
+		Entry("existing PENDING status requires only a Hub write", privatev1.VirtualNetworkStatus_builder{
+			State: privatev1.VirtualNetworkState_VIRTUAL_NETWORK_STATE_PENDING,
+		}.Build(), "status.hub"),
+	)
+})
+
+var _ = Describe("canonical networking Hub resolution", func() {
+	It("rejects a conflicting assignment and never selects a Hub when resolution is unavailable", func() {
+		resolver := &fakeNetworkingHubReader{result: controllers.NetworkingHub{
+			ID:        "hub-a",
+			Namespace: "hub-a-ns",
+			Client:    fake.NewClientBuilder().Build(),
+		}}
+		r := &function{logger: logger, networkingHubReader: resolver}
+		t := &task{
+			r: r,
+			virtualNetwork: privatev1.VirtualNetwork_builder{
+				Status: privatev1.VirtualNetworkStatus_builder{Hub: "hub-b"}.Build(),
+			}.Build(),
+		}
+		err := t.selectHub(context.Background())
+		Expect(err).To(HaveOccurred())
+		Expect(errors.Is(err, controllers.ErrResourceHubConflict)).To(BeTrue())
+		Expect(t.hubClient).To(BeNil())
+
+		for _, resolutionErr := range []error{
+			controllers.ErrNoNetworkingHubs,
+			controllers.ErrMultipleNetworkingHubs,
+			controllers.ErrCanonicalHubUnavailable,
+		} {
+			resolver.err = resolutionErr
+			t := &task{r: r, virtualNetwork: privatev1.VirtualNetwork_builder{}.Build()}
+			Expect(t.selectHub(context.Background())).To(MatchError(resolutionErr))
+			Expect(t.hubClient).To(BeNil())
+		}
 	})
 })
 
@@ -832,12 +821,11 @@ var _ = Describe("Kubernetes validation error handling", func() {
 			}).
 			Build()
 
-		hubCache := controllers.NewMockHubCache(ctrl)
-		hubCache.EXPECT().
-			Get(gomock.Any(), "hub-validation").
-			Return(&controllers.HubEntry{Namespace: "hub-ns", Client: fakeClient}, nil).
-			AnyTimes()
-
+		resolver := &fakeNetworkingHubReader{result: controllers.NetworkingHub{
+			ID:        "hub-validation",
+			Namespace: "hub-ns",
+			Client:    fakeClient,
+		}}
 		vnClient := NewMockVirtualNetworksClient(ctrl)
 		vnClient.EXPECT().
 			Update(gomock.Any(), gomock.Any(), gomock.Any()).
@@ -852,10 +840,7 @@ var _ = Describe("Kubernetes validation error handling", func() {
 				Finalizers: []string{finalizers.Controller},
 				Tenant:     "test-tenant",
 			}.Build(),
-			Spec: privatev1.VirtualNetworkSpec_builder{
-				Region:       "us-east-1",
-				NetworkClass: privatev1.NetworkClassReference_builder{Name: "cudn-net"}.Build(),
-			}.Build(),
+			Spec: privatev1.VirtualNetworkSpec_builder{}.Build(),
 			Status: privatev1.VirtualNetworkStatus_builder{
 				State: privatev1.VirtualNetworkState_VIRTUAL_NETWORK_STATE_PENDING,
 				Hub:   "hub-validation",
@@ -864,8 +849,8 @@ var _ = Describe("Kubernetes validation error handling", func() {
 
 		f := &function{
 			logger:                logger,
-			hubCache:              hubCache,
 			virtualNetworksClient: vnClient,
+			networkingHubReader:   resolver,
 			maskCalculator:        nil,
 		}
 

@@ -18,10 +18,13 @@ package inventory
 
 import (
 	"context"
+	"reflect"
 	"strings"
 	"testing"
 
 	metal3api "github.com/metal3-io/baremetal-operator/apis/metal3.io/v1alpha1"
+	. "github.com/onsi/ginkgo/v2" //nolint:revive,staticcheck
+	. "github.com/onsi/gomega"    //nolint:revive,staticcheck
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -36,6 +39,54 @@ const (
 	testNamespace = "test-bmaas"
 	testHostClass = "metal3"
 )
+
+func TestGetHostLogicalPortMACs_Metal3(t *testing.T) {
+	tests := []struct {
+		name        string
+		annotations map[string]string
+		hostID      string
+		missingHost bool
+		want        map[string]string
+		wantErr     bool
+	}{
+		{
+			name: "logical port names and MACs are preserved",
+			annotations: map[string]string{
+				HostInterfaceMACsAnnotation: `{"data-0":"52:54:00:16:04:83","data-1":"52:54:00:AA:BB:CC"}`,
+			},
+			want: map[string]string{"data-0": "52:54:00:16:04:83", "data-1": "52:54:00:AA:BB:CC"},
+		},
+		{name: "absent annotation", want: map[string]string{}},
+		{name: "empty annotation", annotations: map[string]string{HostInterfaceMACsAnnotation: ""}, want: map[string]string{}},
+		{name: "empty mapping", annotations: map[string]string{HostInterfaceMACsAnnotation: `{}`}, want: map[string]string{}},
+		{name: "null mapping", annotations: map[string]string{HostInterfaceMACsAnnotation: `null`}},
+		{name: "malformed JSON", annotations: map[string]string{HostInterfaceMACsAnnotation: "not-json"}, wantErr: true},
+		{name: "wrong shape", annotations: map[string]string{HostInterfaceMACsAnnotation: `[]`}, wantErr: true},
+		{name: "non-string MAC", annotations: map[string]string{HostInterfaceMACsAnnotation: `{"data-0":42}`}, wantErr: true},
+		{name: "missing host", missingHost: true, wantErr: true},
+		{name: "invalid host ID", hostID: "bad-id", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var objects []client.Object
+			if !tt.missingHost {
+				objects = append(objects, newBMHBuilder("host-macs").WithAnnotations(tt.annotations).Build())
+			}
+			m := newMetal3ClientForTest(objects...)
+			hostID := tt.hostID
+			if hostID == "" {
+				hostID = testNamespace + "/host-macs"
+			}
+			got, err := m.GetHostLogicalPortMACs(context.Background(), hostID)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("GetHostLogicalPortMACs error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if !tt.wantErr && !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("GetHostLogicalPortMACs = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
 
 func newTestScheme() *runtime.Scheme {
 	s := runtime.NewScheme()
@@ -986,7 +1037,7 @@ func TestUnassignHost(t *testing.T) {
 			Build()
 
 		m := newMetal3ClientForTest(bmh)
-		err := m.UnassignHost(ctx, testNamespace+"/host-1", []string{"profileName"})
+		err := m.UnassignHost(ctx, testNamespace+"/host-1", "instance-123", []string{"profileName"})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -1013,7 +1064,7 @@ func TestUnassignHost(t *testing.T) {
 			Build()
 
 		m := newMetal3ClientForTest(bmh)
-		err := m.UnassignHost(ctx, testNamespace+"/host-2", nil)
+		err := m.UnassignHost(ctx, testNamespace+"/host-2", "instance-456", nil)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -1029,12 +1080,30 @@ func TestUnassignHost(t *testing.T) {
 
 	t.Run("returns error for invalid host ID", func(t *testing.T) {
 		m := newMetal3ClientForTest()
-		err := m.UnassignHost(ctx, "invalid-id", nil)
+		err := m.UnassignHost(ctx, "invalid-id", "instance-123", nil)
 		if err == nil {
 			t.Fatal("expected error for invalid hostID, got nil")
 		}
 	})
 }
+
+var _ = Describe("Metal3 UnassignHost ownership", func() {
+	It("leaves a BMH assigned to another instance untouched", func() {
+		bmh := newBMHBuilder("host-3").
+			WithLabels(map[string]string{metal3LabelPrefix + "profileName": "myProfile"}).
+			WithConsumerRef(&corev1.ObjectReference{Name: "instance-456"}).
+			Build()
+		m := newMetal3ClientForTest(bmh)
+
+		Expect(m.UnassignHost(context.Background(), testNamespace+"/host-3", "instance-123", []string{"profileName"})).To(Succeed())
+
+		updated := &metal3api.BareMetalHost{}
+		Expect(m.client.Get(context.Background(), client.ObjectKey{Namespace: testNamespace, Name: "host-3"}, updated)).To(Succeed())
+		Expect(updated.Spec.ConsumerRef).NotTo(BeNil())
+		Expect(updated.Spec.ConsumerRef.Name).To(Equal("instance-456"))
+		Expect(updated.Labels).To(HaveKeyWithValue(metal3LabelPrefix+"profileName", "myProfile"))
+	})
+})
 
 // --- GetHostNICs ---
 

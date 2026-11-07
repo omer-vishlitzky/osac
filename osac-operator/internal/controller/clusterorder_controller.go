@@ -20,15 +20,21 @@ package controller
 import (
 	"context"
 	"fmt"
+	"math"
 	"time"
 
+	"github.com/go-logr/logr"
 	hypershiftv1beta1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
-	"k8s.io/apimachinery/pkg/api/meta"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/client-go/tools/events"
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -42,6 +48,7 @@ import (
 
 	"github.com/osac-project/osac/osac-operator/api/v1alpha1"
 	"github.com/osac-project/osac/osac-operator/pkg/provisioning"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
 // NewComponentFn is the type of a function that creates a required component
@@ -69,14 +76,48 @@ func (r *ClusterOrderReconciler) components() []component {
 // ClusterOrderReconciler reconciles a ClusterOrder object
 type ClusterOrderReconciler struct {
 	client.Client
-	apiReader             client.Reader
-	Scheme                *runtime.Scheme
-	ClusterOrderNamespace string
-	AgentNamespace        string
-	NetworkingNamespace   string
-	ProvisioningProvider  provisioning.ProvisioningProvider
-	StatusPollInterval    time.Duration
-	MaxJobHistory         int
+	apiReader                   client.Reader
+	Scheme                      *runtime.Scheme
+	ClusterOrderNamespace       string
+	AgentNamespace              string
+	NetworkingNamespace         string
+	ClustersClient              automaticClustersGetter
+	ExternalIPAttachmentsClient automaticExternalIPAttachmentsClient
+	ProvisioningProvider        provisioning.ProvisioningProvider
+	StatusPollInterval          time.Duration
+	MaxJobHistory               int
+	StallThresholds             ClusterOrderStallThresholds
+	Recorder                    events.EventRecorder
+	// SecretsClient resolves the Cluster's registered SSH-key Secret through
+	// the fulfillment private API. The resolved material is passed only as an
+	// AAP launch variable; it is never persisted on the ClusterOrder.
+	SecretsClient SecretsClient
+	now           func() time.Time
+}
+
+const (
+	defaultPreparingInfrastructureStallThreshold = 15 * time.Minute
+	defaultControlPlaneStartingStallThreshold    = 30 * time.Minute
+	defaultWorkersJoiningStallThreshold          = 20 * time.Minute
+)
+
+// ClusterOrderStallThresholds configures the maximum time a ClusterOrder may spend
+// in each provisioning stage before it is reported as stalled.
+type ClusterOrderStallThresholds struct {
+	PreparingInfrastructure      time.Duration
+	ControlPlaneStarting         time.Duration
+	WorkersJoining               time.Duration
+	WorkersJoiningByInstanceType map[string]time.Duration
+}
+
+// DefaultClusterOrderStallThresholds returns the production-safe stall thresholds.
+func DefaultClusterOrderStallThresholds() ClusterOrderStallThresholds {
+	return ClusterOrderStallThresholds{
+		PreparingInfrastructure:      defaultPreparingInfrastructureStallThreshold,
+		ControlPlaneStarting:         defaultControlPlaneStartingStallThreshold,
+		WorkersJoining:               defaultWorkersJoiningStallThreshold,
+		WorkersJoiningByInstanceType: map[string]time.Duration{},
+	}
 }
 
 func NewClusterOrderReconciler(
@@ -84,7 +125,6 @@ func NewClusterOrderReconciler(
 	apiReader client.Reader,
 	scheme *runtime.Scheme,
 	clusterOrderNamespace string,
-	agentNamespace string,
 	networkingNamespace string,
 	provisioningProvider provisioning.ProvisioningProvider,
 	statusPollInterval time.Duration,
@@ -93,10 +133,6 @@ func NewClusterOrderReconciler(
 
 	if clusterOrderNamespace == "" {
 		clusterOrderNamespace = defaultClusterOrderNamespace
-	}
-
-	if agentNamespace == "" {
-		agentNamespace = defaultAgentNamespace
 	}
 
 	if statusPollInterval <= 0 {
@@ -112,11 +148,13 @@ func NewClusterOrderReconciler(
 		apiReader:             apiReader,
 		Scheme:                scheme,
 		ClusterOrderNamespace: clusterOrderNamespace,
-		AgentNamespace:        agentNamespace,
 		NetworkingNamespace:   networkingNamespace,
 		ProvisioningProvider:  provisioningProvider,
 		StatusPollInterval:    statusPollInterval,
 		MaxJobHistory:         maxJobHistory,
+		StallThresholds:       DefaultClusterOrderStallThresholds(),
+		Recorder:              nil,
+		now:                   time.Now,
 	}
 }
 
@@ -125,12 +163,12 @@ func NewClusterOrderReconciler(
 // +kubebuilder:rbac:groups=osac.openshift.io,resources=clusterorders/finalizers,verbs=update
 // +kubebuilder:rbac:groups="",resources=namespaces;serviceaccounts,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=rolebindings,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=agent-install.openshift.io,resources=agents,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=hypershift.openshift.io,resources=hostedclusters;nodepools,verbs=get;list;watch
 // +kubebuilder:rbac:groups=osac.openshift.io,resources=subnets,verbs=get;list;watch
 // +kubebuilder:rbac:groups=osac.openshift.io,resources=networkclasses,verbs=get;list;watch
 // +kubebuilder:rbac:groups=osac.openshift.io,resources=externalipattachments,verbs=get;list;watch;delete
 // +kubebuilder:rbac:groups=osac.openshift.io,resources=externalips,verbs=get;list;watch;delete
+// +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -148,6 +186,13 @@ func (r *ClusterOrderReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		log.Info("ignoring ClusterOrder due to management-state annotation", "management-state", val)
 		return ctrl.Result{}, nil
 	}
+	if instance.ObjectMeta.DeletionTimestamp.IsZero() {
+		for i, request := range instance.Spec.NodeRequests {
+			if request.BareMetal == nil || request.BareMetal.InstanceType == "" {
+				return ctrl.Result{}, fmt.Errorf("spec.nodeRequests[%d].bareMetal.instanceType is required", i)
+			}
+		}
+	}
 
 	log.Info("start reconcile")
 
@@ -161,38 +206,205 @@ func (r *ClusterOrderReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	}
 
 	if err == nil {
-		if !equality.Semantic.DeepEqual(instance.Status, *oldstatus) {
-			log.Info("status requires update")
-			if err := r.patchStatusWithRetry(ctx, req.NamespacedName, instance.Status); err != nil {
-				return res, err
-			}
+		if err := r.persistStatusAndRecordTransitionEvents(ctx, req.NamespacedName, instance, oldstatus); err != nil {
+			return res, err
 		}
+	}
+	if err == nil && instance.DeletionTimestamp.IsZero() {
+		autoAttachmentResult, autoAttachmentErr := r.reconcileAutomaticExternalIPAttachments(ctx, instance)
+		if autoAttachmentErr != nil {
+			return res, autoAttachmentErr
+		}
+		res = mergeReconcileResult(res, autoAttachmentResult)
 	}
 
 	log.Info("end reconcile")
 	return res, err
 }
 
-func (r *ClusterOrderReconciler) patchStatusWithRetry(ctx context.Context, key client.ObjectKey, computed v1alpha1.ClusterOrderStatus) error {
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+func (r *ClusterOrderReconciler) persistStatusAndRecordTransitionEvents(
+	ctx context.Context,
+	key client.ObjectKey,
+	instance *v1alpha1.ClusterOrder,
+	oldStatus *v1alpha1.ClusterOrderStatus,
+) error {
+	var transition *statusTransition
+	if !equality.Semantic.DeepEqual(instance.Status, *oldStatus) {
+		ctrllog.FromContext(ctx).Info("status requires update")
+		var err error
+		transition, err = r.patchStatusWithRetry(ctx, key, instance.Status)
+		if err != nil {
+			return err
+		}
+	}
+	if transition != nil {
+		r.recordTransitionEventsForStatus(instance, &transition.oldStatus, &transition.newStatus)
+	}
+	return nil
+}
+
+const (
+	clusterOrderCreatedEventReason      = v1alpha1.ReasonCreated
+	clusterOrderCreatedEventAction      = "Created"
+	clusterOrderReadyEventReason        = v1alpha1.ReasonReady
+	clusterOrderReadyEventAction        = "Ready"
+	clusterOrderProvisioningEventAction = "Provisioning"
+	clusterOrderDeletingEventReason     = v1alpha1.ReasonDeleting
+	clusterOrderDeletingEventAction     = "Deleting"
+	clusterOrderFailedEventAction       = "Failed"
+)
+
+var clusterOrderProvisioningEventReasons = map[string]struct{}{
+	v1alpha1.ReasonPreparingInfrastructure: {},
+	v1alpha1.ReasonControlPlaneStarting:    {},
+	v1alpha1.ReasonWorkersJoining:          {},
+	v1alpha1.ReasonStageUnknown:            {},
+	v1alpha1.ReasonStalled:                 {},
+}
+
+var clusterOrderWarningEventReasons = map[string]struct{}{
+	v1alpha1.ReasonStageUnknown: {},
+	v1alpha1.ReasonStalled:      {},
+}
+
+func (r *ClusterOrderReconciler) recordTransitionEventsForStatus(instance *v1alpha1.ClusterOrder,
+	oldStatus, newStatus *v1alpha1.ClusterOrderStatus) {
+	if r.Recorder == nil {
+		return
+	}
+
+	oldProgressing := apimeta.FindStatusCondition(oldStatus.Conditions, v1alpha1.ConditionProgressing)
+	newProgressing := apimeta.FindStatusCondition(newStatus.Conditions, v1alpha1.ConditionProgressing)
+	if oldStatus.Phase == "" && len(oldStatus.Conditions) == 0 &&
+		(newStatus.Phase != "" || len(newStatus.Conditions) > 0) {
+		r.Recorder.Eventf(instance, nil, corev1.EventTypeNormal, clusterOrderCreatedEventReason,
+			clusterOrderCreatedEventAction, "ClusterOrder created")
+	}
+
+	if newProgressing != nil && (oldProgressing == nil || oldProgressing.Reason != newProgressing.Reason) {
+		if _, shouldRecord := clusterOrderProvisioningEventReasons[newProgressing.Reason]; shouldRecord {
+			eventType := corev1.EventTypeNormal
+			if _, shouldWarn := clusterOrderWarningEventReasons[newProgressing.Reason]; shouldWarn {
+				eventType = corev1.EventTypeWarning
+			}
+			r.Recorder.Eventf(instance, nil, eventType, newProgressing.Reason,
+				clusterOrderProvisioningEventAction, "ClusterOrder entered provisioning stage %s",
+				humanizeConditionName(newProgressing.Reason))
+		}
+	}
+
+	if oldStatus.Phase != v1alpha1.ClusterOrderPhaseFailed &&
+		newStatus.Phase == v1alpha1.ClusterOrderPhaseFailed {
+		reason := v1alpha1.ReasonFailed
+		message := "ClusterOrder provisioning failed"
+		if newProgressing != nil {
+			if newProgressing.Reason != "" {
+				reason = newProgressing.Reason
+			}
+			if newProgressing.Message != "" {
+				message = fmt.Sprintf("ClusterOrder provisioning failed: %s", newProgressing.Message)
+			}
+		}
+		r.Recorder.Eventf(instance, nil, corev1.EventTypeWarning, reason,
+			clusterOrderFailedEventAction, "%s", message)
+	}
+
+	oldReady := oldStatus.Phase == v1alpha1.ClusterOrderPhaseReady && oldProgressing != nil &&
+		oldProgressing.Status == metav1.ConditionFalse
+	newReady := newStatus.Phase == v1alpha1.ClusterOrderPhaseReady && newProgressing != nil &&
+		newProgressing.Status == metav1.ConditionFalse
+	if newReady && !oldReady {
+		r.Recorder.Eventf(instance, nil, corev1.EventTypeNormal, clusterOrderReadyEventReason,
+			clusterOrderReadyEventAction, "ClusterOrder is ready")
+	}
+
+	oldDeleting := apimeta.IsStatusConditionTrue(oldStatus.Conditions, v1alpha1.ConditionDeleting)
+	newDeleting := apimeta.IsStatusConditionTrue(newStatus.Conditions, v1alpha1.ConditionDeleting)
+	// ConditionDeleting must be set alongside Phase=Deleting (see handleDelete).
+	if newDeleting && !oldDeleting {
+		r.Recorder.Eventf(instance, nil, corev1.EventTypeNormal, clusterOrderDeletingEventReason,
+			clusterOrderDeletingEventAction, "ClusterOrder entered deleting phase")
+	}
+}
+
+type statusTransition struct {
+	oldStatus v1alpha1.ClusterOrderStatus
+	newStatus v1alpha1.ClusterOrderStatus
+}
+
+// setClusterOrderPhase records the phase and, when it changes, the time of the change, so
+// metering can bill the state transition from the moment it happened rather than from when
+// feedback noticed it. The time is stamped once per phase change and kept while the phase is
+// unchanged, the same pattern as ComputeInstance's RunningConfigSince.
+func setClusterOrderPhase(status *v1alpha1.ClusterOrderStatus, phase v1alpha1.ClusterOrderPhaseType) {
+	if status.Phase == phase {
+		return
+	}
+	status.Phase = phase
+	now := metav1.Now()
+	status.PhaseTransitionTime = &now
+}
+
+func (r *ClusterOrderReconciler) patchStatusWithRetry(ctx context.Context, key client.ObjectKey, computed v1alpha1.ClusterOrderStatus) (*statusTransition, error) {
+	var transition *statusTransition
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		latest := &v1alpha1.ClusterOrder{}
 		if err := r.apiReader.Get(ctx, key, latest); err != nil {
 			return err
 		}
 		base := latest.DeepCopy()
-		latest.Status.Phase = computed.Phase
+		deleting := !latest.DeletionTimestamp.IsZero()
+		terminalPhase := latest.Status.Phase == v1alpha1.ClusterOrderPhaseFailed ||
+			latest.Status.Phase == v1alpha1.ClusterOrderPhaseDeleting || deleting
+		workerPending := !terminalPhase && computed.Phase == v1alpha1.ClusterOrderPhaseReady &&
+			latest.HasBareMetalNodeSet() && !bareMetalWorkersReady(latest)
+		switch {
+		case deleting:
+			latest.Status.Phase = v1alpha1.ClusterOrderPhaseDeleting
+		case terminalPhase:
+			// A stale reconcile must not revive a terminal order.
+		case workerPending:
+			setClusterOrderPhase(&latest.Status, v1alpha1.ClusterOrderPhaseProgressing)
+		default:
+			setClusterOrderPhase(&latest.Status, computed.Phase)
+		}
 		latest.Status.ClusterReference = computed.ClusterReference
+		latest.Status.ObservedVersion = computed.ObservedVersion
+		latest.Status.UpgradeObservation = computed.UpgradeObservation
 		latest.Status.NodeRequests = computed.NodeRequests
-		latest.Status.NodeSets = computed.NodeSets
 		latest.Status.ProvisioningJobs = computed.ProvisioningJobs
 		latest.Status.DesiredConfigVersion = computed.DesiredConfigVersion
 		latest.Status.ApiEndpoint = computed.ApiEndpoint
 		latest.Status.IngressEndpoint = computed.IngressEndpoint
+		// Workers[] and its aggregate counts are owned by the BareMetalWorkerReconciler.
+		// Leave them from the fresh read so a concurrent worker status update is preserved.
 		for _, c := range computed.Conditions {
-			meta.SetStatusCondition(&latest.Status.Conditions, c)
+			if c.Type == v1alpha1.ConditionWorkersFailed ||
+				(terminalPhase && c.Type == v1alpha1.ConditionProgressing) ||
+				(deleting && c.Type == v1alpha1.ConditionDeleting) ||
+				c.Type == string(v1alpha1.ClusterOrderConditionAddOnOperatorsReady) {
+				continue
+			}
+			apimeta.SetStatusCondition(&latest.Status.Conditions, c)
 		}
-		return r.Status().Patch(ctx, latest, client.MergeFrom(base))
+		if deleting {
+			latest.SetStatusCondition(v1alpha1.ConditionDeleting, metav1.ConditionTrue,
+				"ClusterOrder is being deleted", v1alpha1.ReasonDeleting)
+		}
+		if workerPending {
+			latest.SetStatusCondition(v1alpha1.ConditionProgressing, metav1.ConditionTrue,
+				humanizeConditionName(v1alpha1.ReasonWorkersJoining), v1alpha1.ReasonWorkersJoining)
+		}
+		if equality.Semantic.DeepEqual(base.Status, latest.Status) {
+			return nil
+		}
+		if err := r.Status().Patch(ctx, latest, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{})); err != nil {
+			return err
+		}
+		transition = &statusTransition{oldStatus: base.Status, newStatus: latest.Status}
+		return nil
 	})
+	return transition, err
 }
 
 func NamespacePredicate(namespace string) predicate.Predicate {
@@ -301,11 +513,16 @@ func (r *ClusterOrderReconciler) handleUpdate(ctx context.Context, _ reconcile.R
 
 	r.initializeStatusConditions(instance)
 	if instance.Status.Phase == "" {
-		instance.Status.Phase = v1alpha1.ClusterOrderPhaseProgressing
+		setClusterOrderPhase(&instance.Status, v1alpha1.ClusterOrderPhaseProgressing)
+	}
+	if instance.Status.Phase == v1alpha1.ClusterOrderPhaseProgressing {
+		r.initializeProgressingStage(instance)
 	}
 
-	if controllerutil.AddFinalizer(instance, osacFinalizer) {
-		if err := r.Update(ctx, instance); err != nil {
+	if !controllerutil.ContainsFinalizer(instance, osacFinalizer) {
+		base := instance.DeepCopy()
+		controllerutil.AddFinalizer(instance, osacFinalizer)
+		if err := r.Patch(ctx, instance, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{})); err != nil {
 			return ctrl.Result{}, err
 		}
 	}
@@ -345,32 +562,27 @@ func (r *ClusterOrderReconciler) handleUpdate(ctx context.Context, _ reconcile.R
 		return ctrl.Result{}, err
 	}
 
-	// Select agents for each node set (labels them for HyperShift NodePool claiming)
-	agentResult, err := r.reconcileAgentSelection(ctx, instance)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-	if agentResult.RequeueAfter > 0 {
-		return agentResult, nil
-	}
-
 	ns, err := r.findNamespace(ctx, instance)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 
-	if hc, _ := r.findHostedCluster(ctx, instance, ns.GetName()); hc != nil {
+	hc, err := r.findHostedCluster(ctx, instance, ns.GetName())
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if hc != nil {
 		if err := r.handleHostedCluster(ctx, instance, hc); err != nil {
 			return ctrl.Result{}, err
 		}
+	} else if instance.Status.Phase != v1alpha1.ClusterOrderPhaseFailed &&
+		instance.Status.Phase != v1alpha1.ClusterOrderPhaseDeleting {
+		setClusterOrderPhase(&instance.Status, v1alpha1.ClusterOrderPhaseProgressing)
+		r.setProgressingStage(instance, v1alpha1.ReasonControlPlaneStarting)
 	}
 
 	// If provision job needs polling, requeue for status updates
-	if provisionResult.RequeueAfter > 0 {
-		return provisionResult, nil
-	}
-
-	return ctrl.Result{}, nil
+	return r.withStallRequeue(instance, provisionResult), nil
 }
 
 func (r *ClusterOrderReconciler) handleHostedCluster(ctx context.Context, instance *v1alpha1.ClusterOrder,
@@ -381,6 +593,11 @@ func (r *ClusterOrderReconciler) handleHostedCluster(ctx context.Context, instan
 	name := hc.GetName()
 	instance.SetClusterReferenceHostedClusterName(name)
 	instance.SetStatusCondition(v1alpha1.ConditionControlPlaneCreated, metav1.ConditionTrue, "", v1alpha1.ReasonAsExpected)
+
+	if instance.Status.Phase == v1alpha1.ClusterOrderPhaseProgressing {
+		subStage := deriveProvisioningSubStage(hc)
+		r.setProgressingStage(instance, subStage)
+	}
 
 	if hostedClusterControlPlaneIsAvailable(hc) {
 		log.Info("hosted control plane is available", "clusterorder", instance.GetName())
@@ -404,7 +621,199 @@ func (r *ClusterOrderReconciler) handleHostedCluster(ctx context.Context, instan
 	if err := r.handleNodePools(ctx, instance, nodePools); err != nil {
 		return err
 	}
+	recordObservedClusterVersions(instance, hc, nodePools.Items)
+	recordUpgradeObservations(instance, hc, nodePools.Items)
+	// A successful provisioning job only means that the infrastructure request
+	// was accepted. Derive terminal readiness from the live HostedCluster and
+	// NodePool observations in this reconcile.
+	finalizeReadyIfProvisioned(log, instance, hc, nodePools.Items)
+	r.reconcileClusterOrderReadiness(instance, hc)
 	return nil
+}
+
+func bareMetalWorkersReady(instance *v1alpha1.ClusterOrder) bool {
+	if instance == nil {
+		return false
+	}
+	if !instance.HasBareMetalNodeSet() {
+		return true
+	}
+	if instance.Status.DesiredWorkers == nil ||
+		instance.Status.CurrentWorkers == nil ||
+		instance.Status.ReadyWorkers == nil {
+		return false
+	}
+	if apimeta.IsStatusConditionTrue(instance.Status.Conditions, v1alpha1.ConditionWorkersFailed) {
+		return false
+	}
+	// An unknown observation must not promote readiness from a stale ready
+	// summary: the worker controller leaves the last-known counts in place while
+	// the fulfillment service is unavailable.
+	if apimeta.IsStatusConditionTrue(instance.Status.Conditions, v1alpha1.ConditionFulfillmentServiceUnavailable) {
+		return false
+	}
+	requestedWorkers := int32(0)
+	for _, nodeRequest := range instance.Spec.NodeRequests {
+		if !nodeRequest.IsBareMetal() {
+			continue
+		}
+		if nodeRequest.NumberOfNodes <= 0 {
+			return false
+		}
+		if int(requestedWorkers) > math.MaxInt32-nodeRequest.NumberOfNodes {
+			return false
+		}
+		requestedWorkers += int32(nodeRequest.NumberOfNodes)
+	}
+	if requestedWorkers <= 0 || *instance.Status.DesiredWorkers != requestedWorkers {
+		return false
+	}
+	return *instance.Status.ReadyWorkers >= *instance.Status.DesiredWorkers &&
+		*instance.Status.CurrentWorkers >= *instance.Status.DesiredWorkers
+}
+
+func (r *ClusterOrderReconciler) reconcileClusterOrderReadiness(
+	instance *v1alpha1.ClusterOrder,
+	hostedCluster *hypershiftv1beta1.HostedCluster,
+) {
+	if hostedCluster == nil {
+		return
+	}
+	if instance.Status.Phase == v1alpha1.ClusterOrderPhaseFailed ||
+		instance.Status.Phase == v1alpha1.ClusterOrderPhaseDeleting {
+		return
+	}
+	if !hostedClusterControlPlaneIsAvailable(hostedCluster) || !hostedClusterIsReady(hostedCluster) {
+		setClusterOrderPhase(&instance.Status, v1alpha1.ClusterOrderPhaseProgressing)
+		r.setProgressingStage(instance, deriveProvisioningSubStage(hostedCluster))
+		return
+	}
+
+	instance.SetStatusCondition(v1alpha1.ConditionClusterAvailable, metav1.ConditionTrue, "", v1alpha1.ReasonAsExpected)
+
+	if instance.HasBareMetalNodeSet() && !bareMetalWorkersReady(instance) {
+		setClusterOrderPhase(&instance.Status, v1alpha1.ClusterOrderPhaseProgressing)
+		instance.SetStatusCondition(v1alpha1.ConditionProgressing, metav1.ConditionTrue,
+			humanizeConditionName(v1alpha1.ReasonWorkersJoining), v1alpha1.ReasonWorkersJoining)
+		return
+	}
+
+	setClusterOrderPhase(&instance.Status, v1alpha1.ClusterOrderPhaseReady)
+	instance.SetStatusCondition(v1alpha1.ConditionProgressing, metav1.ConditionFalse, "", v1alpha1.ReasonAsExpected)
+}
+
+func (r *ClusterOrderReconciler) setProgressingStage(instance *v1alpha1.ClusterOrder, stage string) {
+	instance.SetStatusCondition(v1alpha1.ConditionProgressing, metav1.ConditionTrue,
+		humanizeConditionName(stage), stage)
+}
+
+func (r *ClusterOrderReconciler) initializeProgressingStage(instance *v1alpha1.ClusterOrder) {
+	progressing := apimeta.FindStatusCondition(instance.Status.Conditions, v1alpha1.ConditionProgressing)
+	if progressing == nil || progressing.Reason == "" || progressing.Reason == v1alpha1.ReasonProgressing {
+		r.setProgressingStage(instance, v1alpha1.ReasonPreparingInfrastructure)
+	}
+}
+
+func (r *ClusterOrderReconciler) withStallRequeue(instance *v1alpha1.ClusterOrder, result ctrl.Result) ctrl.Result {
+	stallResult := r.detectProvisioningStall(instance)
+	if stallResult.RequeueAfter > 0 &&
+		(result.RequeueAfter == 0 || stallResult.RequeueAfter < result.RequeueAfter) {
+		result.RequeueAfter = stallResult.RequeueAfter
+	}
+	return result
+}
+
+// detectProvisioningStall updates the Progressing condition once the current
+// provisioning stage exceeds its threshold and returns the precise next check time.
+func (r *ClusterOrderReconciler) detectProvisioningStall(instance *v1alpha1.ClusterOrder) ctrl.Result {
+	if instance.Status.Phase != v1alpha1.ClusterOrderPhaseProgressing {
+		return ctrl.Result{}
+	}
+
+	progressing := apimeta.FindStatusCondition(instance.Status.Conditions, v1alpha1.ConditionProgressing)
+	if progressing == nil || progressing.Status != metav1.ConditionTrue {
+		return ctrl.Result{}
+	}
+
+	stageStartedAt, threshold, found := r.provisioningStageTiming(instance, progressing.Reason)
+	if !found || stageStartedAt.IsZero() {
+		return ctrl.Result{}
+	}
+
+	now := time.Now()
+	if r.now != nil {
+		now = r.now()
+	}
+	elapsed := now.Sub(stageStartedAt)
+	if elapsed >= threshold {
+		instance.SetStatusCondition(v1alpha1.ConditionProgressing, metav1.ConditionTrue,
+			fmt.Sprintf("Stalled at %s", humanizeConditionName(progressing.Reason)), v1alpha1.ReasonStalled)
+		return ctrl.Result{RequeueAfter: r.StatusPollInterval}
+	}
+
+	return ctrl.Result{RequeueAfter: threshold - elapsed}
+}
+
+func (r *ClusterOrderReconciler) provisioningStageTiming(instance *v1alpha1.ClusterOrder, stage string) (time.Time, time.Duration, bool) {
+	thresholds := r.StallThresholds
+	if thresholds.PreparingInfrastructure <= 0 {
+		thresholds.PreparingInfrastructure = defaultPreparingInfrastructureStallThreshold
+	}
+	if thresholds.ControlPlaneStarting <= 0 {
+		thresholds.ControlPlaneStarting = defaultControlPlaneStartingStallThreshold
+	}
+	if thresholds.WorkersJoining <= 0 {
+		thresholds.WorkersJoining = defaultWorkersJoiningStallThreshold
+	}
+
+	conditionType := ""
+	threshold := time.Duration(0)
+	switch stage {
+	case v1alpha1.ReasonPreparingInfrastructure:
+		conditionType = v1alpha1.ConditionAccepted
+		threshold = thresholds.PreparingInfrastructure
+	case v1alpha1.ReasonControlPlaneStarting:
+		conditionType = v1alpha1.ConditionControlPlaneCreated
+		threshold = thresholds.ControlPlaneStarting
+	case v1alpha1.ReasonWorkersJoining:
+		conditionType = v1alpha1.ConditionControlPlaneAvailable
+		threshold = thresholds.workersJoiningThreshold(instance.Spec.NodeRequests)
+	default:
+		return time.Time{}, 0, false
+	}
+
+	condition := apimeta.FindStatusCondition(instance.Status.Conditions, conditionType)
+	if condition == nil {
+		return time.Time{}, 0, false
+	}
+	return condition.LastTransitionTime.Time, threshold, true
+}
+
+func (thresholds ClusterOrderStallThresholds) workersJoiningThreshold(nodeRequests []v1alpha1.NodeRequest) time.Duration {
+	baseThreshold := thresholds.WorkersJoining
+	if baseThreshold <= 0 {
+		baseThreshold = defaultWorkersJoiningStallThreshold
+	}
+	if len(nodeRequests) == 0 {
+		return baseThreshold
+	}
+
+	// A cluster cannot finish joining until every node set does. Use the longest
+	// effective threshold among its requested instance types.
+	threshold := time.Duration(0)
+	for _, nodeRequest := range nodeRequests {
+		effectiveThreshold := baseThreshold
+		if nodeRequest.BareMetal == nil {
+			continue
+		}
+		if override, found := thresholds.WorkersJoiningByInstanceType[nodeRequest.BareMetal.InstanceType]; found && override > 0 {
+			effectiveThreshold = override
+		}
+		if effectiveThreshold > threshold {
+			threshold = effectiveThreshold
+		}
+	}
+	return threshold
 }
 
 // reconcileVIPEndpoints copies VIP annotations written by the CaaS template
@@ -424,12 +833,27 @@ func reconcileVIPEndpoints(instance *v1alpha1.ClusterOrder) {
 
 func (r *ClusterOrderReconciler) handleNodePools(ctx context.Context, instance *v1alpha1.ClusterOrder,
 	nodePools *hypershiftv1beta1.NodePoolList) error {
+	present := make(map[string]bool, len(nodePools.Items))
 	for i := range len(nodePools.Items) {
+		if name, ok := nodePoolNodeSet(&nodePools.Items[i]); ok {
+			present[name] = true
+		}
 		err := r.handleNodePool(ctx, instance, &nodePools.Items[i])
 		if err != nil {
 			return fmt.Errorf("failed to handle node pool %d: %w", i, err)
 		}
 	}
+	desired := make(map[string]bool, len(instance.Spec.NodeRequests))
+	for _, request := range instance.Spec.NodeRequests {
+		desired[request.NodeSet] = true
+	}
+	retained := instance.Status.NodeRequests[:0]
+	for _, request := range instance.Status.NodeRequests {
+		if desired[request.NodeSet] || present[request.NodeSet] {
+			retained = append(retained, request)
+		}
+	}
+	instance.Status.NodeRequests = retained
 	return nil
 }
 
@@ -437,46 +861,77 @@ func (r *ClusterOrderReconciler) handleNodePool(ctx context.Context, instance *v
 	nodePool *hypershiftv1beta1.NodePool) error {
 	log := ctrllog.FromContext(ctx)
 
-	// TODO: Currently there is no way to know what is the item of the `nodeRequests` field that corresponds to a
-	// node pool. The best we can do is check if there is exactly one, and then assume that this node pool
-	// corresponds to that node request.
-
 	log.Info("processing nodepool", "nodepool", nodePool.GetName())
-	nodeRequestsCount := len(instance.Spec.NodeRequests)
-	if nodeRequestsCount != 1 {
-		log.Info(
-			"expected exactly one node request, will ignore the node pool",
-			"node_pool", nodePool.Name,
-			"node_requests", nodeRequestsCount,
-		)
+	nodeSet, ok := nodePoolNodeSet(nodePool)
+	if !ok {
+		log.Info("node pool has no NodeSet label, will ignore it", "node_pool", nodePool.Name)
+		return nil
+	}
+	instanceType, ok := nodePoolInstanceType(nodePool)
+	if !ok {
+		log.Info("node pool has no instance type label, will ignore it", "node_pool", nodePool.Name)
 		return nil
 	}
 
-	// Find the matching item inside the `nodeRequests` field of the status, or create a new one if there is no
-	// matching item yet.
-	resourceClass := instance.Spec.NodeRequests[0].ResourceClass
-	var nodeRequestStatus *v1alpha1.NodeRequest
+	// Skip the status update while observed replicas is zero.
+	// A newly created NodePool reports Status.Replicas == 0
+	// before any node joins.  Publishing zero would violate the
+	// fulfillment ClusterNodeSet.size > 0 constraint.  An
+	// existing ClusterOrder status entry retains its last
+	// positive value until a new positive observation arrives.
+	//
+	// Spec.Replicas is intentionally not checked: it is nil when
+	// autoscaling is active (HyperShift enforces Replicas XOR
+	// AutoScaling), yet Status.Replicas still reflects the
+	// actual observed count and should be reported.
+	if nodePool.Status.Replicas == 0 {
+		// Remove a pre-existing zero-valued entry so the feedback
+		// controller does not forward it to fulfillment where
+		// ClusterNodeSet.size > 0 would reject it.  Older operator
+		// versions wrote NumberOfNodes = 0 for newly created
+		// NodePools; this cleans them up on upgrade.  Positive
+		// entries are preserved (last-known-value).
+		for i, nr := range instance.Status.NodeRequests {
+			if nr.NodeSet == nodeSet && nr.NumberOfNodes == 0 {
+				instance.Status.NodeRequests = append(
+					instance.Status.NodeRequests[:i],
+					instance.Status.NodeRequests[i+1:]...)
+				break
+			}
+		}
+		return nil
+	}
+
+	// Find the matching item inside the `nodeRequests` field of the
+	// status, or create a new one if there is no matching item yet.
+	var nodeRequestStatus *v1alpha1.NodeRequestStatus
 	for i, nodeRequestsItem := range instance.Status.NodeRequests {
-		log.Info("looking for resource class", "want", resourceClass, "have", nodeRequestsItem.ResourceClass)
-		if nodeRequestsItem.ResourceClass == resourceClass {
+		if nodeRequestsItem.NodeSet == nodeSet {
 			nodeRequestStatus = &instance.Status.NodeRequests[i]
 		}
 	}
 	if nodeRequestStatus == nil {
-		instance.Status.NodeRequests = append(instance.Status.NodeRequests, v1alpha1.NodeRequest{
-			ResourceClass: resourceClass,
-		})
+		instance.Status.NodeRequests = append(
+			instance.Status.NodeRequests,
+			v1alpha1.NodeRequestStatus{
+				NodeSet:   nodeSet,
+				BareMetal: &v1alpha1.BareMetalNodeSpec{InstanceType: instanceType},
+			},
+		)
 		nodeRequestStatus = &instance.Status.NodeRequests[len(instance.Status.NodeRequests)-1]
 	}
 
-	// Update the selected `nodeRequests` item:
+	// Update the selected `nodeRequests` item with the NodePool's
+	// observed replica count.  The zero-guard above ensures this
+	// value is always positive, satisfying the fulfillment proto's
+	// ClusterNodeSet.size > 0 constraint.
 	oldValue := nodeRequestStatus.NumberOfNodes
 	newValue := int(nodePool.Status.Replicas)
 	if newValue != oldValue {
 		log.Info(
 			"updating number of nodes from node pool",
 			"node_pool", nodePool.Name,
-			"resource_class", resourceClass,
+			"instance_type", instanceType,
 			"old_value", oldValue,
 			"new_value", newValue,
 		)
@@ -487,13 +942,142 @@ func (r *ClusterOrderReconciler) handleNodePool(ctx context.Context, instance *v
 }
 
 func hostedClusterControlPlaneIsAvailable(hc *hypershiftv1beta1.HostedCluster) bool {
-	return (meta.IsStatusConditionTrue(hc.Status.Conditions, "Available") &&
-		meta.IsStatusConditionFalse(hc.Status.Conditions, "Degraded"))
+	return (apimeta.IsStatusConditionTrue(hc.Status.Conditions, string(hypershiftv1beta1.HostedClusterAvailable)) &&
+		apimeta.IsStatusConditionFalse(hc.Status.Conditions, string(hypershiftv1beta1.HostedClusterDegraded)))
 }
 
 func hostedClusterIsReady(hc *hypershiftv1beta1.HostedCluster) bool {
-	return (meta.IsStatusConditionTrue(hc.Status.Conditions, "ClusterVersionSucceeding") &&
-		meta.IsStatusConditionFalse(hc.Status.Conditions, "Degraded"))
+	return (apimeta.IsStatusConditionTrue(hc.Status.Conditions, string(hypershiftv1beta1.ClusterVersionSucceeding)) &&
+		apimeta.IsStatusConditionFalse(hc.Status.Conditions, string(hypershiftv1beta1.HostedClusterDegraded)))
+}
+
+func hostedClusterAndNodePoolsAreReady(instance *v1alpha1.ClusterOrder, hc *hypershiftv1beta1.HostedCluster,
+	nodePools []hypershiftv1beta1.NodePool) bool {
+	if !hostedClusterControlPlaneIsAvailable(hc) ||
+		!apimeta.IsStatusConditionTrue(hc.Status.Conditions, string(hypershiftv1beta1.KubeAPIServerAvailable)) ||
+		!hostedClusterIsReady(hc) {
+		return false
+	}
+	return nodePoolsMatchRequests(instance.Spec.NodeRequests, nodePools)
+}
+
+func nodePoolsMatchRequests(requests []v1alpha1.NodeRequest, nodePools []hypershiftv1beta1.NodePool) bool {
+	if len(requests) == 0 || len(nodePools) == 0 {
+		return false
+	}
+	if nodeRequestsContainDuplicateNodeSets(requests) {
+		return false
+	}
+	expectedReplicas := expectedNodePoolReplicas(requests)
+	if len(expectedReplicas) != len(nodePools) {
+		return false
+	}
+
+	seen := sets.New[string]()
+	for i := range nodePools {
+		nodeSet, ok := nodePoolNodeSet(&nodePools[i])
+		if !ok {
+			return false
+		}
+		expected, ok := expectedReplicas[nodeSet]
+		if !ok {
+			return false
+		}
+		if seen.Has(nodeSet) || !nodePoolMatchesRequest(&nodePools[i], expected) {
+			return false
+		}
+		seen.Insert(nodeSet)
+	}
+	return len(seen) == len(expectedReplicas)
+}
+
+func nodeRequestsContainDuplicateNodeSets(requests []v1alpha1.NodeRequest) bool {
+	seen := sets.New[string]()
+	for _, request := range requests {
+		if request.NodeSet == "" || request.BareMetal == nil || request.BareMetal.InstanceType == "" || seen.Has(request.NodeSet) {
+			return true
+		}
+		seen.Insert(request.NodeSet)
+	}
+	return false
+}
+
+func expectedNodePoolReplicas(requests []v1alpha1.NodeRequest) map[string]int {
+	expected := make(map[string]int, len(requests))
+	for _, request := range requests {
+		if request.BareMetal != nil && request.BareMetal.InstanceType != "" {
+			expected[request.NodeSet] = request.NumberOfNodes
+		}
+	}
+	return expected
+}
+
+func nodePoolNodeSet(nodePool *hypershiftv1beta1.NodePool) (string, bool) {
+	key := nodePool.Labels[agentNodeSetLabel]
+	return key, key != ""
+}
+
+func nodePoolInstanceType(nodePool *hypershiftv1beta1.NodePool) (string, bool) {
+	instanceType, ok := nodePool.Labels[agentInstanceTypeLabel]
+	return instanceType, ok && instanceType != ""
+}
+
+func nodePoolMatchesRequest(nodePool *hypershiftv1beta1.NodePool, expectedReplicas int) bool {
+	return nodePoolIsReady(nodePool) && int(nodePool.Status.Replicas) == expectedReplicas
+}
+
+func nodePoolIsReady(nodePool *hypershiftv1beta1.NodePool) bool {
+	allMachinesReady := false
+	poolReady := false
+	for _, condition := range nodePool.Status.Conditions {
+		switch condition.Type {
+		case hypershiftv1beta1.NodePoolAllMachinesReadyConditionType:
+			allMachinesReady = condition.Status == corev1.ConditionTrue
+		case hypershiftv1beta1.NodePoolReadyConditionType:
+			poolReady = condition.Status == corev1.ConditionTrue
+		}
+	}
+	return allMachinesReady && poolReady
+}
+
+func provisioningJobSucceeded(instance *v1alpha1.ClusterOrder) bool {
+	job := provisioning.FindLatestJobByType(instance.Status.ProvisioningJobs, v1alpha1.JobTypeProvision)
+	return job != nil && job.State == v1alpha1.JobStateSucceeded
+}
+
+func finalizeReadyIfProvisioned(log logr.Logger, instance *v1alpha1.ClusterOrder, hc *hypershiftv1beta1.HostedCluster,
+	nodePools []hypershiftv1beta1.NodePool) bool {
+	if !provisioningJobSucceeded(instance) {
+		return false
+	}
+	if nodeRequestsContainDuplicateNodeSets(instance.Spec.NodeRequests) {
+		log.Info("node pool readiness blocked by missing or duplicate NodeSet keys in node requests")
+		return false
+	}
+	if !hostedClusterAndNodePoolsAreReady(instance, hc, nodePools) {
+		return false
+	}
+	setClusterOrderPhase(&instance.Status, v1alpha1.ClusterOrderPhaseReady)
+	instance.SetStatusCondition(v1alpha1.ConditionProgressing, metav1.ConditionFalse, "", v1alpha1.ReasonAsExpected)
+	return true
+}
+
+// deriveProvisioningSubStage returns a live sub-stage reason reflecting the current HC condition
+// snapshot. It is intentionally non-monotonic: if conditions transiently disappear the reason can
+// regress (e.g. WorkersJoining back to StageUnknown). The coarse stage conditions
+// (ControlPlaneCreated, ControlPlaneAvailable) remain sticky-True and provide monotonic progress.
+func deriveProvisioningSubStage(hc *hypershiftv1beta1.HostedCluster) string {
+	if len(hc.Status.Conditions) == 0 {
+		return v1alpha1.ReasonStageUnknown
+	}
+	if !apimeta.IsStatusConditionTrue(hc.Status.Conditions, string(hypershiftv1beta1.InfrastructureReady)) {
+		return v1alpha1.ReasonPreparingInfrastructure
+	}
+	if apimeta.IsStatusConditionTrue(hc.Status.Conditions, string(hypershiftv1beta1.KubeAPIServerAvailable)) &&
+		apimeta.IsStatusConditionTrue(hc.Status.Conditions, string(hypershiftv1beta1.HostedClusterAvailable)) {
+		return v1alpha1.ReasonWorkersJoining
+	}
+	return v1alpha1.ReasonControlPlaneStarting
 }
 
 func (r *ClusterOrderReconciler) findHostedCluster(ctx context.Context, instance *v1alpha1.ClusterOrder, nsName string) (*hypershiftv1beta1.HostedCluster, error) {
@@ -540,17 +1124,20 @@ func (r *ClusterOrderReconciler) handleDelete(ctx context.Context, _ reconcile.R
 	log := ctrllog.FromContext(ctx)
 	log.Info("deleting clusterorder")
 
-	instance.Status.Phase = v1alpha1.ClusterOrderPhaseDeleting
+	setClusterOrderPhase(&instance.Status, v1alpha1.ClusterOrderPhaseDeleting)
+	instance.SetStatusCondition(v1alpha1.ConditionDeleting, metav1.ConditionTrue,
+		"ClusterOrder is being deleted", v1alpha1.ReasonDeleting)
+
+	// The add-on controller gets one deletion pass through its finalizer to
+	// cancel active jobs. Job state itself must not block ClusterOrder teardown.
+	if controllerutil.ContainsFinalizer(instance, osacAddOnOperatorFinalizer) {
+		return ctrl.Result{RequeueAfter: r.StatusPollInterval}, nil
+	}
 
 	// Delete auto-provisioned ExternalIPAttachments then ExternalIPs before deprovisioning.
 	done, cleanupResult, err := r.reconcileAutoExternalIPCleanup(ctx, instance)
 	if err != nil || !done {
 		return cleanupResult, err
-	}
-
-	// Release agents allocated to this cluster
-	if err := r.reconcileAgentCleanup(ctx, instance); err != nil {
-		return ctrl.Result{}, err
 	}
 
 	// Handle deprovisioning via provider
@@ -599,74 +1186,54 @@ func (r *ClusterOrderReconciler) handleDelete(ctx context.Context, _ reconcile.R
 	return ctrl.Result{}, nil
 }
 
-// reconcileAutoExternalIPCleanup deletes auto-provisioned ExternalIPAttachments and
+// reconcileAutoExternalIPCleanup deletes automatically created ExternalIPAttachments and
 // ExternalIPs for this ClusterOrder in phase order: EIAs first, then EIPs. Returns
 // (done=true) when cleanup is complete or not applicable, (done=false) with a requeue
 // result when resources still exist.
 func (r *ClusterOrderReconciler) reconcileAutoExternalIPCleanup(ctx context.Context, instance *v1alpha1.ClusterOrder) (bool, ctrl.Result, error) {
-	if r.NetworkingNamespace == "" {
-		return true, ctrl.Result{}, nil
+	return reconcileAutoExternalIPCleanup(ctx, r.Client, r.NetworkingNamespace, autoExternalIPOwner{
+		kind: clusterOrderOwner,
+		id:   instance.GetLabels()[osacClusterOrderIDLabel],
+	}, r.StatusPollInterval)
+}
+
+func (r *ClusterOrderReconciler) reconcileAutomaticExternalIPAttachments(
+	ctx context.Context,
+	instance *v1alpha1.ClusterOrder,
+) (ctrl.Result, error) {
+	if instance.Status.Phase != v1alpha1.ClusterOrderPhaseReady || r.ClustersClient == nil ||
+		r.ExternalIPAttachmentsClient == nil || r.NetworkingNamespace == "" {
+		return ctrl.Result{}, nil
 	}
-	clusterUUID, exists := instance.GetLabels()[osacClusterOrderIDLabel]
-	if !exists || clusterUUID == "" {
-		return true, ctrl.Result{}, nil
+	clusterID := instance.Labels[osacClusterOrderIDLabel]
+	if clusterID == "" {
+		return ctrl.Result{}, nil
+	}
+	response, err := r.ClustersClient.Get(ctx, privatev1.ClustersGetRequest_builder{Id: clusterID}.Build())
+	if status.Code(err) == codes.NotFound {
+		return ctrl.Result{}, nil
+	}
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("get Fulfillment Cluster %q for automatic ExternalIPAttachment: %w", clusterID, err)
+	}
+	cluster := response.GetObject()
+	if cluster == nil || !cluster.GetSpec().GetAutoExternalIpAttachment() {
+		return ctrl.Result{}, nil
 	}
 
-	log := ctrllog.FromContext(ctx)
-
-	// Phase 1: ExternalIPAttachments targeting this cluster, labeled auto-provisioned.
-	eiaList := &v1alpha1.ExternalIPAttachmentList{}
-	if err := r.List(ctx, eiaList,
-		client.InNamespace(r.NetworkingNamespace),
-		client.MatchingLabels{osacAutoProvisionedLabel: labelValueTrue},
-	); err != nil {
-		return false, ctrl.Result{}, err
-	}
-	var pendingEIAs int
-	for i := range eiaList.Items {
-		eia := &eiaList.Items[i]
-		if eia.Spec.Cluster == nil || *eia.Spec.Cluster != clusterUUID {
-			continue
-		}
-		pendingEIAs++
-		if eia.DeletionTimestamp.IsZero() {
-			log.Info("deleting auto-provisioned ExternalIPAttachment", "name", eia.Name)
-			if err := client.IgnoreNotFound(r.Delete(ctx, eia)); err != nil {
-				return false, ctrl.Result{}, err
-			}
-		}
-	}
-	if pendingEIAs > 0 {
-		return false, ctrl.Result{RequeueAfter: r.StatusPollInterval}, nil
-	}
-
-	// Phase 2: ExternalIPs labeled auto-provisioned-for this cluster.
-	eipList := &v1alpha1.ExternalIPList{}
-	if err := r.List(ctx, eipList,
-		client.InNamespace(r.NetworkingNamespace),
-		client.MatchingLabels{
-			osacAutoProvisionedLabel:    labelValueTrue,
-			osacAutoProvisionedForLabel: clusterUUID,
+	target := automaticExternalIPAttachmentTarget{
+		owner:     autoExternalIPOwner{kind: clusterOrderOwner, id: clusterID},
+		kind:      clusterOrderOwner,
+		kindLabel: autoExternalIPKindLabel(clusterOrderOwner),
+		tenant:    cluster.GetMetadata().GetTenant(),
+		endpoints: []string{autoCreatedEndpointAPI, autoCreatedEndpointIngress},
+		availableEndpoints: map[string]bool{
+			autoCreatedEndpointAPI:     instance.Status.ApiEndpoint != "",
+			autoCreatedEndpointIngress: instance.Status.IngressEndpoint != "",
 		},
-	); err != nil {
-		return false, ctrl.Result{}, err
 	}
-	var pendingEIPs int
-	for i := range eipList.Items {
-		eip := &eipList.Items[i]
-		pendingEIPs++
-		if eip.DeletionTimestamp.IsZero() {
-			log.Info("deleting auto-provisioned ExternalIP", "name", eip.Name)
-			if err := client.IgnoreNotFound(r.Delete(ctx, eip)); err != nil {
-				return false, ctrl.Result{}, err
-			}
-		}
-	}
-	if pendingEIPs > 0 {
-		return false, ctrl.Result{RequeueAfter: r.StatusPollInterval}, nil
-	}
-
-	return true, ctrl.Result{}, nil
+	return reconcileAutomaticExternalIPAttachments(ctx, r.Client, r.NetworkingNamespace,
+		r.ExternalIPAttachmentsClient, r.StatusPollInterval, target)
 }
 
 func (r *ClusterOrderReconciler) provisionState(instance *v1alpha1.ClusterOrder) *provisioning.State {
@@ -684,13 +1251,23 @@ func (r *ClusterOrderReconciler) provisioningCallbacks(instance *v1alpha1.Cluste
 			// stays Progressing and the failed job is visible in status.provisioningJobs.
 			if instance.Status.ClusterReference == nil ||
 				instance.Status.ClusterReference.HostedClusterName == "" {
-				instance.Status.Phase = v1alpha1.ClusterOrderPhaseFailed
+				setClusterOrderPhase(&instance.Status, v1alpha1.ClusterOrderPhaseFailed)
 				instance.SetStatusCondition(v1alpha1.ConditionProgressing, metav1.ConditionFalse, message, v1alpha1.ReasonProvisioningFailed)
 			}
 		},
 		OnSuccess: func(_ provisioning.ProvisionStatus) {
-			instance.Status.Phase = v1alpha1.ClusterOrderPhaseReady
-			instance.SetStatusCondition(v1alpha1.ConditionProgressing, metav1.ConditionFalse, "", v1alpha1.ReasonAsExpected)
+			if instance.Status.Phase != v1alpha1.ClusterOrderPhaseProgressing {
+				return
+			}
+			if instance.HasBareMetalNodeSet() && !bareMetalWorkersReady(instance) {
+				instance.SetStatusCondition(v1alpha1.ConditionProgressing, metav1.ConditionTrue,
+					humanizeConditionName(v1alpha1.ReasonWorkersJoining), v1alpha1.ReasonWorkersJoining)
+				return
+			}
+			progressing := apimeta.FindStatusCondition(instance.Status.Conditions, v1alpha1.ConditionProgressing)
+			if progressing == nil || progressing.Status != metav1.ConditionTrue {
+				instance.SetStatusCondition(v1alpha1.ConditionProgressing, metav1.ConditionTrue, "", v1alpha1.ReasonProgressing)
+			}
 		},
 	}
 }
@@ -704,7 +1281,7 @@ func (r *ClusterOrderReconciler) handleProvisioning(ctx context.Context, instanc
 		return ctrl.Result{}, nil
 	}
 
-	return provisioning.RunProvisioningLifecycle(ctx, r.ProvisioningProvider, instance,
+	return provisioning.RunProvisioningLifecycleWithPrepareTrigger(ctx, r.ProvisioningProvider, instance,
 		r.provisionState(instance),
 		r.MaxJobHistory, r.StatusPollInterval,
 		r.provisioningCallbacks(instance),
@@ -714,9 +1291,60 @@ func (r *ClusterOrderReconciler) handleProvisioning(ctx context.Context, instanc
 			})
 		},
 		func() error {
-			return r.patchStatusWithRetry(ctx, client.ObjectKeyFromObject(instance), instance.Status)
+			transition, err := r.patchStatusWithRetry(ctx, client.ObjectKeyFromObject(instance), instance.Status)
+			if err != nil {
+				return err
+			}
+			if transition != nil {
+				r.recordTransitionEventsForStatus(instance, &transition.oldStatus, &transition.newStatus)
+			}
+			return nil
 		},
+		r.prepareSSHKeyLaunch(ctx, instance),
 	)
+}
+
+// sshKeyResolutionRetry bounds the requeue delay while the Cluster's SSH-key
+// Secret cannot be resolved. The controller-runtime backoff provides the
+// retry loop; this delay only prevents a hot loop.
+const sshKeyResolutionRetry = time.Minute
+
+// prepareSSHKeyLaunch resolves the Cluster's registered SSH-key Secret only
+// when a new provisioning job is about to be launched. The resolved material
+// is supplied as a trigger-only AAP variable and never persisted. A nil or
+// empty reference yields no variable so the provider default remains
+// available. A resolution failure holds provisioning with a recoverable
+// condition; the message identifies the Secret by ID only.
+func (r *ClusterOrderReconciler) prepareSSHKeyLaunch(ctx context.Context, instance *v1alpha1.ClusterOrder) provisioning.PrepareTriggerFunc {
+	return func() (map[string]any, bool, time.Duration) {
+		ref := instance.Spec.SSHKey
+		if ref == nil || ref.ID == "" {
+			return nil, true, 0
+		}
+		if r.SecretsClient == nil {
+			r.setSSHKeyResolutionPending(instance, "ssh key secret resolution is not configured")
+			return nil, false, sshKeyResolutionRetry
+		}
+		response, err := r.SecretsClient.Get(ctx, privatev1.SecretsGetRequest_builder{Id: ref.ID}.Build())
+		if err != nil {
+			r.setSSHKeyResolutionPending(instance, err.Error())
+			return nil, false, sshKeyResolutionRetry
+		}
+		key := string(response.GetObject().GetData()["public_key"])
+		if key == "" {
+			r.setSSHKeyResolutionPending(instance,
+				fmt.Sprintf("SSH key Secret %q has no public_key data", ref.ID))
+			return nil, false, sshKeyResolutionRetry
+		}
+		return map[string]any{"ssh_public_key": key}, true, 0
+	}
+}
+
+// setSSHKeyResolutionPending records a recoverable SSH-key resolution failure
+// on the ClusterOrder. The condition never carries key material.
+func (r *ClusterOrderReconciler) setSSHKeyResolutionPending(instance *v1alpha1.ClusterOrder, message string) {
+	instance.SetStatusCondition(v1alpha1.ConditionProgressing, metav1.ConditionTrue,
+		message, v1alpha1.ReasonSSHKeyResolutionPending)
 }
 
 func (r *ClusterOrderReconciler) handleDesiredConfigVersion(instance *v1alpha1.ClusterOrder) error {
@@ -793,11 +1421,11 @@ func (r *ClusterOrderReconciler) initializeStatusCondition(instance *v1alpha1.Cl
 	if instance.Status.Conditions == nil {
 		instance.Status.Conditions = []metav1.Condition{}
 	}
-	condition := meta.FindStatusCondition(instance.Status.Conditions, conditionType)
+	condition := apimeta.FindStatusCondition(instance.Status.Conditions, conditionType)
 	if condition != nil {
 		return
 	}
-	_ = meta.SetStatusCondition(
+	_ = apimeta.SetStatusCondition(
 		&instance.Status.Conditions,
 		metav1.Condition{
 			Type:   conditionType,

@@ -1,0 +1,691 @@
+#!/usr/bin/env python3
+"""Check the BMF NetBox, osac-infra, and umbrella Helm render contracts."""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import pathlib
+import subprocess
+import tempfile
+import uuid
+from typing import Any
+
+import yaml
+
+SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
+INSTALLER_DIR = SCRIPT_DIR.parent
+REPO_ROOT = INSTALLER_DIR.parent
+BMF_CHART = REPO_ROOT / "bare-metal-fulfillment-operator/charts/operator"
+OSAC_CHART = INSTALLER_DIR / "charts/osac"
+INFRA_CHART = INSTALLER_DIR / "charts/osac-infra"
+
+BMF_NETBOX_VALUES = """\
+secrets:
+  inventoryConfig: osac-inventory-config
+  managementConfig: osac-management-config
+  netboxToken: custom-netbox-token
+  netboxCA: custom-netbox-ca
+netbox:
+  enabled: true
+  bmhNamespace: host-inventory
+  url: https://netbox.example.test
+  tokenValue: render-test-netbox-token
+  caCert: |
+    TEST-CA-CERTIFICATE
+  allowInsecureHTTP: false
+metal3:
+  enabled: false
+secretAPI:
+  url: https://fulfillment-internal-api:8001
+  issuerUrl: https://keycloak.example.test/realms/osac
+  caBundle:
+    configMap: ca-bundle
+    key: bundle.pem
+"""
+
+OSAC_NETBOX_VALUES = """\
+global:
+  services:
+    bmaas:
+      enabled: true
+service:
+  auth:
+    issuerUrl: https://keycloak.example.test/realms/osac
+bmf:
+  secrets:
+    netboxToken: custom-netbox-token
+  secretAPI:
+    issuerUrl: https://keycloak.example.test/realms/osac
+  netbox:
+    enabled: true
+    bmhNamespace: host-inventory
+    url: https://netbox.example.test
+    tokenValue: render-test-netbox-token
+  metal3:
+    enabled: false
+"""
+
+def helm_result(release: str, chart: pathlib.Path, *args: str) -> subprocess.CompletedProcess[str]:
+    command = ["helm", "template", release, str(chart), *args]
+    return subprocess.run(command, check=False, capture_output=True, text=True, cwd=INSTALLER_DIR)
+
+
+def kubectl(*args: str) -> None:
+    result = subprocess.run(["kubectl", *args], check=False, capture_output=True, text=True)
+    if result.returncode:
+        raise RuntimeError(f"kubectl failed:\n{result.stderr}")
+
+
+def render(release: str, chart: pathlib.Path, *args: str) -> list[dict[str, Any]]:
+    result = helm_result(release, chart, *args)
+    if result.returncode:
+        command = " ".join(["helm", "template", release, str(chart), *args])
+        raise RuntimeError(f"Helm render failed: {command}\n{result.stderr}")
+    return [doc for doc in yaml.safe_load_all(result.stdout) if isinstance(doc, dict)]
+
+
+def assert_helm_failure(expected: str, release: str, chart: pathlib.Path, *args: str) -> None:
+    result = helm_result(release, chart, *args)
+    output = result.stdout + result.stderr
+    assert result.returncode != 0, f"Helm unexpectedly accepted invalid values; expected: {expected}"
+    assert expected in output, f"Helm failed without the expected error: {expected}\n{output}"
+
+
+def resource(docs: list[dict[str, Any]], kind: str, name: str) -> dict[str, Any]:
+    matches = [doc for doc in docs if doc.get("kind") == kind and doc.get("metadata", {}).get("name") == name]
+    assert len(matches) == 1, f"expected one {kind}/{name}, found {len(matches)}"
+    return matches[0]
+
+
+def assert_resource_absent(docs: list[dict[str, Any]], kind: str, name: str) -> None:
+    matches = [doc for doc in docs if doc.get("kind") == kind and doc.get("metadata", {}).get("name") == name]
+    assert not matches, f"expected {kind}/{name} to be omitted"
+
+
+def embedded_config(docs: list[dict[str, Any]], secret_name: str, key: str) -> dict[str, Any]:
+    secret = resource(docs, "Secret", secret_name)
+    config = yaml.safe_load(secret["stringData"][key])
+    assert isinstance(config, dict), f"expected {secret_name}.{key} to contain a YAML mapping"
+    return config
+
+
+def container(resource_doc: dict[str, Any], name: str) -> dict[str, Any]:
+    containers = resource_doc["spec"]["template"]["spec"]["containers"]
+    matches = [item for item in containers if item.get("name") == name]
+    assert len(matches) == 1, f"expected one container named {name}, found {len(matches)}"
+    return matches[0]
+
+
+def environment(container_doc: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {item["name"]: item for item in container_doc.get("env", [])}
+
+
+def bmf_render(*args: str) -> list[dict[str, Any]]:
+    return render("bmf", BMF_CHART, "--namespace", "osac", *args)
+
+
+def infra_render(*values: str) -> list[dict[str, Any]]:
+    return render(
+        "osac-infra",
+        INFRA_CHART,
+        "--namespace",
+        "osac-infra",
+        "--set",
+        "osacNamespace=osac",
+        *[flag for value in values for flag in ("--values", value)],
+    )
+
+
+def check_infra_netbox_shared_postgres() -> None:
+    """NetBox must use the shared bundled PostgreSQL, not its own database."""
+    docs = infra_render("values/bmaas-ci/infra.yaml", "values/bmaas-netbox-ci/infra.yaml")
+
+    cert = resource(docs, "Certificate", "postgres-client-netbox")
+    assert cert["spec"]["commonName"] == "netbox"
+    assert cert["spec"]["usages"] == ["client auth"]
+    assert cert["spec"]["secretName"] == "postgres-client-cert-netbox"
+
+    init = resource(docs, "Secret", "postgres-init")["stringData"]["init.sh"]
+    assert "create user netbox;" in init
+    assert "create database netbox owner netbox;" in init
+
+    # The subchart's Bitnami PostgreSQL stays undeployed; the shared one remains.
+    assert_resource_absent(docs, "StatefulSet", "osac-infra-postgresql")
+    assert_resource_absent(docs, "Secret", "osac-infra-postgresql")
+    resource(docs, "Deployment", "postgres")
+    resource(docs, "Service", "postgres")
+
+    config = yaml.safe_load(resource(docs, "ConfigMap", "osac-infra-netbox")["data"]["netbox.yaml"])
+    database = config["DATABASES"]["default"]
+    assert database["HOST"] == "postgres"
+    assert database["PORT"] == 5432
+    assert database["USER"] == "netbox"
+    assert database["NAME"] == "netbox"
+    options = database["OPTIONS"]
+    assert options["sslmode"] == "verify-full"
+    assert options["sslcert"] == "/secrets/database-client/tls.crt"
+    assert options["sslkey"] == "/secrets/database-client/tls.key"
+    assert options["sslrootcert"] == "/secrets/database-client/ca.crt"
+
+    db_password = resource(docs, "Secret", "osac-infra-netbox-postgresql")["data"]["db_password"]
+    assert db_password == ""
+
+    for name in ("osac-infra-netbox", "osac-infra-netbox-worker"):
+        spec = resource(docs, "Deployment", name)["spec"]["template"]["spec"]
+        volume = next(v for v in spec["volumes"] if v["name"] == "database-client-cert")
+        assert volume["secret"]["secretName"] == "postgres-client-cert-netbox"
+        assert volume["secret"]["defaultMode"] == 0o440
+        mount = next(m for m in spec["containers"][0]["volumeMounts"] if m["name"] == "database-client-cert")
+        assert mount["mountPath"] == "/secrets/database-client"
+        assert mount["readOnly"] is True
+
+    # The Valkey cache never talks to PostgreSQL and must not carry its credentials.
+    for doc in docs:
+        if doc.get("kind") in ("StatefulSet", "Deployment") and "valkey" in doc["metadata"]["name"]:
+            assert "postgres-client-cert-netbox" not in str(doc), doc["metadata"]["name"]
+
+
+def check_infra_netbox_disabled() -> None:
+    """Without the NetBox overlay the shared PostgreSQL gains no NetBox artifacts."""
+    docs = infra_render("values/bmaas-ci/infra.yaml")
+    assert_resource_absent(docs, "Certificate", "postgres-client-netbox")
+    init = resource(docs, "Secret", "postgres-init")["stringData"]["init.sh"]
+    assert "netbox" not in init
+
+
+def check_bmf_netbox(docs: list[dict[str, Any]]) -> None:
+    inventory = embedded_config(docs, "osac-inventory-config", "inventory.yaml")
+    assert inventory["type"] == "netbox"
+    assert inventory["hostClass"] == "metal3"
+    netbox = inventory["options"]["netbox"]
+    assert netbox["url"] == "https://netbox.example.test"
+    assert netbox["tokenFile"] == "/etc/osac/secrets/netbox/token"
+    assert netbox["caFile"] == "/etc/osac/secrets/netbox-ca/ca.crt"
+    assert netbox["allowInsecureHTTP"] is False
+    assert "render-test-netbox-token" not in str(inventory)
+    assert "TEST-CA-CERTIFICATE" not in str(inventory)
+
+    management = embedded_config(docs, "osac-management-config", "management.yaml")
+    assert management["options"]["metal3"]["namespace"] == "host-inventory"
+
+    token_secret = resource(docs, "Secret", "custom-netbox-token")
+    assert token_secret["stringData"]["token"] == "render-test-netbox-token"
+    ca_secret = resource(docs, "Secret", "custom-netbox-ca")
+    assert "TEST-CA-CERTIFICATE" in str(ca_secret.get("stringData", {}))
+
+    bmc_role = resource(docs, "Role", "bmf-operator-bmc-secrets")
+    assert bmc_role["metadata"]["namespace"] == "host-inventory"
+    bmc_verbs = {verb for rule in bmc_role["rules"] for verb in rule.get("verbs", [])}
+    assert not {"list", "watch"}.intersection(bmc_verbs)
+
+    deployment = resource(docs, "Deployment", "bmf-operator-controller-manager")
+    manager = container(deployment, "manager")
+    env = environment(manager)
+    assert "OSAC_SECRET_API_URL" in env
+    assert env["OSAC_SECRET_API_ISSUER_URL"]["value"] == "https://keycloak.example.test/realms/osac"
+    assert "OSAC_SECRET_API_CLIENT_ID_FILE" in env
+    assert "OSAC_SECRET_API_CLIENT_SECRET_FILE" in env
+    assert "OSAC_SECRET_API_CA_FILE" in env
+    assert "OSAC_SECRET_API_TOKEN_FILE" not in env
+
+    volume_secret_names = {
+        volume.get("secret", {}).get("secretName") for volume in deployment["spec"]["template"]["spec"]["volumes"]
+    }
+    assert "fulfillment-controller-credentials" in volume_secret_names
+    mount_paths = {mount["mountPath"] for mount in manager.get("volumeMounts", [])}
+    assert "/etc/osac/secrets/netbox/" in mount_paths
+    assert "/etc/osac/secrets/netbox-ca/" in mount_paths
+    assert "/etc/osac/secret-api/credentials/" in mount_paths
+    assert "/etc/osac/secret-api/ca/" in mount_paths
+    assert sum(mount.get("readOnly") is True for mount in manager.get("volumeMounts", [])) >= 3
+
+
+def check_bmf_secret_api_is_independent(netbox_values: pathlib.Path) -> None:
+    """Check URL opt-in independently of NetBox, preserving required NetBox settings."""
+    for netbox_enabled in (False, True):
+        for configured in (False, True):
+            endpoint = "https://fulfillment-internal-api:8001" if configured else ""
+            args = (
+                "--values", str(netbox_values),
+                "--set", f"netbox.enabled={str(netbox_enabled).lower()}",
+                "--set-string", f"secretAPI.url={endpoint}",
+            )
+            if netbox_enabled and not configured:
+                expect_bmf_failure("secretAPI.url is required when netbox.enabled is true", *args)
+                continue
+            docs = bmf_render(*args)
+            deployment = resource(docs, "Deployment", "bmf-operator-controller-manager")
+            manager = container(deployment, "manager")
+            env = environment(manager)
+            for suffix in ("URL", "ISSUER_URL", "CLIENT_ID_FILE", "CLIENT_SECRET_FILE", "CA_FILE"):
+                assert (f"OSAC_SECRET_API_{suffix}" in env) == configured
+            assert env["OSAC_INSTALLATION_API_URL"]["value"] == endpoint
+            if configured:
+                assert env["OSAC_SECRET_API_URL"]["value"] == endpoint
+            pod_spec = deployment["spec"]["template"]["spec"]
+            for name in ("secret-api-client-credentials", "secret-api-ca"):
+                assert any(volume["name"] == name for volume in pod_spec["volumes"]) == configured
+                assert any(mount["name"] == name for mount in manager["volumeMounts"]) == configured
+
+
+def check_bmf_ca_bundle_is_opt_in() -> None:
+    docs = bmf_render()
+    deployment = resource(docs, "Deployment", "bmf-operator-controller-manager")
+    manager = container(deployment, "manager")
+    env = environment(manager)
+    pod_spec = deployment["spec"]["template"]["spec"]
+    assert "OSAC_INSTALLATION_API_CA_FILE" not in env
+    assert not any(volume.get("name") == "secret-api-ca" for volume in pod_spec["volumes"])
+    assert not any(mount.get("name") == "secret-api-ca" for mount in manager.get("volumeMounts", []))
+
+    configured_docs = bmf_render("--set-string", "secretAPI.caBundle.configMap=ca-bundle")
+    configured_deployment = resource(configured_docs, "Deployment", "bmf-operator-controller-manager")
+    configured_manager = container(configured_deployment, "manager")
+    configured_env = environment(configured_manager)
+    configured_pod_spec = configured_deployment["spec"]["template"]["spec"]
+    assert configured_env["OSAC_INSTALLATION_API_CA_FILE"]["value"] == "/etc/osac/secret-api/ca/bundle.pem"
+    volume = next(volume for volume in configured_pod_spec["volumes"] if volume.get("name") == "secret-api-ca")
+    assert volume["configMap"]["name"] == "ca-bundle"
+    mount = next(mount for mount in configured_manager["volumeMounts"] if mount.get("name") == "secret-api-ca")
+    assert mount["mountPath"] == "/etc/osac/secret-api/ca/"
+
+
+def check_bmf_custom_token_key(netbox_values: pathlib.Path) -> None:
+    docs = bmf_render("--values", str(netbox_values), "--set-string", "netbox.tokenSecretKey=true")
+    token_secret = resource(docs, "Secret", "custom-netbox-token")
+    assert token_secret["stringData"]["true"] == "render-test-netbox-token"
+
+    deployment = resource(docs, "Deployment", "bmf-operator-controller-manager")
+    token_volume = next(
+        volume for volume in deployment["spec"]["template"]["spec"]["volumes"] if volume.get("name") == "netbox-token"
+    )
+    assert token_volume["secret"]["items"][0]["key"] == "true"
+
+
+def check_bmf_without_ca(netbox_values: pathlib.Path) -> None:
+    docs = bmf_render("--values", str(netbox_values), "--set-string", "netbox.caCert=")
+    inventory = embedded_config(docs, "osac-inventory-config", "inventory.yaml")
+    assert "caFile" not in inventory["options"]["netbox"]
+    assert_resource_absent(docs, "Secret", "custom-netbox-ca")
+    deployment = resource(docs, "Deployment", "bmf-operator-controller-manager")
+    pod_spec = deployment["spec"]["template"]["spec"]
+    assert not any(
+        volume.get("name") == "netbox-ca" or volume.get("secret", {}).get("secretName") == "custom-netbox-ca"
+        for volume in pod_spec["volumes"]
+    )
+    manager = container(deployment, "manager")
+    assert not any(mount.get("name") == "netbox-ca" for mount in manager.get("volumeMounts", []))
+
+
+def check_bmf_metal3() -> None:
+    docs = bmf_render("--set", "metal3.enabled=true", "--set-string", "metal3.namespace=host-inventory")
+    inventory = embedded_config(docs, "osac-inventory-config", "inventory.yaml")
+    assert inventory["type"] == "metal3"
+    assert "netbox" not in str(inventory)
+
+
+def check_bmf_bcm() -> None:
+    docs = bmf_render(
+        "--set",
+        "bcm.enabled=true",
+        "--set-string",
+        "bcm.url=https://bcm.example.test",
+        "--set-string",
+        "bcm.bmhNamespace=host-inventory",
+        "--set-string",
+        "bcm.cert=TEST-BCM-CERT",
+        "--set-string",
+        "bcm.key=TEST-BCM-KEY",
+    )
+    inventory = embedded_config(docs, "osac-inventory-config", "inventory.yaml")
+    assert inventory["type"] == "bcm"
+    assert inventory["options"]["bcm"]["credentialsSecret"] == "osac-bcm-certs"
+
+    management = embedded_config(docs, "osac-management-config", "management.yaml")
+    assert management["type"] == "metal3"
+    assert management["options"]["metal3"]["namespace"] == "host-inventory"
+
+    bmc_role = resource(docs, "Role", "bmf-operator-bmc-secrets")
+    assert bmc_role["metadata"]["namespace"] == "host-inventory"
+    certs = resource(docs, "Secret", "osac-bcm-certs")
+    assert "TEST-BCM-CERT" in str(certs)
+    assert "TEST-BCM-KEY" in str(certs)
+
+
+def expect_bmf_failure(expected: str, *args: str) -> None:
+    assert_helm_failure(expected, "bmf", BMF_CHART, "--namespace", "osac", *args)
+
+
+def check_bmf_invalid_values(netbox_values: pathlib.Path) -> None:
+    expect_bmf_failure(
+        "bcm.enabled and metal3.enabled are mutually exclusive",
+        "--set",
+        "bcm.enabled=true",
+        "--set",
+        "metal3.enabled=true",
+    )
+    expect_bmf_failure(
+        "netbox.url is required",
+        "--set",
+        "netbox.enabled=true",
+        "--set-string",
+        "netbox.tokenValue=render-test",
+        "--set-string",
+        "netbox.bmhNamespace=host-inventory",
+    )
+    expect_bmf_failure(
+        "netbox.tokenValue is required",
+        "--set",
+        "netbox.enabled=true",
+        "--set-string",
+        "netbox.url=https://netbox.example.test",
+        "--set-string",
+        "netbox.tokenValue=",
+        "--set-string",
+        "netbox.bmhNamespace=host-inventory",
+    )
+    expect_bmf_failure(
+        "netbox.bmhNamespace is required",
+        "--set",
+        "netbox.enabled=true",
+        "--set-string",
+        "netbox.url=https://netbox.example.test",
+        "--set-string",
+        "netbox.tokenValue=render-test",
+    )
+    expect_bmf_failure(
+        "netbox.enabled and metal3.enabled are mutually exclusive",
+        "--values",
+        str(netbox_values),
+        "--set",
+        "metal3.enabled=true",
+    )
+    expect_bmf_failure(
+        "netbox.enabled and bcm.enabled are mutually exclusive",
+        "--values",
+        str(netbox_values),
+        "--set",
+        "bcm.enabled=true",
+    )
+    expect_bmf_failure(
+        "netbox.url must start with http:// or https://",
+        "--values",
+        str(netbox_values),
+        "--set-string",
+        "netbox.url=netbox.example.test",
+    )
+    expect_bmf_failure(
+        "netbox.url must start with http:// or https://",
+        "--values",
+        str(netbox_values),
+        "--set-string",
+        "netbox.url=ftp://netbox.example.test",
+    )
+    expect_bmf_failure(
+        "netbox.url uses HTTP", "--values", str(netbox_values), "--set-string", "netbox.url=http://netbox.example.test"
+    )
+    expect_bmf_failure(
+        "secretAPI.url must use HTTPS when NetBox is enabled",
+        "--values",
+        str(netbox_values),
+        "--set-string",
+        "secretAPI.url=http://fulfillment-internal-api:8001",
+    )
+    expect_bmf_failure(
+        "secretAPI.issuerUrl is required when netbox.enabled is true",
+        "--values",
+        str(netbox_values),
+        "--set-string",
+        "secretAPI.issuerUrl=",
+    )
+
+    allowed_http = bmf_render(
+        "--values",
+        str(netbox_values),
+        "--set-string",
+        "netbox.url=http://netbox.example.test",
+        "--set",
+        "netbox.allowInsecureHTTP=true",
+    )
+    inventory = embedded_config(allowed_http, "osac-inventory-config", "inventory.yaml")
+    assert inventory["options"]["netbox"]["allowInsecureHTTP"] is True
+
+
+def check_bmf_netbox_secret_lookup(netbox_values: pathlib.Path) -> None:
+    namespace = f"bmf-netbox-lookup-{uuid.uuid4().hex[:8]}"
+    release = "bmf-netbox-lookup"
+    secret_name = "custom-netbox-token"
+
+    def create_secret(value: str, *, key: str = "token", owned_by_release: bool = False) -> None:
+        kubectl(
+            "create", "secret", "generic", secret_name, "--namespace", namespace, "--from-literal", f"{key}={value}"
+        )
+        kubectl(
+            "annotate",
+            "secret",
+            secret_name,
+            "--namespace",
+            namespace,
+            "osac.openshift.io/tenant=bmf-netbox-lookup",
+            "osac.openshift.io/owner-reference=bmf-netbox-lookup",
+        )
+        if owned_by_release:
+            kubectl("label", "secret", secret_name, "--namespace", namespace, "app.kubernetes.io/managed-by=Helm")
+            kubectl(
+                "annotate",
+                "secret",
+                secret_name,
+                "--namespace",
+                namespace,
+                f"meta.helm.sh/release-name={release}",
+                f"meta.helm.sh/release-namespace={namespace}",
+            )
+
+    def server_render() -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [
+                "helm",
+                "template",
+                release,
+                str(BMF_CHART),
+                "--namespace",
+                namespace,
+                "--dry-run=server",
+                "--show-only",
+                "templates/netbox-secrets.yaml",
+                "--values",
+                str(netbox_values),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            cwd=INSTALLER_DIR,
+        )
+
+    def server_docs() -> list[dict[str, Any]]:
+        result = server_render()
+        if result.returncode:
+            raise RuntimeError(f"Server-side Helm render failed:\n{result.stderr}")
+        return [doc for doc in yaml.safe_load_all(result.stdout) if isinstance(doc, dict)]
+
+    try:
+        kubectl("create", "namespace", namespace)
+        kubectl(
+            "annotate",
+            "namespace",
+            namespace,
+            "osac.openshift.io/tenant=bmf-netbox-lookup",
+            "osac.openshift.io/owner-reference=bmf-netbox-lookup",
+        )
+
+        create_secret("existing-token", owned_by_release=True)
+        managed_docs = server_docs()
+        managed_secret = resource(managed_docs, "Secret", secret_name)
+        assert managed_secret["data"]["token"] == base64.b64encode(b"existing-token").decode(), (
+            "Helm lookup did not preserve data from the current release's Secret"
+        )
+        assert "stringData" not in managed_secret, "Helm lookup replaced existing Secret data"
+
+        kubectl("delete", "secret", secret_name, "--namespace", namespace)
+        create_secret("external-token")
+        external_docs = server_docs()
+        assert_resource_absent(external_docs, "Secret", secret_name)
+
+        kubectl("delete", "secret", secret_name, "--namespace", namespace)
+        create_secret("wrong-key", key="other")
+        missing_key = server_render()
+        assert missing_key.returncode != 0, "Helm accepted an existing token Secret without the configured key"
+        assert "must contain key" in missing_key.stderr, "Helm failed without identifying the missing Secret key"
+
+        kubectl("delete", "secret", secret_name, "--namespace", namespace)
+        fallback_docs = server_docs()
+        fallback_secret = resource(fallback_docs, "Secret", secret_name)
+        assert fallback_secret["stringData"]["token"] == "render-test-netbox-token", (
+            "Helm did not create the token Secret from netbox.tokenValue when lookup found no Secret"
+        )
+    finally:
+        subprocess.run(
+            ["kubectl", "delete", "namespace", namespace, "--ignore-not-found=true", "--wait=false"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+
+def preflight_report(docs: list[dict[str, Any]]) -> dict[str, Any]:
+    """The render-time preflight report ConfigMap, parsed."""
+    for doc in docs:
+        name = doc.get("metadata", {}).get("name", "")
+        if doc.get("kind") == "ConfigMap" and name.endswith("-preflight-report"):
+            return json.loads(doc["data"]["render.json"])
+    raise AssertionError("no preflight report ConfigMap rendered")
+
+
+def check_osac_wiring(temp_dir: pathlib.Path) -> None:
+    values_path = temp_dir / "osac-netbox-values.yaml"
+    values_path.write_text(OSAC_NETBOX_VALUES, encoding="utf-8")
+    default_values = OSAC_CHART / "ci/default-values.yaml"
+    docs = render("osac", OSAC_CHART, "--values", str(default_values), "--values", str(values_path))
+
+    inventory_resources = [
+        doc
+        for doc in docs
+        if doc.get("kind") == "Secret" and doc.get("metadata", {}).get("name") == "osac-inventory-config"
+    ]
+    assert len(inventory_resources) == 1
+    inventory = yaml.safe_load(inventory_resources[0]["stringData"]["inventory.yaml"])
+    assert inventory["type"] == "netbox"
+
+    deployment = resource(docs, "Deployment", "bmf-operator-controller-manager")
+    manager = container(deployment, "manager")
+    env = environment(manager)
+    assert "OSAC_SECRET_API_ISSUER_URL" in env
+    assert env["OSAC_SECRET_API_ISSUER_URL"]["value"] == "https://keycloak.example.test/realms/osac"
+    assert env["OSAC_SECRET_API_CA_FILE"]["value"] == "/etc/osac/secret-api/ca/bundle.pem"
+    assert "fulfillment-controller-credentials" in str(deployment)
+    assert "OSAC_SECRET_API_TOKEN_FILE" not in env
+    secret_api_ca = next(
+        volume
+        for volume in deployment["spec"]["template"]["spec"]["volumes"]
+        if volume.get("name") == "secret-api-ca"
+    )
+    assert secret_api_ca["configMap"]["name"] == "ca-bundle"
+
+    management = embedded_config(docs, "osac-management-config", "management.yaml")
+    assert management["type"] == "metal3"
+    assert management["options"]["metal3"]["namespace"] == "host-inventory"
+
+    # The shell pre-install validation hook was retired in #1845 (OSAC-6561).
+    # Its Metal3 prerequisites moved into the render-time preflight engine, so
+    # assert the Job stays gone AND that the checks still run here. Without
+    # this, dropping the hook a second time would silently lose coverage.
+    assert not [
+        doc
+        for doc in docs
+        if doc.get("kind") == "Job"
+        and doc.get("metadata", {}).get("name") == "osac-pre-install-validate"
+    ], "the retired pre-install validation Job is rendered again"
+
+    check_ids = {result["id"] for result in preflight_report(docs)["results"]}
+    assert {"metal3-bmh-crd", "metal3-watch-all-namespaces"} <= check_ids, sorted(check_ids)
+
+    # The Provisioning grant left this chart in #1845 (OSAC-6561) and now
+    # renders from osac-infra/templates/hooks/configure-metal3.yaml, which
+    # check_infra_metal3_rbac asserts below.
+
+    assert_helm_failure(
+        "bmf.secretAPI.issuerUrl must match service.auth.issuerUrl when bmf.netbox.enabled is true",
+        "osac",
+        OSAC_CHART,
+        "--values",
+        str(default_values),
+        "--values",
+        str(values_path),
+        "--set-string",
+        "bmf.secretAPI.issuerUrl=https://wrong-issuer.example.test/realms/osac",
+    )
+
+
+def check_infra_metal3_rbac() -> None:
+    """The Metal3 Provisioning grant renders from the osac-infra hook."""
+    docs = render(
+        "osac-infra",
+        INFRA_CHART,
+        "--namespace",
+        "osac-infra",
+        "--set",
+        "osacNamespace=osac",
+        "--values",
+        "values/bmaas-ci/infra.yaml",
+        "--values",
+        "values/bmaas-netbox-ci/infra.yaml",
+        "--set",
+        "metal3.enabled=true",
+    )
+    role = resource(docs, "ClusterRole", "osac-infra-configure-metal3")
+    provisioning_rules = [rule for rule in role["rules"] if rule.get("resources") == ["provisionings"]]
+    assert len(provisioning_rules) == 1
+    assert set(provisioning_rules[0]["verbs"]) == {"get", "list", "create", "patch"}
+
+
+def main() -> None:
+    """Run BMF render contracts or the explicitly selected live Secret lookup check."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--live-lookup-only",
+        action="store_true",
+        help="exercise NetBox Secret lookup against the current Kubernetes cluster",
+    )
+    args = parser.parse_args()
+
+    with tempfile.TemporaryDirectory(prefix="bmf-netbox-render-") as temp:
+        temp_dir = pathlib.Path(temp)
+        netbox_values = temp_dir / "netbox-values.yaml"
+        netbox_values.write_text(BMF_NETBOX_VALUES, encoding="utf-8")
+
+        if args.live_lookup_only:
+            check_bmf_netbox_secret_lookup(netbox_values)
+            print("BMF NetBox Secret lookup checks passed.")
+            return
+
+        bmf_docs = bmf_render("--values", str(netbox_values))
+        check_bmf_netbox(bmf_docs)
+        check_bmf_secret_api_is_independent(netbox_values)
+        check_bmf_ca_bundle_is_opt_in()
+        check_bmf_custom_token_key(netbox_values)
+        check_bmf_without_ca(netbox_values)
+        check_bmf_metal3()
+        check_bmf_bcm()
+        check_bmf_invalid_values(netbox_values)
+        check_infra_netbox_shared_postgres()
+        check_infra_metal3_rbac()
+        check_infra_netbox_disabled()
+        check_osac_wiring(temp_dir)
+
+    print("BMF NetBox Helm render checks passed.")
+
+
+if __name__ == "__main__":
+    main()

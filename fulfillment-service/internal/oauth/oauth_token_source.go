@@ -17,8 +17,6 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
-	"crypto/tls"
-	"crypto/x509"
 	"embed"
 	"encoding/base64"
 	"encoding/json"
@@ -30,15 +28,16 @@ import (
 	"net/url"
 	"slices"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/google/go-querystring/query"
 	"github.com/skratchdot/open-golang/open"
+	"golang.org/x/sync/singleflight"
 
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
-	"github.com/osac-project/osac/fulfillment-service/internal/network"
 	"github.com/osac-project/osac/fulfillment-service/internal/templating"
+	"github.com/osac-project/osac/fulfillment-service/internal/tlsconfig"
+	"github.com/osac-project/osac/fulfillment-service/internal/trust"
 )
 
 //go:embed templates
@@ -70,7 +69,7 @@ type TokenSourceBuilder struct {
 	scopes       []string
 	audience     string
 	insecure     bool
-	caPool       *x509.CertPool
+	caPool       *trust.CertPool
 	interactive  bool
 	timeout      time.Duration
 	httpClient   *http.Client
@@ -92,10 +91,10 @@ type TokenSource struct {
 	scopes           []string
 	audience         string
 	insecure         bool
-	caPool           *x509.CertPool
+	caPool           *trust.CertPool
 	interactive      bool
 	timeout          time.Duration
-	discoverOnce     sync.Once
+	discoveryGroup   singleflight.Group
 	tokenEndpoint    string
 	authEndpoint     string
 	deviceEndpoint   string
@@ -241,7 +240,7 @@ func (b *TokenSourceBuilder) SetInsecure(value bool) *TokenSourceBuilder {
 // SetCaPool sets the certificate pool that contains the certificates of the certificate authorities that are trusted
 // when connecting using TLS. This is optional, and the default is to use trust the certificate authorities trusted by
 // the operating system.
-func (b *TokenSourceBuilder) SetCaPool(value *x509.CertPool) *TokenSourceBuilder {
+func (b *TokenSourceBuilder) SetCaPool(value *trust.CertPool) *TokenSourceBuilder {
 	b.caPool = value
 	return b
 }
@@ -354,7 +353,7 @@ func (b *TokenSourceBuilder) Build() (result *TokenSource, err error) {
 type resolvedConfig struct {
 	scopes           []string
 	timeout          time.Duration
-	caPool           *x509.CertPool
+	caPool           *trust.CertPool
 	httpClient       *http.Client
 	openFunc         func(context.Context, string) error
 	redirectUri      string
@@ -422,7 +421,7 @@ func (b *TokenSourceBuilder) resolveDefaults() (cfg resolvedConfig, err error) {
 	// Set the default CA pool if needed:
 	cfg.caPool = b.caPool
 	if cfg.caPool == nil {
-		cfg.caPool, err = network.NewCertPool().
+		cfg.caPool, err = trust.NewCertPool().
 			SetLogger(b.logger).
 			AddSystemFiles(true).
 			AddKubernetesFiles(true).
@@ -442,10 +441,8 @@ func (b *TokenSourceBuilder) resolveDefaults() (cfg resolvedConfig, err error) {
 	// canceled (e.g. a bare context.Background()).
 	cfg.httpClient = b.httpClient
 	if cfg.httpClient == nil {
-		tlsConfig := &tls.Config{
-			RootCAs:    cfg.caPool,
-			MinVersion: tls.VersionTLS13,
-		}
+		tlsConfig := tlsconfig.NewClientTLSConfig()
+		tlsConfig.RootCAs = cfg.caPool.Pool()
 		if b.insecure {
 			tlsConfig.InsecureSkipVerify = true
 		}
@@ -654,6 +651,16 @@ func (s *TokenSource) discover(ctx context.Context) error {
 	return nil
 }
 
+func (s *TokenSource) ensureDiscovered(ctx context.Context) error {
+	_, err, _ := s.discoveryGroup.Do("metadata", func() (any, error) {
+		if s.tokenEndpoint != "" {
+			return nil, nil
+		}
+		return nil, s.discover(ctx)
+	})
+	return err
+}
+
 // isFresh checks if the given token can still be used. Note that if the token expires soon it will not be considered
 // fresh, even if it is still valid. This is to avoid using a token that is about to expire, and may expire in the
 // middle of the operation that it is used for.
@@ -672,9 +679,7 @@ func (s *TokenSource) isExpired(token *auth.Token) bool {
 
 func (s *TokenSource) runRefresh(ctx context.Context, refreshToken string) (result *auth.Token, err error) {
 	// Perform discovery if not already done:
-	s.discoverOnce.Do(func() {
-		err = s.discover(ctx)
-	})
+	err = s.ensureDiscovered(ctx)
 	if err != nil {
 		err = fmt.Errorf("failed to discover metadata: %w", err)
 		return
@@ -714,9 +719,7 @@ func (s *TokenSource) runRefresh(ctx context.Context, refreshToken string) (resu
 
 func (s *TokenSource) runFlow(ctx context.Context) (result *auth.Token, err error) {
 	// Perform discovery if not already done:
-	s.discoverOnce.Do(func() {
-		err = s.discover(ctx)
-	})
+	err = s.ensureDiscovered(ctx)
 	if err != nil {
 		err = fmt.Errorf("failed to discover metadata: %w", err)
 		return

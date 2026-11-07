@@ -21,8 +21,13 @@ logger = logging.getLogger(__name__)
 class TestNetworkingReferences:
     """OSAC-3095: Networking resource reference tests."""
 
+    @pytest.mark.reference_networking
     def test_create_subnet_with_virtual_network_by_name(
-        self, grpc: GRPCClient, k8s_hub_client: K8sClient, ref_virtual_network: dict[str, str], ref_test_run_id: str
+        self,
+        grpc: GRPCClient,
+        k8s_hub_client: K8sClient,
+        networking_ref_virtual_network: dict[str, str],
+        ref_test_run_id: str,
     ):
         subnet_name = f"ref-sub-vn-{ref_test_run_id}"
         response = grpc.call(
@@ -30,7 +35,10 @@ class TestNetworkingReferences:
             data={
                 "object": {
                     "metadata": {"name": subnet_name},
-                    "spec": {"virtual_network": {"name": ref_virtual_network["name"]}, "ipv4_cidr": "10.210.200.0/24"},
+                    "spec": {
+                        "virtual_network": {"name": networking_ref_virtual_network["name"]},
+                        "ipv4_cidr": "172.26.200.0/24",
+                    },
                 }
             },
         )
@@ -38,7 +46,10 @@ class TestNetworkingReferences:
         try:
             subnet = grpc.call(service=f"{PUBLIC_API}.Subnets/Get", data={"id": subnet_id})
             vn_ref = subnet["object"]["spec"].get("virtual_network", subnet["object"]["spec"].get("virtualNetwork", {}))
-            assert vn_ref.get("name") == ref_virtual_network["name"] or vn_ref.get("id") == ref_virtual_network["id"]
+            assert (
+                vn_ref.get("name") == networking_ref_virtual_network["name"]
+                or vn_ref.get("id") == networking_ref_virtual_network["id"]
+            )
         finally:
             grpc.delete_subnet(subnet_id=subnet_id)
             try:
@@ -47,6 +58,7 @@ class TestNetworkingReferences:
             except (subprocess.CalledProcessError, AssertionError, TimeoutError):
                 logger.warning("Cleanup wait failed for subnet %s", subnet_id)
 
+    @pytest.mark.reference_networking
     def test_create_security_group_with_virtual_network_by_name(
         self, grpc: GRPCClient, k8s_hub_client: K8sClient, ref_virtual_network: dict[str, str], ref_test_run_id: str
     ):
@@ -73,6 +85,7 @@ class TestNetworkingReferences:
             except (subprocess.CalledProcessError, AssertionError, TimeoutError):
                 logger.warning("Cleanup wait failed for security group %s", sg_id)
 
+    @pytest.mark.reference_networking
     def test_invalid_virtual_network_reference_returns_field_path(self, grpc: GRPCClient, ref_test_run_id: str):
         with pytest.raises(subprocess.CalledProcessError) as exc_info:
             grpc.call(
@@ -80,12 +93,13 @@ class TestNetworkingReferences:
                 data={
                     "object": {
                         "metadata": {"name": f"ref-bad-vn-{ref_test_run_id}"},
-                        "spec": {"virtual_network": {"name": "nonexistent-vn"}, "ipv4_cidr": "10.212.0.0/24"},
+                        "spec": {"virtual_network": {"name": "nonexistent-vn"}, "ipv4_cidr": "172.28.0.0/24"},
                     }
                 },
             )
         assert_grpc_field_violation(exc_info, field_path="spec.virtual_network")
 
+    @pytest.mark.reference_networking
     def test_cel_filter_by_virtual_network_name(
         self, grpc: GRPCClient, ref_subnet: dict[str, str], ref_virtual_network: dict[str, str]
     ):

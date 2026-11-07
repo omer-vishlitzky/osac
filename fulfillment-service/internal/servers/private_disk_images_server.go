@@ -17,6 +17,9 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"maps"
+	"slices"
+	"strings"
 
 	"github.com/prometheus/client_golang/prometheus"
 	grpccodes "google.golang.org/grpc/codes"
@@ -26,14 +29,14 @@ import (
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
-	"github.com/osac-project/osac/fulfillment-service/internal/events"
+	"github.com/osac-project/osac/fulfillment-service/internal/database"
+	"github.com/osac-project/osac/fulfillment-service/internal/database/dao"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
 type PrivateDiskImagesServerBuilder struct {
 	logger            *slog.Logger
-	notifier          events.Notifier
 	attributionLogic  auth.AttributionLogic
 	tenancyLogic      auth.TenancyLogic
 	metricsRegisterer prometheus.Registerer
@@ -55,11 +58,6 @@ func NewPrivateDiskImagesServer() *PrivateDiskImagesServerBuilder {
 
 func (b *PrivateDiskImagesServerBuilder) SetLogger(value *slog.Logger) *PrivateDiskImagesServerBuilder {
 	b.logger = value
-	return b
-}
-
-func (b *PrivateDiskImagesServerBuilder) SetNotifier(value events.Notifier) *PrivateDiskImagesServerBuilder {
-	b.notifier = value
 	return b
 }
 
@@ -98,7 +96,6 @@ func (b *PrivateDiskImagesServerBuilder) Build() (result *PrivateDiskImagesServe
 	generic, err := NewGenericServer[*privatev1.DiskImage]().
 		SetLogger(b.logger).
 		SetService(privatev1.DiskImages_ServiceDesc.ServiceName).
-		SetNotifier(b.notifier).
 		SetAttributionLogic(b.attributionLogic).
 		SetTenancyLogic(b.tenancyLogic).
 		SetMetricsRegisterer(b.metricsRegisterer).
@@ -209,8 +206,38 @@ func (s *PrivateDiskImagesServer) Update(ctx context.Context,
 	request.SetObject(merged)
 	request.GetObject().GetMetadata().SetVersion(clientVersion)
 
-	err = s.generic.Update(ctx, request, &response)
+	err = s.generic.UpdateWithCandidatePreparation(ctx, request, &response, s.validateArchitectureUpdate)
 	return
+}
+
+// validateArchitectureUpdate runs on the final candidate while GenericServer holds the image
+// lock. BMI and catalog admission take the same lock, so no dependent can be admitted between
+// the compatibility check and the image update's commit.
+func (s *PrivateDiskImagesServer) validateArchitectureUpdate(ctx context.Context, current, candidate *privatev1.DiskImage) (err error) {
+	var removed []string
+	for _, architecture := range current.GetSpec().GetArchitecture() {
+		if !slices.Contains(candidate.GetSpec().GetArchitecture(), architecture) {
+			removed = append(removed, strings.ToLower(strings.TrimPrefix(architecture.String(), "ARCHITECTURE_")))
+		}
+	}
+	if len(removed) == 0 {
+		return nil
+	}
+	tx, err := database.TxFromContext(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.ReportError(&err)
+	inUse, err := dao.BareMetalReferencesDiskImageArch(ctx, current.GetId(), removed)
+	if err != nil {
+		s.logger.ErrorContext(ctx, "Failed to check disk image architecture dependencies", slog.Any("error", err))
+		return grpcstatus.Error(grpccodes.Internal, "failed to check disk image architecture dependencies")
+	}
+	if inUse {
+		return grpcstatus.Error(grpccodes.FailedPrecondition,
+			"DISK_IMAGE_ARCHITECTURE_IN_USE: cannot remove an architecture required by an existing bare metal instance or catalog item; retain it or replace the dependent resources")
+	}
+	return nil
 }
 
 func (s *PrivateDiskImagesServer) Delete(ctx context.Context,
@@ -241,6 +268,12 @@ func applyDiskImageUpdate(base, update *privatev1.DiskImage, mask *fieldmaskpb.F
 	}
 	for _, path := range mask.GetPaths() {
 		switch path {
+		case "spec":
+			base.SetSpec(proto.Clone(update.GetSpec()).(*privatev1.DiskImageSpec))
+		case "metadata.labels":
+			base.GetMetadata().SetLabels(maps.Clone(update.GetMetadata().GetLabels()))
+		case "metadata.annotations":
+			base.GetMetadata().SetAnnotations(maps.Clone(update.GetMetadata().GetAnnotations()))
 		case "spec.lifecycle":
 			base.GetSpec().SetLifecycle(update.GetSpec().GetLifecycle())
 		case "spec.architecture":

@@ -18,7 +18,9 @@ import (
 
 	"github.com/osac-project/osac/fulfillment-service/internal/cmd/service/start/consoleproxy"
 	"github.com/osac-project/osac/fulfillment-service/internal/cmd/service/start/controller"
+	"github.com/osac-project/osac/fulfillment-service/internal/cmd/service/start/eventpublisher"
 	"github.com/osac-project/osac/fulfillment-service/internal/cmd/service/start/grpcserver"
+	"github.com/osac-project/osac/fulfillment-service/internal/cmd/service/start/mcpserver"
 	"github.com/osac-project/osac/fulfillment-service/internal/cmd/service/start/restgateway"
 )
 
@@ -33,7 +35,9 @@ func Cmd() *cobra.Command {
 	}
 	result.AddCommand(consoleproxy.Cmd())
 	result.AddCommand(controller.Cmd())
+	result.AddCommand(eventpublisher.Cmd())
 	result.AddCommand(grpcserver.Cmd())
+	result.AddCommand(mcpserver.Cmd())
 	result.AddCommand(restgateway.Cmd())
 	return result
 }

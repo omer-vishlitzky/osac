@@ -19,11 +19,13 @@ import (
 	"github.com/google/uuid"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"google.golang.org/grpc/codes"
+	grpcstatus "google.golang.org/grpc/status"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
-	publicv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/public/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
 	"github.com/osac-project/osac/fulfillment-service/internal/database/dao"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
 
 var _ = Describe("Public NAT gateways server", func() {
@@ -115,6 +117,7 @@ var _ = Describe("Public NAT gateways server", func() {
 				SetTenancyLogic(tenancy).
 				Build()
 			Expect(err).ToNot(HaveOccurred())
+			_ = networkClassDao
 
 			poolResp, err := externalIPPoolDao.Create().SetObject(
 				privatev1.ExternalIPPool_builder{
@@ -138,12 +141,16 @@ var _ = Describe("Public NAT gateways server", func() {
 
 		createVirtualNetwork := func() string {
 			if sharedNetworkClass == nil {
-				ncResp, err := networkClassDao.Create().SetObject(
+				ncResp, err := reuseNetworkClassDAO.Create().SetObject(
 					privatev1.NetworkClass_builder{
-						FabricManager: new("netris"),
+						FabricManager: "netris",
 						Metadata: privatev1.Metadata_builder{
 							Tenant: auth.SharedTenant,
 							Name:   fmt.Sprintf("test-%s", uuid.NewString()[:8]),
+						}.Build(),
+						Status: privatev1.NetworkClassStatus_builder{
+							State: privatev1.NetworkClassState_NETWORK_CLASS_STATE_READY,
+							Hub:   "network-hub-a",
 						}.Build(),
 					}.Build(),
 				).Do(ctx)
@@ -157,8 +164,10 @@ var _ = Describe("Public NAT gateways server", func() {
 						Tenant: testTenant,
 						Name:   fmt.Sprintf("test-%s", uuid.NewString()[:8]),
 					}.Build(),
-					Spec: privatev1.VirtualNetworkSpec_builder{
-						NetworkClass: privatev1.NetworkClassReference_builder{Id: sharedNetworkClass.GetId()}.Build(),
+					Spec: privatev1.VirtualNetworkSpec_builder{}.Build(),
+					Status: privatev1.VirtualNetworkStatus_builder{
+						State: privatev1.VirtualNetworkState_VIRTUAL_NETWORK_STATE_READY,
+						Hub:   "network-hub-a",
 					}.Build(),
 				}.Build(),
 			).Do(ctx)
@@ -176,7 +185,7 @@ var _ = Describe("Public NAT gateways server", func() {
 			eip := createAllocatedExternalIP()
 			createResp, err := publicServer.Create(ctx, publicv1.NATGatewaysCreateRequest_builder{
 				Object: publicv1.NATGateway_builder{
-					Metadata: publicv1.Metadata_builder{Tenant: testTenant}.Build(),
+					Metadata: publicv1.Metadata_builder{Name: "nat-1", Tenant: testTenant}.Build(),
 					Spec: publicv1.NATGatewaySpec_builder{
 						VirtualNetwork: publicv1.VirtualNetworkLocalReference_builder{Id: vnID}.Build(),
 						ExternalIp:     publicv1.ExternalIPLocalReference_builder{Id: eip.GetId()}.Build(),
@@ -191,6 +200,26 @@ var _ = Describe("Public NAT gateways server", func() {
 			}.Build())
 			Expect(err).ToNot(HaveOccurred())
 			Expect(getResp.GetObject().GetId()).To(Equal(createResp.GetObject().GetId()))
+		})
+
+		It("rejects caller-supplied output status on Create", func() {
+			vnID := createVirtualNetwork()
+			eip := createAllocatedExternalIP()
+			message := "malicious status"
+			_, err := publicServer.Create(ctx, publicv1.NATGatewaysCreateRequest_builder{
+				Object: publicv1.NATGateway_builder{
+					Metadata: publicv1.Metadata_builder{Name: "nat-2", Tenant: testTenant}.Build(),
+					Spec: publicv1.NATGatewaySpec_builder{
+						VirtualNetwork: publicv1.VirtualNetworkLocalReference_builder{Id: vnID}.Build(),
+						ExternalIp:     publicv1.ExternalIPLocalReference_builder{Id: eip.GetId()}.Build(),
+					}.Build(),
+					Status: publicv1.NATGatewayStatus_builder{
+						State:   publicv1.NATGatewayState_NAT_GATEWAY_STATE_READY,
+						Message: &message,
+					}.Build(),
+				}.Build(),
+			}.Build())
+			Expect(grpcstatus.Code(err)).To(Equal(codes.InvalidArgument))
 		})
 
 		It("lists NATGateways", func() {
@@ -217,38 +246,13 @@ var _ = Describe("Public NAT gateways server", func() {
 			Expect(listResp.GetItems()).To(HaveLen(3))
 		})
 
-		It("updates a NATGateway", func() {
-			vnID := createVirtualNetwork()
-			eip := createAllocatedExternalIP()
-			createResp, err := publicServer.Create(ctx, publicv1.NATGatewaysCreateRequest_builder{
-				Object: publicv1.NATGateway_builder{
-					Metadata: publicv1.Metadata_builder{
-						Tenant: testTenant,
-						Name:   fmt.Sprintf("test-%s", uuid.NewString()[:8]),
-					}.Build(),
-					Spec: publicv1.NATGatewaySpec_builder{
-						VirtualNetwork: publicv1.VirtualNetworkLocalReference_builder{Id: vnID}.Build(),
-						ExternalIp:     publicv1.ExternalIPLocalReference_builder{Id: eip.GetId()}.Build(),
-					}.Build(),
-				}.Build(),
-			}.Build())
-			Expect(err).ToNot(HaveOccurred())
-
-			object := createResp.GetObject()
-			object.GetMetadata().SetLabels(map[string]string{"env": "test"})
-			updateResp, err := publicServer.Update(ctx, publicv1.NATGatewaysUpdateRequest_builder{
-				Object: object,
-			}.Build())
-			Expect(err).ToNot(HaveOccurred())
-			Expect(updateResp.GetObject().GetMetadata().GetLabels()).To(HaveKeyWithValue("env", "test"))
-		})
-
 		It("deletes a NATGateway", func() {
 			vnID := createVirtualNetwork()
 			eip := createAllocatedExternalIP()
 			createResp, err := publicServer.Create(ctx, publicv1.NATGatewaysCreateRequest_builder{
 				Object: publicv1.NATGateway_builder{
 					Metadata: publicv1.Metadata_builder{
+						Name:   "nat-delete",
 						Tenant: testTenant,
 					}.Build(),
 					Spec: publicv1.NATGatewaySpec_builder{

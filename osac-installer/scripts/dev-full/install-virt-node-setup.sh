@@ -10,39 +10,42 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname "${BASH_SOURCE[0]}")" >/dev/null && pwd)"
+KIND_PROFILE="${KIND_PROFILE:-dev-full}"
+# shellcheck source=./kind-runtime.sh
+source "${SCRIPT_DIR}/kind-runtime.sh"
+
 CLUSTER_NAME="${1:-osac-dev}"
 BRIDGE_CNI_VERSION="${2:-v1.6.2}"
 
-log() { echo "[+] $*"; }
+ARCH=$(uname -m)
+case "$ARCH" in
+    x86_64)  ARCH="amd64" ;;
+    aarch64) ARCH="arm64" ;;
+    arm64)   ARCH="arm64" ;;   # macOS Apple Silicon reports "arm64"
+    *)       echo "Unsupported architecture: $ARCH"; exit 1 ;;
+esac
+
 die() { echo "[!] $*" >&2; exit 1; }
 
-# Detect container runtime (try rootful first, then rootless)
-if command -v podman >/dev/null 2>&1; then
-  RUNTIME=podman
-  export KIND_EXPERIMENTAL_PROVIDER=podman
-  # Check if cluster exists in rootful podman (created with sudo)
-  if sudo podman ps --filter "name=${CLUSTER_NAME}-control-plane" --format '{{.Names}}' 2>/dev/null | grep -q "${CLUSTER_NAME}-control-plane"; then
-    RUNTIME="sudo podman"
-  # Check if cluster exists in rootless podman
-  elif podman ps --filter "name=${CLUSTER_NAME}-control-plane" --format '{{.Names}}' 2>/dev/null | grep -q "${CLUSTER_NAME}-control-plane"; then
-    RUNTIME=podman
-  else
-    die "Kind cluster '${CLUSTER_NAME}' not found in podman (tried both rootful and rootless)"
-  fi
-elif command -v docker >/dev/null 2>&1; then
-  RUNTIME=docker
-  # Verify cluster exists
-  $RUNTIME ps --filter "name=${CLUSTER_NAME}-control-plane" --format '{{.Names}}' | grep -q "${CLUSTER_NAME}-control-plane" \
-    || die "Kind cluster '${CLUSTER_NAME}' not found"
-else
-  die "Neither podman nor docker found"
-fi
+case "$KIND_PROVIDER" in
+  podman)
+    detect_podman_mode
+    ;;
+  docker)
+    ;;
+  *)
+    die "Unsupported KIND_EXPERIMENTAL_PROVIDER: ${KIND_EXPERIMENTAL_PROVIDER}"
+    ;;
+esac
 
 NODE_NAME="${CLUSTER_NAME}-control-plane"
+container_cmd inspect "${NODE_NAME}" >/dev/null 2>&1 \
+  || die "Kind cluster '${CLUSTER_NAME}' not found in ${KIND_PROVIDER}"
 
 log "Installing bridge CNI plugin into ${NODE_NAME}..."
-$RUNTIME exec "${NODE_NAME}" bash -c \
-  "curl -sL https://github.com/containernetworking/plugins/releases/download/${BRIDGE_CNI_VERSION}/cni-plugins-linux-amd64-${BRIDGE_CNI_VERSION}.tgz | tar -C /opt/cni/bin -xz" \
+container_cmd exec "${NODE_NAME}" bash -c \
+  "curl -sL https://github.com/containernetworking/plugins/releases/download/${BRIDGE_CNI_VERSION}/cni-plugins-linux-${ARCH}-${BRIDGE_CNI_VERSION}.tgz | tar -C /opt/cni/bin -xz" \
   || die "Failed to install bridge CNI plugin"
 
 log "Bridge CNI plugin installed successfully"

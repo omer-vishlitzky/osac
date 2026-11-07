@@ -39,11 +39,11 @@ type Host struct {
 	HostClass           string
 	ProvisionState      string
 	ManagedBy           string
-	// Ready reports whether the underlying host is ready for provisioning.
-	// Backends managing pre-existing resources (Metal3, OpenStack) always set
-	// true; the BCM backend sets false until the on-demand BareMetalHost has
-	// completed Metal3 registration/inspection.
-	Ready bool
+	// Available reports whether the underlying host is available for
+	// provisioning. Backends managing pre-existing resources (Metal3,
+	// OpenStack) always set true; the BCM backend sets false until the
+	// on-demand BareMetalHost has completed Metal3 registration/inspection.
+	Available bool
 }
 
 // HostNIC represents a physical network interface on an inventory host.
@@ -64,13 +64,20 @@ type Client interface {
 	// This operation must be strongly consistent: it only returns when the inventory state reflects the assignment
 	AssignHost(ctx context.Context, inventoryHostID string, bareMetalInstanceID string, labels map[string]string) (*Host, error)
 
-	// UnassignHost updates the host by undoing the assign operation
-	UnassignHost(ctx context.Context, inventoryHostID string, labels []string) error
+	// UnassignHost updates the host by undoing the assign operation for the given instance.
+	// A retry must not unassign a host that has since been assigned to another instance.
+	UnassignHost(ctx context.Context, inventoryHostID, bareMetalInstanceID string, labels []string) error
 
 	// GetHostNICs returns the physical network interfaces for an allocated host.
 	// Returns nil, nil when the backend does not support NIC discovery for this host class.
 	// Returns an error when NIC data is expected but unavailable (backend failure or unexpected missing data on a supported backend).
 	GetHostNICs(ctx context.Context, inventoryHostID string) ([]HostNIC, error)
+
+	// GetHostLogicalPortMACs returns an administrator-supplied mapping from OSAC
+	// logical port names to physical MAC addresses, used for DHCP lease matching.
+	// Returns an empty map when no mapping is configured, and an error for
+	// malformed mapping data or backend failures.
+	GetHostLogicalPortMACs(ctx context.Context, inventoryHostID string) (map[string]string, error)
 }
 
 // NewClientFunc is a function that creates a new inventory client from config

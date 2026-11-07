@@ -7,11 +7,23 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname "${BASH_SOURCE[0]}")" >/dev/null && pwd)"
+KIND_PROFILE="${KIND_PROFILE:-dev-full}"
 # shellcheck source=./kind-runtime.sh
 source "${SCRIPT_DIR}/kind-runtime.sh"
+if [[ "$KIND_PROVIDER" == "podman" ]]; then
+  detect_podman_mode
+fi
 
 CLUSTER_NAME="${1:-${KIND_CLUSTER_NAME:-osac-dev}}"
 BRIDGE_CNI_VERSION="${BRIDGE_CNI_VERSION:-v1.6.2}"
+
+ARCH=$(uname -m)
+case "$ARCH" in
+    x86_64)  ARCH="amd64" ;;
+    aarch64) ARCH="arm64" ;;
+    arm64)   ARCH="arm64" ;;   # macOS Apple Silicon reports "arm64"
+    *)       echo "Unsupported architecture: $ARCH"; exit 1 ;;
+esac
 
 install_multus() {
   log "Installing Multus CNI..."
@@ -21,7 +33,7 @@ install_multus() {
   log "Installing bridge CNI plugin into the kind node..."
   local node_name="${CLUSTER_NAME}-control-plane"
   container_cmd exec "${node_name}" bash -c \
-    "curl -sL https://github.com/containernetworking/plugins/releases/download/${BRIDGE_CNI_VERSION}/cni-plugins-linux-amd64-${BRIDGE_CNI_VERSION}.tgz | tar -C /opt/cni/bin -xz"
+    "curl -sL https://github.com/containernetworking/plugins/releases/download/${BRIDGE_CNI_VERSION}/cni-plugins-linux-${ARCH}-${BRIDGE_CNI_VERSION}.tgz | tar -C /opt/cni/bin -xz"
   log "Multus installed"
 }
 

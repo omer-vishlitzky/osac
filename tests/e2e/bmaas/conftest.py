@@ -3,18 +3,29 @@ from __future__ import annotations
 import subprocess
 import tempfile
 import uuid
-from collections.abc import Generator
+from collections.abc import Generator, Iterator
 from pathlib import Path
 
 import pytest
 
-from tests.e2e.core.grpc_client import GRPCClient
+from tests.e2e.core.grpc_client import PRIVATE_API, GRPCClient
+from tests.e2e.core.helpers import bmi_instance_type_for_tests, registered_ssh_key_secret
+from tests.e2e.core.osac_cli import OsacCLI
 from tests.e2e.core.runner import env
+
+BMI_DISK_IMAGE_SOURCE_REF = "oci://quay.io/osac-project/fedora-cloud-bmi:44"
 
 
 @pytest.fixture(scope="session")
 def bmi_template() -> str:
     return env("OSAC_BMI_TEMPLATE", "bm-host-provisioning")
+
+
+@pytest.fixture(scope="session")
+def bmi_instance_type(private_grpc: GRPCClient, bmi_template: str) -> Generator[str, None, None]:
+    yield from bmi_instance_type_for_tests(
+        private_grpc, template_name=bmi_template, configured=env("OSAC_BMI_INSTANCE_TYPE", "").strip()
+    )
 
 
 @pytest.fixture(scope="session")
@@ -40,15 +51,52 @@ def ssh_public_key() -> Generator[str, None, None]:
 
 
 @pytest.fixture(scope="session")
-def catalog_item(private_grpc: GRPCClient, bmi_template: str, test_run_id: str) -> Generator[str, None, None]:
+def bmi_disk_image(private_grpc: GRPCClient, test_run_id: str) -> Generator[str, None, None]:
+    """Create a default DiskImage for BMaaS E2E tests and clean it up afterward."""
+    di_name = f"e2e-bmi-di-{test_run_id}"
+    di_id = private_grpc.create_disk_image(
+        name=di_name,
+        source_ref=BMI_DISK_IMAGE_SOURCE_REF,
+        architecture=["ARCHITECTURE_AMD64", "ARCHITECTURE_ARM64"],
+        api=PRIVATE_API,
+    )
+
+    yield di_name
+
+    try:
+        private_grpc.delete_disk_image(disk_image_id=di_id, api=PRIVATE_API)
+    except Exception as e:
+        print(f"WARNING: Failed to delete disk image {di_id}: {e}")
+
+
+@pytest.fixture(scope="session")
+def ssh_key_secret(jwt_cli_user: OsacCLI, ssh_public_key: str, test_run_id: str) -> Iterator[str]:
+    """Register the generated public key as the tenant Secret used by BMaaS tests."""
+    with registered_ssh_key_secret(jwt_cli_user, ssh_public_key, f"e2e-bmaas-key-{test_run_id}") as name:
+        yield name
+
+
+@pytest.fixture(scope="session")
+def catalog_item(
+    grpc: GRPCClient,
+    bmi_template: str,
+    bmi_instance_type: str,
+    test_run_id: str,
+    bmi_disk_image: str,
+    ssh_key_secret: str,
+) -> Generator[str, None, None]:
     name = f"e2e-bmaas-{test_run_id}"
     print(f"\nCreating BareMetalInstanceCatalogItem: {name}")
-    item_id: str = private_grpc.create_baremetal_instance_catalog_item(
+    item_id: str = grpc.create_baremetal_instance_catalog_item(
         name=name,
         title=f"E2E BMaaS Test ({test_run_id})",
         description="Temporary catalog item for BMaaS E2E tests",
         template=bmi_template,
-        field_definitions=[{"path": "ssh_public_key", "display_name": "SSH Public Key", "editable": True}],
+        fields={
+            "ssh_key": {"editable": {"default_value": {"name": ssh_key_secret}}},
+            "disk_image": {"editable": {"default_value": {"name": bmi_disk_image}}},
+            "instance_type": {"editable": {"default_value": {"name": bmi_instance_type, "shared": True}}},
+        },
     )
     print(f"CatalogItem created: {item_id}")
 
@@ -56,7 +104,7 @@ def catalog_item(private_grpc: GRPCClient, bmi_template: str, test_run_id: str) 
 
     try:
         print(f"\nDeleting BareMetalInstanceCatalogItem {item_id}...")
-        private_grpc.delete_baremetal_instance_catalog_item(item_id=item_id)
+        grpc.delete_baremetal_instance_catalog_item(item_id=item_id)
         print(f"CatalogItem {item_id} deleted")
     except Exception as e:
         print(f"WARNING: Failed to delete catalog item {item_id}: {e}")

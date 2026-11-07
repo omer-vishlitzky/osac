@@ -49,25 +49,23 @@ type BareMetalInstanceReconciler struct {
 	// APIReader is a direct, uncached reader (mgr.GetAPIReader) used by the
 	// duplicate-job guard so it does not read the same lagging informer cache it
 	// is meant to bypass. Set in SetupWithManager.
-	APIReader                         client.Reader
-	Scheme                            *runtime.Scheme
-	InventoryClient                   inventory.Client
-	ManagementClient                  management.Client
-	ProvisioningProvider              provisioning.ProvisioningProvider
-	NetworkingProvider                provisioning.ProvisioningProvider
-	IPDiscoveryProvider               provisioning.ProvisioningProvider
-	AAPClient                         *aap.Client
-	NoFreeHostsPollIntervalDuration   time.Duration
-	TryLockFailPollIntervalDuration   time.Duration
-	ManagementRecheckIntervalDuration time.Duration
-	ProvisionPollIntervalDuration     time.Duration
-	HostReadinessPollIntervalDuration time.Duration
+	APIReader                            client.Reader
+	Scheme                               *runtime.Scheme
+	InventoryClient                      inventory.Client
+	ManagementClient                     management.Client
+	ProvisioningProvider                 provisioning.ProvisioningProvider
+	NetworkingProvider                   provisioning.ProvisioningProvider
+	IPDiscoveryProvider                  provisioning.ProvisioningProvider
+	AAPClient                            *aap.Client
+	NoFreeHostsPollIntervalDuration      time.Duration
+	TryLockFailPollIntervalDuration      time.Duration
+	ManagementRecheckIntervalDuration    time.Duration
+	ProvisionPollIntervalDuration        time.Duration
+	HostAvailabilityPollIntervalDuration time.Duration
 }
 
 // +kubebuilder:rbac:groups=osac.openshift.io,resources=subnets,verbs=get;list;watch
 // +kubebuilder:rbac:groups=osac.openshift.io,resources=networkclasses,verbs=get;list;watch
-// +kubebuilder:rbac:groups=osac.openshift.io,resources=externalips,verbs=get;list;watch;delete
-// +kubebuilder:rbac:groups=osac.openshift.io,resources=externalipattachments,verbs=get;list;watch;delete
 
 func NewBareMetalInstanceReconciler(
 	client client.Client,
@@ -82,7 +80,7 @@ func NewBareMetalInstanceReconciler(
 	tryLockFailPollIntervalDuration time.Duration,
 	managementRecheckIntervalDuration time.Duration,
 	provisionPollIntervalDuration time.Duration,
-	hostReadinessPollIntervalDuration time.Duration,
+	hostAvailabilityPollIntervalDuration time.Duration,
 ) *BareMetalInstanceReconciler {
 	if noFreeHostsPollIntervalDuration <= 0 {
 		noFreeHostsPollIntervalDuration = DefaultNoFreeHostsPollIntervalDuration
@@ -100,24 +98,24 @@ func NewBareMetalInstanceReconciler(
 		provisionPollIntervalDuration = DefaultProvisionPollIntervalDuration
 	}
 
-	if hostReadinessPollIntervalDuration <= 0 {
-		hostReadinessPollIntervalDuration = DefaultHostReadinessPollIntervalDuration
+	if hostAvailabilityPollIntervalDuration <= 0 {
+		hostAvailabilityPollIntervalDuration = DefaultHostAvailabilityPollIntervalDuration
 	}
 
 	return &BareMetalInstanceReconciler{
-		Client:                            client,
-		Scheme:                            scheme,
-		InventoryClient:                   inventoryClient,
-		NoFreeHostsPollIntervalDuration:   noFreeHostsPollIntervalDuration,
-		TryLockFailPollIntervalDuration:   tryLockFailPollIntervalDuration,
-		ManagementClient:                  managementClient,
-		ProvisioningProvider:              provisioningProvider,
-		NetworkingProvider:                networkingProvider,
-		IPDiscoveryProvider:               ipDiscoveryProvider,
-		AAPClient:                         aapClient,
-		ManagementRecheckIntervalDuration: managementRecheckIntervalDuration,
-		ProvisionPollIntervalDuration:     provisionPollIntervalDuration,
-		HostReadinessPollIntervalDuration: hostReadinessPollIntervalDuration,
+		Client:                               client,
+		Scheme:                               scheme,
+		InventoryClient:                      inventoryClient,
+		NoFreeHostsPollIntervalDuration:      noFreeHostsPollIntervalDuration,
+		TryLockFailPollIntervalDuration:      tryLockFailPollIntervalDuration,
+		ManagementClient:                     managementClient,
+		ProvisioningProvider:                 provisioningProvider,
+		NetworkingProvider:                   networkingProvider,
+		IPDiscoveryProvider:                  ipDiscoveryProvider,
+		AAPClient:                            aapClient,
+		ManagementRecheckIntervalDuration:    managementRecheckIntervalDuration,
+		ProvisionPollIntervalDuration:        provisionPollIntervalDuration,
+		HostAvailabilityPollIntervalDuration: hostAvailabilityPollIntervalDuration,
 	}
 }
 
@@ -194,7 +192,14 @@ func (r *BareMetalInstanceReconciler) updateStatusWithRetry(ctx context.Context,
 		if err := r.Get(ctx, key, latest); err != nil {
 			return err
 		}
-		latest.Status = newStatus
+		status := newStatus
+		if !latest.DeletionTimestamp.IsZero() {
+			// A provision reconcile may finish after Kubernetes has accepted a
+			// delete. Keep its job history so deletion can cancel or clean up the
+			// provider operation, but never publish its stale Ready/Progressing phase.
+			status.Phase = v1alpha1.BareMetalInstancePhaseDeleting
+		}
+		latest.Status = status
 		return r.Status().Update(ctx, latest)
 	})
 }
@@ -354,13 +359,13 @@ func (r *BareMetalInstanceReconciler) reconcileInventory(ctx context.Context, ba
 	}
 
 	// The host is reserved but the inventory backend may report it as not yet
-	// ready for provisioning (e.g. underlying hardware still completing
+	// available for provisioning (e.g. underlying hardware still completing
 	// registration/inspection). Keep the instance in Allocating (don't set
-	// HostClass/Allocated yet) and requeue until the host reports Ready.
-	if !inventoryHost.Ready {
-		log.V(1).Info("Host reserved but not ready yet, requeuing",
+	// HostClass/Allocated yet) and requeue until the host reports Available.
+	if !inventoryHost.Available {
+		log.V(1).Info("Host reserved but not available yet, requeuing",
 			"InventoryHostID", bareMetalInstance.Spec.ExternalHostID)
-		return ctrl.Result{RequeueAfter: r.HostReadinessPollIntervalDuration}, nil
+		return ctrl.Result{RequeueAfter: r.HostAvailabilityPollIntervalDuration}, nil
 	}
 
 	bareMetalInstance.Spec.HostClass = inventoryHost.HostClass
@@ -394,15 +399,17 @@ func (r *BareMetalInstanceReconciler) reconcileManagement(ctx context.Context, b
 		return ctrl.Result{}, nil
 	}
 
-	// Add cleanup finalizer if auto-provisioned ExternalIP resources exist for this BMI
-	if err := r.addCleanupFinalizerIfNeeded(ctx, bareMetalInstance); err != nil {
-		return ctrl.Result{}, err
-	}
-
 	if result, err := r.reconcileNetworkProvisionAndDiscovery(ctx, bareMetalInstance); err != nil || !result.IsZero() {
 		return result, err
 	}
 	if bareMetalInstance.Status.Phase == v1alpha1.BareMetalInstancePhaseFailed {
+		return ctrl.Result{}, nil
+	}
+	// A retrying provision attempt is still in flight: power management and
+	// the Ready phase must wait until provisioning succeeds or fails for good
+	// (OSAC-1700). Without this guard the failure-observing reconcile returns
+	// a zero result and falls through to the Ready transition.
+	if v1alpha1.IsProvisionRetrying(bareMetalInstance.GetStatusCondition(v1alpha1.HostConditionProvisionTemplateComplete)) {
 		return ctrl.Result{}, nil
 	}
 
@@ -545,6 +552,23 @@ func (r *BareMetalInstanceReconciler) reconcilePower(ctx context.Context, bareMe
 	return true, nil
 }
 
+// provisionRetryMessagePrefix is the operator-facing prefix for retryable
+// provision failures; the latest backend error is appended for diagnostics.
+const provisionRetryMessagePrefix = "Provisioning retry scheduled after failed attempt: "
+
+// markProvisionRetrying stamps the retryable-failure state on the instance:
+// phase Progressing with the Retrying condition reason, preserving the latest
+// backend error in the condition message (OSAC-1700).
+func markProvisionRetrying(bareMetalInstance *v1alpha1.BareMetalInstance, backendError string) {
+	bareMetalInstance.Status.Phase = v1alpha1.BareMetalInstancePhaseProgressing
+	bareMetalInstance.SetStatusCondition(
+		v1alpha1.HostConditionProvisionTemplateComplete,
+		metav1.ConditionFalse,
+		v1alpha1.HostConditionReasonRetrying,
+		provisionRetryMessagePrefix+backendError,
+	)
+}
+
 func (r *BareMetalInstanceReconciler) reconcileNetworkProvisionAndDiscovery(ctx context.Context, bareMetalInstance *v1alpha1.BareMetalInstance) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
@@ -569,6 +593,10 @@ func (r *BareMetalInstanceReconciler) reconcileNetworkProvisionAndDiscovery(ctx 
 		}
 		provisionCond := bareMetalInstance.GetStatusCondition(v1alpha1.HostConditionProvisionTemplateComplete)
 		if provisionCond != nil && provisionCond.Status != metav1.ConditionTrue {
+			if v1alpha1.IsProvisionRetrying(provisionCond) {
+				bareMetalInstance.Status.Phase = v1alpha1.BareMetalInstancePhaseProgressing
+				return ctrl.Result{}, nil
+			}
 			bareMetalInstance.Status.Phase = v1alpha1.BareMetalInstancePhaseFailed
 			return ctrl.Result{}, nil
 		}
@@ -662,13 +690,7 @@ func (r *BareMetalInstanceReconciler) reconcileProvisioning(ctx context.Context,
 		provisioning.DefaultMaxJobHistory, r.ProvisionPollIntervalDuration,
 		&provisioning.PollCallbacks{
 			OnFailed: func(message string) {
-				bareMetalInstance.Status.Phase = v1alpha1.BareMetalInstancePhaseFailed
-				bareMetalInstance.SetStatusCondition(
-					v1alpha1.HostConditionProvisionTemplateComplete,
-					metav1.ConditionFalse,
-					v1alpha1.HostConditionReasonTemplateFailed,
-					message,
-				)
+				markProvisionRetrying(bareMetalInstance, message)
 			},
 			OnSuccess: func(_ provisioning.ProvisionStatus) {
 				bareMetalInstance.SetStatusCondition(
@@ -695,15 +717,21 @@ func (r *BareMetalInstanceReconciler) reconcileProvisioning(ctx context.Context,
 		return result, err
 	}
 
-	// Set progressing condition while provisioning is in-flight, but don't overwrite a failure.
+	// Set a progressing condition while provisioning is in-flight. Migrate a
+	// retained pre-OSAC-1700 failure to retrying without losing its backend error.
 	provisionCond := bareMetalInstance.GetStatusCondition(v1alpha1.HostConditionProvisionTemplateComplete)
-	if result.RequeueAfter > 0 && (provisionCond == nil || provisionCond.Reason != v1alpha1.HostConditionReasonTemplateFailed) {
-		bareMetalInstance.SetStatusCondition(
-			v1alpha1.HostConditionProvisionTemplateComplete,
-			metav1.ConditionFalse,
-			v1alpha1.HostConditionReasonProgressing,
-			"Provisioning job in progress",
-		)
+	if result.RequeueAfter > 0 {
+		switch {
+		case provisionCond != nil && provisionCond.Reason == v1alpha1.HostConditionReasonTemplateFailed:
+			markProvisionRetrying(bareMetalInstance, provisionCond.Message)
+		case provisionCond == nil || provisionCond.Reason != v1alpha1.HostConditionReasonRetrying:
+			bareMetalInstance.SetStatusCondition(
+				v1alpha1.HostConditionProvisionTemplateComplete,
+				metav1.ConditionFalse,
+				v1alpha1.HostConditionReasonProgressing,
+				"Provisioning job in progress",
+			)
+		}
 	}
 
 	return result, nil
@@ -978,11 +1006,26 @@ func (r *BareMetalInstanceReconciler) triggerRestart(ctx context.Context, bareMe
 	// Trigger restart through management backend
 	if err := r.ManagementClient.TriggerRestart(ctx, hostID); err != nil {
 		if errors.Is(err, management.ErrTransitioning) {
+			// The host is busy transitioning; the restart was NOT triggered. This is
+			// benign backpressure, not a failure — we swallow the error and requeue to
+			// retry once the host is idle. Two things must hold for the reason we stamp:
+			//   1. It must not be a hard-failure reason (PowerSyncFailed), which would be
+			//      surfaced to users as a power-sync failure while we are still retrying.
+			//   2. It must NOT be Progressing: reconcileRestartTrigger treats
+			//      PowerSynced=False/Progressing as "a restart I already triggered is in
+			//      flight — poll IsRestartComplete instead of re-triggering". Nothing was
+			//      triggered here, so using Progressing would make the next reconcile poll
+			//      for a completion that will never come from us, and on backends where
+			//      ErrTransitioning reflects an unrelated power transition it could adopt
+			//      that transition as "the restart" and report success with no reboot.
+			// PowerSyncRequired satisfies both: it is in the derivation's benign denylist
+			// (reported as non-failure) and leaves the in-progress guard false, so the
+			// next reconcile re-triggers until a real restart is actually initiated.
 			log.Info("Host is already transitioning, will retry restart when host becomes idle", "hostID", hostID)
 			bareMetalInstance.SetStatusCondition(
 				v1alpha1.HostConditionPowerSynced,
 				metav1.ConditionFalse,
-				v1alpha1.HostConditionReasonPowerSyncFailed,
+				v1alpha1.HostConditionReasonPowerSyncRequired,
 				"Host is transitioning, will retry restart when host becomes idle",
 			)
 			return ctrl.Result{RequeueAfter: r.ManagementRecheckIntervalDuration}, nil
@@ -1007,16 +1050,19 @@ func (r *BareMetalInstanceReconciler) triggerRestart(ctx context.Context, bareMe
 func (r *BareMetalInstanceReconciler) handleDeletion(ctx context.Context, bareMetalInstance *v1alpha1.BareMetalInstance) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 	log.Info("Deleting BareMetalInstance")
-
-	// Auto-cleanup: delete auto-provisioned ExternalIP resources first
-	result, done, err := r.reconcileAutoCleanup(ctx, bareMetalInstance)
-	if err != nil {
-		return result, err
-	}
-	if !done {
+	if controllerutil.ContainsFinalizer(bareMetalInstance, bareMetalInstanceOSACNetworkingFinalizer) {
 		bareMetalInstance.Status.Phase = v1alpha1.BareMetalInstancePhaseDeleting
-		return result, nil
+		log.Info("Waiting for osac-operator ExternalIP cleanup before host teardown")
+		pollInterval := r.ManagementRecheckIntervalDuration
+		if pollInterval <= 0 {
+			pollInterval = DefaultManagementRecheckIntervalDuration
+		}
+		return ctrl.Result{RequeueAfter: pollInterval}, nil
 	}
+
+	var result ctrl.Result
+	var done bool
+	var err error
 
 	// Power off BEFORE moving the port back to the provisioning network — ensures tenant
 	// workloads never run on the provisioning network. Only needed when networking
@@ -1105,9 +1151,9 @@ func (r *BareMetalInstanceReconciler) handleDeletion(ctx context.Context, bareMe
 			labelsToRemove = append(labelsToRemove, shared.OsacBareMetalPoolIDLabel)
 		}
 
-		err := r.InventoryClient.UnassignHost(ctx, hostID, labelsToRemove)
+		err := r.InventoryClient.UnassignHost(ctx, hostID, string(bareMetalInstance.UID), labelsToRemove)
 		if err != nil {
-			log.Error(err, "Failed to unassign host in inventory")
+			log.Error(err, "Failed to unassign host in inventory", "InventoryHostID", hostID)
 			return ctrl.Result{}, err
 		}
 	}

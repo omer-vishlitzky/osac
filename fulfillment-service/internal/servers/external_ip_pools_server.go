@@ -22,18 +22,17 @@ import (
 	grpccodes "google.golang.org/grpc/codes"
 	grpcstatus "google.golang.org/grpc/status"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
-	publicv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/public/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
-	"github.com/osac-project/osac/fulfillment-service/internal/database"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
 
 type ExternalIPPoolsServerBuilder struct {
-	logger            *slog.Logger
-	notifier          *database.Notifier
-	attributionLogic  auth.AttributionLogic
-	tenancyLogic      auth.TenancyLogic
-	metricsRegisterer prometheus.Registerer
+	logger             *slog.Logger
+	attributionLogic   auth.AttributionLogic
+	tenancyLogic       auth.TenancyLogic
+	metricsRegisterer  prometheus.Registerer
+	networkingSettings *NetworkingSettings
 }
 
 var _ publicv1.ExternalIPPoolsServer = (*ExternalIPPoolsServer)(nil)
@@ -55,11 +54,6 @@ func (b *ExternalIPPoolsServerBuilder) SetLogger(value *slog.Logger) *ExternalIP
 	return b
 }
 
-func (b *ExternalIPPoolsServerBuilder) SetNotifier(value *database.Notifier) *ExternalIPPoolsServerBuilder {
-	b.notifier = value
-	return b
-}
-
 func (b *ExternalIPPoolsServerBuilder) SetAttributionLogic(value auth.AttributionLogic) *ExternalIPPoolsServerBuilder {
 	b.attributionLogic = value
 	return b
@@ -72,6 +66,13 @@ func (b *ExternalIPPoolsServerBuilder) SetTenancyLogic(value auth.TenancyLogic) 
 
 func (b *ExternalIPPoolsServerBuilder) SetMetricsRegisterer(value prometheus.Registerer) *ExternalIPPoolsServerBuilder {
 	b.metricsRegisterer = value
+	return b
+}
+
+// SetNetworkingSettings sets the networking installation settings. This is optional; the default is
+// DefaultNetworkingSettings.
+func (b *ExternalIPPoolsServerBuilder) SetNetworkingSettings(value NetworkingSettings) *ExternalIPPoolsServerBuilder {
+	b.networkingSettings = &value
 	return b
 }
 
@@ -99,11 +100,11 @@ func (b *ExternalIPPoolsServerBuilder) Build() (result *ExternalIPPoolsServer, e
 
 	delegate, err := NewPrivateExternalIPPoolsServer().
 		SetLogger(b.logger).
-		SetNotifier(b.notifier).
 		SetAttributionLogic(b.attributionLogic).
 		SetTenancyLogic(b.tenancyLogic).
 		SetMetricsRegisterer(b.metricsRegisterer).
 		SetFilterDesc((*publicv1.ExternalIPPool)(nil).ProtoReflect().Descriptor()).
+		SetNetworkingSettings(resolveNetworkingSettings(b.networkingSettings)).
 		Build()
 	if err != nil {
 		return

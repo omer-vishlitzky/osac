@@ -13,9 +13,9 @@ import (
 	grpccodes "google.golang.org/grpc/codes"
 	grpcstatus "google.golang.org/grpc/status"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
-	publicv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/public/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/uuid"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
 
 var _ = Describe("Multitenancy authentication error handling", Label("multitenancy", "autherrors"), func() {
@@ -45,7 +45,6 @@ var _ = Describe("Multitenancy authentication error handling", Label("multitenan
 		},
 		Entry("clusters", "/api/fulfillment/v1/clusters"),
 		Entry("Cluster templates", "/api/fulfillment/v1/cluster_templates"),
-		Entry("Host types", "/api/fulfillment/v1/host_types"),
 	)
 
 	DescribeTable(
@@ -73,7 +72,6 @@ var _ = Describe("Multitenancy authentication error handling", Label("multitenan
 		},
 		Entry("Clusters", "/api/fulfillment/v1/clusters"),
 		Entry("Cluster templates", "/api/fulfillment/v1/cluster_templates"),
-		Entry("Host types", "/api/fulfillment/v1/host_types"),
 	)
 })
 
@@ -96,26 +94,44 @@ var _ = Describe("Multitenancy basic tenant isolation", Ordered, Label("multiten
 
 		Describe("cluster resources", func() {
 			var tenantClusterMapping map[string][]string
+			var clusterBMIT string
 
 			BeforeAll(func(ctx context.Context) {
 				// Create map to track which clusters belong to which tenants
 				tenantClusterMapping = make(map[string][]string)
 
-				// Create host type for testing
-				hostTypesClient := privatev1.NewHostTypesClient(tool.InternalView().AdminConn())
-				hostTypeId := fmt.Sprintf("sa-isolation-hosttype-%s", uuid.New())
-				_, err := hostTypesClient.Create(ctx, privatev1.HostTypesCreateRequest_builder{
-					Object: privatev1.HostType_builder{
-						Id: hostTypeId,
+				// Create a bare metal instance type for testing
+				instanceTypesClient := privatev1.NewBareMetalInstanceTypesClient(tool.InternalView().AdminConn())
+				bmitName := fmt.Sprintf("test-bmit-%s", uuid.New()[24:32])
+				clusterBMIT = bmitName
+				_, err := instanceTypesClient.Create(ctx, privatev1.BareMetalInstanceTypesCreateRequest_builder{
+					Object: privatev1.BareMetalInstanceType_builder{
 						Metadata: privatev1.Metadata_builder{
-							Name: fmt.Sprintf("test-hosttype-%s", uuid.New()[24:32]),
+							Name: bmitName,
+						}.Build(),
+						Spec: privatev1.BareMetalInstanceTypeSpec_builder{
+							Hardware: privatev1.BareMetalHardwareSpec_builder{
+								Cpu:    privatev1.BareMetalCPUSpec_builder{Cores: 32, Architecture: "amd64", ThreadsPerCore: 2}.Build(),
+								Memory: privatev1.BareMetalMemorySpec_builder{TotalGb: 128}.Build(),
+								NetworkPorts: []*privatev1.BareMetalNetworkPortSpec{
+									privatev1.BareMetalNetworkPortSpec_builder{
+										Name:  "eth0",
+										Role:  "fabric",
+										Type:  "Ethernet",
+										Speed: "10Gbps",
+									}.Build(),
+								},
+							}.Build(),
+							HostLabelSelector: privatev1.BareMetalLabelSelector_builder{
+								MatchLabels: map[string]string{"hardware.profile": "compute"},
+							}.Build(),
 						}.Build(),
 					}.Build(),
 				}.Build())
 				Expect(err).ToNot(HaveOccurred())
 				DeferCleanup(func(ctx context.Context) {
-					_, err := hostTypesClient.Delete(ctx, privatev1.HostTypesDeleteRequest_builder{
-						Id: hostTypeId,
+					_, err := instanceTypesClient.Delete(ctx, privatev1.BareMetalInstanceTypesDeleteRequest_builder{
+						Id: bmitName,
 					}.Build())
 					Expect(err).ToNot(HaveOccurred())
 				})
@@ -135,10 +151,12 @@ var _ = Describe("Multitenancy basic tenant isolation", Ordered, Label("multiten
 						err = nil
 					}
 					Expect(err).ToNot(HaveOccurred())
+					// Cluster creates use the tenant's default networking.
+					ensureTenantDefaultNetworkingFixture(ctx, tenant, "")
 				}
 
 				// Create cluster template for testing
-				templateId := fmt.Sprintf("sa-isolation-template-%s", uuid.New())
+				templateId := newTemplateID("sa_isolation_template")
 				templatesClient := privatev1.NewClusterTemplatesClient(tool.InternalView().AdminConn())
 				_, err = templatesClient.Create(ctx, privatev1.ClusterTemplatesCreateRequest_builder{
 					Object: privatev1.ClusterTemplate_builder{
@@ -146,12 +164,6 @@ var _ = Describe("Multitenancy basic tenant isolation", Ordered, Label("multiten
 						Metadata: privatev1.Metadata_builder{
 							Name: fmt.Sprintf("test-template-%s", uuid.New()[24:32]),
 						}.Build(),
-						NodeSets: map[string]*privatev1.ClusterTemplateNodeSet{
-							"my-node-set": privatev1.ClusterTemplateNodeSet_builder{
-								HostType: privatev1.HostTypeReference_builder{Id: hostTypeId}.Build(),
-								Size:     3,
-							}.Build(),
-						},
 					}.Build(),
 				}.Build())
 				Expect(err).ToNot(HaveOccurred())
@@ -177,16 +189,16 @@ var _ = Describe("Multitenancy basic tenant isolation", Ordered, Label("multiten
 							}.Build(),
 							Spec: publicv1.ClusterSpec_builder{
 								Template: publicv1.ClusterTemplateReference_builder{Id: templateId}.Build(),
+								NodeSets: testClusterNodeSets(clusterBMIT, 3),
 							}.Build(),
 						}.Build(),
 					}.Build())
 					Expect(err).ToNot(HaveOccurred())
 					clusterObject := createResponse.GetObject()
 
-					DeferCleanup(func(ctx context.Context) {
-						err := deleteCluster(ctx, clusterObject.GetId())
-						Expect(err).ToNot(HaveOccurred())
-					})
+					// Wait for the archive, so the default networking cleanup
+					// doesn't race a cluster that still references it.
+					deferClusterDeletion(clusterObject.GetId(), tool.InternalView().AdminConn())
 
 					// Populate map to track which clusters belong to which tenants
 					tenantClusterMapping[tenant] = append(tenantClusterMapping[tenant], clusterObject.GetId())
@@ -349,6 +361,7 @@ var _ = Describe("Multitenancy basic tenant isolation", Ordered, Label("multiten
 			var (
 				tenantClusterMapping map[string][]string
 				clusterTenantMapping map[string][]string
+				clusterBMIT          string
 			)
 
 			BeforeAll(func(ctx context.Context) {
@@ -379,29 +392,48 @@ var _ = Describe("Multitenancy basic tenant isolation", Ordered, Label("multiten
 						err = nil
 					}
 					Expect(err).ToNot(HaveOccurred())
+					// Cluster creates use the tenant's default networking.
+					ensureTenantDefaultNetworkingFixture(ctx, tenant, "")
 				}
 
-				// Create host type for testing
-				hostTypeId := fmt.Sprintf("oidc-isolation-hosttype-%s", uuid.New())
-				hostTypesClient := privatev1.NewHostTypesClient(tool.InternalView().AdminConn())
-				_, err := hostTypesClient.Create(ctx, privatev1.HostTypesCreateRequest_builder{
-					Object: privatev1.HostType_builder{
-						Id: hostTypeId,
+				// Create a bare metal instance type for testing
+				bmitName := fmt.Sprintf("test-bmit-%s", uuid.New()[24:32])
+				clusterBMIT = bmitName
+				instanceTypesClient := privatev1.NewBareMetalInstanceTypesClient(tool.InternalView().AdminConn())
+				_, err := instanceTypesClient.Create(ctx, privatev1.BareMetalInstanceTypesCreateRequest_builder{
+					Object: privatev1.BareMetalInstanceType_builder{
 						Metadata: privatev1.Metadata_builder{
-							Name: fmt.Sprintf("test-hosttype-%s", uuid.New()[24:32]),
+							Name: bmitName,
+						}.Build(),
+						Spec: privatev1.BareMetalInstanceTypeSpec_builder{
+							Hardware: privatev1.BareMetalHardwareSpec_builder{
+								Cpu:    privatev1.BareMetalCPUSpec_builder{Cores: 32, Architecture: "amd64", ThreadsPerCore: 2}.Build(),
+								Memory: privatev1.BareMetalMemorySpec_builder{TotalGb: 128}.Build(),
+								NetworkPorts: []*privatev1.BareMetalNetworkPortSpec{
+									privatev1.BareMetalNetworkPortSpec_builder{
+										Name:  "eth0",
+										Role:  "fabric",
+										Type:  "Ethernet",
+										Speed: "10Gbps",
+									}.Build(),
+								},
+							}.Build(),
+							HostLabelSelector: privatev1.BareMetalLabelSelector_builder{
+								MatchLabels: map[string]string{"hardware.profile": "compute"},
+							}.Build(),
 						}.Build(),
 					}.Build(),
 				}.Build())
 				Expect(err).ToNot(HaveOccurred())
 				DeferCleanup(func(ctx context.Context) {
-					_, err := hostTypesClient.Delete(ctx, privatev1.HostTypesDeleteRequest_builder{
-						Id: hostTypeId,
+					_, err := instanceTypesClient.Delete(ctx, privatev1.BareMetalInstanceTypesDeleteRequest_builder{
+						Id: bmitName,
 					}.Build())
 					Expect(err).ToNot(HaveOccurred())
 				})
 
 				// Create cluster template for testing
-				templateId := fmt.Sprintf("oidc-isolation-template-%s", uuid.New())
+				templateId := newTemplateID("oidc_isolation_template")
 				templatesClient := privatev1.NewClusterTemplatesClient(tool.InternalView().AdminConn())
 				_, err = templatesClient.Create(ctx, privatev1.ClusterTemplatesCreateRequest_builder{
 					Object: privatev1.ClusterTemplate_builder{
@@ -409,12 +441,6 @@ var _ = Describe("Multitenancy basic tenant isolation", Ordered, Label("multiten
 						Metadata: privatev1.Metadata_builder{
 							Name: fmt.Sprintf("test-template-%s", uuid.New()[24:32]),
 						}.Build(),
-						NodeSets: map[string]*privatev1.ClusterTemplateNodeSet{
-							"my-node-set": privatev1.ClusterTemplateNodeSet_builder{
-								HostType: privatev1.HostTypeReference_builder{Id: hostTypeId}.Build(),
-								Size:     3,
-							}.Build(),
-						},
 					}.Build(),
 				}.Build())
 				Expect(err).ToNot(HaveOccurred())
@@ -440,16 +466,16 @@ var _ = Describe("Multitenancy basic tenant isolation", Ordered, Label("multiten
 							}.Build(),
 							Spec: publicv1.ClusterSpec_builder{
 								Template: publicv1.ClusterTemplateReference_builder{Id: templateId}.Build(),
+								NodeSets: testClusterNodeSets(clusterBMIT, 3),
 							}.Build(),
 						}.Build(),
 					}.Build())
 					Expect(err).ToNot(HaveOccurred())
 					clusterObject := createResponse.GetObject()
 
-					DeferCleanup(func(ctx context.Context) {
-						err := deleteCluster(ctx, clusterObject.GetId())
-						Expect(err).ToNot(HaveOccurred())
-					})
+					// Wait for the archive, so the default networking cleanup
+					// doesn't race a cluster that still references it.
+					deferClusterDeletion(clusterObject.GetId(), tool.InternalView().AdminConn())
 
 					// Each object now has a single tenant; record the actual assigned tenant:
 					tenant := clusterObject.GetMetadata().GetTenant()
@@ -520,14 +546,6 @@ func listClusters(ctx context.Context, conn *grpc.ClientConn) *publicv1.Clusters
 	Expect(err).ToNot(HaveOccurred(), "error listing clusters")
 
 	return response
-}
-
-func deleteCluster(ctx context.Context, clusterId string) error {
-	clusterClient := privatev1.NewClustersClient(tool.InternalView().AdminConn())
-	_, err := clusterClient.Delete(ctx, privatev1.ClustersDeleteRequest_builder{
-		Id: clusterId,
-	}.Build())
-	return err
 }
 
 // calculateResponseSize calculates the response size based on a tenant-resource mapping and a user's tenant membership

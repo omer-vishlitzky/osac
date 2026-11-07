@@ -18,23 +18,25 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 
 	"github.com/prometheus/client_golang/prometheus"
 	grpccodes "google.golang.org/grpc/codes"
 	grpcstatus "google.golang.org/grpc/status"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
-	publicv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/public/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
-	"github.com/osac-project/osac/fulfillment-service/internal/events"
+	"github.com/osac-project/osac/fulfillment-service/internal/vault"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
 
 type ClustersServerBuilder struct {
-	logger            *slog.Logger
-	notifier          events.Notifier
-	attributionLogic  auth.AttributionLogic
-	tenancyLogic      auth.TenancyLogic
-	metricsRegisterer prometheus.Registerer
+	logger             *slog.Logger
+	attributionLogic   auth.AttributionLogic
+	tenancyLogic       auth.TenancyLogic
+	metricsRegisterer  prometheus.Registerer
+	networkingSettings *NetworkingSettings
+	secretStore        vault.SecretStore
 }
 
 var _ publicv1.ClustersServer = (*ClustersServer)(nil)
@@ -58,12 +60,6 @@ func (b *ClustersServerBuilder) SetLogger(value *slog.Logger) *ClustersServerBui
 	return b
 }
 
-// SetNotifier sets the notifier to use. This is optional.
-func (b *ClustersServerBuilder) SetNotifier(value events.Notifier) *ClustersServerBuilder {
-	b.notifier = value
-	return b
-}
-
 // SetAttributionLogic sets the attribution logic to use. This is optional.
 func (b *ClustersServerBuilder) SetAttributionLogic(value auth.AttributionLogic) *ClustersServerBuilder {
 	b.attributionLogic = value
@@ -76,10 +72,24 @@ func (b *ClustersServerBuilder) SetTenancyLogic(value auth.TenancyLogic) *Cluste
 	return b
 }
 
+// SetSecretStore sets the store used to load Vault-backed SSH-key Secret data
+// during spec.ssh_key reference validation on the delegated private server.
+func (b *ClustersServerBuilder) SetSecretStore(value vault.SecretStore) *ClustersServerBuilder {
+	b.secretStore = value
+	return b
+}
+
 // SetMetricsRegisterer sets the Prometheus registerer used to register the metrics for the underlying database
 // access objects. This is optional. If not set, no metrics will be recorded.
 func (b *ClustersServerBuilder) SetMetricsRegisterer(value prometheus.Registerer) *ClustersServerBuilder {
 	b.metricsRegisterer = value
+	return b
+}
+
+// SetNetworkingSettings sets the networking installation settings. This is optional; the default is
+// DefaultNetworkingSettings.
+func (b *ClustersServerBuilder) SetNetworkingSettings(value NetworkingSettings) *ClustersServerBuilder {
+	b.networkingSettings = &value
 	return b
 }
 
@@ -125,11 +135,13 @@ func (b *ClustersServerBuilder) Build() (result *ClustersServer, err error) {
 	// Create the private server to delegate to:
 	delegate, err := NewPrivateClustersServer().
 		SetLogger(b.logger).
-		SetNotifier(b.notifier).
 		SetAttributionLogic(b.attributionLogic).
 		SetTenancyLogic(b.tenancyLogic).
 		SetMetricsRegisterer(b.metricsRegisterer).
+		SetNetworkingSettings(resolveNetworkingSettings(b.networkingSettings)).
+		SetAddOnOperatorResolverFactory(newPublishedScopedAddOnOperatorResourceResolver).
 		SetFilterDesc(objectDesc).
+		SetSecretStore(b.secretStore).
 		Build()
 	if err != nil {
 		return
@@ -233,9 +245,13 @@ func (s *ClustersServer) Create(ctx context.Context,
 			"Failed to map public cluster to private",
 			slog.Any("error", err),
 		)
-		err = grpcstatus.Errorf(grpccodes.Internal, "failed to process cluster")
+		err = publicInputMappingError(err, "failed to process cluster")
 		return
 	}
+	// The status is output-only: only the system writes it. The metering source contract
+	// is not enforced on inserts, so a caller-supplied status must never reach the
+	// database as a fabricated fact.
+	privateCluster.ClearStatus()
 
 	// Delegate to the private server:
 	privateRequest := &privatev1.ClustersCreateRequest{}
@@ -267,6 +283,11 @@ func (s *ClustersServer) Create(ctx context.Context,
 
 func (s *ClustersServer) Update(ctx context.Context,
 	request *publicv1.ClustersUpdateRequest) (response *publicv1.ClustersUpdateResponse, err error) {
+	ctx = withPublicAPIView(ctx)
+	if err := validatePublicObjectMetadata(request.GetObject()); err != nil {
+		return nil, err
+	}
+
 	// Validate the request:
 	publicCluster := request.GetObject()
 	if publicCluster == nil {
@@ -277,6 +298,20 @@ func (s *ClustersServer) Update(ctx context.Context,
 	if id == "" {
 		err = grpcstatus.Errorf(grpccodes.InvalidArgument, "object identifier is mandatory")
 		return
+	}
+
+	// The system sets the version transition time when it accepts a version change; users can
+	// read it but never supply it. The rest of the status is already ignored on input.
+	for _, path := range request.GetUpdateMask().GetPaths() {
+		if path == "status.version_transition_time" {
+			err = grpcstatus.Errorf(grpccodes.InvalidArgument, "%s is output-only", path)
+			return
+		}
+		if path == "spec.control_plane_attempt_id" || path == "spec.node_set_attempt_ids" ||
+			strings.HasPrefix(path, "spec.node_set_attempt_ids.") {
+			err = grpcstatus.Errorf(grpccodes.InvalidArgument, "%s is server-owned", path)
+			return
+		}
 	}
 
 	// Determine how to prepare the private cluster based on whether there's a field mask. When there's a field mask,
@@ -305,7 +340,7 @@ func (s *ClustersServer) Update(ctx context.Context,
 			"Failed to map public cluster to private",
 			slog.Any("error", err),
 		)
-		err = grpcstatus.Errorf(grpccodes.Internal, "failed to process cluster")
+		err = publicInputMappingError(err, "failed to process cluster")
 		return
 	}
 

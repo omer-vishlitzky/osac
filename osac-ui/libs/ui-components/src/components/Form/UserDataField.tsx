@@ -1,0 +1,171 @@
+import type { ReactNode } from 'react';
+import {
+  Card,
+  CardBody,
+  CardHeader,
+  CardTitle,
+  Flex,
+  FlexItem,
+  FormGroup,
+  Gallery,
+  GalleryItem,
+  Label,
+} from '@patternfly/react-core';
+import { useField } from 'formik';
+
+import { Secret, SecretType } from '@osac/types';
+import { cel } from '@osac/ui-components/api/cel';
+
+import { getVisibleFieldError } from './fieldError';
+import { useShowFieldValidationErrors } from './FieldValidationContext';
+import { FileUploadField } from './FileUploadField';
+import { FormFieldHelper } from './FormFieldHelper';
+import SecretSelectionField from './SecretSelectionField';
+import { useTranslation } from '../../hooks/useTranslation';
+
+interface UserDataFieldProps {
+  name: string;
+  projectName: string;
+  isDisabled?: boolean;
+  isRequired?: boolean;
+  labelInfo?: ReactNode;
+  label?: string;
+  inlinePlaceholder?: string;
+}
+
+interface UserDataSourceOption {
+  value: 'inline' | 'secret';
+  title: string;
+  description: string;
+}
+
+const UserDataField = ({
+  name,
+  projectName,
+  isDisabled = false,
+  isRequired = false,
+  labelInfo,
+  label,
+  inlinePlaceholder,
+}: UserDataFieldProps) => {
+  const { t } = useTranslation();
+  const sourceName = `${name}.source`;
+  const secretRefName = `${name}.secret`;
+  const inlineName = `${name}.inline`;
+  const [{ value }, sourceMeta, sourceHelpers] = useField<'secret' | 'inline'>(sourceName);
+  const showValidationErrors = useShowFieldValidationErrors();
+  const currentSource = value === 'secret' ? 'secret' : 'inline';
+  const sourceError = getVisibleFieldError(sourceMeta, showValidationErrors);
+  const options: UserDataSourceOption[] = [
+    {
+      value: 'inline',
+      title: t('Enter value'),
+      description: t('Upload or paste user data'),
+    },
+    {
+      value: 'secret',
+      title: t('Select secret'),
+      description: t('Use a USER_DATA secret from this project'),
+    },
+  ];
+
+  const selectSource = (value: UserDataSourceOption['value']) => {
+    void sourceHelpers.setValue(value);
+  };
+
+  return (
+    <>
+      <FormGroup
+        role="radiogroup"
+        label={label || t('User data')}
+        fieldId="user-data-source"
+        isRequired={isRequired}
+        labelInfo={labelInfo}
+      >
+        <Gallery hasGutter minWidths={{ default: '30%' }}>
+          {options.map((option) => {
+            const isSelected = currentSource === option.value;
+            const cardId = `user-data-source-${option.value}`;
+            return (
+              <GalleryItem key={option.value}>
+                <Card
+                  id={cardId}
+                  isCompact
+                  isFullHeight
+                  isSelectable
+                  isSelected={isSelected}
+                  isDisabled={isDisabled}
+                  onClick={() => {
+                    if (!isDisabled) {
+                      selectSource(option.value);
+                    }
+                  }}
+                >
+                  <CardHeader
+                    selectableActions={{
+                      selectableActionId: `${cardId}-input`,
+                      selectableActionAriaLabelledby: `${cardId}-label`,
+                      name: sourceName,
+                      variant: 'single',
+                      onChange: (_event, checked) => {
+                        if (checked && !isDisabled) {
+                          selectSource(option.value);
+                        }
+                      },
+                      hasNoOffset: true,
+                      isHidden: true,
+                    }}
+                  >
+                    <span id={`${cardId}-label`} className="pf-v6-screen-reader">
+                      {option.title}
+                    </span>
+                    <CardTitle>
+                      <Flex
+                        justifyContent={{ default: 'justifyContentSpaceBetween' }}
+                        alignItems={{ default: 'alignItemsCenter' }}
+                      >
+                        <FlexItem>{option.title}</FlexItem>
+                        {isSelected && (
+                          <FlexItem>
+                            <Label color="grey">{t('Selected')}</Label>
+                          </FlexItem>
+                        )}
+                      </Flex>
+                    </CardTitle>
+                  </CardHeader>
+                  <CardBody>{option.description}</CardBody>
+                </Card>
+              </GalleryItem>
+            );
+          })}
+        </Gallery>
+        <FormFieldHelper error={sourceError} fieldId="user-data-source" />
+      </FormGroup>
+      {currentSource === 'secret' ? (
+        <SecretSelectionField
+          label={t('User data secret')}
+          filter={cel<Secret>((filter) =>
+            filter.and(
+              filter.field('metadata.project').equals(projectName),
+              filter.field('type').equals(SecretType.USER_DATA),
+            ),
+          )}
+          name={secretRefName}
+          placeholder={t('Select a user data secret')}
+          isDisabled={isDisabled}
+          asFormGroup={false}
+        />
+      ) : (
+        <FileUploadField
+          name={inlineName}
+          fieldId="inline-user-data"
+          placeholder={inlinePlaceholder}
+          helperText={t('Optional')}
+          isDisabled={isDisabled}
+        />
+      )}
+    </>
+  );
+};
+
+export default UserDataField;

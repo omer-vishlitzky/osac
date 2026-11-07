@@ -20,16 +20,17 @@ import (
 	"github.com/google/uuid"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-	"go.uber.org/mock/gomock"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
+	"github.com/osac-project/osac/fulfillment-service/internal/database"
 	"github.com/osac-project/osac/fulfillment-service/internal/database/dao"
-	"github.com/osac-project/osac/fulfillment-service/internal/events"
+	"github.com/osac-project/osac/fulfillment-service/internal/validation"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
 // Fixture credentials for storage backend tests. Named with a test* prefix so
@@ -39,6 +40,213 @@ const (
 	testNewPassword   = "new-secret"
 	testOtherPassword = "other-secret"
 )
+
+var _ = Describe("Storage backend ownership", func() {
+	var server *PrivateStorageBackendsServer
+	BeforeEach(func() {
+		var err error
+		server, err = NewPrivateStorageBackendsServer().
+			SetLogger(logger).SetAttributionLogic(attribution).SetTenancyLogic(tenancy).Build()
+		Expect(err).NotTo(HaveOccurred())
+	})
+
+	backend := func(cspManaged bool) *privatev1.StorageBackend {
+		spec := privatev1.StorageBackendSpec_builder{
+			Provider: "vast", CspManaged: cspManaged,
+		}.Build()
+		if !cspManaged {
+			spec.SetEndpoint("https://storage.example.com")
+			spec.SetCredentials(privatev1.StorageBackendCredentials_builder{
+				Username: "admin", Password: testPassword,
+			}.Build())
+		}
+		return privatev1.StorageBackend_builder{
+			Metadata: privatev1.Metadata_builder{Name: "backend-" + uuid.NewString()}.Build(),
+			Spec:     spec,
+		}.Build()
+	}
+	create := func(cspManaged bool) *privatev1.StorageBackend {
+		response, err := server.Create(ctx, privatev1.StorageBackendsCreateRequest_builder{
+			Object: backend(cspManaged),
+		}.Build())
+		Expect(err).NotTo(HaveOccurred())
+		return response.GetObject()
+	}
+
+	DescribeTable("validates NetApp ownership before database persistence",
+		func(provider string, cspManaged, accepted bool) {
+			Expect(suiteTx.End(ctx)).To(Succeed())
+			suiteTx = nil
+			ctx = database.TxManagerIntoContext(context.Background(), tm)
+			object := backend(cspManaged)
+			object.GetSpec().SetProvider(provider)
+			request := privatev1.StorageBackendsCreateRequest_builder{Object: object}.Build()
+			interceptor, err := validation.NewProtovalidateInterceptor().SetLogger(logger).Build()
+			Expect(err).NotTo(HaveOccurred())
+			response, err := database.WithNewTx(ctx, func(txCtx context.Context) (*privatev1.StorageBackendsCreateResponse, error) {
+				result, err := interceptor.UnaryServer(txCtx, request, &grpc.UnaryServerInfo{},
+					func(handlerCtx context.Context, _ any) (any, error) {
+						return server.Create(handlerCtx, request)
+					})
+				if err != nil {
+					return nil, err
+				}
+				return result.(*privatev1.StorageBackendsCreateResponse), nil
+			})
+			if accepted {
+				Expect(err).NotTo(HaveOccurred())
+				Expect(response.GetObject().GetSpec().GetCspManaged()).To(Equal(cspManaged))
+			} else {
+				Expect(status.Code(err)).To(Equal(codes.InvalidArgument))
+				Expect(err.Error()).To(ContainSubstring("OSAC-managed NetApp storage is not supported; set cspManaged to true"))
+				Expect(response).To(BeNil())
+			}
+			listed, err := database.WithNewTx(ctx, func(txCtx context.Context) (*privatev1.StorageBackendsListResponse, error) {
+				return server.List(txCtx, privatev1.StorageBackendsListRequest_builder{
+					Filter: new(fmt.Sprintf("this.metadata.name == %q", object.GetMetadata().GetName())),
+				}.Build())
+			})
+			Expect(err).NotTo(HaveOccurred())
+			if accepted {
+				Expect(listed.GetItems()).To(HaveLen(1))
+				Expect(listed.GetItems()[0].GetId()).To(Equal(response.GetObject().GetId()))
+			} else {
+				Expect(listed.GetItems()).To(BeEmpty())
+			}
+		},
+		Entry("OSAC-managed NetApp", "netapp", false, false),
+		Entry("CSP-managed NetApp", "netapp", true, true),
+		Entry("OSAC-managed VAST", "vast", false, true),
+		Entry("OSAC-managed Pure", "pure", false, true),
+	)
+
+	DescribeTable("persists ownership without adding connection details",
+		func(provider string) {
+			object := backend(true)
+			object.GetSpec().SetProvider(provider)
+			response, err := server.Create(ctx, privatev1.StorageBackendsCreateRequest_builder{Object: object}.Build())
+			Expect(err).NotTo(HaveOccurred())
+			got, err := server.Get(ctx, privatev1.StorageBackendsGetRequest_builder{Id: response.GetObject().GetId()}.Build())
+			Expect(err).NotTo(HaveOccurred())
+			Expect(got.GetObject().GetSpec().GetCspManaged()).To(BeTrue())
+			Expect(got.GetObject().GetSpec().GetEndpoint()).To(BeEmpty())
+			Expect(got.GetObject().GetSpec().GetCredentials()).To(BeNil())
+			Expect(got.GetObject().GetMetadata().GetTenant()).To(Equal(auth.SharedTenant))
+		},
+		Entry("NetApp", "netapp"), Entry("VAST", "vast"), Entry("Pure", "pure"),
+	)
+
+	It("preserves CSP-managed NetApp ownership on a partial description update", func() {
+		object := backend(true)
+		object.GetSpec().SetProvider("netapp")
+		created, err := server.Create(ctx, privatev1.StorageBackendsCreateRequest_builder{Object: object}.Build())
+		Expect(err).NotTo(HaveOccurred())
+		_, err = server.Update(ctx, privatev1.StorageBackendsUpdateRequest_builder{
+			Object: privatev1.StorageBackend_builder{
+				Id:   created.GetObject().GetId(),
+				Spec: privatev1.StorageBackendSpec_builder{Description: "Updated NetApp description"}.Build(),
+			}.Build(),
+			UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"spec.description"}},
+		}.Build())
+		Expect(err).NotTo(HaveOccurred())
+		got, err := server.Get(ctx, privatev1.StorageBackendsGetRequest_builder{Id: created.GetObject().GetId()}.Build())
+		Expect(err).NotTo(HaveOccurred())
+		Expect(got.GetObject().GetSpec().GetProvider()).To(Equal("netapp"))
+		Expect(got.GetObject().GetSpec().GetCspManaged()).To(BeTrue())
+		Expect(got.GetObject().GetSpec().GetDescription()).To(Equal("Updated NetApp description"))
+	})
+
+	DescribeTable("rejects ownership changes after applying the update mask",
+		func(cspManaged bool, paths []string) {
+			created := create(cspManaged)
+			candidate := proto.Clone(created).(*privatev1.StorageBackend)
+			candidate.GetSpec().SetCspManaged(!cspManaged)
+			// Keep both ownership modes structurally valid so this tests immutability.
+			candidate.GetSpec().SetEndpoint("https://storage.example.com")
+			candidate.GetSpec().SetCredentials(privatev1.StorageBackendCredentials_builder{
+				Username: "admin", Password: testPassword,
+			}.Build())
+			request := privatev1.StorageBackendsUpdateRequest_builder{Object: candidate}.Build()
+			if paths != nil {
+				request.SetUpdateMask(&fieldmaskpb.FieldMask{Paths: paths})
+			}
+			_, err := server.Update(ctx, request)
+			Expect(status.Code(err)).To(Equal(codes.InvalidArgument))
+			Expect(err.Error()).To(ContainSubstring("spec.csp_managed"))
+			got, err := server.Get(ctx, privatev1.StorageBackendsGetRequest_builder{Id: created.GetId()}.Build())
+			Expect(err).NotTo(HaveOccurred())
+			Expect(got.GetObject().GetSpec().GetCspManaged()).To(Equal(cspManaged))
+		},
+		Entry("OSAC to CSP, leaf mask", false, []string{"spec.csp_managed"}),
+		Entry("CSP to OSAC, leaf mask", true, []string{"spec.csp_managed", "spec.endpoint", "spec.credentials"}),
+		Entry("OSAC to CSP, whole spec", false, []string{"spec"}),
+		Entry("CSP to OSAC, whole spec", true, []string{"spec"}),
+		Entry("OSAC to CSP, full replacement", false, nil),
+		Entry("CSP to OSAC, full replacement", true, nil),
+	)
+
+	DescribeTable("preserves ownership on unrelated and empty masks",
+		func(cspManaged bool, paths []string) {
+			created := create(cspManaged)
+			response, err := server.Update(ctx, privatev1.StorageBackendsUpdateRequest_builder{
+				Object: privatev1.StorageBackend_builder{
+					Id: created.GetId(),
+					Spec: privatev1.StorageBackendSpec_builder{
+						Description: "Updated description", CspManaged: !cspManaged,
+					}.Build(),
+				}.Build(),
+				UpdateMask: &fieldmaskpb.FieldMask{Paths: paths},
+			}.Build())
+			Expect(err).NotTo(HaveOccurred())
+			Expect(response.GetObject().GetSpec().GetCspManaged()).To(Equal(cspManaged))
+			if len(paths) > 0 {
+				Expect(response.GetObject().GetSpec().GetDescription()).To(Equal("Updated description"))
+			}
+		},
+		Entry("CSP-managed description", true, []string{"spec.description"}),
+		Entry("OSAC-managed description", false, []string{"spec.description"}),
+		Entry("CSP-managed no-op", true, []string{}),
+		Entry("OSAC-managed no-op", false, []string{}),
+	)
+
+	DescribeTable("allows connection details to be removed only for CSP-managed backends",
+		func(cspManaged bool, paths []string, allowed bool) {
+			object := backend(cspManaged)
+			object.GetSpec().SetEndpoint("https://storage.example.com")
+			object.GetSpec().SetCredentials(privatev1.StorageBackendCredentials_builder{
+				Username: "admin", Password: testPassword,
+			}.Build())
+			created, err := server.Create(ctx, privatev1.StorageBackendsCreateRequest_builder{Object: object}.Build())
+			Expect(err).NotTo(HaveOccurred())
+			response, err := server.Update(ctx, privatev1.StorageBackendsUpdateRequest_builder{
+				Object:     privatev1.StorageBackend_builder{Id: created.GetObject().GetId()}.Build(),
+				UpdateMask: &fieldmaskpb.FieldMask{Paths: paths},
+			}.Build())
+			if !allowed {
+				Expect(status.Code(err)).To(Equal(codes.InvalidArgument))
+				return
+			}
+			Expect(err).NotTo(HaveOccurred())
+			Expect(response.GetObject().GetSpec().GetCspManaged()).To(BeTrue())
+			Expect(response.GetObject().GetSpec().GetCredentials()).To(BeNil())
+			Expect(response.GetObject().GetSpec().GetEndpoint()).To(BeEmpty())
+		},
+		Entry("CSP-managed whole credentials and endpoint", true, []string{"spec.credentials", "spec.endpoint"}, true),
+		Entry("OSAC-managed credentials remain required", false, []string{"spec.credentials"}, false),
+		Entry("OSAC-managed endpoint remains required", false, []string{"spec.endpoint"}, false),
+		Entry("CSP-managed remaining credentials must be valid", true, []string{"spec.credentials.password"}, false),
+	)
+
+	It("does not allow CSP-managed registration with a dangling Secret reference", func() {
+		object := backend(true)
+		object.GetSpec().SetCredentials(privatev1.StorageBackendCredentials_builder{
+			Username: "admin", PasswordSecret: privatev1.SecretLocalReference_builder{Id: "missing"}.Build(),
+		}.Build())
+		_, err := server.Create(ctx, privatev1.StorageBackendsCreateRequest_builder{Object: object}.Build())
+		Expect(status.Code(err)).To(Equal(codes.InvalidArgument))
+		Expect(err.Error()).To(ContainSubstring("there is no secret"))
+	})
+})
 
 var _ = Describe("Private storage backends server", func() {
 	Describe("Creation", func() {
@@ -367,7 +575,7 @@ var _ = Describe("Private storage backends server", func() {
 					Object: privatev1.StorageBackend_builder{
 						Id: created.GetId(),
 						Spec: privatev1.StorageBackendSpec_builder{
-							Provider: "ceph",
+							Provider: "netapp",
 						}.Build(),
 					}.Build(),
 					UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"spec.provider"}},
@@ -438,7 +646,7 @@ var _ = Describe("Private storage backends server", func() {
 							Name: "unique-name",
 						}.Build(),
 						Spec: privatev1.StorageBackendSpec_builder{
-							Provider: "ceph",
+							Provider: "vast",
 							Endpoint: "https://other.example.com:8443",
 							Credentials: privatev1.StorageBackendCredentials_builder{
 								Username: "admin",
@@ -517,56 +725,6 @@ var _ = Describe("Private storage backends server", func() {
 		})
 	})
 
-	It("Redacts event payload", func() {
-		// Create a mock notifier that captures the event:
-		var event *privatev1.Event
-		notifier := events.NewMockNotifier(ctrl)
-		notifier.EXPECT().
-			Notify(gomock.Any(), gomock.Any()).
-			DoAndReturn(
-				func(ctx context.Context, payload proto.Message) error {
-					event = payload.(*privatev1.Event)
-					return nil
-				},
-			)
-
-		// Create the server configured with the mock notifier:
-		server, err := NewPrivateStorageBackendsServer().
-			SetLogger(logger).
-			SetAttributionLogic(attribution).
-			SetTenancyLogic(tenancy).
-			SetNotifier(notifier).
-			Build()
-		Expect(err).ToNot(HaveOccurred())
-
-		// Create the object:
-		_, err = server.Create(
-			ctx,
-			privatev1.StorageBackendsCreateRequest_builder{
-				Object: privatev1.StorageBackend_builder{
-					Metadata: privatev1.Metadata_builder{
-						Name: "my-backend",
-					}.Build(),
-					Spec: privatev1.StorageBackendSpec_builder{
-						Provider: "ceph",
-						Endpoint: "https://other.example.com:8443",
-						Credentials: privatev1.StorageBackendCredentials_builder{
-							Username: "admin",
-							Password: testPassword,
-						}.Build(),
-					}.Build(),
-				}.Build(),
-			}.Build(),
-		)
-		Expect(err).ToNot(HaveOccurred())
-
-		// Verify the event:
-		Expect(event).ToNot(BeNil())
-		Expect(event.GetType()).To(Equal(privatev1.EventType_EVENT_TYPE_OBJECT_CREATED))
-		object := event.GetStorageBackend()
-		Expect(object).ToNot(BeNil())
-		Expect(object.GetSpec().GetCredentials().GetPassword()).To(BeEmpty())
-	})
 })
 
 var _ = Describe("Password secret reference", func() {
@@ -588,7 +746,8 @@ var _ = Describe("Password secret reference", func() {
 		Expect(err).ToNot(HaveOccurred())
 
 		_, err = secretsDao.Create().SetObject(privatev1.Secret_builder{
-			Id: "my-secret-id",
+			Id:   "my-secret-id",
+			Type: privatev1.SecretType_SECRET_TYPE_VALUE,
 			Metadata: privatev1.Metadata_builder{
 				Name:   "my-secret-name",
 				Tenant: auth.SharedTenant,

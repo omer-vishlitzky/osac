@@ -21,13 +21,14 @@ import (
 	"github.com/spf13/cobra"
 	"google.golang.org/protobuf/proto"
 
-	publicv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/public/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/cmd/cli/create/fieldutil"
+	"github.com/osac-project/osac/fulfillment-service/internal/cmd/cli/create/metautil"
 	"github.com/osac-project/osac/fulfillment-service/internal/cmd/cli/create/netutil"
 	"github.com/osac-project/osac/fulfillment-service/internal/cmd/cli/lookup"
 	"github.com/osac-project/osac/fulfillment-service/internal/config"
 	"github.com/osac-project/osac/fulfillment-service/internal/logging"
 	"github.com/osac-project/osac/fulfillment-service/internal/terminal"
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
 
 var runStrategyMap = map[string]publicv1.BareMetalInstanceRunStrategy{
@@ -73,22 +74,22 @@ func Cmd() *cobra.Command {
 		userDataFlagHelp,
 	)
 	flags.StringVar(
+		&runner.args.userDataSecret,
+		"user-data-secret",
+		"",
+		userDataSecretFlagHelp,
+	)
+	flags.StringVar(
 		&runner.args.runStrategy,
 		"run-strategy",
 		"",
 		runStrategyFlagHelp,
 	)
 	flags.StringVar(
-		&runner.args.imageSourceRef,
-		"image",
+		&runner.args.diskImage,
+		"disk-image",
 		"",
-		imageFlagHelp,
-	)
-	flags.StringVar(
-		&runner.args.imageSourceType,
-		"image-source-type",
-		"registry",
-		imageSourceTypeFlagHelp,
+		diskImageFlagHelp,
 	)
 	flags.BoolVar(
 		&runner.args.externalIPAttachment,
@@ -108,10 +109,17 @@ func Cmd() *cobra.Command {
 		nil,
 		setFlagHelp,
 	)
+	flags.StringVar(
+		&runner.args.instanceType,
+		"instance-type",
+		"",
+		instanceTypeFlagHelp,
+	)
 
 	if err := result.MarkFlagRequired("catalog-item"); err != nil {
 		panic(fmt.Sprintf("failed to mark catalog-item flag as required: %v", err))
 	}
+	result.MarkFlagsMutuallyExclusive("user-data", "user-data-secret")
 	return result
 }
 
@@ -123,9 +131,10 @@ type runnerContext struct {
 		networkAttachments   []string
 		sshKey               string
 		userData             string
+		userDataSecret       string
 		runStrategy          string
-		imageSourceRef       string
-		imageSourceType      string
+		diskImage            string
+		instanceType         string
 		externalIPAttachment bool
 	}
 	logger *slog.Logger
@@ -163,48 +172,14 @@ func (c *runnerContext) run(cmd *cobra.Command, _ []string) error {
 		return err
 	}
 
-	spec := publicv1.BareMetalInstanceSpec_builder{
-		CatalogItem: &publicv1.BareMetalInstanceCatalogItemReference{Id: catalogItem.GetId()},
-	}
-	if c.args.sshKey != "" {
-		sshKey := c.args.sshKey
-		spec.SshPublicKey = &sshKey
-	}
-	if c.args.userData != "" {
-		userData := c.args.userData
-		spec.UserData = &userData
-	}
-	if c.args.imageSourceRef != "" {
-		spec.Image = publicv1.BareMetalInstanceImage_builder{
-			SourceType: c.args.imageSourceType,
-			SourceRef:  c.args.imageSourceRef,
-		}.Build()
-	}
-	if c.args.runStrategy != "" {
-		rs, err := fieldutil.ParseEnum(c.args.runStrategy, runStrategyMap, "run-strategy")
-		if err != nil {
-			return err
-		}
-		spec.RunStrategy = &rs
-	}
-	if cmd.Flags().Changed("external-ip-attachment") {
-		spec.AutoExternalIpAttachment = proto.Bool(c.args.externalIPAttachment)
-	}
-
-	if err := c.applyNetworkingFlags(&spec); err != nil {
-		return err
-	}
-
-	builtSpec := spec.Build()
-	if err := fieldutil.ApplyFields(builtSpec, c.args.setFields); err != nil {
+	builtSpec, err := c.buildSpec(catalogItem.GetId(), cmd.Flags().Changed("external-ip-attachment"))
+	if err != nil {
 		return err
 	}
 
 	bmi := publicv1.BareMetalInstance_builder{
-		Metadata: publicv1.Metadata_builder{
-			Name: c.args.name,
-		}.Build(),
-		Spec: builtSpec,
+		Metadata: metautil.ForCreate(ctx, c.args.name).Build(),
+		Spec:     builtSpec,
 	}.Build()
 
 	client := publicv1.NewBareMetalInstancesClient(conn)
@@ -215,8 +190,52 @@ func (c *runnerContext) run(cmd *cobra.Command, _ []string) error {
 		return fmt.Errorf("failed to create bare metal instance: %w", err)
 	}
 
+	for _, warning := range response.GetWarnings() {
+		console.Errorf(ctx, "Warning: %s\n", warning)
+	}
 	console.Infof(ctx, "Created bare metal instance '%s'.\n", response.GetObject().GetId())
 	return nil
+}
+
+func (c *runnerContext) buildSpec(catalogItemID string, externalIPAttachmentSet bool) (*publicv1.BareMetalInstanceSpec, error) {
+	spec := publicv1.BareMetalInstanceSpec_builder{
+		CatalogItem: &publicv1.BareMetalInstanceCatalogItemReference{Id: catalogItemID},
+	}
+	if c.args.sshKey != "" {
+		sshKeyRef, err := fieldutil.ParseSSHKeyFlag(c.args.sshKey)
+		if err != nil {
+			return nil, err
+		}
+		spec.SshKey = sshKeyRef
+	}
+	c.applyUserDataFlags(&spec)
+	if c.args.diskImage != "" {
+		spec.DiskImage = &publicv1.DiskImageReference{Name: c.args.diskImage}
+	}
+	if c.args.instanceType != "" {
+		spec.InstanceType = &publicv1.BareMetalInstanceTypeReference{Name: c.args.instanceType, Shared: true}
+	}
+	if c.args.runStrategy != "" {
+		rs, err := fieldutil.ParseEnum(c.args.runStrategy, runStrategyMap, "run-strategy")
+		if err != nil {
+			return nil, err
+		}
+		spec.RunStrategy = &rs
+	}
+	if externalIPAttachmentSet {
+		spec.AutoExternalIpAttachment = proto.Bool(c.args.externalIPAttachment)
+	}
+
+	if err := c.applyNetworkingFlags(&spec); err != nil {
+		return nil, err
+	}
+
+	builtSpec := spec.Build()
+	if err := fieldutil.ApplyFields(builtSpec, c.args.setFields); err != nil {
+		return nil, err
+	}
+
+	return builtSpec, nil
 }
 
 const shortHelp = `Create a bare metal instance`
@@ -230,17 +249,26 @@ _NAME_ - Name of the bare metal instance.
 `
 
 const catalogItemFlagHelp = `
-_ID_ - Catalog item identifier or name. Required.
+_ID_OR_NAME_ - Catalog item identifier or name. If a name matches more than
+one visible item, use its identifier. Required.
 `
 
 const sshKeyFlagHelp = `
-_KEY_ - SSH public key injected into the OS at provisioning time. Must be a
-valid OpenSSH public key. Immutable after creation.
+_NAME_ or {{ bt }}name=<name>[,project=<project>]{{ bt }} - Name of a registered
+SSH public-key Secret. A bare name selects the tenant's default project.
+Immutable after creation.
 `
 
 const userDataFlagHelp = `
 _DATA_ - User data passed to the OS at first boot (e.g. cloud-init).
 Maximum 64 KB. Immutable after creation.
+`
+
+const userDataSecretFlagHelp = `
+_NAME_ - Name of a Secret resource containing user data passed to the OS at
+first boot. The secret must exist in the same tenant. See also
+{{ bt }}osac create secret{{ bt }}. Mutually exclusive with
+{{ bt }}--user-data{{ bt }}.
 `
 
 const runStrategyFlagHelp = `
@@ -249,12 +277,14 @@ _STRATEGY_ - Run strategy controlling the power state. Valid values are
 (power off).
 `
 
-const imageFlagHelp = `
-_URL_ - Image reference, for example an OCI image URL.
+const diskImageFlagHelp = `
+_NAME_ - DiskImage resource name to use for this bare metal instance. When
+omitted, the catalog item must provide a default.
 `
 
-const imageSourceTypeFlagHelp = `
-_TYPE_ - Image source type.
+const instanceTypeFlagHelp = `
+_NAME_ - InstanceType resource name to use for this bare metal instance. When
+omitted, the catalog item must provide a default.
 `
 
 const externalIPAttachmentFlagHelp = `
@@ -284,6 +314,9 @@ func (c *runnerContext) applyNetworkingFlags(spec *publicv1.BareMetalInstanceSpe
 	if len(c.args.networkAttachments) == 0 {
 		return nil
 	}
+	if len(c.args.networkAttachments) > 1 {
+		return fmt.Errorf("at most one --network-attachment is supported")
+	}
 	attachments := make([]*publicv1.BareMetalNetworkAttachment, 0, len(c.args.networkAttachments))
 	for _, raw := range c.args.networkAttachments {
 		na, err := parseBareMetalNetworkAttachmentFlag(raw)
@@ -294,6 +327,15 @@ func (c *runnerContext) applyNetworkingFlags(spec *publicv1.BareMetalInstanceSpe
 	}
 	spec.NetworkAttachments = attachments
 	return nil
+}
+
+func (c *runnerContext) applyUserDataFlags(spec *publicv1.BareMetalInstanceSpec_builder) {
+	if c.args.userData != "" {
+		spec.UserDataSource = publicv1.UserDataSource_builder{Inline: proto.String(c.args.userData)}.Build()
+	}
+	if c.args.userDataSecret != "" {
+		spec.UserDataSource = publicv1.UserDataSource_builder{Secret: publicv1.SecretLocalReference_builder{Name: c.args.userDataSecret}.Build()}.Build()
+	}
 }
 
 func parseBareMetalNetworkAttachmentFlag(s string) (*publicv1.BareMetalNetworkAttachment, error) {

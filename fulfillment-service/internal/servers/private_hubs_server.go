@@ -24,16 +24,13 @@ import (
 	grpcstatus "google.golang.org/grpc/status"
 	"google.golang.org/protobuf/reflect/protoreflect"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
 	"github.com/osac-project/osac/fulfillment-service/internal/database/dao"
-	"github.com/osac-project/osac/fulfillment-service/internal/events"
-	"github.com/osac-project/osac/fulfillment-service/internal/references"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
 type PrivateHubsServerBuilder struct {
 	logger            *slog.Logger
-	notifier          events.Notifier
 	attributionLogic  auth.AttributionLogic
 	tenancyLogic      auth.TenancyLogic
 	metricsRegisterer prometheus.Registerer
@@ -56,11 +53,6 @@ func NewPrivateHubsServer() *PrivateHubsServerBuilder {
 
 func (b *PrivateHubsServerBuilder) SetLogger(value *slog.Logger) *PrivateHubsServerBuilder {
 	b.logger = value
-	return b
-}
-
-func (b *PrivateHubsServerBuilder) SetNotifier(value events.Notifier) *PrivateHubsServerBuilder {
-	b.notifier = value
 	return b
 }
 
@@ -119,8 +111,6 @@ func (b *PrivateHubsServerBuilder) Build() (result *PrivateHubsServer, err error
 	s.generic, err = NewGenericServer[*privatev1.Hub]().
 		SetLogger(b.logger).
 		SetService(privatev1.Hubs_ServiceDesc.ServiceName).
-		SetNotifier(b.notifier).
-		SetRedactFunc(s.redact).
 		SetAttributionLogic(b.attributionLogic).
 		SetTenancyLogic(b.tenancyLogic).
 		SetMetricsRegisterer(b.metricsRegisterer).
@@ -134,15 +124,6 @@ func (b *PrivateHubsServerBuilder) Build() (result *PrivateHubsServer, err error
 	// Return the server:
 	result = s
 	return
-}
-
-// redact clears sensitive fields from the hub before it is included in event notification payloads.
-func (s *PrivateHubsServer) redact(object *privatev1.Hub) *privatev1.Hub {
-	spec := object.GetSpec()
-	if spec != nil {
-		spec.SetKubeconfig(nil)
-	}
-	return object
 }
 
 func (s *PrivateHubsServer) List(ctx context.Context,
@@ -270,22 +251,10 @@ func (s *PrivateHubsServer) validateKubeconfigSecret(ctx context.Context, spec *
 	if ref == nil {
 		return nil
 	}
-	if ref.GetId() == "" && ref.GetName() == "" {
-		return grpcstatus.Errorf(grpccodes.InvalidArgument, "kubeconfig_secret must specify id or name")
-	}
-	resolved, err := references.NewDAOLookupFunc(s.secretsDao)(ctx, "", "", ref.GetId(), ref.GetName())
+	resolved, err := resolveSecretReferenceOfType(ctx, s.logger, s.secretsDao, ref,
+		"kubeconfig_secret", privatev1.SecretType_SECRET_TYPE_KUBECONFIG)
 	if err != nil {
-		var deniedErr *dao.ErrDenied
-		if errors.As(err, &deniedErr) {
-			return grpcstatus.Errorf(grpccodes.PermissionDenied, "%s", deniedErr.Reason)
-		}
-		var nf interface{ IsNotFound() bool }
-		if errors.As(err, &nf) && nf.IsNotFound() {
-			return grpcstatus.Errorf(grpccodes.InvalidArgument,
-				"there is no secret with identifier or name '%s'", refKey(ref))
-		}
-		s.logger.ErrorContext(ctx, "Failed to resolve kubeconfig_secret reference", "error", err)
-		return grpcstatus.Errorf(grpccodes.Internal, "failed to resolve kubeconfig_secret reference")
+		return err
 	}
 	resolvedRef := &privatev1.SecretLocalReference{}
 	resolvedRef.SetId(resolved.ID)

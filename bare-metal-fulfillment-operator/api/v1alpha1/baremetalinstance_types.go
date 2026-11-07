@@ -19,8 +19,9 @@ package v1alpha1
 import (
 	"strings"
 
-	opv1alpha1 "github.com/osac-project/osac/osac-operator/api/v1alpha1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	opv1alpha1 "github.com/osac-project/osac/osac-operator/api/v1alpha1"
 )
 
 // BareMetalInstanceRunStrategy controls the desired power state of a BareMetalInstance.
@@ -49,24 +50,26 @@ type BareMetalNetworkAttachment struct {
 	SubnetRef string `json:"subnetRef"`
 
 	// SecurityGroupRefs lists fulfillment SecurityGroup IDs applied on this NIC.
-	// Mutable — can be changed to add/remove security groups.
 	// +kubebuilder:validation:Optional
 	SecurityGroupRefs []string `json:"securityGroupRefs,omitempty"`
 
-	// Interface is the physical interface name from the HostType's NetworkInterface list.
-	// When omitted on a single-attachment instance, the system selects the first fabric-role interface.
+	// Interface is the physical network port name bound to this attachment.
+	// Fulfillment sets this from the selected BareMetalInstanceType's first fabric-role port
+	// when it materializes a default network attachment; otherwise an omitted value remains unset.
 	// +kubebuilder:validation:Optional
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="interface is immutable"
 	Interface string `json:"interface,omitempty"`
 
-	// Primary designates this attachment as the default gateway for multi-NIC instances.
-	// When omitted on a single-attachment instance, that attachment is implicitly primary.
+	// Primary designates this attachment as the default gateway.
+	// With a single attachment, omit primary or set true; false is rejected by the API.
 	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:XValidation:rule="self == true",message="primary must be true when specified"
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="primary is immutable"
 	Primary bool `json:"primary,omitempty"`
 }
 
 // BareMetalInstanceSpec defines the desired state of BareMetalInstance.
+// +kubebuilder:validation:XValidation:rule="has(self.networkAttachments) == has(oldSelf.networkAttachments) && (!has(self.networkAttachments) || self.networkAttachments == oldSelf.networkAttachments)",message="networkAttachments are immutable after creation"
 type BareMetalInstanceSpec struct {
 	// ExternalHostID is the host ID from external inventory (used by Host Management Operator as node identifier).
 	// +kubebuilder:validation:Required
@@ -113,15 +116,13 @@ type BareMetalInstanceSpec struct {
 	// The value itself is not important; only the change matters.
 	// +kubebuilder:validation:Optional
 	RestartTrigger int64 `json:"restartTrigger"`
-	// NetworkAttachments for the bare metal instance. One entry per physical NIC.
-	// The list structure is immutable after creation (entries cannot be added or removed),
-	// but securityGroupRefs within each entry can be updated.
+	// NetworkAttachments for the bare metal instance. At most one tenant attachment is supported.
+	// The complete value is immutable after creation; change it by recreating the instance.
 	//
 	// MaxItems is required for CEL cost budget calculation.
 	// +kubebuilder:validation:Optional
-	// +kubebuilder:validation:MaxItems=8
-	// +kubebuilder:validation:XValidation:rule="size(oldSelf) == 0 || (size(self) == size(oldSelf) && self.all(na, oldSelf.exists(old, old.subnetRef == na.subnetRef)))",message="cannot change or add/remove network attachments after initial assignment"
-	// +kubebuilder:validation:XValidation:rule="self.size() <= 1 || self.filter(x, x.primary == true).size() == 1",message="when multiple network attachments exist, exactly one must have primary set to true"
+	// +kubebuilder:validation:MaxItems=1
+	// +kubebuilder:validation:XValidation:rule="self.size() <= 1",message="at most one network attachment is supported"
 	// +listType=map
 	// +listMapKey=subnetRef
 	NetworkAttachments []BareMetalNetworkAttachment `json:"networkAttachments,omitempty"`
@@ -196,6 +197,9 @@ const (
 	// HostConditionReasonProgressing indicates the template workflow is still running.
 	HostConditionReasonProgressing = "Progressing"
 
+	// HostConditionReasonRetrying indicates a failed template attempt will be retried.
+	HostConditionReasonRetrying = "Retrying"
+
 	// HostConditionReasonTemplateFailed indicates the template workflow failed.
 	HostConditionReasonTemplateFailed = "TemplateFailed"
 
@@ -211,8 +215,12 @@ const (
 	// HostConditionReasonPowerSyncFailed indicates a restart has failed
 	HostConditionReasonPowerSyncFailed = "PowerSyncFailed"
 
-	// HostConditionReasonPowerSyncRequired indicates a restart is required
-	// Reserved for future use — not set by any current code path
+	// HostConditionReasonPowerSyncRequired indicates a restart is still required but
+	// has not been triggered yet — the host was busy transitioning when the restart
+	// was attempted, so the reconciler backs off and retries. It is a benign
+	// in-progress reason (not a failure) and, unlike Progressing, does not mark a
+	// restart as already in flight, so the reconciler keeps re-triggering until a real
+	// restart is initiated. Set by triggerRestart on management.ErrTransitioning.
 	HostConditionReasonPowerSyncRequired = "PowerSyncRequired"
 
 	// HostConditionReasonNoMatchingHosts indicates no hosts match the selector labels
@@ -338,6 +346,7 @@ func (h *BareMetalInstance) GetPoolID() (string, bool) {
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
+// +kubebuilder:validation:XValidation:rule="has(self.spec) == has(oldSelf.spec)",message="spec presence is immutable after creation"
 // +kubebuilder:resource:shortName=bmi
 // +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
 // +kubebuilder:printcolumn:name="Template",type=string,JSONPath=`.spec.templateID`

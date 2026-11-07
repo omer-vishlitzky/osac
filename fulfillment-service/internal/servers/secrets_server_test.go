@@ -22,9 +22,10 @@ import (
 	grpccodes "google.golang.org/grpc/codes"
 	grpcstatus "google.golang.org/grpc/status"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
-	publicv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/public/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
+	"github.com/osac-project/osac/fulfillment-service/internal/vault"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
 
 type mockPrivateSecretsServer struct {
@@ -119,9 +120,19 @@ var _ = Describe("Secrets Server", func() {
 				SetLogger(logger).
 				SetTenancyLogic(tenancyLogic).
 				SetAttributionLogic(attributionLogic).
+				SetSecretStore(vault.NewMockSecretStore(ctrl)).
 				Build()
 			Expect(err).ToNot(HaveOccurred())
 			Expect(server).ToNot(BeNil())
+		})
+
+		It("fails if secret store is not set", func() {
+			server, err := NewSecretsServer().
+				SetLogger(logger).
+				SetTenancyLogic(tenancyLogic).
+				Build()
+			Expect(err).To(MatchError(ContainSubstring("secret store is mandatory")))
+			Expect(server).To(BeNil())
 		})
 
 		It("fails if logger is not set", func() {

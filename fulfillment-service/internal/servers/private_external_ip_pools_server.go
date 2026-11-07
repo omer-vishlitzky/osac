@@ -17,24 +17,24 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"net/netip"
 
 	"github.com/prometheus/client_golang/prometheus"
 	grpccodes "google.golang.org/grpc/codes"
 	grpcstatus "google.golang.org/grpc/status"
 	"google.golang.org/protobuf/reflect/protoreflect"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
-	"github.com/osac-project/osac/fulfillment-service/internal/events"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
 type PrivateExternalIPPoolsServerBuilder struct {
-	logger            *slog.Logger
-	notifier          events.Notifier
-	attributionLogic  auth.AttributionLogic
-	tenancyLogic      auth.TenancyLogic
-	metricsRegisterer prometheus.Registerer
-	filterDesc        protoreflect.MessageDescriptor
+	logger             *slog.Logger
+	attributionLogic   auth.AttributionLogic
+	tenancyLogic       auth.TenancyLogic
+	metricsRegisterer  prometheus.Registerer
+	filterDesc         protoreflect.MessageDescriptor
+	networkingSettings *NetworkingSettings
 }
 
 var _ privatev1.ExternalIPPoolsServer = (*PrivateExternalIPPoolsServer)(nil)
@@ -42,8 +42,10 @@ var _ privatev1.ExternalIPPoolsServer = (*PrivateExternalIPPoolsServer)(nil)
 type PrivateExternalIPPoolsServer struct {
 	privatev1.UnimplementedExternalIPPoolsServer
 
-	logger  *slog.Logger
-	generic *GenericServer[*privatev1.ExternalIPPool]
+	logger   *slog.Logger
+	generic  *GenericServer[*privatev1.ExternalIPPool]
+	settings NetworkingSettings
+	guards   *networkingGuards
 }
 
 func NewPrivateExternalIPPoolsServer() *PrivateExternalIPPoolsServerBuilder {
@@ -52,11 +54,6 @@ func NewPrivateExternalIPPoolsServer() *PrivateExternalIPPoolsServerBuilder {
 
 func (b *PrivateExternalIPPoolsServerBuilder) SetLogger(value *slog.Logger) *PrivateExternalIPPoolsServerBuilder {
 	b.logger = value
-	return b
-}
-
-func (b *PrivateExternalIPPoolsServerBuilder) SetNotifier(value events.Notifier) *PrivateExternalIPPoolsServerBuilder {
-	b.notifier = value
 	return b
 }
 
@@ -82,6 +79,13 @@ func (b *PrivateExternalIPPoolsServerBuilder) SetFilterDesc(value protoreflect.M
 	return b
 }
 
+// SetNetworkingSettings sets the networking installation settings. This is optional; the default is
+// DefaultNetworkingSettings.
+func (b *PrivateExternalIPPoolsServerBuilder) SetNetworkingSettings(value NetworkingSettings) *PrivateExternalIPPoolsServerBuilder {
+	b.networkingSettings = &value
+	return b
+}
+
 func (b *PrivateExternalIPPoolsServerBuilder) Build() (result *PrivateExternalIPPoolsServer, err error) {
 	if b.logger == nil {
 		err = errors.New("logger is mandatory")
@@ -92,10 +96,14 @@ func (b *PrivateExternalIPPoolsServerBuilder) Build() (result *PrivateExternalIP
 		return
 	}
 
+	guards, err := newNetworkingGuards(b.logger)
+	if err != nil {
+		return
+	}
+
 	generic, err := NewGenericServer[*privatev1.ExternalIPPool]().
 		SetLogger(b.logger).
 		SetService(privatev1.ExternalIPPools_ServiceDesc.ServiceName).
-		SetNotifier(b.notifier).
 		SetAttributionLogic(b.attributionLogic).
 		SetTenancyLogic(b.tenancyLogic).
 		SetMetricsRegisterer(b.metricsRegisterer).
@@ -107,8 +115,10 @@ func (b *PrivateExternalIPPoolsServerBuilder) Build() (result *PrivateExternalIP
 	}
 
 	result = &PrivateExternalIPPoolsServer{
-		logger:  b.logger,
-		generic: generic,
+		logger:   b.logger,
+		generic:  generic,
+		settings: resolveNetworkingSettings(b.networkingSettings),
+		guards:   guards,
 	}
 	return
 }
@@ -127,167 +137,117 @@ func (s *PrivateExternalIPPoolsServer) Get(ctx context.Context,
 
 func (s *PrivateExternalIPPoolsServer) Create(ctx context.Context,
 	request *privatev1.ExternalIPPoolsCreateRequest) (response *privatev1.ExternalIPPoolsCreateResponse, err error) {
-	pool := request.GetObject()
-
-	err = s.validateCreate(ctx, pool)
-	if err != nil {
+	if err = rejectOutputStatusOnCreate(request.GetObject().HasStatus()); err != nil {
 		return
 	}
-
-	total := calculatePoolCapacity(pool.GetSpec().GetCidrs(), pool.GetSpec().GetIpFamily())
-	pool.SetStatus(privatev1.ExternalIPPoolStatus_builder{
-		Total:     total,
-		Available: total,
-	}.Build())
-
-	err = s.generic.Create(ctx, request, &response)
+	err = s.generic.CreateWithCandidatePreparation(ctx, request, &response,
+		func(ctx context.Context, _, pool *privatev1.ExternalIPPool) error {
+			if err := s.validateCreate(ctx, pool); err != nil {
+				return err
+			}
+			total := calculatePoolCapacity(pool.GetSpec().GetCidrs())
+			pool.SetStatus(privatev1.ExternalIPPoolStatus_builder{
+				State:     privatev1.ExternalIPPoolState_EXTERNAL_IP_POOL_STATE_PENDING,
+				Total:     total,
+				Available: total,
+			}.Build())
+			return nil
+		})
 	return
 }
 
+// Update writes status only. The capacity counters (total, allocated, available) are kept by the fulfillment
+// service, so the values in the request are ignored.
 func (s *PrivateExternalIPPoolsServer) Update(ctx context.Context,
 	request *privatev1.ExternalIPPoolsUpdateRequest) (response *privatev1.ExternalIPPoolsUpdateResponse, err error) {
-	id := request.GetObject().GetId()
-	if id == "" {
+	if request.GetObject().GetId() == "" {
 		err = grpcstatus.Errorf(grpccodes.InvalidArgument, "object identifier is mandatory")
 		return
 	}
-
-	getRequest := &privatev1.ExternalIPPoolsGetRequest{}
-	getRequest.SetId(id)
-	var getResponse *privatev1.ExternalIPPoolsGetResponse
-	err = s.generic.Get(ctx, getRequest, &getResponse)
-	if err != nil {
-		return
-	}
-
-	err = validateExternalIPPoolUpdate(request.GetObject(), getResponse.GetObject())
-	if err != nil {
-		return
-	}
-
-	err = s.generic.Update(ctx, request, &response)
+	err = s.generic.UpdateWithCandidatePreparation(ctx, request, &response,
+		func(_ context.Context, current, candidate *privatev1.ExternalIPPool) error {
+			if err := validateNetworkingStatusOnlyUpdate("ExternalIPPool", current, candidate); err != nil {
+				return err
+			}
+			if err := rejectStateChangeWhileDeleting(current, candidate, current.GetMetadata()); err != nil {
+				return err
+			}
+			if !candidate.HasStatus() {
+				candidate.SetStatus(&privatev1.ExternalIPPoolStatus{})
+			}
+			candidate.GetStatus().SetTotal(current.GetStatus().GetTotal())
+			candidate.GetStatus().SetAllocated(current.GetStatus().GetAllocated())
+			candidate.GetStatus().SetAvailable(current.GetStatus().GetAvailable())
+			return nil
+		})
 	return
 }
 
+// validateCreate checks a pool create under the exclusive NetworkClass lock, so a concurrent VirtualNetwork or Cluster
+// create can't overlap it.
 func (s *PrivateExternalIPPoolsServer) validateCreate(ctx context.Context,
 	pool *privatev1.ExternalIPPool) error {
-
-	if pool == nil {
-		return grpcstatus.Errorf(grpccodes.InvalidArgument, "external IP pool is mandatory")
-	}
-
 	spec := pool.GetSpec()
 	if spec == nil {
 		return grpcstatus.Errorf(grpccodes.InvalidArgument, "external IP pool spec is mandatory")
 	}
-
-	if spec.GetIpFamily() == privatev1.IPFamily_IP_FAMILY_UNSPECIFIED {
-		return grpcstatus.Errorf(grpccodes.InvalidArgument, "field 'spec.ip_family' is required")
+	if spec.GetIpFamily() != privatev1.IPFamily_IP_FAMILY_IPV4 {
+		return grpcstatus.Errorf(grpccodes.InvalidArgument,
+			"field 'spec.ip_family' must be IP_FAMILY_IPV4; IPv6 and unspecified-family pools are not supported")
 	}
-
-	cidrs := spec.GetCidrs()
-	if len(cidrs) == 0 {
-		return grpcstatus.Errorf(grpccodes.InvalidArgument, "field 'spec.cidrs' is required")
-	}
-
-	canonicalCIDRs := make([]string, len(cidrs))
-	for i, cidr := range cidrs {
-		canonical, err := validatePoolCIDRFormat(cidr, spec.GetIpFamily(), i)
-		if err != nil {
-			return err
-		}
-		canonicalCIDRs[i] = canonical
-	}
-	spec.SetCidrs(canonicalCIDRs)
-
-	if err := validateNoCIDRSelfOverlap(canonicalCIDRs); err != nil {
+	canonicalCIDRs, err := validateSingleIPv4PoolCIDR(spec.GetCidrs())
+	if err != nil {
 		return err
 	}
+	prefix := netip.MustParsePrefix(canonicalCIDRs[0])
 
-	return s.validateNoExternalIPPoolCIDROverlap(ctx, pool)
-}
-
-func validateExternalIPPoolUpdate(newPool *privatev1.ExternalIPPool, existing *privatev1.ExternalIPPool) error {
-	if newPool == nil {
-		return grpcstatus.Errorf(grpccodes.InvalidArgument, "external IP pool is mandatory")
+	networkClass, err := requireReadyNetworkClass(ctx, s.guards.networkClasses, true)
+	if err != nil {
+		return err
 	}
-
-	spec := newPool.GetSpec()
-	if spec == nil {
-		return nil
-	}
-
-	if spec.GetIpFamily() != privatev1.IPFamily_IP_FAMILY_UNSPECIFIED &&
-		spec.GetIpFamily() != existing.GetSpec().GetIpFamily() {
+	if excluded, overlaps := s.settings.firstExcludedOverlap(prefix); overlaps {
 		return grpcstatus.Errorf(grpccodes.InvalidArgument,
-			"field 'spec.ip_family' is immutable and cannot be changed from '%s' to '%s'",
-			existing.GetSpec().GetIpFamily().String(), spec.GetIpFamily().String())
+			"field 'spec.cidrs[0]' overlaps the excluded range %s", excluded)
 	}
-
-	if newCIDRs := spec.GetCidrs(); len(newCIDRs) > 0 && !cidrSlicesEqual(newCIDRs, existing.GetSpec().GetCidrs()) {
+	if defaultCIDR, err := netip.ParsePrefix(
+		networkClass.GetSpec().GetDefaults().GetVirtualNetworkIpv4Cidr()); err == nil && defaultCIDR.Overlaps(prefix) {
 		return grpcstatus.Errorf(grpccodes.InvalidArgument,
-			"field 'spec.cidrs' is immutable and cannot be changed after creation")
+			"field 'spec.cidrs[0]' overlaps the default VirtualNetwork CIDR %s of the NetworkClass", defaultCIDR)
 	}
-
-	return nil
-}
-
-func (s *PrivateExternalIPPoolsServer) validateNoExternalIPPoolCIDROverlap(ctx context.Context,
-	pool *privatev1.ExternalIPPool) error {
-
-	newCIDRs := pool.GetSpec().GetCidrs()
-
-	var offset int32
-	for {
-		listRequest := &privatev1.ExternalIPPoolsListRequest{}
-		listRequest.SetOffset(offset)
-		var listResponse *privatev1.ExternalIPPoolsListResponse
-		if err := s.generic.List(ctx, listRequest, &listResponse); err != nil {
-			s.logger.ErrorContext(ctx, "Failed to list pools for overlap check", slog.Any("error", err))
-			return grpcstatus.Errorf(grpccodes.Internal, "failed to validate CIDR overlap")
-		}
-
-		for _, existing := range listResponse.GetItems() {
-			for _, existingCIDR := range existing.GetSpec().GetCidrs() {
-				for _, newCIDR := range newCIDRs {
-					overlap, err := cidrsOverlap(newCIDR, existingCIDR)
-					if err != nil {
-						s.logger.ErrorContext(ctx, "Failed to check CIDR overlap", slog.Any("error", err))
-						return grpcstatus.Errorf(grpccodes.Internal, "failed to validate CIDR overlap")
-					}
-					if overlap {
-						return grpcstatus.Errorf(grpccodes.AlreadyExists,
-							"CIDR '%s' overlaps with CIDR '%s' from existing pool '%s'",
-							newCIDR, existingCIDR, existing.GetMetadata().GetName())
-					}
-				}
-			}
-		}
-
-		if offset+listResponse.GetSize() >= listResponse.GetTotal() {
-			break
-		}
-		offset += listResponse.GetSize()
+	poolID, err := s.guards.firstPoolOverlap(ctx, prefix, "")
+	if err != nil {
+		return err
 	}
-
+	if poolID != "" {
+		return grpcstatus.Errorf(grpccodes.InvalidArgument,
+			"field 'spec.cidrs[0]' overlaps ExternalIPPool '%s'", poolID)
+	}
+	other, err := s.guards.firstVirtualNetworkOrClusterOverlap(ctx, prefix)
+	if err != nil {
+		return err
+	}
+	if other != "" {
+		return grpcstatus.Errorf(grpccodes.InvalidArgument, "field 'spec.cidrs[0]' overlaps %s", other)
+	}
 	return nil
 }
 
 func (s *PrivateExternalIPPoolsServer) Delete(ctx context.Context,
 	request *privatev1.ExternalIPPoolsDeleteRequest) (response *privatev1.ExternalIPPoolsDeleteResponse, err error) {
-	var getResponse *privatev1.ExternalIPPoolsGetResponse
-	err = s.generic.Get(ctx, privatev1.ExternalIPPoolsGetRequest_builder{
-		Id: request.GetId(),
-	}.Build(), &getResponse)
+	pool, err := lockLifecycleResource(ctx, s.generic.dao, request.GetId(), "ExternalIPPool")
 	if err != nil {
 		return
 	}
-	if allocated := getResponse.GetObject().GetStatus().GetAllocated(); allocated > 0 {
-		err = grpcstatus.Errorf(
-			grpccodes.FailedPrecondition,
-			"cannot delete external IP pool '%s': %d external IP(s) are still allocated from it",
-			request.GetId(), allocated,
-		)
+	if deleteAlreadyAccepted(pool.GetMetadata()) {
+		return &privatev1.ExternalIPPoolsDeleteResponse{}, nil
+	}
+	if err = rejectGuardedDelete(ctx, s.guards, s.guards.externalIPs, "ExternalIP", "ExternalIPPool", pool,
+		func(externalIP *privatev1.ExternalIP) bool {
+			return referenceMatches(externalIP.GetSpec().GetPool(), pool.GetId(), pool.GetMetadata())
+		}); err != nil {
+		return
+	}
+	if err = markDeleting(ctx, s.generic.dao, pool); err != nil {
 		return
 	}
 	err = s.generic.Delete(ctx, request, &response)

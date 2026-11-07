@@ -15,8 +15,6 @@ package consoleproxy
 
 import (
 	"context"
-	"crypto/tls"
-	"crypto/x509"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -38,8 +36,8 @@ import (
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/reflection"
 
-	_ "github.com/osac-project/osac/fulfillment-service/internal/api/cleanapi"
-	publicv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/public/v1"
+	_ "github.com/osac-project/osac/proto/gen/cleanapi"
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 
 	"github.com/osac-project/osac/fulfillment-service/internal/auth/jwe"
 	"github.com/osac-project/osac/fulfillment-service/internal/console"
@@ -49,6 +47,8 @@ import (
 	"github.com/osac-project/osac/fulfillment-service/internal/recovery"
 	"github.com/osac-project/osac/fulfillment-service/internal/servers"
 	shtdwn "github.com/osac-project/osac/fulfillment-service/internal/shutdown"
+	"github.com/osac-project/osac/fulfillment-service/internal/tlsconfig"
+	"github.com/osac-project/osac/fulfillment-service/internal/trust"
 )
 
 // Cmd creates and returns the `start console-proxy` command.
@@ -129,7 +129,7 @@ func (c *runnerContext) run(cmd *cobra.Command, argv []string) error {
 	}
 
 	// Load the trusted CA certificates:
-	caPool, err := network.NewCertPool().
+	caPool, err := trust.NewCertPool().
 		SetLogger(c.logger).
 		AddSystemFiles(true).
 		AddKubernetesFiles(true).
@@ -426,7 +426,7 @@ func (c *runnerContext) run(cmd *cobra.Command, argv []string) error {
 // createJWKSCache creates a JWKS cache and registers the given URL without
 // blocking on the first fetch. The cache starts fetching in the background;
 // callers should poll cache.Lookup to detect when keys are available.
-func (c *runnerContext) createJWKSCache(ctx context.Context, jwksURL string, caPool *x509.CertPool) (*jwk.Cache, error) {
+func (c *runnerContext) createJWKSCache(ctx context.Context, jwksURL string, caPool *trust.CertPool) (*jwk.Cache, error) {
 	c.logger.InfoContext(ctx, "Creating JWKS cache",
 		slog.String("jwks_url", jwksURL),
 	)
@@ -441,14 +441,13 @@ func (c *runnerContext) createJWKSCache(ctx context.Context, jwksURL string, caP
 		jwk.WithWaitReady(false),
 		jwk.WithHttprcResourceOption(httprc.WithMinInterval(time.Minute)),
 	}
+	tlsConfig := tlsconfig.NewClientTLSConfig()
 	if caPool != nil {
+		tlsConfig.RootCAs = caPool.Pool()
 		registerOpts = append(registerOpts, jwk.WithHTTPClient(
 			jwk.WrapHTTPClientDefaults(&http.Client{
 				Transport: &http.Transport{
-					TLSClientConfig: &tls.Config{
-						RootCAs:    caPool,
-						MinVersion: tls.VersionTLS13,
-					},
+					TLSClientConfig: tlsConfig,
 				},
 			}),
 		))

@@ -25,12 +25,24 @@ keycloak:
   # suite logs in as these accounts by password.
   devFixtures:
     enabled: true
+kafka:
+  enabled: true
 
 # --- Bundled PostgreSQL ---
-# Single-pod ephemeral database for testing.
-# Uses fsync=off -- data is lost on restart. Not for production.
+# Bundled PostgreSQL for testing only; not intended for production.
 bundledPostgres:
   enabled: true
   database:
     name: service
     user: service
+
+# --- Bundled OpenBao ---
+# Bundled OpenBao for testing and CI. Not for production.
+bundledVault:
+  enabled: true
+  keycloakIssuerUrl: "https://keycloak.example.com/realms/osac"
+  # Override podSecurityContext for OpenShift restricted-v2 SCC: omit numeric
+  # runAsUser/runAsGroup/fsGroup — the SCC allocates UIDs from the namespace UID
+  # range and resolves the named user automatically.
+  podSecurityContext:
+    runAsNonRoot: true

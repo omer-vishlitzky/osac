@@ -18,12 +18,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"sort"
-	"strconv"
 	"strings"
 
 	"github.com/bits-and-blooms/bitset"
-	"github.com/dustin/go-humanize/english"
 	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/exp/maps"
 	grpccodes "google.golang.org/grpc/codes"
@@ -33,42 +30,57 @@ import (
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
+	"k8s.io/apimachinery/pkg/util/validation"
+
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
 	"github.com/osac-project/osac/fulfillment-service/internal/database"
 	"github.com/osac-project/osac/fulfillment-service/internal/database/dao"
-	"github.com/osac-project/osac/fulfillment-service/internal/events"
-	"github.com/osac-project/osac/fulfillment-service/internal/references"
 	"github.com/osac-project/osac/fulfillment-service/internal/utils"
+	"github.com/osac-project/osac/fulfillment-service/internal/vault"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
 type PrivateClustersServerBuilder struct {
-	logger            *slog.Logger
-	notifier          events.Notifier
-	attributionLogic  auth.AttributionLogic
-	tenancyLogic      auth.TenancyLogic
-	metricsRegisterer prometheus.Registerer
-	filterDesc        protoreflect.MessageDescriptor
+	logger                       *slog.Logger
+	attributionLogic             auth.AttributionLogic
+	tenancyLogic                 auth.TenancyLogic
+	metricsRegisterer            prometheus.Registerer
+	filterDesc                   protoreflect.MessageDescriptor
+	addOnOperatorResolverFactory addOnOperatorResolverFactory
+	networkingSettings           *NetworkingSettings
+	secretStore                  vault.SecretStore
 }
 
 var _ privatev1.ClustersServer = (*PrivateClustersServer)(nil)
 
 type PrivateClustersServer struct {
 	privatev1.UnimplementedClustersServer
-	logger                  *slog.Logger
-	notifier                events.Notifier
-	tenancyLogic            auth.TenancyLogic
-	templatesDao            *dao.GenericDAO[*privatev1.ClusterTemplate]
-	catalogItemsDao         *dao.GenericDAO[*privatev1.ClusterCatalogItem]
-	hostTypesDao            *dao.GenericDAO[*privatev1.HostType]
-	clusterVersionsDao      *dao.GenericDAO[*privatev1.ClusterVersion]
-	subnetsDao              *dao.GenericDAO[*privatev1.Subnet]
-	securityGroupsDao       *dao.GenericDAO[*privatev1.SecurityGroup]
-	externalIPPoolDao       *dao.GenericDAO[*privatev1.ExternalIPPool]
-	externalIPDao           *dao.GenericDAO[*privatev1.ExternalIP]
-	externalIPAttachmentDao *dao.GenericDAO[*privatev1.ExternalIPAttachment]
-	secretsDao              *dao.GenericDAO[*privatev1.Secret]
-	generic                 *GenericServer[*privatev1.Cluster]
+	logger                    *slog.Logger
+	tenancyLogic              auth.TenancyLogic
+	templatesDao              *dao.GenericDAO[*privatev1.ClusterTemplate]
+	catalogItemsDao           *dao.GenericDAO[*privatev1.ClusterCatalogItem]
+	clusterVersionsDao        *dao.GenericDAO[*privatev1.ClusterVersion]
+	networkClassesDao         *dao.GenericDAO[*privatev1.NetworkClass]
+	subnetsDao                *dao.GenericDAO[*privatev1.Subnet]
+	securityGroupsDao         *dao.GenericDAO[*privatev1.SecurityGroup]
+	externalIPPoolDao         *dao.GenericDAO[*privatev1.ExternalIPPool]
+	externalIPDao             *dao.GenericDAO[*privatev1.ExternalIP]
+	externalIPAttachmentDao   *dao.GenericDAO[*privatev1.ExternalIPAttachment]
+	secretsDao                *dao.GenericDAO[*privatev1.Secret]
+	addOnOperators            *addOnOperatorResourceResolver
+	generic                   *GenericServer[*privatev1.Cluster]
+	secretStore               vault.SecretStore
+	lifecycle                 *externalIPLifecycle
+	bareMetalInstanceTypesDao *dao.GenericDAO[*privatev1.BareMetalInstanceType]
+	tenantsDao                *dao.GenericDAO[*privatev1.Tenant]
+	settings                  NetworkingSettings
+}
+
+// SetSecretStore sets the store used to load Vault-backed SSH-key Secret data
+// during reference validation.
+func (b *PrivateClustersServerBuilder) SetSecretStore(value vault.SecretStore) *PrivateClustersServerBuilder {
+	b.secretStore = value
+	return b
 }
 
 func NewPrivateClustersServer() *PrivateClustersServerBuilder {
@@ -77,11 +89,6 @@ func NewPrivateClustersServer() *PrivateClustersServerBuilder {
 
 func (b *PrivateClustersServerBuilder) SetLogger(value *slog.Logger) *PrivateClustersServerBuilder {
 	b.logger = value
-	return b
-}
-
-func (b *PrivateClustersServerBuilder) SetNotifier(value events.Notifier) *PrivateClustersServerBuilder {
-	b.notifier = value
 	return b
 }
 
@@ -109,6 +116,21 @@ func (b *PrivateClustersServerBuilder) SetFilterDesc(value protoreflect.MessageD
 	return b
 }
 
+// SetAddOnOperatorResolverFactory sets the resolver policy used with the server-owned DAO.
+func (b *PrivateClustersServerBuilder) SetAddOnOperatorResolverFactory(value addOnOperatorResolverFactory) *PrivateClustersServerBuilder {
+	b.addOnOperatorResolverFactory = value
+	return b
+}
+
+// SetNetworkingSettings sets the networking installation settings. This is optional; the default is
+// DefaultNetworkingSettings.
+func (b *PrivateClustersServerBuilder) SetNetworkingSettings(value NetworkingSettings) *PrivateClustersServerBuilder {
+	b.networkingSettings = &value
+	return b
+}
+
+type addOnOperatorResolverFactory func(*dao.GenericDAO[*privatev1.AddOnOperator]) *addOnOperatorResourceResolver
+
 func (b *PrivateClustersServerBuilder) Build() (result *PrivateClustersServer, err error) {
 	// Check parameters:
 	if b.logger == nil {
@@ -117,6 +139,14 @@ func (b *PrivateClustersServerBuilder) Build() (result *PrivateClustersServer, e
 	}
 	if b.tenancyLogic == nil {
 		err = errors.New("tenancy logic is mandatory")
+		return
+	}
+	networkClassesDao, err := newNetworkClassesDAO(b.logger, b.tenancyLogic, b.metricsRegisterer)
+	if err != nil {
+		return
+	}
+	tenantsDao, err := newGuardDAO[*privatev1.Tenant](b.logger)
+	if err != nil {
 		return
 	}
 	// Create the templates DAO:
@@ -139,8 +169,24 @@ func (b *PrivateClustersServerBuilder) Build() (result *PrivateClustersServer, e
 		return
 	}
 
-	// Create the host types DAO:
-	hostTypesDao, err := dao.NewGenericDAO[*privatev1.HostType]().
+	// Create the private add-on operators DAO:
+	addOnOperatorsDao, err := dao.NewGenericDAO[*privatev1.AddOnOperator]().
+		SetLogger(b.logger).
+		SetTenancyLogic(b.tenancyLogic).
+		SetMetricsRegisterer(b.metricsRegisterer).
+		Build()
+	if err != nil {
+		return
+	}
+	var addOnOperators *addOnOperatorResourceResolver
+	if b.addOnOperatorResolverFactory != nil {
+		addOnOperators = b.addOnOperatorResolverFactory(addOnOperatorsDao)
+	} else {
+		addOnOperators = newScopedAddOnOperatorResourceResolver(addOnOperatorsDao)
+	}
+
+	// Create the bare metal instance types DAO:
+	bareMetalInstanceTypesDao, err := dao.NewGenericDAO[*privatev1.BareMetalInstanceType]().
 		SetLogger(b.logger).
 		SetTenancyLogic(b.tenancyLogic).
 		SetMetricsRegisterer(b.metricsRegisterer).
@@ -170,11 +216,11 @@ func (b *PrivateClustersServerBuilder) Build() (result *PrivateClustersServer, e
 	}
 
 	// Create the ExternalIP DAOs:
-	externalIPPoolDao, err := dao.NewGenericDAO[*privatev1.ExternalIPPool]().
+	externalIPPoolDaoBuilder := dao.NewGenericDAO[*privatev1.ExternalIPPool]().
 		SetLogger(b.logger).
 		SetTenancyLogic(b.tenancyLogic).
-		SetMetricsRegisterer(b.metricsRegisterer).
-		Build()
+		SetMetricsRegisterer(b.metricsRegisterer)
+	externalIPPoolDao, err := externalIPPoolDaoBuilder.Build()
 	if err != nil {
 		return
 	}
@@ -189,20 +235,20 @@ func (b *PrivateClustersServerBuilder) Build() (result *PrivateClustersServer, e
 		return
 	}
 
-	externalIPDao, err := dao.NewGenericDAO[*privatev1.ExternalIP]().
+	externalIPDaoBuilder := dao.NewGenericDAO[*privatev1.ExternalIP]().
 		SetLogger(b.logger).
 		SetTenancyLogic(b.tenancyLogic).
-		SetMetricsRegisterer(b.metricsRegisterer).
-		Build()
+		SetMetricsRegisterer(b.metricsRegisterer)
+	externalIPDao, err := externalIPDaoBuilder.Build()
 	if err != nil {
 		return
 	}
 
-	externalIPAttachmentDao, err := dao.NewGenericDAO[*privatev1.ExternalIPAttachment]().
+	externalIPAttachmentDaoBuilder := dao.NewGenericDAO[*privatev1.ExternalIPAttachment]().
 		SetLogger(b.logger).
 		SetTenancyLogic(b.tenancyLogic).
-		SetMetricsRegisterer(b.metricsRegisterer).
-		Build()
+		SetMetricsRegisterer(b.metricsRegisterer)
+	externalIPAttachmentDao, err := externalIPAttachmentDaoBuilder.Build()
 	if err != nil {
 		return
 	}
@@ -218,19 +264,13 @@ func (b *PrivateClustersServerBuilder) Build() (result *PrivateClustersServer, e
 	}
 
 	// Create the generic server:
-	// TODO(OSAC-1060): Remove AddAllowedTenants(auth.SharedTenant) once the osac-operator storage
-	// controller handles CaaS cluster deletion independently of tenant-level storage provisioning.
-	// CaaS e2e tests use SA auth → shared tenant to avoid cluster-storage finalizer blocking deletion
-	// when AAP storage provisioning jobs fail in test environments without configured backends.
 	generic, err := NewGenericServer[*privatev1.Cluster]().
 		SetLogger(b.logger).
 		SetService(privatev1.Clusters_ServiceDesc.ServiceName).
-		SetNotifier(b.notifier).
 		SetAttributionLogic(b.attributionLogic).
 		SetTenancyLogic(b.tenancyLogic).
 		SetMetricsRegisterer(b.metricsRegisterer).
 		SetFilterDesc(b.filterDesc).
-		AddAllowedTenants(auth.SharedTenant).
 		Build()
 	if err != nil {
 		return
@@ -238,21 +278,35 @@ func (b *PrivateClustersServerBuilder) Build() (result *PrivateClustersServer, e
 
 	// Create and populate the object:
 	result = &PrivateClustersServer{
-		logger:                  b.logger,
-		notifier:                b.notifier,
-		tenancyLogic:            b.tenancyLogic,
-		templatesDao:            templatesDao,
-		catalogItemsDao:         catalogItemsDao,
-		hostTypesDao:            hostTypesDao,
-		clusterVersionsDao:      clusterVersionsDao,
-		subnetsDao:              subnetsDao,
-		securityGroupsDao:       securityGroupsDao,
-		externalIPPoolDao:       externalIPPoolDao,
-		externalIPDao:           externalIPDao,
-		externalIPAttachmentDao: externalIPAttachmentDao,
-		secretsDao:              secretsDao,
-		generic:                 generic,
+		logger:                    b.logger,
+		tenancyLogic:              b.tenancyLogic,
+		templatesDao:              templatesDao,
+		catalogItemsDao:           catalogItemsDao,
+		bareMetalInstanceTypesDao: bareMetalInstanceTypesDao,
+		tenantsDao:                tenantsDao,
+		settings:                  resolveNetworkingSettings(b.networkingSettings),
+		clusterVersionsDao:        clusterVersionsDao,
+		networkClassesDao:         networkClassesDao,
+		subnetsDao:                subnetsDao,
+		securityGroupsDao:         securityGroupsDao,
+		externalIPPoolDao:         externalIPPoolDao,
+		externalIPDao:             externalIPDao,
+		externalIPAttachmentDao:   externalIPAttachmentDao,
+		secretsDao:                secretsDao,
+		addOnOperators:            addOnOperators,
+		generic:                   generic,
+		secretStore:               b.secretStore,
 	}
+	result.lifecycle = newExternalIPLifecycle(
+		externalIPDao,
+		externalIPAttachmentDao,
+		nil,
+		externalIPPoolDao,
+		nil,
+		generic.dao,
+		nil,
+		nil,
+	)
 	return
 }
 
@@ -268,95 +322,16 @@ func (s *PrivateClustersServer) Get(ctx context.Context,
 	return
 }
 
-func (s *PrivateClustersServer) Create(ctx context.Context,
-	request *privatev1.ClustersCreateRequest) (response *privatev1.ClustersCreateResponse, err error) {
-	// Ensure sane defaults:
-	s.setDefaults(request.GetObject())
-
-	// Get the spec:
-	spec := request.GetObject().GetSpec()
-
-	// The user may have specified the host types of the node sets by name, but we want to save the
-	// identifiers, so we need to look them up:
-	for _, nodeSet := range spec.GetNodeSets() {
-		var hostType *privatev1.HostType
-		hostType, err = s.lookupHostType(ctx, refKey(nodeSet.GetHostType()))
-		if err != nil {
-			return
-		}
-		if hostType != nil {
-			hostTypeRef := &privatev1.HostTypeReference{}
-			hostTypeRef.SetId(hostType.GetId())
-			hostTypeRef.SetName(hostType.GetMetadata().GetName())
-			nodeSet.SetHostType(hostTypeRef)
-		}
-	}
-
-	// Validate duplicate conditions first:
-	err = s.validateNoDuplicateConditions(request.GetObject())
+func (s *PrivateClustersServer) Create(ctx context.Context, request *privatev1.ClustersCreateRequest) (response *privatev1.ClustersCreateResponse, err error) {
+	err = s.generic.CreateWithCandidatePreparation(ctx, request, &response, func(ctx context.Context, _ *privatev1.Cluster, candidate *privatev1.Cluster) error {
+		return s.prepareCreate(ctx, candidate)
+	})
 	if err != nil {
 		return
 	}
-
-	// Dispatch between catalog item and template paths:
-	catalogItemRef := spec.GetCatalogItem()
-	templateRef := spec.GetTemplate()
-	if catalogItemRef != nil && templateRef != nil {
-		err = grpcstatus.Errorf(grpccodes.InvalidArgument,
-			"catalog_item and template are mutually exclusive")
-		return
-	}
-	if catalogItemRef != nil {
-		err = s.validateAndTransformCatalogItem(ctx, request.GetObject())
+	if !isDryRun(ctx) && response.GetObject().GetSpec().GetAutoExternalIpAttachment() {
+		err = s.autoProvisionExternalIPs(ctx, response.GetObject())
 		if err != nil {
-			return
-		}
-	} else {
-		err = s.validateAndTransformCluster(ctx, request.GetObject())
-		if err != nil {
-			return
-		}
-	}
-
-	// Inject default network attachment from tenant defaults when not provided.
-	// Injection errors are deferred — generic.Create validates the tenant and
-	// produces a clearer error when the tenant itself doesn't exist.
-	var networkAttachmentErr error
-	if request.GetObject().GetSpec().GetNetworkAttachment() == nil {
-		networkAttachmentErr = s.injectDefaultNetworkAttachment(ctx, request.GetObject())
-	}
-
-	// Validate network attachment references (subnet READY, SGs same-VN):
-	if networkAttachmentErr == nil && request.GetObject().GetSpec().GetNetworkAttachment() != nil {
-		networkAttachmentErr = s.validateNetworkAttachmentState(ctx, request.GetObject())
-	}
-
-	// Resolve fabric_interface for each node set when the cluster has a
-	// network attachment. The HostType's interfaces list is searched for
-	// the first interface with role "fabric".
-	if spec.GetNetworkAttachment() != nil {
-		if err = s.resolveFabricInterfaces(ctx, spec); err != nil {
-			return
-		}
-	}
-
-	// Attempt to persist — generic.Create validates tenant existence, so if the
-	// tenant is invalid, the tenant error takes priority over a network error.
-	err = s.generic.Create(ctx, request, &response)
-	if err != nil {
-		return
-	}
-
-	// If persist succeeded but we had a deferred network attachment error, roll
-	// back by returning the error (the DB transaction will be rolled back by the
-	// gRPC interceptor).
-	if networkAttachmentErr != nil {
-		err = networkAttachmentErr
-		response = nil
-	}
-
-	if response.GetObject().GetSpec().GetAutoExternalIpAttachment() {
-		if err = s.autoProvisionExternalIPs(ctx, response.GetObject()); err != nil {
 			if tx, txErr := database.TxFromContext(ctx); txErr == nil {
 				tx.ReportError(&err)
 			}
@@ -366,107 +341,322 @@ func (s *PrivateClustersServer) Create(ctx context.Context,
 	return
 }
 
+// prepareCreate fills the new Cluster before it is stored. It selects either a published
+// Catalog Item or a direct Template, applies Catalog rules and Template defaults, then
+// checks the resulting network, node sets, and other required inputs.
+func (s *PrivateClustersServer) prepareCreate(ctx context.Context, candidate *privatev1.Cluster) (err error) {
+	// Ensure sane defaults:
+	s.setDefaults(candidate)
+	if err = validateClusterEndpointAddresses(candidate.GetStatus(), nil); err != nil {
+		return
+	}
+	// Get the spec:
+	spec := candidate.GetSpec()
+
+	// Validate duplicate conditions first:
+	err = s.validateNoDuplicateConditions(candidate)
+	if err != nil {
+		return
+	}
+
+	template, err := s.resolveCreationSource(ctx, candidate)
+	if err != nil {
+		return err
+	}
+	clusterVersion, err := s.applyClusterTemplate(ctx, candidate, template)
+	if err != nil {
+		return
+	}
+	if err := s.validateCreatedNodeSetVersions(ctx, candidate); err != nil {
+		return err
+	}
+	if spec.GetSshKey() != nil {
+		canonical, keyErr := resolveAndCanonicalizeSSHKeyReference(ctx, s.logger, s.secretsDao, s.secretStore,
+			candidate.GetMetadata(), spec.GetSshKey())
+		if keyErr != nil {
+			return keyErr
+		}
+		spec.SetSshKey(canonical)
+	}
+
+	if err = s.validateAndExpandAddOnOperators(ctx, candidate, clusterVersion); err != nil {
+		return
+	}
+
+	if candidate.GetSpec().GetNetworkAttachment() == nil {
+		if err = s.injectDefaultNetworkAttachment(ctx, candidate); err != nil {
+			return
+		}
+	}
+
+	// Resolve fabric_interface for each node set when the cluster has a
+	// network attachment. The BareMetalInstanceType's network ports are
+	// searched for the first port with role "fabric". This runs before
+	// network attachment validation so a missing fabric port surfaces first.
+	if spec.GetNetworkAttachment() != nil {
+		if err = s.resolveFabricInterfaces(ctx, candidate); err != nil {
+			return
+		}
+	}
+
+	if err = s.validateNetworkAttachmentState(ctx, candidate); err != nil {
+		return
+	}
+	// The resolved creation reference is the initial observed baseline until
+	// HyperShift reports the installed versions.
+	candidate.GetStatus().SetObservedVersion(clusterVersion.GetSpec().GetVersion())
+	nodeSetStatus := make(map[string]*privatev1.ClusterNodeSet, len(spec.GetNodeSets()))
+	for name := range spec.GetNodeSets() {
+		status := &privatev1.ClusterNodeSet{}
+		status.SetObservedVersion(clusterVersion.GetSpec().GetVersion())
+		nodeSetStatus[name] = status
+	}
+	candidate.GetStatus().SetNodeSets(nodeSetStatus)
+
+	return
+}
+
+// resolveCreationSource accepts exactly one provisioning source: spec.catalog_item or
+// spec.template. For a Catalog Item it finds the item's Template and applies its field rules;
+// for a direct Template it resolves that reference under the Cluster's assigned tenant/project.
+func (s *PrivateClustersServer) resolveCreationSource(ctx context.Context,
+	candidate *privatev1.Cluster) (*privatev1.ClusterTemplate, error) {
+	spec := candidate.GetSpec()
+	if spec.GetCatalogItem() != nil && spec.GetTemplate() != nil {
+		return nil, grpcstatus.Errorf(grpccodes.InvalidArgument,
+			"catalog_item and template are mutually exclusive")
+	}
+	if spec.GetCatalogItem() != nil {
+		return s.resolveCatalogItem(ctx, candidate)
+	}
+	if spec.GetTemplate() == nil {
+		return nil, grpcstatus.Errorf(grpccodes.InvalidArgument, "template is mandatory")
+	}
+	return resolveAndCanonicalizeReference(ctx, s.templatesDao, candidate.GetMetadata(), spec.GetTemplate(),
+		"template", grpccodes.InvalidArgument)
+}
+
+// Update validates a partial cluster update and merges accepted
+// upgrade feedback.
 func (s *PrivateClustersServer) Update(ctx context.Context,
 	request *privatev1.ClustersUpdateRequest) (response *privatev1.ClustersUpdateResponse, err error) {
-	err = s.validateNoDuplicateConditions(request.GetObject())
+	if err = s.validateNoDuplicateConditions(request.GetObject()); err != nil {
+		return
+	}
+	if err = s.validateClusterStateForSpecUpdate(ctx, request); err != nil {
+		return
+	}
+	// Version validation canonicalizes selected references; keep the caller's request intact.
+	request = proto.Clone(request).(*privatev1.ClustersUpdateRequest)
+	resolvedTarget, err := s.validateClusterUpdateRequest(ctx, request)
 	if err != nil {
 		return
 	}
-	err = s.validateClusterStateForSpecUpdate(ctx, request)
-	if err != nil {
-		return
-	}
-	err = s.validateTemplateImmutability(ctx, request)
-	if err != nil {
-		return
-	}
-	err = s.validateVersionUpdate(ctx, request)
-	if err != nil {
-		return
-	}
-	err = s.validateNodeSetsUpdate(ctx, request)
-	if err != nil {
-		return
-	}
-	err = s.validateNetworkAttachmentImmutability(ctx, request)
-	if err != nil {
-		return
-	}
-	// Validate network attachment state when security groups are being updated.
-	// For sub-field masks (e.g. spec.network_attachment.security_groups), merge
-	// the existing cluster's subnet into the update object before validation,
-	// because the caller may only send the changed security_groups.
-	mask := request.GetUpdateMask()
-	if mask != nil && len(mask.GetPaths()) > 0 &&
-		updateIncludesField(mask, "spec.network_attachment.security_groups") {
-		obj := request.GetObject()
-		if obj == nil || obj.GetSpec() == nil {
-			err = grpcstatus.Errorf(grpccodes.InvalidArgument, "object and spec are required")
-			return
-		}
-		if obj.GetSpec().GetNetworkAttachment().GetSubnet() == nil {
-			existing, found, lookupErr := s.getExistingCluster(ctx, request)
-			if lookupErr != nil {
-				err = lookupErr
-				return
-			}
-			if found && existing.GetSpec().GetNetworkAttachment() != nil {
-				att := obj.GetSpec().GetNetworkAttachment()
-				if att == nil {
-					att = privatev1.ClusterNetworkAttachment_builder{}.Build()
-					obj.GetSpec().SetNetworkAttachment(att)
-				}
-				att.SetSubnet(existing.GetSpec().GetNetworkAttachment().GetSubnet())
-			}
-		}
-		err = s.validateNetworkAttachmentState(ctx, request.GetObject())
-		if err != nil {
-			return
-		}
-	}
-	err = s.validateAutoExternalIPImmutability(ctx, request)
-	if err != nil {
-		return
-	}
-	allowExistingSharedRef := false
-	requestedRef := request.GetObject().GetSpec().GetPullSecretSecret()
-	if requestedRef != nil && requestedRef.GetId() != "" {
-		existing, found, lookupErr := s.getExistingCluster(ctx, request)
-		if lookupErr != nil {
-			err = lookupErr
-			return
-		}
-		allowExistingSharedRef = found &&
-			existing.GetSpec().GetPullSecretSecret().GetId() == requestedRef.GetId()
-	}
-	if err = s.validatePullSecretSecret(
-		ctx, request.GetObject().GetSpec(), allowExistingSharedRef,
-	); err != nil {
-		return
-	}
-	if err = utils.ValidateClusterSpecFields(request.GetObject().GetSpec()); err != nil {
-		return
-	}
-	err = s.generic.Update(ctx, request, &response)
+	// Upgrade-history updates identify the attempt and component, then supply its
+	// changed state and transition time.
+	// Merge the stored audit fields before validating the completed candidate.
+	err = s.generic.updateWithCandidatePreparation(ctx, request, &response, func(ctx context.Context,
+		current, candidate *privatev1.Cluster) error {
+		return s.prepareUpdatedCluster(ctx, current, candidate, request, resolvedTarget)
+	}, true)
 	return
+}
+
+// validateClusterUpdateRequest validates an update request and returns the
+// ClusterVersion resolved during version validation.
+func (s *PrivateClustersServer) validateClusterUpdateRequest(ctx context.Context,
+	request *privatev1.ClustersUpdateRequest) (*privatev1.ClusterVersion, error) {
+	resolvedTarget, err := s.validateVersionUpdate(ctx, request)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.validateNodeSetsUpdate(ctx, request); err != nil {
+		return nil, err
+	}
+	if err := s.validateAutoExternalIPImmutability(ctx, request); err != nil {
+		return nil, err
+	}
+	if err := s.validateSpecUpdateRequest(request); err != nil {
+		return nil, err
+	}
+	return resolvedTarget, nil
+}
+
+// prepareUpdatedCluster applies server-owned defaults and validation to the
+// completed update candidate before it is persisted.
+func (s *PrivateClustersServer) prepareUpdatedCluster(ctx context.Context, current, candidate *privatev1.Cluster,
+	request *privatev1.ClustersUpdateRequest, resolvedTarget *privatev1.ClusterVersion) error {
+	if current.GetMetadata().GetTenant() != candidate.GetMetadata().GetTenant() {
+		return grpcstatus.Error(grpccodes.InvalidArgument, "metadata.tenant is immutable")
+	}
+	// An unmasked metadata-only request omits spec. Keep the stored spec so its
+	// version and node sets are not interpreted as a metering-relevant change.
+	if request.GetUpdateMask() == nil && request.GetObject().GetSpec() == nil && current.GetSpec() != nil {
+		candidate.SetSpec(proto.Clone(current.GetSpec()).(*privatev1.ClusterSpec))
+	}
+	if err := validateClusterEndpointAddresses(candidate.GetStatus(), request.GetUpdateMask()); err != nil {
+		return err
+	}
+	if err := validateClusterNetworkAttachmentImmutability(current, candidate, request.GetUpdateMask()); err != nil {
+		return err
+	}
+	if err := validateClusterTemplateImmutability(current, candidate, request.GetUpdateMask()); err != nil {
+		return err
+	}
+	mask := request.GetUpdateMask()
+	sizeOnlyNodeSets := len(mask.GetPaths()) > 0 && s.isUpdatingOnlySizes(mask)
+	if err := s.prepareUpdatedClusterNodeSets(ctx, current, candidate,
+		request.GetObject().GetSpec().GetNodeSets(), mask, sizeOnlyNodeSets); err != nil {
+		return err
+	}
+	// A parent spec mask or a full-object replacement must never replace IDs
+	// generated by Fulfillment.
+	candidate.GetSpec().SetControlPlaneAttemptId(current.GetSpec().GetControlPlaneAttemptId())
+	attemptIDs := make(map[string]string, len(current.GetSpec().GetNodeSetAttemptIds()))
+	for name, id := range current.GetSpec().GetNodeSetAttemptIds() {
+		if candidate.GetSpec().GetNodeSets()[name] != nil {
+			attemptIDs[name] = id
+		}
+	}
+	candidate.GetSpec().SetNodeSetAttemptIds(attemptIDs)
+	mergeClusterUpgradeHistory(current, candidate, mask)
+	if err := s.prepareClusterVersionChange(ctx, current, candidate, mask, resolvedTarget); err != nil {
+		return err
+	}
+	if err := s.initializeAddedNodeSetVersions(ctx, current, candidate); err != nil {
+		return err
+	}
+	if err := s.validateUpdatedClusterSpec(current, candidate, mask); err != nil {
+		return err
+	}
+	return s.prepareUpdatedClusterReferences(ctx, current, candidate, mask, sizeOnlyNodeSets)
+}
+
+// initializeAddedNodeSetVersions seeds observed versions for node sets added
+// by an update.
+func (s *PrivateClustersServer) initializeAddedNodeSetVersions(ctx context.Context,
+	current, candidate *privatev1.Cluster) error {
+	for name, nodeSet := range candidate.GetSpec().GetNodeSets() {
+		if current.GetSpec().GetNodeSets()[name] != nil || nodeSet == nil {
+			continue
+		}
+		clusterVersion, err := getClusterVersionByID(ctx, s.clusterVersionsDao, nodeSet.GetVersion().GetId())
+		if err != nil {
+			return err
+		}
+		version := clusterVersion.GetSpec().GetVersion()
+		statuses := candidate.GetStatus().GetNodeSets()
+		if statuses == nil {
+			statuses = map[string]*privatev1.ClusterNodeSet{}
+			candidate.GetStatus().SetNodeSets(statuses)
+		}
+		status := &privatev1.ClusterNodeSet{}
+		status.SetObservedVersion(version)
+		statuses[name] = status
+	}
+	return nil
+}
+
+func (s *PrivateClustersServer) validateUpdatedClusterSpec(current, candidate *privatev1.Cluster,
+	mask *fieldmaskpb.FieldMask) error {
+	if updateIncludesField(mask, "spec.ssh_key") {
+		existingKey := current.GetSpec().GetSshKey()
+		candidateKey := candidate.GetSpec().GetSshKey()
+		if !sameImmutableSSHKeyReference(existingKey, candidateKey) {
+			return grpcstatus.Error(grpccodes.InvalidArgument,
+				"cannot change spec.ssh_key: ssh_key is immutable after creation")
+		}
+		if existingKey != nil {
+			candidate.GetSpec().SetSshKey(cloneMessage(existingKey))
+		}
+	}
+	if err := s.validateAddOnOperatorImmutability(current, candidate, mask); err != nil {
+		return err
+	}
+	if err := utils.ValidateClusterSpecFields(candidate.GetSpec()); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *PrivateClustersServer) prepareUpdatedClusterReferences(ctx context.Context,
+	current, candidate *privatev1.Cluster, mask *fieldmaskpb.FieldMask, sizeOnlyNodeSets bool) error {
+	// An explicit size-only update keeps the existing hardware type and fabric interface.
+	// Re-resolving here would prevent scaling legacy clusters with tenant-scoped BMITs.
+	if s.updateAffectsNodeSets(mask) && candidate.GetSpec().GetNetworkAttachment() != nil && !sizeOnlyNodeSets {
+		if err := s.resolveFabricInterfaces(ctx, candidate); err != nil {
+			return err
+		}
+	}
+	if updateIncludesField(mask, "spec.network_attachment.security_groups") {
+		if err := s.validateNetworkAttachmentState(ctx, candidate); err != nil {
+			return err
+		}
+	}
+	if !proto.Equal(current.GetSpec().GetPullSecretSecret(), candidate.GetSpec().GetPullSecretSecret()) {
+		ref := candidate.GetSpec().GetPullSecretSecret()
+		allowShared := ref.GetId() != "" && ref.GetId() == current.GetSpec().GetPullSecretSecret().GetId()
+		if err := s.validatePullSecretSecret(ctx, candidate, allowShared); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// prepareUpdatedClusterNodeSets preserves stored fields for nested node-set
+// updates and checks that newly selected hardware types are not being deleted.
+func (s *PrivateClustersServer) prepareUpdatedClusterNodeSets(
+	ctx context.Context, current, candidate *privatev1.Cluster,
+	requestedNodeSets map[string]*privatev1.ClusterNodeSet, mask *fieldmaskpb.FieldMask, sizeOnlyNodeSets bool,
+) error {
+	if !s.updateAffectsNodeSets(mask) {
+		return nil
+	}
+	partialSizeOrVersionUpdate := isUpdatingOnlyNodeSizeOrVersionFields(mask) && !sizeOnlyNodeSets
+	for name, nodeSet := range candidate.GetSpec().GetNodeSets() {
+		existing := current.GetSpec().GetNodeSets()[name]
+		if partialSizeOrVersionUpdate {
+			var err error
+			nodeSet, err = restoreMaskedNodeSetFields(name, existing, requestedNodeSets[name], mask)
+			if err != nil {
+				return err
+			}
+			candidate.GetSpec().GetNodeSets()[name] = nodeSet
+		}
+		retainOmittedNodeSetVersion(current.GetSpec().GetVersion(), existing, nodeSet)
+		if err := s.prepareUpdatedNodeSetHardware(ctx, name, existing, nodeSet, mask, sizeOnlyNodeSets); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *PrivateClustersServer) validateSpecUpdateRequest(request *privatev1.ClustersUpdateRequest) error {
+	updateMask := request.GetUpdateMask()
+	if updateMask != nil && len(updateMask.GetPaths()) > 0 &&
+		updateIncludesField(updateMask, "spec") && request.GetObject().GetSpec() == nil {
+		return grpcstatus.Errorf(grpccodes.InvalidArgument, "object and spec are required")
+	}
+	return nil
 }
 
 func (s *PrivateClustersServer) Delete(ctx context.Context,
 	request *privatev1.ClustersDeleteRequest) (response *privatev1.ClustersDeleteResponse, err error) {
 	id := request.GetId()
-	if id != "" {
-		getResponse, getErr := s.generic.dao.Get().SetId(id).Do(ctx)
-		if getErr != nil {
-			var notFoundErr *dao.ErrNotFound
-			if !errors.As(getErr, &notFoundErr) {
-				err = getErr
-				return
-			}
-		} else if getResponse.GetObject().GetSpec().GetAutoExternalIpAttachment() {
-			err = s.autoCleanupExternalIP(ctx, id)
-			if err != nil {
-				return
-			}
+	if id == "" {
+		return nil, grpcstatus.Error(grpccodes.InvalidArgument, "identifier is mandatory")
+	}
+	cluster, err := lockLifecycleResource(ctx, s.generic.dao, id, "Cluster")
+	if err != nil {
+		return
+	}
+	if err = s.lifecycle.rejectManualAttachmentDelete(ctx, "Cluster", id, cluster.GetMetadata()); err != nil {
+		return
+	}
+	if cluster.GetSpec().GetAutoExternalIpAttachment() {
+		err = s.autoCleanupExternalIP(ctx, id)
+		if err != nil {
+			return
 		}
 	}
 	err = s.generic.Delete(ctx, request, &response)
@@ -474,10 +664,7 @@ func (s *PrivateClustersServer) Delete(ctx context.Context,
 }
 
 func (s *PrivateClustersServer) autoCleanupExternalIP(ctx context.Context, clusterID string) error {
-	filter := fmt.Sprintf(
-		"this.metadata.labels['%s'] == '%s'",
-		autoCreatedForLabel, clusterID,
-	)
+	filter := autoCreatedExternalIPAttachmentFilter(clusterID)
 	listResp, err := s.externalIPAttachmentDao.List().SetFilter(filter).Do(ctx)
 	if err != nil {
 		return fmt.Errorf("auto_external_ip_attachment cleanup: failed to list attachments: %w", err)
@@ -488,61 +675,18 @@ func (s *PrivateClustersServer) autoCleanupExternalIP(ctx context.Context, clust
 		eipRef := attachment.GetSpec().GetExternalIp()
 		eipID := refKey(eipRef)
 
-		_, err = s.externalIPAttachmentDao.Delete().SetId(attachmentID).Do(ctx)
-		if err != nil {
-			return fmt.Errorf("auto_external_ip_attachment cleanup: failed to delete attachment: %w", err)
-		}
-
-		if s.notifier != nil {
-			attResp, getErr := s.externalIPAttachmentDao.Get().SetId(attachmentID).Do(ctx)
-			if getErr == nil {
-				attEvent := privatev1.Event_builder{
-					Type:                 privatev1.EventType_EVENT_TYPE_OBJECT_UPDATED,
-					ExternalIpAttachment: attResp.GetObject(),
-				}.Build()
-				if notifyErr := s.notifier.Notify(ctx, attEvent); notifyErr != nil {
-					s.logger.WarnContext(ctx, "Failed to notify ExternalIPAttachment deletion", "error", notifyErr)
-				}
-			}
-		}
-
 		if eipID != "" {
-			err = s.updateExternalIPAttachedFlag(ctx, eipID, false)
-			if err != nil {
-				return fmt.Errorf("auto_external_ip_attachment cleanup: %w", err)
-			}
-
-			eipResp, getErr := s.externalIPDao.Get().SetId(eipID).Do(ctx)
-			if getErr != nil {
-				return fmt.Errorf("auto_external_ip_attachment cleanup: failed to get ExternalIP: %w", getErr)
-			}
-			poolRef := eipResp.GetObject().GetSpec().GetPool()
-
-			_, err = s.externalIPDao.Delete().SetId(eipID).Do(ctx)
-			if err != nil {
-				return fmt.Errorf("auto_external_ip_attachment cleanup: failed to delete ExternalIP: %w", err)
-			}
-
-			if s.notifier != nil {
-				updatedEIP, getErr := s.externalIPDao.Get().SetId(eipID).Do(ctx)
-				if getErr == nil {
-					eipEvent := privatev1.Event_builder{
-						Type:       privatev1.EventType_EVENT_TYPE_OBJECT_UPDATED,
-						ExternalIp: updatedEIP.GetObject(),
-					}.Build()
-					if notifyErr := s.notifier.Notify(ctx, eipEvent); notifyErr != nil {
-						s.logger.WarnContext(ctx, "Failed to notify ExternalIP deletion", "error", notifyErr)
-					}
-				}
-			}
-
-			if poolRef != nil {
-				err = UpdatePoolCapacity(ctx, s.externalIPPoolDao, refKey(poolRef), -1)
-				if err != nil {
-					return fmt.Errorf("auto_external_ip_attachment cleanup: %w", err)
-				}
-			}
+			err = s.lifecycle.deleteAttachmentAndExternalIP(ctx, attachmentID, eipID)
+		} else {
+			err = s.lifecycle.deleteAttachment(ctx, attachmentID)
 		}
+		if err != nil {
+			return fmt.Errorf("auto_external_ip_attachment cleanup: %w", err)
+		}
+	}
+
+	if err := s.lifecycle.deleteAutoCreatedExternalIPs(ctx, clusterID); err != nil {
+		return fmt.Errorf("auto_external_ip_attachment cleanup: %w", err)
 	}
 
 	return nil
@@ -563,125 +707,77 @@ func (s *PrivateClustersServer) setDefaults(cluster *privatev1.Cluster) {
 	}
 }
 
-func (s *PrivateClustersServer) lookupTemplate(ctx context.Context,
-	key string) (result *privatev1.ClusterTemplate, err error) {
-	if key == "" {
-		return
-	}
-	response, err := s.templatesDao.List().
-		SetFilter(fmt.Sprintf("this.id == %[1]s || this.metadata.name == %[1]s", strconv.Quote(key))).
-		SetLimit(1).
-		Do(ctx)
-	if err != nil {
-		var deniedErr *dao.ErrDenied
-		if errors.As(err, &deniedErr) {
-			err = grpcstatus.Errorf(grpccodes.PermissionDenied, "%s", deniedErr.Reason)
+func validateClusterEndpointAddresses(status *privatev1.ClusterStatus, updateMask *fieldmaskpb.FieldMask) error {
+	for _, field := range []struct {
+		path  string
+		value string
+	}{
+		{path: "status.api_endpoint", value: status.GetApiEndpoint()},
+		{path: "status.ingress_endpoint", value: status.GetIngressEndpoint()},
+	} {
+		if updateIncludesField(updateMask, field.path) {
+			if err := validateCanonicalIPv4Address(field.path, field.value); err != nil {
+				return err
+			}
 		}
-		return
 	}
-	switch response.GetTotal() {
-	case 0:
-		err = grpcstatus.Errorf(
-			grpccodes.InvalidArgument,
-			"there is no template with identifier or name '%s'",
-			key,
-		)
-	case 1:
-		result = response.GetItems()[0]
-	default:
-		err = grpcstatus.Errorf(
-			grpccodes.InvalidArgument,
-			"there are multiple templates with identifier or name '%s'",
-			key,
-		)
-	}
-	return
+	return nil
 }
 
 func (s *PrivateClustersServer) validatePullSecretSecret(
-	ctx context.Context, spec *privatev1.ClusterSpec, allowShared bool,
+	ctx context.Context, cluster *privatev1.Cluster, allowShared bool,
 ) error {
-	ref := spec.GetPullSecretSecret()
+	ref := cluster.GetSpec().GetPullSecretSecret()
 	if ref == nil {
 		return nil
 	}
 	if ref.GetId() == "" && ref.GetName() == "" {
 		return grpcstatus.Errorf(grpccodes.InvalidArgument, "pull_secret_secret must specify id or name")
 	}
-	resolved, err := references.NewDAOLookupFunc(s.secretsDao)(ctx, "", "", ref.GetId(), ref.GetName())
-	if err != nil {
-		var deniedErr *dao.ErrDenied
-		if errors.As(err, &deniedErr) {
-			return grpcstatus.Errorf(grpccodes.PermissionDenied, "%s", deniedErr.Reason)
+	identifier := refKey(ref)
+	metadata := cluster.GetMetadata()
+	var secret *privatev1.Secret
+	var err error
+	if allowShared {
+		sharedMetadata := privatev1.Metadata_builder{Tenant: auth.SharedTenant}.Build()
+		secret, err = resolveAndCanonicalizeReference(ctx, s.secretsDao, sharedMetadata, ref, "pull_secret_secret", grpccodes.NotFound)
+		if err != nil && grpcstatus.Code(err) != grpccodes.NotFound {
+			return err
 		}
-		var nf interface{ IsNotFound() bool }
-		if errors.As(err, &nf) && nf.IsNotFound() {
-			return grpcstatus.Errorf(grpccodes.InvalidArgument,
-				"there is no secret with identifier or name '%s'", refKey(ref))
+	}
+	if secret == nil {
+		secret, err = resolveAndCanonicalizeReference(ctx, s.secretsDao, metadata, ref, "pull_secret_secret", grpccodes.InvalidArgument)
+		if err != nil {
+			return err
 		}
-		s.logger.ErrorContext(ctx, "Failed to resolve pull_secret_secret reference", "error", err)
-		return grpcstatus.Errorf(grpccodes.Internal, "failed to resolve pull_secret_secret reference")
 	}
-	if resolved.Tenant == auth.SharedTenant && !allowShared {
-		return grpcstatus.Errorf(grpccodes.InvalidArgument,
-			"shared pull_secret_secret references must be inherited from a shared cluster template")
-	}
-	resolvedRef := &privatev1.SecretLocalReference{}
-	resolvedRef.SetId(resolved.ID)
-	resolvedRef.SetName(resolved.Name)
-	spec.SetPullSecretSecret(resolvedRef)
-	return nil
-}
-
-func (s *PrivateClustersServer) lookupHostType(ctx context.Context,
-	key string) (result *privatev1.HostType, err error) {
-	if key == "" {
-		return
-	}
-	response, err := s.hostTypesDao.List().
-		SetFilter(fmt.Sprintf("this.id == %[1]s || this.metadata.name == %[1]s", strconv.Quote(key))).
-		SetLimit(1).
-		Do(ctx)
-	if err != nil {
-		var deniedErr *dao.ErrDenied
-		if errors.As(err, &deniedErr) {
-			err = grpcstatus.Errorf(grpccodes.PermissionDenied, "%s", deniedErr.Reason)
-		}
-		return
-	}
-	switch response.GetTotal() {
-	case 0:
-		err = grpcstatus.Errorf(
-			grpccodes.NotFound,
-			"there is no host type with identifier or name '%s'",
-			key,
-		)
-	case 1:
-		result = response.GetItems()[0]
-	default:
-		err = grpcstatus.Errorf(
-			grpccodes.InvalidArgument,
-			"there are multiple host types with identifier or name '%s'",
-			key,
-		)
-	}
-	return
+	return validateResolvedSecretLifecycleAndType(secret, identifier, "pull_secret_secret",
+		privatev1.SecretType_SECRET_TYPE_PULL_SECRET)
 }
 
 // ensureClusterVersion makes sure the cluster spec has a usable version reference: if the user didn't provide one, it
-// resolves the system default. Either way, it validates that the resulting ClusterVersion isn't deleted, disabled,
-// or obsolete.
-func (s *PrivateClustersServer) ensureClusterVersion(ctx context.Context, cluster *privatev1.Cluster) error {
+// resolves the system default.
+func (s *PrivateClustersServer) ensureClusterVersion(
+	ctx context.Context,
+	cluster *privatev1.Cluster,
+) (*privatev1.ClusterVersion, error) {
 	versionRef := cluster.GetSpec().GetVersion()
-	if versionRef != nil && versionRef.GetName() != "" {
-		return lookupAndValidateClusterVersion(ctx, s.logger, s.clusterVersionsDao, versionRef.GetName())
+	if versionRef != nil {
+		version, err := resolveAndCanonicalizeReference(ctx, s.clusterVersionsDao, cluster.GetMetadata(), versionRef, "version", grpccodes.InvalidArgument)
+		if err != nil {
+			return nil, err
+		}
+		if err := validateResolvedClusterVersion(version, version.GetMetadata().GetName(), ""); err != nil {
+			return nil, err
+		}
+		return version, nil
 	}
-	ref, err := resolveDefaultClusterVersion(ctx, s.logger, s.clusterVersionsDao)
+	version, err := resolveDefaultClusterVersion(ctx, s.logger, s.clusterVersionsDao)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	cluster.GetSpec().SetVersion(ref)
-	return nil
+	cluster.GetSpec().SetVersion(buildClusterVersionReference(version))
+	return version, nil
 }
 
 func (s *PrivateClustersServer) validateNoDuplicateConditions(object *privatev1.Cluster) error {
@@ -714,8 +810,10 @@ func (s *PrivateClustersServer) validateNodeSetsUpdate(ctx context.Context,
 		return nil
 	}
 
-	// Check if only size fields are being updated - these are always allowed
-	if s.isUpdatingOnlySizes(request.GetUpdateMask()) {
+	// Full-object updates and nested size/version masks are checked against the
+	// prepared candidate instead of treating a partial node-set map as a replacement.
+	if s.isUpdatingOnlySizes(request.GetUpdateMask()) ||
+		isUpdatingOnlyNodeSizeOrVersionFields(request.GetUpdateMask()) {
 		return nil
 	}
 
@@ -736,7 +834,10 @@ func (s *PrivateClustersServer) validateNodeSetsUpdate(ctx context.Context,
 	if err := s.validateAtLeastOneNodeSet(newNodeSets); err != nil {
 		return err
 	}
-	if err := s.validateNodeSetHostTypeImmutability(existingNodeSets, newNodeSets); err != nil {
+	if err := validateNodeSetNames(newNodeSets); err != nil {
+		return err
+	}
+	if err := s.validateNodeSetBareMetalInstanceTypeImmutability(existingNodeSets, newNodeSets); err != nil {
 		return err
 	}
 
@@ -814,14 +915,19 @@ func (s *PrivateClustersServer) updateAffectsNodeSets(updateMask *fieldmaskpb.Fi
 
 // isUpdatingOnlySizes checks if the update mask is only modifying size fields of node sets.
 func (s *PrivateClustersServer) isUpdatingOnlySizes(updateMask *fieldmaskpb.FieldMask) bool {
+	if len(updateMask.GetPaths()) == 0 {
+		return true
+	}
+	hasSize := false
 	for _, path := range updateMask.GetPaths() {
-		if strings.HasPrefix(path, "spec.node_sets") {
+		if path == "spec" || strings.HasPrefix(path, "spec.node_sets") {
 			if !strings.HasSuffix(path, ".size") {
 				return false
 			}
+			hasSize = true
 		}
 	}
-	return true
+	return hasSize
 }
 
 // validateAtLeastOneNodeSet ensures that clusters always have at least one node set.
@@ -835,165 +941,161 @@ func (s *PrivateClustersServer) validateAtLeastOneNodeSet(nodeSets map[string]*p
 	return nil
 }
 
-// validateNodeSetHostTypeImmutability ensures that the host_type field of existing node sets
-// cannot be changed. This is an existing documented restriction in the API specification.
-func (s *PrivateClustersServer) validateNodeSetHostTypeImmutability(
+// validateClusterNodeSetMap checks that a node-set map has at least one entry and that
+// every entry has the fields required after defaults and references have been resolved.
+func validateClusterNodeSetMap(nodeSets map[string]*privatev1.ClusterNodeSet) error {
+	if len(nodeSets) == 0 {
+		return fmt.Errorf("must contain at least one node set")
+	}
+	for name, nodeSet := range nodeSets {
+		if errs := validation.IsDNS1123Label(name); len(errs) > 0 {
+			return fmt.Errorf("node set name '%s' is not a valid DNS label: %s", name, strings.Join(errs, ", "))
+		}
+		if nodeSet == nil {
+			return fmt.Errorf("node set '%s' must not be null", name)
+		}
+		if !nodeSet.HasSize() {
+			return fmt.Errorf("size for node set '%s' is required", name)
+		}
+		if nodeSet.GetSize() <= 0 {
+			return fmt.Errorf("size for node set '%s' should be greater than zero, but it is %d", name, nodeSet.GetSize())
+		}
+		if refKey(nodeSet.GetBaremetalInstanceType()) == "" {
+			return fmt.Errorf("bare metal instance type for node set '%s' is required", name)
+		}
+	}
+	return nil
+}
+
+// validateNodeSetNames checks that every key in the node-set map is a valid RFC 1123 DNS label.
+func validateNodeSetNames[V any](nodeSets map[string]V) error {
+	for name := range nodeSets {
+		if errs := validation.IsDNS1123Label(name); len(errs) > 0 {
+			return grpcstatus.Errorf(
+				grpccodes.InvalidArgument,
+				"node set name '%s' is not a valid DNS label: %s", name, strings.Join(errs, ", "),
+			)
+		}
+	}
+	return nil
+}
+
+func (s *PrivateClustersServer) validateNodeSetBareMetalInstanceTypeImmutability(
 	existingNodeSets map[string]*privatev1.ClusterNodeSet,
 	newNodeSets map[string]*privatev1.ClusterNodeSet) error {
 	for nodeSetName, existingNodeSet := range existingNodeSets {
 		newNodeSet, exists := newNodeSets[nodeSetName]
 		if !exists {
-			// Node set is being removed, which is allowed (if at least one remains)
 			continue
 		}
-		existingHostType := existingNodeSet.GetHostType()
-		newHostType := newNodeSet.GetHostType()
-		if refKey(existingHostType) != refKey(newHostType) {
+		existingBmit := existingNodeSet.GetBaremetalInstanceType()
+		newBmit := newNodeSet.GetBaremetalInstanceType()
+		if refKey(existingBmit) != refKey(newBmit) {
 			return grpcstatus.Errorf(
 				grpccodes.InvalidArgument,
-				"cannot change host_type for node set '%s' from '%s' to '%s': host_type is immutable",
+				"cannot change baremetal_instance_type for node set '%s' from '%s' to '%s': baremetal_instance_type is immutable",
 				nodeSetName,
-				refKey(existingHostType),
-				refKey(newHostType),
+				refKey(existingBmit),
+				refKey(newBmit),
 			)
 		}
 	}
 	return nil
 }
 
-// validateTemplateImmutability ensures that the template and template_parameters fields
-// cannot be changed after cluster creation.
-func (s *PrivateClustersServer) validateTemplateImmutability(ctx context.Context,
-	request *privatev1.ClustersUpdateRequest) error {
-	// Check if template, template_parameters, or catalog_item are being updated:
-	updateMask := request.GetUpdateMask()
-	updatingTemplate := updateIncludesField(updateMask, "spec.template")
-	updatingTemplateParams := updateIncludesField(updateMask, "spec.template_parameters")
-	updatingCatalogItem := updateIncludesField(updateMask, "spec.catalog_item")
-
-	// If none of the immutable fields are being updated, no validation needed:
-	if !updatingTemplate && !updatingTemplateParams && !updatingCatalogItem {
-		return nil
-	}
-
-	// Fetch the existing cluster from the database:
-	existingCluster, found, err := s.getExistingCluster(ctx, request)
-	if err != nil {
-		return err
-	}
-	if !found {
-		return nil
-	}
-
-	// Get the specs from both clusters:
-	existingSpec := existingCluster.GetSpec()
-	newSpec := request.GetObject().GetSpec()
-
-	// Sparse updates can reach private validation with spec omitted entirely.
-	// Without a spec message, this validator has no immutable spec fields to compare.
-	if newSpec == nil {
-		return nil
-	}
-
-	// These immutable non-optional proto3 fields have no presence tracking, so a
-	// zero value is ambiguous. Treat zero as absent and normalize to the existing
-	// value before comparing.
-	if updatingTemplate && newSpec.GetTemplate().GetId() == "" && newSpec.GetTemplate().GetName() == "" {
-		newSpec.SetTemplate(existingSpec.GetTemplate())
-	}
-	if updatingTemplateParams && len(newSpec.GetTemplateParameters()) == 0 {
-		newSpec.SetTemplateParameters(existingSpec.GetTemplateParameters())
-	}
-	if updatingCatalogItem && newSpec.GetCatalogItem().GetId() == "" && newSpec.GetCatalogItem().GetName() == "" {
-		newSpec.SetCatalogItem(existingSpec.GetCatalogItem())
-	}
-
-	// Check if template has changed. Compare by refKey (Id) rather than proto.Equal because
-	// the reference validator interceptor may backfill additional fields on incoming requests.
-	if updatingTemplate && refKey(existingSpec.GetTemplate()) != refKey(newSpec.GetTemplate()) {
-		return grpcstatus.Errorf(
-			grpccodes.InvalidArgument,
-			"cannot change spec.template from '%s' to '%s': template is immutable",
-			refKey(existingSpec.GetTemplate()),
-			refKey(newSpec.GetTemplate()),
-		)
-	}
-
-	// Check if template_parameters have changed:
-	if updatingTemplateParams {
-		templateParamsEqual := func(first, second *anypb.Any) bool {
-			return proto.Equal(first, second)
+// validateClusterTemplateImmutability checks that Update keeps the Cluster's original Template
+// and parameters. It also preserves the stored spec.catalog_item as history, so a normal Update
+// works after that Catalog Item is deleted without reading the deleted item.
+func validateClusterTemplateImmutability(current, candidate *privatev1.Cluster, mask *fieldmaskpb.FieldMask) error {
+	oldSpec, newSpec := current.GetSpec(), candidate.GetSpec()
+	// Preserve the legacy unmasked Update behavior for omitted immutable inputs.
+	// An explicit mask, including a parent mask, still makes clearing an error.
+	if mask == nil {
+		if newSpec == nil {
+			newSpec = &privatev1.ClusterSpec{}
+			candidate.SetSpec(newSpec)
 		}
-		if !maps.EqualFunc(existingSpec.GetTemplateParameters(), newSpec.GetTemplateParameters(), templateParamsEqual) { //nolint:govet // inline: Go compiler doesn't support type param inference for inlining yet
-			return grpcstatus.Errorf(
-				grpccodes.InvalidArgument,
-				"cannot change spec.template_parameters: template parameters are immutable",
-			)
+		if newSpec.GetTemplate() == nil {
+			newSpec.SetTemplate(cloneMessage(oldSpec.GetTemplate()))
+		}
+		if len(newSpec.GetTemplateParameters()) == 0 {
+			newSpec.SetTemplateParameters(cloneMessage(oldSpec).GetTemplateParameters())
 		}
 	}
-
-	if updatingCatalogItem && refKey(existingSpec.GetCatalogItem()) != refKey(newSpec.GetCatalogItem()) {
-		return grpcstatus.Errorf(
-			grpccodes.InvalidArgument,
-			"cannot change spec.catalog_item from '%s' to '%s': catalog item is immutable",
-			refKey(existingSpec.GetCatalogItem()),
-			refKey(newSpec.GetCatalogItem()),
-		)
+	if updateIncludesField(mask, "spec.template") && refKey(oldSpec.GetTemplate()) != refKey(newSpec.GetTemplate()) {
+		return grpcstatus.Errorf(grpccodes.InvalidArgument, "cannot change spec.template from '%s' to '%s': template is immutable", refKey(oldSpec.GetTemplate()), refKey(newSpec.GetTemplate()))
+	}
+	if updateIncludesField(mask, "spec.template_parameters") && !maps.EqualFunc(oldSpec.GetTemplateParameters(), newSpec.GetTemplateParameters(), func(a, b *anypb.Any) bool { return proto.Equal(a, b) }) { //nolint:govet // inline: type parameter inference is not supported yet
+		return grpcstatus.Error(grpccodes.InvalidArgument, "cannot change spec.template_parameters: template parameters are immutable")
+	}
+	if updateIncludesField(mask, "spec.catalog_item") {
+		ref, err := preserveCatalogItemProvenance(oldSpec.GetCatalogItem(), newSpec.GetCatalogItem(), mask)
+		if err != nil {
+			return err
+		}
+		if newSpec != nil {
+			newSpec.SetCatalogItem(ref)
+		}
 	}
 
 	return nil
 }
 
-// validateVersionUpdate ensures version stays valid on update. Absent
-// version is normalized to the existing value (cannot be cleared once set).
-// Changed values are validated the same way as Create via ensureClusterVersion.
-func (s *PrivateClustersServer) validateVersionUpdate(ctx context.Context,
-	request *privatev1.ClustersUpdateRequest) error {
-	if !updateIncludesField(request.GetUpdateMask(), "spec.version") {
+// validateAddOnOperatorImmutability validates and preserves the canonical operator references during updates.
+func (s *PrivateClustersServer) validateAddOnOperatorImmutability(
+	current, candidate *privatev1.Cluster, mask *fieldmaskpb.FieldMask,
+) error {
+	currentOperators := current.GetSpec().GetAddOnOperators()
+	candidateOperators := candidate.GetSpec().GetAddOnOperators()
+	cloneCurrent := func() []*privatev1.AddOnOperatorReference {
+		result := make([]*privatev1.AddOnOperatorReference, len(currentOperators))
+		for i, ref := range currentOperators {
+			result[i] = cloneMessage(ref)
+		}
+		return result
+	}
+
+	if !updateIncludesField(mask, "spec.add_on_operators") || (mask == nil && len(candidateOperators) == 0) {
+		candidate.GetSpec().SetAddOnOperators(cloneCurrent())
 		return nil
 	}
-	newSpec := request.GetObject().GetSpec()
-	if newSpec == nil {
+	if len(currentOperators) != len(candidateOperators) {
+		return grpcstatus.Errorf(
+			grpccodes.InvalidArgument,
+			"cannot change spec.add_on_operators: add-on operators are immutable",
+		)
+	}
+
+	for i, ref := range candidateOperators {
+		stored := currentOperators[i]
+		if err := validateImmutableReferenceIdentity(
+			stored, ref, fmt.Sprintf("spec.add_on_operators[%d]", i), "add-on operators", true,
+		); err != nil {
+			return err
+		}
+	}
+	candidate.GetSpec().SetAddOnOperators(cloneCurrent())
+	return nil
+}
+
+// validateClusterNetworkAttachmentImmutability rejects changes to the complete
+// network attachment after applying the update mask.
+func validateClusterNetworkAttachmentImmutability(current, candidate *privatev1.Cluster,
+	updateMask *fieldmaskpb.FieldMask) error {
+	if !updateIncludesField(updateMask, "spec.network_attachment") {
 		return nil
 	}
-	existing, found, err := s.getExistingCluster(ctx, request)
-	if err != nil || !found {
-		return err
-	}
-	newRef := newSpec.GetVersion()
-	existingRef := existing.GetSpec().GetVersion()
-	if newRef == nil || newRef.GetName() == "" {
-		if existingRef != nil {
-			newSpec.SetVersion(existingRef)
+	// The create resolves the attachment, so a maskless update that omits it keeps the stored one.
+	if updateMask == nil && !candidate.GetSpec().HasNetworkAttachment() {
+		if candidate.HasSpec() && current.GetSpec().HasNetworkAttachment() {
+			candidate.GetSpec().SetNetworkAttachment(cloneMessage(current.GetSpec().GetNetworkAttachment()))
 		}
 		return nil
 	}
-	if existingRef != nil && newRef.GetName() == existingRef.GetName() {
-		return nil
-	}
-	return s.ensureClusterVersion(ctx, request.GetObject())
-}
-
-// validateNetworkAttachmentImmutability ensures that the subnet field within
-// network_attachment cannot be changed after cluster creation.
-func (s *PrivateClustersServer) validateNetworkAttachmentImmutability(ctx context.Context,
-	request *privatev1.ClustersUpdateRequest) error {
-	updateMask := request.GetUpdateMask()
-
-	if !updateIncludesField(updateMask, "spec.network_attachment.subnet") {
-		return nil
-	}
-
-	existingCluster, found, err := s.getExistingCluster(ctx, request)
-	if err != nil {
-		return err
-	}
-	if !found {
-		return nil
-	}
-
-	existingSubnet := existingCluster.GetSpec().GetNetworkAttachment().GetSubnet()
-	newSubnet := request.GetObject().GetSpec().GetNetworkAttachment().GetSubnet()
+	existingAttachment := current.GetSpec().GetNetworkAttachment()
+	newAttachment := candidate.GetSpec().GetNetworkAttachment()
+	existingSubnet := existingAttachment.GetSubnet()
+	newSubnet := newAttachment.GetSubnet()
 
 	if refKey(existingSubnet) != refKey(newSubnet) {
 		return grpcstatus.Errorf(
@@ -1001,6 +1103,13 @@ func (s *PrivateClustersServer) validateNetworkAttachmentImmutability(ctx contex
 			"cannot change spec.network_attachment.subnet from '%s' to '%s': subnet is immutable",
 			refKey(existingSubnet), refKey(newSubnet),
 		)
+	}
+	if err := validateImmutableSecurityGroups(
+		existingAttachment.GetSecurityGroups(),
+		newAttachment.GetSecurityGroups(),
+		"spec.network_attachment.security_groups",
+	); err != nil {
+		return err
 	}
 
 	return nil
@@ -1024,15 +1133,27 @@ func (s *PrivateClustersServer) injectDefaultNetworkAttachment(ctx context.Conte
 		s.logger.ErrorContext(ctx, "failed to determine target tenant", slog.Any("error", err))
 		return grpcstatus.Errorf(grpccodes.Internal, "failed to determine target tenant")
 	}
+	tenants, err := s.tenantsDao.List().SetFilter(fmt.Sprintf("this.id == %q", tenant)).SetLimit(1).Do(ctx)
+	if err != nil {
+		s.logger.ErrorContext(ctx, "failed to check target tenant", slog.Any("error", err))
+		return grpcstatus.Errorf(grpccodes.Internal, "failed to check target tenant")
+	}
+	if len(tenants.GetItems()) == 0 {
+		return grpcstatus.Errorf(grpccodes.InvalidArgument, "tenant '%s' doesn't exist", tenant)
+	}
 
 	spec := cluster.GetSpec()
-	subnet, err := findDefaultSubnet(ctx, s.logger, s.subnetsDao, tenant)
+	subnet, err := findDefaultSubnet(ctx, s.logger, s.subnetsDao, tenant, cluster.GetMetadata().GetProject())
 	if err != nil {
 		s.logger.ErrorContext(ctx, "failed to look up default subnet", slog.Any("error", err))
 		return grpcstatus.Errorf(grpccodes.Internal, "failed to look up default subnet")
 	}
 	if subnet == nil {
-		return nil
+		return grpcstatus.Error(grpccodes.InvalidArgument,
+			"spec.network_attachment.subnet: a default subnet is required when no subnet is provided")
+	}
+	if err := validateResolvedSubnetReady(subnet, subnet.GetId(), " in spec.network_attachment"); err != nil {
+		return err
 	}
 
 	attachment := privatev1.ClusterNetworkAttachment_builder{
@@ -1040,24 +1161,30 @@ func (s *PrivateClustersServer) injectDefaultNetworkAttachment(ctx context.Conte
 	}.Build()
 
 	virtualNetworkID := refKey(subnet.GetSpec().GetVirtualNetwork())
-	sg, err := findDefaultSecurityGroup(ctx, s.logger, s.securityGroupsDao, virtualNetworkID, tenant)
+	sg, err := findDefaultSecurityGroup(ctx, s.logger, s.securityGroupsDao, virtualNetworkID, tenant, cluster.GetMetadata().GetProject())
 	if err != nil {
 		s.logger.ErrorContext(ctx, "failed to look up default security group", slog.Any("error", err))
 		return grpcstatus.Errorf(grpccodes.Internal, "failed to look up default security group")
 	}
-	if sg != nil {
-		attachment.SetSecurityGroups([]*privatev1.SecurityGroupLocalReference{
-			privatev1.SecurityGroupLocalReference_builder{Id: sg.GetId()}.Build(),
-		})
+	if sg == nil {
+		return grpcstatus.Error(grpccodes.InvalidArgument,
+			"spec.network_attachment.security_groups: a default security group is required when no security groups are provided")
 	}
+	if err := validateResolvedSecurityGroup(sg, sg.GetId(), " in spec.network_attachment.security_groups[0]", virtualNetworkID); err != nil {
+		return err
+	}
+	if err := requireDefaultNetworkingReady(ctx, s.tenantsDao, tenant); err != nil {
+		return err
+	}
+	attachment.SetSecurityGroups([]*privatev1.SecurityGroupLocalReference{
+		privatev1.SecurityGroupLocalReference_builder{Id: sg.GetId()}.Build(),
+	})
 
 	spec.SetNetworkAttachment(attachment)
 
 	attrs := []slog.Attr{
 		slog.String("subnet_id", subnet.GetId()),
-	}
-	if sg != nil {
-		attrs = append(attrs, slog.String("security_group_id", sg.GetId()))
+		slog.String("security_group_id", sg.GetId()),
 	}
 	s.logger.LogAttrs(ctx, slog.LevelInfo, "auto-injected default network attachment", attrs...)
 	return nil
@@ -1082,27 +1209,23 @@ func (s *PrivateClustersServer) validateNetworkAttachmentState(ctx context.Conte
 			"spec.network_attachment.subnet is required")
 	}
 
-	getResponse, getErr := s.subnetsDao.Get().SetId(subnetKey).Do(ctx)
-	if getErr != nil {
-		var notFoundErr *dao.ErrNotFound
-		if errors.As(getErr, &notFoundErr) {
+	subnet, err := resolveNetworkingReference(ctx, s.subnetsDao, cluster.GetMetadata(), subnetRef,
+		"subnet", grpccodes.NotFound, true)
+	if err != nil {
+		if grpcstatus.Code(err) == grpccodes.NotFound {
 			return grpcstatus.Errorf(grpccodes.InvalidArgument,
 				"spec.network_attachment: subnet '%s' does not exist", subnetKey)
 		}
-		s.logger.ErrorContext(ctx, "failed to query subnet",
-			slog.String("subnet_key", subnetKey), slog.Any("error", getErr))
-		return grpcstatus.Errorf(grpccodes.Internal, "failed to validate subnet")
+		return err
 	}
-	subnet := getResponse.GetObject()
-	if subnet == nil {
-		return grpcstatus.Errorf(grpccodes.InvalidArgument,
-			"spec.network_attachment: subnet '%s' does not exist", subnetKey)
+	if err := validateResolvedSubnetReady(subnet, subnetKey, " in spec.network_attachment"); err != nil {
+		return err
 	}
-	if subnet.GetStatus().GetState() != privatev1.SubnetState_SUBNET_STATE_READY {
-		return grpcstatus.Errorf(grpccodes.FailedPrecondition,
-			"spec.network_attachment: subnet '%s' is not in READY state (current state: %s)",
-			subnetKey, subnet.GetStatus().GetState().String())
-	}
+	hubReferences := []networkingHubReference{{
+		resourceType: "Subnet",
+		id:           subnet.GetId(),
+		hubID:        subnet.GetStatus().GetHub(),
+	}}
 
 	virtualNetworkID := refKey(subnet.GetSpec().GetVirtualNetwork())
 	if virtualNetworkID == "" {
@@ -1110,6 +1233,7 @@ func (s *PrivateClustersServer) validateNetworkAttachmentState(ctx context.Conte
 			"spec.network_attachment: subnet '%s' has no virtual network reference", subnetKey)
 	}
 
+	// Use the subnet's VirtualNetwork as the expected owner for every SecurityGroup.
 	for i, sgRef := range att.GetSecurityGroups() {
 		sgKey := refKey(sgRef)
 		if sgKey == "" {
@@ -1117,40 +1241,31 @@ func (s *PrivateClustersServer) validateNetworkAttachmentState(ctx context.Conte
 				"spec.network_attachment.security_groups[%d]: reference is empty", i)
 		}
 
-		sgResponse, getErr := s.securityGroupsDao.Get().SetId(sgKey).Do(ctx)
-		if getErr != nil {
-			var notFoundErr *dao.ErrNotFound
-			if errors.As(getErr, &notFoundErr) {
+		sg, err := resolveNetworkingReference(ctx, s.securityGroupsDao, cluster.GetMetadata(), sgRef,
+			"security group", grpccodes.NotFound, true)
+		if err != nil {
+			if grpcstatus.Code(err) == grpccodes.NotFound {
 				return grpcstatus.Errorf(grpccodes.InvalidArgument,
-					"spec.network_attachment.security_groups[%d]: security group '%s' does not exist",
-					i, sgKey)
+					"spec.network_attachment.security_groups[%d]: security group '%s' does not exist", i, sgKey)
 			}
-			s.logger.ErrorContext(ctx, "failed to query security group",
-				slog.String("security_group_key", sgKey), slog.Any("error", getErr))
-			return grpcstatus.Errorf(grpccodes.Internal, "failed to validate security group")
+			return err
 		}
-		sg := sgResponse.GetObject()
-		if sg == nil {
-			return grpcstatus.Errorf(grpccodes.InvalidArgument,
-				"spec.network_attachment.security_groups[%d]: security group '%s' does not exist",
-				i, sgKey)
+		if err := validateResolvedSecurityGroup(sg, sgKey,
+			fmt.Sprintf(" in spec.network_attachment.security_groups[%d]", i), virtualNetworkID); err != nil {
+			return err
 		}
-		if sg.GetStatus().GetState() != privatev1.SecurityGroupState_SECURITY_GROUP_STATE_READY {
-			return grpcstatus.Errorf(grpccodes.FailedPrecondition,
-				"spec.network_attachment.security_groups[%d]: security group '%s' is not in READY state (current state: %s)",
-				i, sgKey, sg.GetStatus().GetState().String())
-		}
-
-		sgVirtualNetworkID := refKey(sg.GetSpec().GetVirtualNetwork())
-		if sgVirtualNetworkID != virtualNetworkID {
-			return grpcstatus.Errorf(grpccodes.InvalidArgument,
-				"spec.network_attachment.security_groups[%d]: security group '%s' belongs to VirtualNetwork '%s', "+
-					"but subnet '%s' belongs to VirtualNetwork '%s'",
-				i, sgKey, sgVirtualNetworkID, subnetKey, virtualNetworkID)
-		}
+		hubReferences = append(hubReferences, networkingHubReference{
+			resourceType: "SecurityGroup",
+			id:           sg.GetId(),
+			hubID:        sg.GetStatus().GetHub(),
+		})
 	}
 
-	return nil
+	canonicalHubID, err := canonicalNetworkingHubID(ctx, s.logger, s.networkClassesDao)
+	if err != nil {
+		return err
+	}
+	return validateNetworkingHubReferences(canonicalHubID, hubReferences...)
 }
 
 // validateAutoExternalIPImmutability prevents changing auto_external_ip_attachment after creation.
@@ -1178,41 +1293,43 @@ func (s *PrivateClustersServer) validateAutoExternalIPImmutability(ctx context.C
 }
 
 // resolveFabricInterfaces populates fabric_interface on each node set by
-// looking up the HostType and selecting the first interface with role "fabric".
-func (s *PrivateClustersServer) resolveFabricInterfaces(ctx context.Context, spec *privatev1.ClusterSpec) error {
-	for name, nodeSet := range spec.GetNodeSets() {
-		hostTypeKey := refKey(nodeSet.GetHostType())
-		if hostTypeKey == "" {
+// loading its BareMetalInstanceType by the already-resolved ID and selecting the first interface with role "fabric".
+func (s *PrivateClustersServer) resolveFabricInterfaces(ctx context.Context, cluster *privatev1.Cluster) error {
+	for name, nodeSet := range cluster.GetSpec().GetNodeSets() {
+		if refKey(nodeSet.GetBaremetalInstanceType()) == "" {
 			continue
 		}
-		hostType, err := s.lookupHostType(ctx, hostTypeKey)
+		ref := nodeSet.GetBaremetalInstanceType()
+		kind := "node_sets." + name + ".baremetal_instance_type"
+		bmit, err := getReferenceResource(ctx, s.bareMetalInstanceTypesDao, ref.GetId())
 		if err != nil {
+			return resourceLookupError(err, kind, ref.GetId(), "", grpccodes.InvalidArgument)
+		}
+		if err := validateResourceNotDeleted(kind, refKey(ref), "", bmit.GetMetadata()); err != nil {
 			return err
 		}
-		if hostType == nil {
-			continue
-		}
-		fabricInterface := ""
-		for _, ni := range hostType.GetInterfaces() {
-			if strings.EqualFold(ni.GetRole(), "fabric") {
-				fabricInterface = ni.GetName()
-				break
-			}
-		}
-		if fabricInterface == "" {
-			return grpcstatus.Errorf(grpccodes.FailedPrecondition,
-				"node_sets[%s]: host type '%s' has no interface with role 'fabric'",
-				name, hostTypeKey)
+		fabricInterface, err := selectClusterFabricInterface(bmit)
+		if err != nil {
+			return grpcstatus.Errorf(grpccodes.FailedPrecondition, "node_sets[%s]: %s", name, err)
 		}
 		nodeSet.SetFabricInterface(fabricInterface)
 	}
 	return nil
 }
 
-// autoProvisionExternalIPs creates two ExternalIPs and two ExternalIPAttachments
-// (one for API, one for ingress) from the best available pool.
+func selectClusterFabricInterface(instanceType *privatev1.BareMetalInstanceType) (string, error) {
+	for _, port := range instanceType.GetSpec().GetHardware().GetNetworkPorts() {
+		if strings.EqualFold(port.GetRole(), "fabric") {
+			return port.GetName(), nil
+		}
+	}
+	return "", fmt.Errorf("bare metal instance type '%s' has no network port with role 'fabric'", instanceType.GetId())
+}
+
+// autoProvisionExternalIPs creates the API and ingress ExternalIPs. The ClusterOrder
+// reconciler requests their ExternalIPAttachments once the cluster endpoints are ready.
 func (s *PrivateClustersServer) autoProvisionExternalIPs(ctx context.Context, cluster *privatev1.Cluster) error {
-	pool, err := SelectExternalIPPool(ctx, s.externalIPPoolDao, privatev1.IPFamily_IP_FAMILY_UNSPECIFIED)
+	pool, err := SelectExternalIPPool(ctx, s.logger, s.externalIPPoolDao, 2)
 	if err != nil {
 		return grpcstatus.Errorf(grpccodes.FailedPrecondition, "auto_external_ip_attachment: %s", err)
 	}
@@ -1225,23 +1342,31 @@ func (s *PrivateClustersServer) autoProvisionExternalIPs(ctx context.Context, cl
 	tenant := cluster.GetMetadata().GetTenant()
 	clusterID := cluster.GetId()
 
-	endpoints := []privatev1.ExternalIPAttachmentEndpoint{
-		privatev1.ExternalIPAttachmentEndpoint_EXTERNAL_IP_ATTACHMENT_ENDPOINT_API,
-		privatev1.ExternalIPAttachmentEndpoint_EXTERNAL_IP_ATTACHMENT_ENDPOINT_INGRESS,
+	endpoints := []struct {
+		endpoint privatev1.ExternalIPAttachmentEndpoint
+		name     string
+	}{
+		{endpoint: privatev1.ExternalIPAttachmentEndpoint_EXTERNAL_IP_ATTACHMENT_ENDPOINT_API, name: "api"},
+		{endpoint: privatev1.ExternalIPAttachmentEndpoint_EXTERNAL_IP_ATTACHMENT_ENDPOINT_INGRESS, name: "ingress"},
 	}
 
 	for _, endpoint := range endpoints {
+		eipLabels := map[string]string{
+			autoCreatedLabel:         "true",
+			autoCreatedForLabel:      clusterID,
+			autoCreatedEndpointLabel: endpoint.name,
+			autoCreatedKindLabel:     "cluster",
+		}
 		eip := privatev1.ExternalIP_builder{
 			Metadata: privatev1.Metadata_builder{
+				Name:   fmt.Sprintf("auto-eip-%s-%s", clusterID, endpoint.name),
 				Tenant: tenant,
-				Labels: map[string]string{
-					autoCreatedLabel:    "true",
-					autoCreatedForLabel: clusterID,
-				},
+				Labels: eipLabels,
 				Annotations: map[string]string{
+					tenantAnnotation:         tenant,
 					ownerReferenceAnnotation: clusterID,
 				},
-				Creator: "system",
+				Creator: systemCreator,
 			}.Build(),
 			Spec: privatev1.ExternalIPSpec_builder{
 				Pool: privatev1.ExternalIPPoolReference_builder{Id: pool.GetId()}.Build(),
@@ -1251,43 +1376,9 @@ func (s *PrivateClustersServer) autoProvisionExternalIPs(ctx context.Context, cl
 			}.Build(),
 		}.Build()
 
-		eipResp, err := s.externalIPDao.Create().SetObject(eip).Do(ctx)
+		_, err = s.externalIPDao.Create().SetObject(eip).Do(ctx)
 		if err != nil {
 			return fmt.Errorf("auto_external_ip_attachment: failed to create ExternalIP: %w", err)
-		}
-		eipID := eipResp.GetObject().GetId()
-
-		attachment := privatev1.ExternalIPAttachment_builder{
-			Metadata: privatev1.Metadata_builder{
-				Tenant: tenant,
-				Labels: map[string]string{
-					autoCreatedLabel:    "true",
-					autoCreatedForLabel: clusterID,
-				},
-				Annotations: map[string]string{
-					ownerReferenceAnnotation: clusterID,
-				},
-				Creator: "system",
-			}.Build(),
-			Spec: privatev1.ExternalIPAttachmentSpec_builder{
-				ExternalIp:     privatev1.ExternalIPLocalReference_builder{Id: eipID}.Build(),
-				Cluster:        privatev1.ClusterLocalReference_builder{Id: clusterID}.Build(),
-				TargetEndpoint: endpoint,
-			}.Build(),
-			Status: privatev1.ExternalIPAttachmentStatus_builder{
-				State: privatev1.ExternalIPAttachmentState_EXTERNAL_IP_ATTACHMENT_STATE_PENDING,
-			}.Build(),
-		}.Build()
-
-		_, err = s.externalIPAttachmentDao.Create().SetObject(attachment).Do(ctx)
-		if err != nil {
-			return fmt.Errorf("auto_external_ip_attachment: failed to create ExternalIPAttachment: %w", err)
-		}
-
-		eipResp.GetObject().GetStatus().SetAttached(true)
-		_, err = s.externalIPDao.Update().SetObject(eipResp.GetObject()).Do(ctx)
-		if err != nil {
-			return fmt.Errorf("auto_external_ip_attachment: failed to update ExternalIP attached flag: %w", err)
 		}
 	}
 
@@ -1296,31 +1387,25 @@ func (s *PrivateClustersServer) autoProvisionExternalIPs(ctx context.Context, cl
 		return grpcstatus.Errorf(grpccodes.FailedPrecondition, "auto_external_ip_attachment: %s", err)
 	}
 
-	s.logger.InfoContext(ctx, "auto-provisioned external IP attachments for cluster",
+	s.logger.InfoContext(ctx, "auto-provisioned external IPs for cluster",
 		slog.String("cluster_id", clusterID),
 		slog.String("pool_id", pool.GetId()),
 	)
 	return nil
 }
 
-func (s *PrivateClustersServer) validateAndTransformCluster(ctx context.Context, cluster *privatev1.Cluster) error {
-	// Check that the template is specified and that refers to a existing template. If the reference was a name
-	// then we replace it with the identifier.
-	if cluster == nil {
-		return grpcstatus.Errorf(grpccodes.InvalidArgument, "object is mandatory")
-	}
-	templateRef := cluster.GetSpec().GetTemplate()
-	if templateRef == nil {
-		return grpcstatus.Errorf(grpccodes.InvalidArgument, "template is mandatory")
-	}
-	templateRefStr := refKey(templateRef)
-	template, err := s.lookupTemplate(ctx, templateRefStr)
+func (s *PrivateClustersServer) applyClusterTemplate(
+	ctx context.Context,
+	cluster *privatev1.Cluster,
+	template *privatev1.ClusterTemplate,
+) (*privatev1.ClusterVersion, error) {
+	actualClusterParameters, err := utils.ApplyTemplateParameterDefaultsAndValidate(
+		utils.ClusterTemplateAdapter{ClusterTemplate: template}, cluster.GetSpec().GetTemplateParameters(),
+	)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	if template.GetMetadata().HasDeletionTimestamp() {
-		return grpcstatus.Errorf(grpccodes.InvalidArgument, "template '%s' has been deleted", templateRefStr)
-	}
+	cluster.GetSpec().SetTemplateParameters(actualClusterParameters)
 
 	// Only a pull secret inherited from a shared template may cross the tenant boundary. Direct
 	// shared SecretLocalReference values on tenant clusters stay local.
@@ -1329,358 +1414,100 @@ func (s *PrivateClustersServer) validateAndTransformCluster(ctx context.Context,
 		template.GetSpecDefaults().GetPullSecretSecret() != nil
 
 	// Apply spec defaults from the template (user values take precedence):
+	inheritVersion := cluster.GetSpec().GetVersion() == nil
 	utils.ApplyClusterSpecDefaults(cluster.GetSpec(), template.GetSpecDefaults())
-
-	// Validate pull_secret_secret reference exists:
-	if err = s.validatePullSecretSecret(ctx, cluster.GetSpec(), inheritsPullSecretSecret); err != nil {
-		return err
+	if inheritVersion && cluster.GetSpec().GetVersion() != nil {
+		inheritReferenceScope(cluster.GetSpec().GetVersion(), template.GetMetadata())
 	}
 
-	if err = s.ensureClusterVersion(ctx, cluster); err != nil {
-		return err
+	// Validate pull_secret_secret reference exists:
+	if err := s.validatePullSecretSecret(ctx, cluster, inheritsPullSecretSecret); err != nil {
+		return nil, err
+	}
+
+	clusterVersion, err := s.ensureClusterVersion(ctx, cluster)
+	if err != nil {
+		return nil, err
 	}
 
 	// Validate cluster spec fields (CIDR format, etc.) after defaults have been applied:
-	if err = utils.ValidateClusterSpecFields(cluster.GetSpec()); err != nil {
-		return err
+	if err := utils.ValidateClusterSpecFields(cluster.GetSpec()); err != nil {
+		return nil, err
 	}
 
-	// Check that the host types given in the cluster and the template exist, and index them by identifier and
-	// name, so that it will be easier to look them up later.
-	hostTypes, err := s.lookupAndIndexHostTypes(ctx, template)
-	if err != nil {
-		return err
+	if err := s.resolveClusterNodeSets(ctx, cluster); err != nil {
+		return nil, err
 	}
 
-	// Validate node sets against the template:
-	templateNodeSets := template.GetNodeSets()
-	clusterNodeSets := cluster.GetSpec().GetNodeSets()
-	if err = s.validateNodeSets(clusterNodeSets, templateNodeSets, hostTypes, templateRefStr); err != nil {
-		return err
-	}
+	// Store the template reference with both ID and name. NodeSet hardware references
+	// already have their IDs and names from the interceptor or Catalog Item authoring.
+	cluster.GetSpec().SetTemplate(canonicalClusterTemplateReference(template))
 
-	// Replace the node sets given in the cluster with those from the template, taking only the size from cluster:
-	mergeNodeSetsWithTemplate(cluster, templateNodeSets, clusterNodeSets)
-
-	// Validate template parameters:
-	clusterParameters := cluster.GetSpec().GetTemplateParameters()
-	err = utils.ValidateClusterTemplateParameters(template, clusterParameters)
-	if err != nil {
-		return err
-	}
-
-	// Set default values for template parameters:
-	actualClusterParameters := utils.ProcessTemplateParametersWithDefaults(
-		utils.ClusterTemplateAdapter{ClusterTemplate: template},
-		clusterParameters,
-	)
-	cluster.GetSpec().SetTemplateParameters(actualClusterParameters)
-
-	// Make sure that the template and the host types of the node sets are referenced by their identifiers and
-	// names, as that is what we want to save to the database. Both fields are needed: id for lookups, name for
-	// display and billing dimensions (metering reads the name).
-	resolvedTemplateRef := &privatev1.ClusterTemplateReference{}
-	resolvedTemplateRef.SetId(template.GetId())
-	resolvedTemplateRef.SetName(template.GetMetadata().GetName())
-	cluster.GetSpec().SetTemplate(resolvedTemplateRef)
-	for _, clusterNodeSet := range cluster.GetSpec().GetNodeSets() {
-		hostType := hostTypes[refKey(clusterNodeSet.GetHostType())]
-		if hostType != nil {
-			resolvedHostTypeRef := &privatev1.HostTypeReference{}
-			resolvedHostTypeRef.SetId(hostType.GetId())
-			resolvedHostTypeRef.SetName(hostType.GetMetadata().GetName())
-			clusterNodeSet.SetHostType(resolvedHostTypeRef)
-		}
-	}
-
-	return nil
+	return clusterVersion, nil
 }
 
-// lookupAndIndexHostTypes fetches host types referenced by the template's node sets and indexes them
-// by both identifier and name.
-func (s *PrivateClustersServer) lookupAndIndexHostTypes(
-	ctx context.Context, template *privatev1.ClusterTemplate,
-) (map[string]*privatev1.HostType, error) {
-	hostTypes := map[string]*privatev1.HostType{}
-	for _, nodeSet := range template.GetNodeSets() {
-		hostTypeRef := nodeSet.GetHostType()
-		if hostTypeRef == nil {
-			continue
-		}
-		hostType, err := s.lookupHostType(ctx, refKey(hostTypeRef))
+// resolveClusterNodeSets validates the effective Cluster NodeSets after Catalog Item
+// policies have been applied. References are already resolved by the interceptor or
+// Catalog Item authoring; only the hardware types' current deletion state is checked here.
+func (s *PrivateClustersServer) resolveClusterNodeSets(ctx context.Context, cluster *privatev1.Cluster) error {
+	if err := validateClusterNodeSetMap(cluster.GetSpec().GetNodeSets()); err != nil {
+		return grpcstatus.Errorf(grpccodes.InvalidArgument, "node_sets: %s", err)
+	}
+	for name, nodeSet := range cluster.GetSpec().GetNodeSets() {
+		ref := nodeSet.GetBaremetalInstanceType()
+		kind := "node_sets." + name + ".baremetal_instance_type"
+		resolved, err := getReferenceResource(ctx, s.bareMetalInstanceTypesDao, ref.GetId())
 		if err != nil {
-			return nil, err
+			return resourceLookupError(err, kind, ref.GetId(), "", grpccodes.InvalidArgument)
 		}
-		hostTypeName := hostType.GetMetadata().GetName()
-		if hostTypeName != "" {
-			hostTypes[hostTypeName] = hostType
-		}
-		hostTypeId := hostType.GetId()
-		hostTypes[hostTypeId] = hostType
-	}
-	return hostTypes, nil
-}
-
-// validateNodeSets checks membership, host-type consistency, and positive size for cluster node sets.
-func (s *PrivateClustersServer) validateNodeSets(
-	clusterNodeSets map[string]*privatev1.ClusterNodeSet,
-	templateNodeSets map[string]*privatev1.ClusterTemplateNodeSet,
-	hostTypes map[string]*privatev1.HostType,
-	templateRef string,
-) error {
-	// Check that all the node sets given in the cluster correspond to node sets that exist in the template:
-	for clusterNodeSetKey := range clusterNodeSets {
-		templateNodeSet := templateNodeSets[clusterNodeSetKey]
-		if templateNodeSet == nil {
-			templateNodeSetKeys := maps.Keys(templateNodeSets)
-			sort.Strings(templateNodeSetKeys)
-			for i, templateNodeSetKey := range templateNodeSetKeys {
-				templateNodeSetKeys[i] = fmt.Sprintf("'%s'", templateNodeSetKey)
-			}
-			return grpcstatus.Errorf(
-				grpccodes.InvalidArgument,
-				"node set '%s' doesn't exist, valid values for template '%s' are %s",
-				clusterNodeSetKey, templateRef, english.WordSeries(templateNodeSetKeys, "and"),
-			)
+		if err := validateResourceNotDeleted(kind, refKey(ref), "", resolved.GetMetadata()); err != nil {
+			return err
 		}
 	}
-
-	// Check that all the node sets given in the cluster specify the same host type that is specified in the
-	// template:
-	for clusterNodeSetKey, clusterNodeSet := range clusterNodeSets {
-		clusterHostTypeRef := clusterNodeSet.GetHostType()
-		clusterHostTypeKey := refKey(clusterHostTypeRef)
-		if clusterHostTypeKey == "" {
-			continue
-		}
-		templateNodeSet := templateNodeSets[clusterNodeSetKey]
-		templateHostTypeRef := templateNodeSet.GetHostType()
-		templateHostType := hostTypes[refKey(templateHostTypeRef)]
-		templateHostTypeId := templateHostType.GetId()
-		templateHostTypeName := templateHostType.GetMetadata().GetName()
-		if templateHostTypeName != "" {
-			if clusterHostTypeKey != templateHostTypeId && clusterHostTypeKey != templateHostTypeName {
-				return grpcstatus.Errorf(
-					grpccodes.InvalidArgument,
-					"host type for node set '%s' should be empty, '%s' or '%s', like in template '%s', "+
-						"but it is '%s'",
-					clusterNodeSetKey,
-					templateHostTypeName,
-					templateHostTypeId,
-					templateRef,
-					clusterHostTypeKey,
-				)
-			}
-		} else {
-			if clusterHostTypeKey != templateHostTypeId {
-				return grpcstatus.Errorf(
-					grpccodes.InvalidArgument,
-					"host type for node set '%s' should be empty or '%s', like in template '%s', "+
-						"but it is '%s'",
-					clusterNodeSetKey,
-					templateHostTypeId,
-					templateRef,
-					clusterHostTypeKey,
-				)
-			}
-		}
-	}
-
-	// Check that all the node sets given in the cluster have a positive size:
-	for clusterNodeSetKey, clusterNodeSet := range clusterNodeSets {
-		if !clusterNodeSet.HasSize() {
-			return grpcstatus.Errorf(
-				grpccodes.InvalidArgument,
-				"size for node set '%s' is required",
-				clusterNodeSetKey,
-			)
-		}
-		clusterNodeSetSize := clusterNodeSet.GetSize()
-		if clusterNodeSetSize <= 0 {
-			return grpcstatus.Errorf(
-				grpccodes.InvalidArgument,
-				"size for node set '%s' should be greater than zero, but it is %d",
-				clusterNodeSetKey, clusterNodeSetSize,
-			)
-		}
-	}
-
 	return nil
 }
 
-// mergeNodeSetsWithTemplate replaces the cluster's node sets with template-derived sets, keeping only
-// the size from the cluster.
-func mergeNodeSetsWithTemplate(
-	cluster *privatev1.Cluster,
-	templateNodeSets map[string]*privatev1.ClusterTemplateNodeSet,
-	clusterNodeSets map[string]*privatev1.ClusterNodeSet,
-) {
-	actualNodeSets := map[string]*privatev1.ClusterNodeSet{}
-	for templateNodeSetKey, templateNodeSet := range templateNodeSets {
-		var actualNodeSetSize int32
-		clusterNodeSet := clusterNodeSets[templateNodeSetKey]
-		if clusterNodeSet != nil {
-			actualNodeSetSize = clusterNodeSet.GetSize()
-		} else {
-			actualNodeSetSize = templateNodeSet.GetSize()
-		}
-		actualNodeSets[templateNodeSetKey] = privatev1.ClusterNodeSet_builder{
-			HostType: templateNodeSet.GetHostType(),
-			Size:     proto.Int32(actualNodeSetSize),
-		}.Build()
-	}
-	cluster.GetSpec().SetNodeSets(actualNodeSets)
-}
-
-func (s *PrivateClustersServer) validateAndTransformCatalogItem(ctx context.Context, cluster *privatev1.Cluster) error {
+// resolveCatalogItem finds the Cluster's published Catalog Item in the selected tenant/project
+// or shared scope, then finds the item's Template under the item's ownership. It applies locked
+// and editable field and parameter rules and returns that Template for defaults.
+func (s *PrivateClustersServer) resolveCatalogItem(ctx context.Context,
+	cluster *privatev1.Cluster) (*privatev1.ClusterTemplate, error) {
 	if cluster == nil {
-		return grpcstatus.Errorf(grpccodes.InvalidArgument, "object is mandatory")
+		return nil, grpcstatus.Errorf(grpccodes.InvalidArgument, "object is mandatory")
 	}
 	catalogItemRef := cluster.GetSpec().GetCatalogItem()
 	if catalogItemRef == nil {
-		return grpcstatus.Errorf(grpccodes.InvalidArgument, "catalog_item is mandatory")
+		return nil, grpcstatus.Errorf(grpccodes.InvalidArgument, "catalog_item is mandatory")
 	}
 	catalogItemRefStr := refKey(catalogItemRef)
 
-	catalogItem, err := s.lookupCatalogItem(ctx, catalogItemRefStr)
+	catalogItem, err := resolveAndCanonicalizeLockedReference(ctx, s.catalogItemsDao, cluster.GetMetadata(), catalogItemRef, "catalog item", grpccodes.NotFound)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	if err := validateCatalogItemAccess(catalogItem, catalogItemRefStr); err != nil {
-		return err
+	if err := validateCatalogItemForCreation(catalogItem, catalogItemRefStr); err != nil {
+		return nil, err
 	}
 
 	templateRef := catalogItem.GetTemplate()
 	if templateRef == nil {
-		return grpcstatus.Errorf(grpccodes.InvalidArgument, "catalog item '%s' has no template", catalogItemRefStr)
+		return nil, grpcstatus.Errorf(grpccodes.InvalidArgument, "catalog item '%s' has no template", catalogItemRefStr)
 	}
-	cluster.GetSpec().SetTemplate(templateRef)
-
-	if err := applyFieldDefinitions(cluster.GetSpec(), catalogItem.GetFieldDefinitions()); err != nil {
-		return err
+	templateRef = cloneMessage(templateRef)
+	resolvedTemplate, resolveErr := resolveAndCanonicalizeLockedReference(ctx, s.templatesDao, catalogItem.GetMetadata(), templateRef, "template", grpccodes.InvalidArgument)
+	if resolveErr != nil {
+		return nil, resolveErr
 	}
 
-	// Look up the template to apply spec defaults, node sets, and parameter validation:
-	templateRefStr := refKey(templateRef)
-	template, err := s.lookupTemplate(ctx, templateRefStr)
+	if err := applyClusterCatalogItemPolicies(cluster.GetSpec(), catalogItem.GetFields()); err != nil {
+		return nil, grpcstatus.Errorf(grpccodes.InvalidArgument, "%s", err)
+	}
+
+	parameters, err := applyCatalogItemTemplateParameterPolicies(utils.ClusterTemplateAdapter{ClusterTemplate: resolvedTemplate}, catalogItem.GetTemplateParameters(), cluster.GetSpec().GetTemplateParameters())
 	if err != nil {
-		return err
+		return nil, err
 	}
-	if template.GetMetadata().HasDeletionTimestamp() {
-		return grpcstatus.Errorf(grpccodes.InvalidArgument, "template '%s' has been deleted", templateRefStr)
-	}
-
-	resolvedTemplateRef := &privatev1.ClusterTemplateReference{}
-	resolvedTemplateRef.SetId(template.GetId())
-	resolvedTemplateRef.SetName(template.GetMetadata().GetName())
-	cluster.GetSpec().SetTemplate(resolvedTemplateRef)
-
-	inheritsPullSecretSecret := cluster.GetSpec().GetPullSecretSecret() == nil &&
-		template.GetMetadata().GetTenant() == auth.SharedTenant &&
-		template.GetSpecDefaults().GetPullSecretSecret() != nil
-
-	// Apply spec defaults from the template (user and field_definition values take precedence):
-	utils.ApplyClusterSpecDefaults(cluster.GetSpec(), template.GetSpecDefaults())
-
-	if err := s.validatePullSecretSecret(ctx, cluster.GetSpec(), inheritsPullSecretSecret); err != nil {
-		return err
-	}
-
-	// Version resolution (catalog-item path):
-	// user input > field_definition default > template spec_defaults > system default.
-	if err := s.ensureClusterVersion(ctx, cluster); err != nil {
-		return err
-	}
-
-	if err := utils.ValidateClusterSpecFields(cluster.GetSpec()); err != nil {
-		return err
-	}
-
-	hostTypes, err := s.lookupAndIndexHostTypes(ctx, template)
-	if err != nil {
-		return err
-	}
-
-	templateNodeSets := template.GetNodeSets()
-	clusterNodeSets := cluster.GetSpec().GetNodeSets()
-	if err := s.validateNodeSets(clusterNodeSets, templateNodeSets, hostTypes, templateRefStr); err != nil {
-		return err
-	}
-
-	mergeNodeSetsWithTemplate(cluster, templateNodeSets, clusterNodeSets)
-
-	clusterParameters := cluster.GetSpec().GetTemplateParameters()
-	if err := utils.ValidateClusterTemplateParameters(template, clusterParameters); err != nil {
-		return err
-	}
-
-	actualClusterParameters := utils.ProcessTemplateParametersWithDefaults(
-		utils.ClusterTemplateAdapter{ClusterTemplate: template},
-		clusterParameters,
-	)
-	cluster.GetSpec().SetTemplateParameters(actualClusterParameters)
-
-	for _, clusterNodeSet := range cluster.GetSpec().GetNodeSets() {
-		hostType := hostTypes[refKey(clusterNodeSet.GetHostType())]
-		if hostType != nil {
-			resolvedHostTypeRef := &privatev1.HostTypeReference{}
-			resolvedHostTypeRef.SetId(hostType.GetId())
-			resolvedHostTypeRef.SetName(hostType.GetMetadata().GetName())
-			clusterNodeSet.SetHostType(resolvedHostTypeRef)
-		}
-	}
-
-	return nil
-}
-
-func (s *PrivateClustersServer) lookupCatalogItem(ctx context.Context,
-	key string) (result *privatev1.ClusterCatalogItem, err error) {
-	if key == "" {
-		return
-	}
-	response, err := s.catalogItemsDao.List().
-		SetFilter(fmt.Sprintf("this.id == %[1]s || this.metadata.name == %[1]s", strconv.Quote(key))).
-		SetLimit(1).
-		Do(ctx)
-	if err != nil {
-		var deniedErr *dao.ErrDenied
-		if errors.As(err, &deniedErr) {
-			err = grpcstatus.Errorf(grpccodes.PermissionDenied, "%s", deniedErr.Reason)
-			return
-		}
-		s.logger.ErrorContext(ctx, "Failed to lookup catalog item",
-			slog.String("key", key),
-			slog.Any("error", err))
-		err = grpcstatus.Errorf(grpccodes.Internal, "failed to lookup catalog item")
-		return
-	}
-	items := response.GetItems()
-	if len(items) == 0 {
-		err = grpcstatus.Errorf(grpccodes.NotFound,
-			"there is no catalog item with identifier or name '%s'", key)
-		return
-	}
-	result = items[0]
-	return
-}
-
-func (s *PrivateClustersServer) updateExternalIPAttachedFlag(ctx context.Context, externalIPID string, attached bool) error {
-	getResponse, err := s.externalIPDao.Get().
-		SetId(externalIPID).
-		SetLock(true).
-		Do(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to get ExternalIP for attached flag update: %w", err)
-	}
-
-	eip := getResponse.GetObject()
-	eip.GetStatus().SetAttached(attached)
-
-	_, err = s.externalIPDao.Update().SetObject(eip).Do(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to update ExternalIP attached flag: %w", err)
-	}
-
-	return nil
+	cluster.GetSpec().SetTemplateParameters(parameters)
+	return resolvedTemplate, nil
 }

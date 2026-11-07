@@ -44,6 +44,9 @@ Create or delete a server cluster with attached servers.
 - `server_cluster_template_id` — Server cluster template ID
 - `server_cluster_tags` — List of tags
 - `server_cluster_admin_id` / `server_cluster_admin_name` — Admin tenant
+- `server_cluster_backend_id` — Exact Netris ID for update or deletion; a missing ID on delete is already deleted and never falls back to a name
+- `server_cluster_vpc_id` — Required for name-based lookup in the OSAC FabricDomain path; lookup also matches site
+- `server_cluster_allow_name_only_lookup` — Explicit legacy opt-in when no VPC ID is known; ambiguous same-site matches fail
 
 **Output:** `server_cluster_id`, `server_cluster_vpc_id`, `server_cluster_vpc_name`
 
@@ -93,7 +96,8 @@ Create or delete a Netris VPC (Virtual Private Cloud / VRF).
 
 **Variables:**
 - `vpc_name` (required) — Name of the VPC
-- `vpc_tenant_id` (required for create) — Admin tenant ID
+- `vpc_tenant_id` — Admin tenant ID (required for create; scopes read lookups)
+- `vpc_id` (optional for read) — Restrict lookup to the exact VPC ID
 
 **Output:** `vpc_id`, `vpc_already_existed`
 
@@ -108,6 +112,7 @@ Create or delete a Netris V-Net (virtual network segment within a VPC).
 **Variables:**
 - `vnet_name` (required) — Name of the V-Net
 - `vnet_vpc_id` (required for create) — Parent VPC ID
+- `vnet_vpc_id` / `vnet_tenant_id` — Scope name lookups to the expected VPC and tenant
 - `vnet_site_id` (required for create) — Netris site ID
 - `vnet_tenant_id` — Owner tenant ID
 - `vnet_gateway` — Gateway CIDR (e.g. `10.0.1.1/24`), enables L3 routing
@@ -117,30 +122,6 @@ Create or delete a Netris V-Net (virtual network segment within a VPC).
 **Output:** `vnet_id`, `vnet_already_existed`
 
 **API:** `POST /api/v2/vnet` (create), `DELETE /api/v2/vnet/{id}` (delete). Uses `tenant` (singular object), `vlan` (integer).
-
-### acl
-
-Create or delete Netris ACL (Access Control List) firewall rules.
-
-**State variable:** `acl_state` (`present` | `absent`)
-
-**Variables:**
-- `acl_name` (required) — Name of the ACL rule
-- `acl_action` (default: `permit`) — `permit` or `deny`
-- `acl_proto` (default: `all`) — Protocol: `all`, `tcp`, `udp`, `icmp`, `ip`, `icmpv6`
-- `acl_vpc_id` (default: `1`) — VPC ID for the rule
-- `acl_src_prefix` — Source prefix in CIDR notation
-- `acl_dst_prefix` — Destination prefix in CIDR notation
-- `acl_src_port_from` / `acl_src_port_to` — Source port range
-- `acl_dst_port_from` / `acl_dst_port_to` — Destination port range
-- `acl_src_port_group` / `acl_dst_port_group` — Port group IDs (0 for none)
-- `acl_established` — Match established connections (0 or 1)
-- `acl_reverse` — Generate reverse rule (`yes` / `no`)
-- `acl_comment` — Comment
-
-**Output:** `acl_id`, `acl_already_existed`
-
-**API:** `POST /api/acl` (create, v1 API), `DELETE /api/acl` with `{"id": [<id>]}` (delete). Field names use snake_case: `proto`, `src_prefix`, `dst_prefix`, `src_port_from`, etc.
 
 ### ipam
 
@@ -163,10 +144,20 @@ Query, create, or delete Netris IPAM allocations and subnets.
 - `ipam_tenant_id` — Owner tenant ID
 - `ipam_vpc_id` — VPC to assign the subnet to
 
+Create reuses an existing subnet only when its name and CIDR match, plus each
+VPC/tenant ID supplied by the caller. Multiple exact matches fail as ambiguous.
+
 **Create output:** `ipam_subnet_id`, `ipam_alloc_id`, `ipam_already_existed`
+
+**Identity lookup variables:** `ipam_name`, `ipam_vpc_id`, and
+`ipam_tenant_id` (required), plus optional `ipam_cidr` and `ipam_parent_id`, for
+`tasks_from: find_subnet_by_identity`.
+The lookup sets `ipam_subnet_by_identity` to the exact match or `none`; multiple
+matches fail as ambiguous.
 
 **Delete variables:**
 - `ipam_name` (required) — Name of the IPAM subnet to delete (also deletes the `<name>-alloc` allocation)
+- `ipam_cidr`, `ipam_vpc_id`, `ipam_tenant_id`, `ipam_parent_id` — Optional identity constraints; multiple matches fail as ambiguous
 
 **API:** Create is two-step: `POST /api/v2/ipam/allocation` (parent), then `POST /api/v2/ipam/subnet` (child). Delete: `DELETE /api/v2/ipam/subnet/{id}`, then `DELETE /api/v2/ipam/allocation/{id}`.
 

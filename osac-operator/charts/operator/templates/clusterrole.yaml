@@ -23,8 +23,30 @@ rules:
   resources:
   - secrets
   verbs:
+  - create
   - get
   - list
+  - watch
+{{- if .Values.ignition.trustIngressCA }}
+# Only read the OpenShift-managed ingress trust bundle (no Secret access).
+- apiGroups:
+  - ""
+  resources:
+  - configmaps
+  resourceNames:
+  - default-ingress-cert
+  verbs:
+  - get
+{{- end }}
+- apiGroups:
+  - agent-install.openshift.io
+  resources:
+  - agents
+  verbs:
+  - get
+  - list
+  - patch
+  - update
   - watch
 - apiGroups:
   - ""
@@ -33,6 +55,22 @@ rules:
   verbs:
   - get
 - apiGroups:
+  - ""
+  resources:
+  - pods
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - cdi.kubevirt.io
+  resources:
+  - datavolumes
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
   - events.k8s.io
   resources:
   - events
@@ -40,26 +78,19 @@ rules:
   - create
   - patch
 - apiGroups:
-  - hypershift.openshift.io
+  - agent-install.openshift.io
   resources:
-  - hostedclusters
-  - nodepools
+  - agents
   verbs:
+  - delete
   - get
   - list
+  - patch
   - watch
-# hostedcontrolplanes: get only — storage controller reads the kubeconfig secret name,
-# no watch/list needed (looked up by name from the ClusterOrder).
 - apiGroups:
-  - hypershift.openshift.io
+  - agent-install.openshift.io
   resources:
-  - hostedcontrolplanes
-  verbs:
-  - get
-- apiGroups:
-  - k8s.ovn.org
-  resources:
-  - userdefinednetworks
+  - infraenvs
   verbs:
   - create
   - delete
@@ -67,6 +98,33 @@ rules:
   - list
   - patch
   - update
+  - watch
+- apiGroups:
+  - hypershift.openshift.io
+  resources:
+  - hostedclusters
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - hypershift.openshift.io
+  resources:
+  - nodepools
+  verbs:
+  - get
+  - list
+  - patch
+  - update
+  - watch
+# HostedControlPlane access is cached by the storage controller.
+- apiGroups:
+  - hypershift.openshift.io
+  resources:
+  - hostedcontrolplanes
+  verbs:
+  - get
+  - list
   - watch
 - apiGroups:
   - kubevirt.io
@@ -88,6 +146,7 @@ rules:
   - externalippools
   - externalips
   - natgateways
+  - networkattachments
   - securitygroups
   - subnets
   - tenants
@@ -104,6 +163,16 @@ rules:
 - apiGroups:
   - osac.openshift.io
   resources:
+  - fabricdomains
+  verbs:
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - osac.openshift.io
+  resources:
   - baremetalinstances/finalizers
   - clusterorders/finalizers
   - computeinstances/finalizers
@@ -111,11 +180,18 @@ rules:
   - externalippools/finalizers
   - externalips/finalizers
   - natgateways/finalizers
+  - networkattachments/finalizers
   - securitygroups/finalizers
   - subnets/finalizers
   - tenants/finalizers
   - virtualnetworks/finalizers
   - volumes/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - osac.openshift.io
+  resources:
+  - fabricdomains/finalizers
   verbs:
   - update
 - apiGroups:
@@ -128,6 +204,7 @@ rules:
   - externalippools/status
   - externalips/status
   - natgateways/status
+  - networkattachments/status
   - securitygroups/status
   - subnets/status
   - tenants/status
@@ -140,11 +217,35 @@ rules:
 - apiGroups:
   - osac.openshift.io
   resources:
+  - fabricdomains/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - osac.openshift.io
+  resources:
   - networkclasses
   verbs:
   - get
   - list
+  - patch
+  - update
   - watch
+- apiGroups:
+  - osac.openshift.io
+  resources:
+  - networkclasses/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - osac.openshift.io
+  resources:
+  - networkclasses/status
+  verbs:
+  - get
+  - patch
+  - update
 - apiGroups:
   - rbac.authorization.k8s.io
   resources:
@@ -165,3 +266,17 @@ rules:
   - get
   - list
   - watch
+- apiGroups:
+  - topolvm.io
+  resources:
+  - logicalvolumes
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - watch
+- nonResourceURLs:
+  - /metrics
+  verbs:
+  - get

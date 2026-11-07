@@ -24,8 +24,8 @@ import (
 	grpcstatus "google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
 
-	publicv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/public/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/uuid"
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
 
 var _ = Describe("Public secrets", Ordered, Label("secrets", "vault"), func() {
@@ -276,6 +276,34 @@ var _ = Describe("Public secrets", Ordered, Label("secrets", "vault"), func() {
 			status, ok = grpcstatus.FromError(err)
 			Expect(ok).To(BeTrue())
 			Expect(status.Code()).To(Equal(grpccodes.NotFound))
+		})
+	})
+
+	Describe("Shared tenant restrictions", func() {
+		It("rejects a platform administrator's shared SSH public-key Secret", func(ctx context.Context) {
+			name := fmt.Sprintf("shared-ssh-key-%s", uuid.New()[24:32])
+			client := publicv1.NewSecretsClient(tool.ExternalView().AdminConn())
+			response, err := client.Create(ctx, publicv1.SecretsCreateRequest_builder{
+				Object: publicv1.Secret_builder{
+					Metadata: publicv1.Metadata_builder{Name: name}.Build(),
+					Type:     publicv1.SecretType_SECRET_TYPE_SSH_PUBLIC_KEY,
+					Data: map[string][]byte{
+						"public_key": []byte("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIG8K1ZuSC7tmzxD5LJJXwkCfStVEjzXWYCFhJaLBxWAn test@example.com"),
+					},
+				}.Build(),
+			}.Build())
+			if err == nil {
+				_, deleteErr := client.Delete(ctx, publicv1.SecretsDeleteRequest_builder{
+					Id: response.GetObject().GetId(),
+				}.Build())
+				Expect(deleteErr).ToNot(HaveOccurred())
+			}
+			Expect(grpcstatus.Code(err)).To(Equal(grpccodes.InvalidArgument))
+
+			filter := fmt.Sprintf("this.metadata.name == '%s'", name)
+			list, err := client.List(ctx, publicv1.SecretsListRequest_builder{Filter: &filter}.Build())
+			Expect(err).ToNot(HaveOccurred())
+			Expect(list.GetItems()).To(BeEmpty())
 		})
 	})
 })

@@ -1,0 +1,198 @@
+/*
+Copyright (c) 2026 Red Hat, Inc.
+
+Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the
+License. You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on an
+"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific
+language governing permissions and limitations under the License.
+*/
+
+package grpcserver
+
+import (
+	"fmt"
+	"log/slog"
+
+	"github.com/prometheus/client_golang/prometheus"
+
+	"github.com/osac-project/osac/fulfillment-service/internal/auth"
+	"github.com/osac-project/osac/fulfillment-service/internal/references"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
+)
+
+// newReferenceValidator registers ordinary reference lookups and skips fields resolved by their
+// handlers. Catalog Item handlers resolve Template and field-policy references after ownership
+// assignment and update-mask merging. Cluster handlers resolve add-on operators and preserve the
+// immutable list during updates. Resource Create handlers resolve their Catalog Item or Template
+// source; Resource Update preserves the stored Catalog Item reference without fetching it again.
+// BMI Create network attachments are resolved by the private handler after tenant
+// assignment; resolving their names here can pick another tenant's same-named
+// default subnet/security group before the handler can enforce owner scope.
+// NATGateway Create ExternalIPs are resolved by the handler, by ID or by name within
+// the NATGateway's tenant and project, after checking that only the system may create
+// a NATGateway for a tenant-default VirtualNetwork.
+// RoleBinding handlers validate service-account references in the request's
+// tenant scope.
+// Workload ssh_key references are resolved by their private handlers after
+// tenant assignment and catalog/template defaults. Those handlers enforce the
+// tenant-only SSH-key contract, validate key material, and store canonical
+// Secret references. Update exclusions also leave immutable-field handling to
+// the merged candidate rather than resolving a replacement in the interceptor.
+// Other references continue through the interceptor's registered lookups.
+func newReferenceValidator(logger *slog.Logger, tenancy auth.TenancyLogic, registerer prometheus.Registerer) (*references.ReferenceValidator, error) {
+	validator, err := references.NewReferenceValidator().SetLogger(logger).SetMetricsRegisterer(registerer).
+		SetExcludedReferencePaths(catalogProvenanceUpdateMethods(), "object.spec.catalog_item").
+		SetExcludedReferencePaths(catalogAuthoringMethods(), "object.template", "object.fields").
+		SetExcludedReferencePaths(catalogCreationSourceMethods(), "object.spec.catalog_item", "object.spec.template").
+		SetExcludedReferencePaths(computeInstanceSSHKeyMethods(), "object.spec.ssh_key").
+		SetExcludedReferencePaths(clusterAddOnOperatorMethods(), "object.spec.add_on_operators").
+		SetExcludedReferencePaths(bareMetalInstanceCreationMethods(), "object.spec.network_attachments").
+		SetExcludedReferencePaths(serviceAccountControllerSecretReferenceMethods(),
+			"object.status.client_secret", "object.status.registration_secret").
+		SetExcludedReferencePaths(natGatewayCreationMethods(), "object.spec.external_ip").
+		SetExcludedReferencePaths(roleBindingServiceAccountMethods(), "object.spec.service_accounts").
+		SetExcludedReferencePaths(bareMetalInstanceSSHKeyMethods(), "object.spec.ssh_key").
+		SetExcludedReferencePaths(clusterSshKeyMethods(), "object.spec.ssh_key").
+		SetExcludedReferencePaths(clusterTemplateSshKeyMethods(), "object.spec_defaults.ssh_key").
+		Build()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create reference validator: %w", err)
+	}
+	if err := registerReferenceLookups(validator, logger, tenancy, registerer); err != nil {
+		return nil, err
+	}
+	return validator, nil
+}
+
+// The service-account controller writes both Secret references. The registration Secret is in the
+// system tenant, while the client Secret is in the account tenant, so generic local-reference
+// validation from the controller's system-tenant context cannot resolve either reference. The
+// controller creates these Secrets and verifies registration-Secret ownership before use.
+func serviceAccountControllerSecretReferenceMethods() []string {
+	return []string{
+		privatev1.ServiceAccounts_Create_FullMethodName,
+		privatev1.ServiceAccounts_Update_FullMethodName,
+	}
+}
+
+func natGatewayCreationMethods() []string {
+	return []string{
+		publicv1.NATGateways_Create_FullMethodName,
+		privatev1.NATGateways_Create_FullMethodName,
+	}
+}
+
+func roleBindingServiceAccountMethods() []string {
+	return []string{
+		publicv1.RoleBindings_Create_FullMethodName,
+		privatev1.RoleBindings_Create_FullMethodName,
+		publicv1.RoleBindings_Update_FullMethodName,
+		privatev1.RoleBindings_Update_FullMethodName,
+	}
+}
+
+// clusterTemplateSshKeyMethods covers the request fields whose SSH-key Secret
+// default references are resolved and canonicalized by the private
+// ClusterTemplates handler at authoring time.
+func clusterTemplateSshKeyMethods() []string {
+	return []string{
+		publicv1.ClusterTemplates_Create_FullMethodName,
+		privatev1.ClusterTemplates_Create_FullMethodName,
+		publicv1.ClusterTemplates_Update_FullMethodName,
+		privatev1.ClusterTemplates_Update_FullMethodName,
+	}
+}
+
+// clusterSshKeyMethods covers the request fields whose effective SSH-key Secret
+// references are resolved by the private Cluster handler after defaults on
+// create and preserved by its immutability check on update.
+func clusterSshKeyMethods() []string {
+	return []string{
+		publicv1.Clusters_Create_FullMethodName,
+		privatev1.Clusters_Create_FullMethodName,
+		publicv1.Clusters_Update_FullMethodName,
+		privatev1.Clusters_Update_FullMethodName,
+	}
+}
+
+func bareMetalInstanceCreationMethods() []string {
+	return []string{
+		publicv1.BareMetalInstances_Create_FullMethodName,
+		privatev1.BareMetalInstances_Create_FullMethodName,
+	}
+}
+
+// bareMetalInstanceSSHKeyMethods covers the request fields whose effective
+// SSH-key Secret references are resolved by the private handler after ownership
+// assignment and defaults. Updates are included so the handler's immutability
+// check answers changes to ssh_key instead of an interceptor lookup.
+func bareMetalInstanceSSHKeyMethods() []string {
+	return []string{
+		publicv1.BareMetalInstances_Create_FullMethodName,
+		privatev1.BareMetalInstances_Create_FullMethodName,
+		publicv1.BareMetalInstances_Update_FullMethodName,
+		privatev1.BareMetalInstances_Update_FullMethodName,
+	}
+}
+
+func clusterAddOnOperatorMethods() []string {
+	return []string{
+		publicv1.Clusters_Create_FullMethodName,
+		privatev1.Clusters_Create_FullMethodName,
+		publicv1.Clusters_Update_FullMethodName,
+		privatev1.Clusters_Update_FullMethodName,
+	}
+}
+
+func catalogProvenanceUpdateMethods() []string {
+	return []string{
+		publicv1.ComputeInstances_Update_FullMethodName,
+		privatev1.ComputeInstances_Update_FullMethodName,
+		publicv1.Clusters_Update_FullMethodName,
+		privatev1.Clusters_Update_FullMethodName,
+		publicv1.BareMetalInstances_Update_FullMethodName,
+		privatev1.BareMetalInstances_Update_FullMethodName,
+	}
+}
+
+func catalogAuthoringMethods() []string {
+	return []string{
+		publicv1.ComputeInstanceCatalogItems_Create_FullMethodName,
+		privatev1.ComputeInstanceCatalogItems_Create_FullMethodName,
+		publicv1.ComputeInstanceCatalogItems_Update_FullMethodName,
+		privatev1.ComputeInstanceCatalogItems_Update_FullMethodName,
+		publicv1.ClusterCatalogItems_Create_FullMethodName,
+		privatev1.ClusterCatalogItems_Create_FullMethodName,
+		publicv1.ClusterCatalogItems_Update_FullMethodName,
+		privatev1.ClusterCatalogItems_Update_FullMethodName,
+		publicv1.BareMetalInstanceCatalogItems_Create_FullMethodName,
+		privatev1.BareMetalInstanceCatalogItems_Create_FullMethodName,
+		publicv1.BareMetalInstanceCatalogItems_Update_FullMethodName,
+		privatev1.BareMetalInstanceCatalogItems_Update_FullMethodName,
+	}
+}
+
+func catalogCreationSourceMethods() []string {
+	return []string{
+		publicv1.ComputeInstances_Create_FullMethodName,
+		privatev1.ComputeInstances_Create_FullMethodName,
+		publicv1.Clusters_Create_FullMethodName,
+		privatev1.Clusters_Create_FullMethodName,
+		publicv1.BareMetalInstances_Create_FullMethodName,
+		privatev1.BareMetalInstances_Create_FullMethodName,
+	}
+}
+
+func computeInstanceSSHKeyMethods() []string {
+	return []string{
+		publicv1.ComputeInstances_Create_FullMethodName,
+		privatev1.ComputeInstances_Create_FullMethodName,
+		publicv1.ComputeInstances_Update_FullMethodName,
+		privatev1.ComputeInstances_Update_FullMethodName,
+	}
+}

@@ -2,6 +2,14 @@
 # when bundled PostgreSQL is deployed by osac-infra (this values file tests the
 # osac chart in isolation -- bundledPostgres has moved to osac-infra).
 
+global:
+  osacDeploymentId: "ci/osac"
+  networking:
+    # The Fabric Manager registration is applied by the admin; rendering only
+    # needs its name.
+    fabricManager: netris
+    k8sManager: cudn_evpn
+
 ui:
   enabled: true
   api:
@@ -10,6 +18,7 @@ ui:
         caBundle:
           configMap: ca-bundle
   auth:
+    oidcIssuerURL: https://keycloak.example.com/realms/osac
     certs:
       caBundle:
         configMap: ca-bundle
@@ -25,6 +34,8 @@ service:
         items:
         - key: client-id
           param: client-id
+        - key: client-secret
+          param: client-secret
   idp:
     url: https://keycloak.example.com
     credentials:
@@ -49,3 +60,14 @@ service:
           param: sslkey
         - key: ca.crt
           param: sslrootcert
+  vault:
+    endpoint: https://vault.example.com
+    lifecycleRole: vault-lifecycle
+    keycloakClientId: vault-client
+    keycloakIssuerUrl: https://keycloak.example.com/realms/osac
+    credentials:
+    - secret:
+        name: vault-credentials
+        items:
+        - key: client-secret
+          param: client-secret

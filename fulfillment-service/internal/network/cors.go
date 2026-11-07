@@ -15,6 +15,7 @@ package network
 
 import (
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"slices"
@@ -26,9 +27,11 @@ import (
 // CorsMiddlewareBuilder contains the data and logic needed to create A CORS middleware. Don't create instances of this
 // object directly, use the NewCorsMiddleware function instead.
 type CorsMiddlewareBuilder struct {
-	logger         *slog.Logger
-	name           string
-	allowedOrigins []string
+	logger                   *slog.Logger
+	name                     string
+	allowedOrigins           []string
+	additionalAllowedHeaders []string
+	rejectDisallowedOrigins  bool
 }
 
 // NewCorsMiddleware creates a builder that can then be used to configure and create a CORS middleware.
@@ -82,10 +85,22 @@ func (b *CorsMiddlewareBuilder) SetFlags(flags *pflag.FlagSet, name string) *Cor
 	return b
 }
 
-// AddAllowedOrigins adds a list of allowed origins to the CORS middleware. This is optional, and the default value is
-// '*'.
+// AddAllowedOrigins adds origins to the CORS middleware. At least one explicit origin is required.
 func (b *CorsMiddlewareBuilder) AddAllowedOrigins(values ...string) *CorsMiddlewareBuilder {
 	b.allowedOrigins = append(b.allowedOrigins, values...)
+	return b
+}
+
+// AddAllowedHeaders permits protocol-specific headers in browser preflight requests.
+func (b *CorsMiddlewareBuilder) AddAllowedHeaders(values ...string) *CorsMiddlewareBuilder {
+	b.additionalAllowedHeaders = append(b.additionalAllowedHeaders, values...)
+	return b
+}
+
+// RejectDisallowedOrigins rejects requests carrying an Origin outside the configured allowlist.
+// Requests without Origin continue to work for non-browser clients.
+func (b *CorsMiddlewareBuilder) RejectDisallowedOrigins() *CorsMiddlewareBuilder {
+	b.rejectDisallowedOrigins = true
 	return b
 }
 
@@ -97,19 +112,31 @@ func (b *CorsMiddlewareBuilder) Build() (result func(http.Handler) http.Handler,
 		return
 	}
 
-	// If no allowed origins are set, use the default value:
-	allowedOrigins := slices.Clone(b.allowedOrigins)
+	// Require at least one allowed origin.
 	if len(b.allowedOrigins) == 0 {
-		allowedOrigins = []string{"*"}
+		err = fmt.Errorf(
+			"CORS allowed origins are required; use '--%s' to configure them",
+			corsFlagName(b.name, corsAllowedOriginsFlagSuffix),
+		)
+		return
 	}
+	if slices.Contains(b.allowedOrigins, "*") {
+		err = fmt.Errorf(
+			"wildcard '*' is not allowed in CORS origins; use '--%s' to set explicit origins",
+			corsFlagName(b.name, corsAllowedOriginsFlagSuffix),
+		)
+		return
+	}
+	allowedOrigins := slices.Clone(b.allowedOrigins)
+	rejectDisallowedOrigins := b.rejectDisallowedOrigins
 	b.logger.Info(
 		"CORS configuration",
 		slog.String("listener", b.name),
 		slog.Any("allowed_origins", allowedOrigins),
 	)
 
-	// Create the middleware:
-	result = handlers.CORS(
+	allowedHeaders := append([]string{"Authorization", "Content-Type"}, b.additionalAllowedHeaders...)
+	cors := handlers.CORS(
 		handlers.AllowedOrigins(allowedOrigins),
 		handlers.AllowedMethods([]string{
 			http.MethodDelete,
@@ -120,10 +147,21 @@ func (b *CorsMiddlewareBuilder) Build() (result func(http.Handler) http.Handler,
 			http.MethodPut,
 		}),
 		handlers.AllowCredentials(),
-		handlers.AllowedHeaders([]string{
-			"Authorization",
-			"Content-Type",
-		}),
+		handlers.AllowedHeaders(allowedHeaders),
 	)
+	result = func(next http.Handler) http.Handler {
+		handler := cors(next)
+		if !rejectDisallowedOrigins {
+			return handler
+		}
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			origins := r.Header.Values("Origin")
+			if len(origins) > 0 && (len(origins) != 1 || !slices.Contains(allowedOrigins, origins[0])) {
+				http.Error(w, "Origin is not allowed", http.StatusForbidden)
+				return
+			}
+			handler.ServeHTTP(w, r)
+		})
+	}
 	return
 }

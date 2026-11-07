@@ -1,0 +1,42 @@
+# Repo-local overrides for osac.
+# Inherits all other settings (path_filters, labeling_instructions,
+# request_changes_workflow, base_branches, etc.) from the central
+# osac-project/coderabbit/.coderabbit.yaml.
+#
+# Schema: https://coderabbit.ai/integrations/schema.v2.json
+#
+# Why: osac-ci auto-approves dependency bot PRs that touch only
+# dependency files (policy/flow.yml bot_approve); CodeRabbit reviews
+# on these PRs add no signal beyond what the policy already checks.
+inheritance: true
+
+reviews:
+  auto_review:
+    ignore_usernames:
+      - "dependabot[bot]"
+      - "red-hat-konflux-kflux-prd-rh02[bot]"
+
+  # Repo-local override of the central no-sensitive-data-in-logs
+  # pre-merge check. Inherited arrays merge child-first and dedupe
+  # by `name`, so this entry replaces the central definition while
+  # every other central check is inherited unchanged.
+  #
+  # Why: OSAC tests routinely log fixture personal data (user emails,
+  # names) to make failures debuggable; flagging those adds review
+  # noise without security value. Secrets stay gated everywhere:
+  # test logs are collected too, so credentials must never appear in
+  # them either.
+  pre_merge_checks:
+    custom_checks:
+      - name: "no-sensitive-data-in-logs"
+        instructions: |
+          Flag logging that may expose passwords, tokens, API keys,
+          session IDs, internal hostnames, or customer data — in BOTH
+          production and test code.
+
+          EXCEPTION for personal data (PII: email, SSN, credit card
+          numbers): flag it in production code ONLY. Do NOT flag test
+          code that logs personal data; tests may output it to ease
+          debugging. Secrets (passwords, tokens, API keys, session
+          IDs) are never exempt — flag them in test code too.
+        mode: "error"

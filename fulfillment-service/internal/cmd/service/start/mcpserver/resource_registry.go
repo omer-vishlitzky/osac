@@ -1,0 +1,427 @@
+/*
+Copyright (c) 2026 Red Hat Inc.
+
+Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the
+License. You may obtain a copy of the License at
+
+http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on an
+"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the
+specific language governing permissions and limitations under the License.
+*/
+
+package mcpserver
+
+import (
+	"context"
+	"fmt"
+	"slices"
+	"strings"
+
+	"google.golang.org/protobuf/proto"
+
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
+)
+
+// resourceOperations contains the concrete API operations that back one MCP
+// deployment resource type. Each entry is a typed adapter; it must never
+// accept an arbitrary public method or serialize a resource directly when a
+// narrower projection is required. A nil get marks a list-only resource.
+type resourceOperations struct {
+	label string
+	list  func(context.Context, string, resourcePageRequest) (ListResourcesOutput, error)
+	get   func(context.Context, string) (proto.Message, error)
+}
+
+type resourceRegistry map[ResourceType]resourceOperations
+
+type resourceListResponse[Item any] interface {
+	GetSize() int32
+	GetTotal() int32
+	GetItems() []Item
+}
+
+type resourceGetResponse[Object proto.Message] interface {
+	GetObject() Object
+}
+
+func (r resourceRegistry) resourceTypes() []ResourceType {
+	result := make([]ResourceType, 0, len(r))
+	for resourceType := range r {
+		result = append(result, resourceType)
+	}
+	slices.Sort(result)
+	return result
+}
+
+func (r resourceRegistry) listResourceTypes() []ResourceType {
+	result := make([]ResourceType, 0, len(r))
+	for resourceType, operations := range r {
+		if operations.list != nil {
+			result = append(result, resourceType)
+		}
+	}
+	slices.Sort(result)
+	return result
+}
+
+func (r resourceRegistry) getResourceTypes() []ResourceType {
+	result := make([]ResourceType, 0, len(r))
+	for resourceType, operations := range r {
+		if operations.get != nil {
+			result = append(result, resourceType)
+		}
+	}
+	slices.Sort(result)
+	return result
+}
+
+func projectResourceOperations(deps ServerDeps) resourceOperations {
+	list := func(ctx context.Context, request *publicv1.ProjectsListRequest) (*publicv1.ProjectsListResponse, error) {
+		return deps.ProjectsClient.List(ctx, request)
+	}
+	get := func(ctx context.Context, request *publicv1.ProjectsGetRequest) (*publicv1.ProjectsGetResponse, error) {
+		return deps.ProjectsClient.Get(ctx, request)
+	}
+	return resourceOperations{
+		label: "project",
+		list:  typedResourceList("projects", list, projectListRequest, projectSummary),
+		get:   typedResourceGet("project", get, projectGetRequest),
+	}
+}
+
+func secretReferenceResourceOperations(deps ServerDeps) resourceOperations {
+	list := func(ctx context.Context, request *publicv1.SecretsListRequest) (*publicv1.SecretsListResponse, error) {
+		return deps.SecretsClient.List(ctx, request)
+	}
+	return resourceOperations{
+		label: "secret reference",
+		list:  typedResourceList("secret references", list, secretListRequest, secretSummary),
+	}
+}
+
+func typedResourceList[
+	Request any,
+	Response resourceListResponse[Item],
+	Item any,
+](
+	label string,
+	list func(context.Context, *Request) (Response, error),
+	buildRequest func(string, resourcePageRequest) *Request,
+	summary func(Item) ResourceSummary,
+) func(context.Context, string, resourcePageRequest) (ListResourcesOutput, error) {
+	return func(ctx context.Context, filter string, page resourcePageRequest) (ListResourcesOutput, error) {
+		response, err := list(ctx, buildRequest(filter, page))
+		if err != nil {
+			return ListResourcesOutput{}, fmt.Errorf("failed to list %s: %w", label, err)
+		}
+		items := summaries(response.GetItems(), summary)
+		return resourceListOutput(page, response.GetSize(), response.GetTotal(), items), nil
+	}
+}
+
+func typedResourceGet[
+	Request any,
+	Response resourceGetResponse[Object],
+	Object proto.Message,
+](
+	label string,
+	get func(context.Context, *Request) (Response, error),
+	buildRequest func(string) *Request,
+) func(context.Context, string) (proto.Message, error) {
+	return func(ctx context.Context, id string) (proto.Message, error) {
+		response, err := get(ctx, buildRequest(id))
+		if err != nil {
+			return nil, fmt.Errorf("failed to get %s %q: %w", label, id, err)
+		}
+		return response.GetObject(), nil
+	}
+}
+
+func projectListRequest(filter string, page resourcePageRequest) *publicv1.ProjectsListRequest {
+	request := publicv1.ProjectsListRequest_builder{
+		Offset: &page.offset,
+		Limit:  &page.limit,
+	}
+	if filter != "" {
+		request.Filter = &filter
+	}
+	return request.Build()
+}
+
+func projectGetRequest(id string) *publicv1.ProjectsGetRequest {
+	return publicv1.ProjectsGetRequest_builder{Id: id}.Build()
+}
+
+func projectSummary(item *publicv1.Project) ResourceSummary {
+	return ResourceSummary{
+		ID:          item.GetId(),
+		Name:        item.GetMetadata().GetName(),
+		Title:       item.GetSpec().GetTitle(),
+		Description: item.GetSpec().GetDescription(),
+		State:       item.GetStatus().GetState().String(),
+	}
+}
+
+func secretListRequest(filter string, page resourcePageRequest) *publicv1.SecretsListRequest {
+	request := publicv1.SecretsListRequest_builder{
+		Offset: &page.offset,
+		Limit:  &page.limit,
+	}
+	if filter != "" {
+		request.Filter = &filter
+	}
+	return request.Build()
+}
+
+func secretSummary(item *publicv1.Secret) ResourceSummary {
+	return ResourceSummary{
+		ID:   item.GetId(),
+		Name: item.GetMetadata().GetName(),
+		Type: secretReferenceType(item.GetType()),
+	}
+}
+
+func newResourceRegistry(deps ServerDeps) resourceRegistry {
+	return resourceRegistry{
+		ResourceTypeProject:         projectResourceOperations(deps),
+		ResourceTypeSecretReference: secretReferenceResourceOperations(deps),
+		ResourceTypeComputeInstanceCatalogItem: {
+			label: "compute instance catalog item",
+			list: func(ctx context.Context, filter string, page resourcePageRequest) (ListResourcesOutput, error) {
+				request := publicv1.ComputeInstanceCatalogItemsListRequest_builder{
+					Offset: &page.offset,
+					Limit:  &page.limit,
+				}
+				if filter != "" {
+					request.Filter = &filter
+				}
+				response, err := deps.ComputeInstanceCatalogItemsClient.List(ctx, request.Build())
+				if err != nil {
+					return ListResourcesOutput{}, fmt.Errorf("failed to list compute instance catalog items: %w", err)
+				}
+				items := summaries(response.GetItems(), func(item *publicv1.ComputeInstanceCatalogItem) ResourceSummary {
+					return ResourceSummary{
+						ID:          item.GetId(),
+						Name:        item.GetMetadata().GetName(),
+						Title:       item.GetTitle(),
+						Description: item.GetDescription(),
+					}
+				})
+				return resourceListOutput(page, response.GetSize(), response.GetTotal(), items), nil
+			},
+			get: func(ctx context.Context, id string) (proto.Message, error) {
+				response, err := deps.ComputeInstanceCatalogItemsClient.Get(ctx, publicv1.ComputeInstanceCatalogItemsGetRequest_builder{Id: id}.Build())
+				if err != nil {
+					return nil, fmt.Errorf("failed to get compute instance catalog item %q: %w", id, err)
+				}
+				return response.GetObject(), nil
+			},
+		},
+		ResourceTypeComputeInstanceTemplate: {
+			label: "compute instance template",
+			list: func(ctx context.Context, filter string, page resourcePageRequest) (ListResourcesOutput, error) {
+				request := publicv1.ComputeInstanceTemplatesListRequest_builder{Offset: &page.offset, Limit: &page.limit}
+				if filter != "" {
+					request.Filter = &filter
+				}
+				response, err := deps.ComputeInstanceTemplatesClient.List(ctx, request.Build())
+				if err != nil {
+					return ListResourcesOutput{}, fmt.Errorf("failed to list compute instance templates: %w", err)
+				}
+				items := summaries(response.GetItems(), func(item *publicv1.ComputeInstanceTemplate) ResourceSummary {
+					return ResourceSummary{ID: item.GetId(), Name: item.GetMetadata().GetName(), Title: item.GetTitle(), Description: item.GetDescription()}
+				})
+				return resourceListOutput(page, response.GetSize(), response.GetTotal(), items), nil
+			},
+			get: func(ctx context.Context, id string) (proto.Message, error) {
+				response, err := deps.ComputeInstanceTemplatesClient.Get(ctx, publicv1.ComputeInstanceTemplatesGetRequest_builder{Id: id}.Build())
+				if err != nil {
+					return nil, fmt.Errorf("failed to get compute instance template %q: %w", id, err)
+				}
+				return response.GetObject(), nil
+			},
+		},
+		ResourceTypeInstanceType: {
+			label: "instance type",
+			list: func(ctx context.Context, filter string, page resourcePageRequest) (ListResourcesOutput, error) {
+				request := publicv1.InstanceTypesListRequest_builder{Offset: &page.offset, Limit: &page.limit}
+				if filter != "" {
+					request.Filter = &filter
+				}
+				response, err := deps.InstanceTypesClient.List(ctx, request.Build())
+				if err != nil {
+					return ListResourcesOutput{}, fmt.Errorf("failed to list instance types: %w", err)
+				}
+				items := summaries(response.GetItems(), func(item *publicv1.InstanceType) ResourceSummary {
+					return ResourceSummary{ID: item.GetId(), Name: item.GetMetadata().GetName(), Description: item.GetSpec().GetDescription(), State: item.GetSpec().GetState().String()}
+				})
+				return resourceListOutput(page, response.GetSize(), response.GetTotal(), items), nil
+			},
+			get: func(ctx context.Context, id string) (proto.Message, error) {
+				response, err := deps.InstanceTypesClient.Get(ctx, publicv1.InstanceTypesGetRequest_builder{Id: id}.Build())
+				if err != nil {
+					return nil, fmt.Errorf("failed to get instance type %q: %w", id, err)
+				}
+				return response.GetObject(), nil
+			},
+		},
+		ResourceTypeDiskImage: {
+			label: "disk image",
+			list: func(ctx context.Context, filter string, page resourcePageRequest) (ListResourcesOutput, error) {
+				request := publicv1.DiskImagesListRequest_builder{Offset: &page.offset, Limit: &page.limit}
+				if filter != "" {
+					request.Filter = &filter
+				}
+				response, err := deps.DiskImagesClient.List(ctx, request.Build())
+				if err != nil {
+					return ListResourcesOutput{}, fmt.Errorf("failed to list disk images: %w", err)
+				}
+				items := summaries(response.GetItems(), func(item *publicv1.DiskImage) ResourceSummary {
+					return ResourceSummary{ID: item.GetId(), Name: item.GetMetadata().GetName(), State: item.GetSpec().GetLifecycle().String()}
+				})
+				return resourceListOutput(page, response.GetSize(), response.GetTotal(), items), nil
+			},
+			get: func(ctx context.Context, id string) (proto.Message, error) {
+				response, err := deps.DiskImagesClient.Get(ctx, publicv1.DiskImagesGetRequest_builder{Id: id}.Build())
+				if err != nil {
+					return nil, fmt.Errorf("failed to get disk image %q: %w", id, err)
+				}
+				return response.GetObject(), nil
+			},
+		},
+		ResourceTypeStorageTier: {
+			label: "storage tier",
+			list: func(ctx context.Context, filter string, page resourcePageRequest) (ListResourcesOutput, error) {
+				request := publicv1.StorageTiersListRequest_builder{Offset: &page.offset, Limit: &page.limit}
+				if filter != "" {
+					request.Filter = &filter
+				}
+				response, err := deps.StorageTiersClient.List(ctx, request.Build())
+				if err != nil {
+					return ListResourcesOutput{}, fmt.Errorf("failed to list storage tiers: %w", err)
+				}
+				items := summaries(response.GetItems(), func(item *publicv1.StorageTier) ResourceSummary {
+					return ResourceSummary{ID: item.GetId(), Name: item.GetMetadata().GetName(), Description: item.GetSpec().GetDescription(), State: item.GetStatus().GetState().String()}
+				})
+				return resourceListOutput(page, response.GetSize(), response.GetTotal(), items), nil
+			},
+			get: func(ctx context.Context, id string) (proto.Message, error) {
+				response, err := deps.StorageTiersClient.Get(ctx, publicv1.StorageTiersGetRequest_builder{Id: id}.Build())
+				if err != nil {
+					return nil, fmt.Errorf("failed to get storage tier %q: %w", id, err)
+				}
+				return response.GetObject(), nil
+			},
+		},
+		ResourceTypeVirtualNetwork: {
+			label: "virtual network",
+			list: func(ctx context.Context, filter string, page resourcePageRequest) (ListResourcesOutput, error) {
+				request := publicv1.VirtualNetworksListRequest_builder{Offset: &page.offset, Limit: &page.limit}
+				if filter != "" {
+					request.Filter = &filter
+				}
+				response, err := deps.VirtualNetworksClient.List(ctx, request.Build())
+				if err != nil {
+					return ListResourcesOutput{}, fmt.Errorf("failed to list virtual networks: %w", err)
+				}
+				items := summaries(response.GetItems(), func(item *publicv1.VirtualNetwork) ResourceSummary {
+					return ResourceSummary{ID: item.GetId(), Name: item.GetMetadata().GetName(), State: item.GetStatus().GetState().String()}
+				})
+				return resourceListOutput(page, response.GetSize(), response.GetTotal(), items), nil
+			},
+			get: func(ctx context.Context, id string) (proto.Message, error) {
+				response, err := deps.VirtualNetworksClient.Get(ctx, publicv1.VirtualNetworksGetRequest_builder{Id: id}.Build())
+				if err != nil {
+					return nil, fmt.Errorf("failed to get virtual network %q: %w", id, err)
+				}
+				return response.GetObject(), nil
+			},
+		},
+		ResourceTypeSubnet: {
+			label: "subnet",
+			list: func(ctx context.Context, filter string, page resourcePageRequest) (ListResourcesOutput, error) {
+				request := publicv1.SubnetsListRequest_builder{Offset: &page.offset, Limit: &page.limit}
+				if filter != "" {
+					request.Filter = &filter
+				}
+				response, err := deps.SubnetsClient.List(ctx, request.Build())
+				if err != nil {
+					return ListResourcesOutput{}, fmt.Errorf("failed to list subnets: %w", err)
+				}
+				items := summaries(response.GetItems(), func(item *publicv1.Subnet) ResourceSummary {
+					return ResourceSummary{ID: item.GetId(), Name: item.GetMetadata().GetName(), State: item.GetStatus().GetState().String()}
+				})
+				return resourceListOutput(page, response.GetSize(), response.GetTotal(), items), nil
+			},
+			get: func(ctx context.Context, id string) (proto.Message, error) {
+				response, err := deps.SubnetsClient.Get(ctx, publicv1.SubnetsGetRequest_builder{Id: id}.Build())
+				if err != nil {
+					return nil, fmt.Errorf("failed to get subnet %q: %w", id, err)
+				}
+				return response.GetObject(), nil
+			},
+		},
+		ResourceTypeSecurityGroup: {
+			label: "security group",
+			list: func(ctx context.Context, filter string, page resourcePageRequest) (ListResourcesOutput, error) {
+				request := publicv1.SecurityGroupsListRequest_builder{Offset: &page.offset, Limit: &page.limit}
+				if filter != "" {
+					request.Filter = &filter
+				}
+				response, err := deps.SecurityGroupsClient.List(ctx, request.Build())
+				if err != nil {
+					return ListResourcesOutput{}, fmt.Errorf("failed to list security groups: %w", err)
+				}
+				items := summaries(response.GetItems(), func(item *publicv1.SecurityGroup) ResourceSummary {
+					return ResourceSummary{ID: item.GetId(), Name: item.GetMetadata().GetName(), State: item.GetStatus().GetState().String()}
+				})
+				return resourceListOutput(page, response.GetSize(), response.GetTotal(), items), nil
+			},
+			get: func(ctx context.Context, id string) (proto.Message, error) {
+				response, err := deps.SecurityGroupsClient.Get(ctx, publicv1.SecurityGroupsGetRequest_builder{Id: id}.Build())
+				if err != nil {
+					return nil, fmt.Errorf("failed to get security group %q: %w", id, err)
+				}
+				return response.GetObject(), nil
+			},
+		},
+		ResourceTypeComputeInstance: {
+			label: "compute instance",
+			list: func(ctx context.Context, filter string, page resourcePageRequest) (ListResourcesOutput, error) {
+				request := publicv1.ComputeInstancesListRequest_builder{Offset: &page.offset, Limit: &page.limit}
+				if filter != "" {
+					request.Filter = &filter
+				}
+				response, err := deps.ComputeInstancesClient.List(ctx, request.Build())
+				if err != nil {
+					return ListResourcesOutput{}, fmt.Errorf("failed to list compute instances: %w", err)
+				}
+				items := summaries(response.GetItems(), func(item *publicv1.ComputeInstance) ResourceSummary {
+					return ResourceSummary{ID: item.GetId(), Name: item.GetMetadata().GetName(), State: item.GetStatus().GetState().String()}
+				})
+				return resourceListOutput(page, response.GetSize(), response.GetTotal(), items), nil
+			},
+			get: func(ctx context.Context, id string) (proto.Message, error) {
+				response, err := deps.ComputeInstancesClient.Get(ctx, publicv1.ComputeInstancesGetRequest_builder{Id: id}.Build())
+				if err != nil {
+					return nil, fmt.Errorf("failed to get compute instance %q: %w", id, err)
+				}
+				return response.GetObject(), nil
+			},
+		},
+	}
+}
+
+func secretReferenceType(secretType publicv1.SecretType) string {
+	return strings.ToLower(strings.TrimPrefix(secretType.String(), "SECRET_TYPE_"))
+}
+
+func summaries[T any](items []T, summarize func(T) ResourceSummary) []ResourceSummary {
+	result := make([]ResourceSummary, len(items))
+	for i, item := range items {
+		result[i] = summarize(item)
+	}
+	return result
+}

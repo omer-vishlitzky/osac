@@ -1,0 +1,1098 @@
+/*
+Copyright 2026.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package controller
+
+import (
+	"context"
+	"fmt"
+	"path/filepath"
+
+	metal3api "github.com/metal3-io/baremetal-operator/apis/metal3.io/v1alpha1"
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/discovery"
+	"k8s.io/client-go/kubernetes/scheme"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/envtest"
+
+	"github.com/osac-project/osac/bare-metal-fulfillment-operator/api/v1alpha1"
+	"github.com/osac-project/osac/bare-metal-fulfillment-operator/internal/inventory"
+	"github.com/osac-project/osac/bare-metal-fulfillment-operator/internal/management"
+	"github.com/osac-project/osac/bare-metal-fulfillment-operator/internal/shared"
+	opv1alpha1 "github.com/osac-project/osac/osac-operator/api/v1alpha1"
+	"github.com/osac-project/osac/osac-operator/pkg/provisioning"
+)
+
+const (
+	metal3TestNS    = "metal3-test"
+	metal3HostClass = "metal3"
+)
+
+func createMetal3BMH(name string, labels map[string]string, opStatus metal3api.OperationalStatus, provState metal3api.ProvisioningState) *metal3api.BareMetalHost {
+	if labels == nil {
+		labels = map[string]string{}
+	}
+	bmh := &metal3api.BareMetalHost{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: metal3TestNS,
+			Labels:    labels,
+		},
+	}
+	ExpectWithOffset(1, k8sClient.Create(ctx, bmh)).To(Succeed())
+
+	// Status is a subresource — Create does not persist it. Re-set and update
+	// separately so envtest stores the desired operational/provisioning state.
+	bmh.Status.OperationalStatus = opStatus
+	bmh.Status.Provisioning.State = provState
+	ExpectWithOffset(1, k8sClient.Status().Update(ctx, bmh)).To(Succeed())
+
+	// NIC inventory is sourced from the companion HardwareData resource (same
+	// name/namespace as the BMH), so create it — without NIC data FindFreeHost
+	// skips the host.
+	hd := &metal3api.HardwareData{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: metal3TestNS,
+		},
+		Spec: metal3api.HardwareDataSpec{
+			HardwareDetails: &metal3api.HardwareDetails{
+				NIC: []metal3api.NIC{{MAC: "aa:bb:cc:dd:ee:01"}},
+			},
+		},
+	}
+	ExpectWithOffset(1, k8sClient.Create(ctx, hd)).To(Succeed())
+	return bmh
+}
+
+func newMetal3Reconciler() *BareMetalInstanceReconciler {
+	invClient := inventory.NewMetal3ClientForTest(k8sClient, metal3TestNS, metal3HostClass)
+	mgmtClient := management.NewMetal3ClientForTest(k8sClient, metal3TestNS)
+	return NewBareMetalInstanceReconciler(
+		k8sClient,
+		k8sClient.Scheme(),
+		invClient,
+		mgmtClient,
+		nil, // provisioning provider
+		nil, // networking provider
+		nil, // IP discovery provider
+		nil, // AAP client
+		0, 0, 0, 0, 0,
+	)
+}
+
+// These are thin, namespace-bound aliases over the shared integration helpers
+// in baremetalinstance_integration_helpers_test.go.
+
+func reconcileN(reconciler *BareMetalInstanceReconciler, name string, n int) ctrl.Result {
+	return reconcileInNS(reconciler, metal3TestNS, name, n)
+}
+
+func getBMI(name string) *v1alpha1.BareMetalInstance { return getBMIInNS(metal3TestNS, name) }
+
+func getBMH(name string) *metal3api.BareMetalHost { return getBMHInNS(metal3TestNS, name) }
+
+func cleanupBMI(name string) { cleanupBMIInNS(metal3TestNS, name) }
+
+func cleanupBMH(name string) {
+	hd := &metal3api.HardwareData{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: metal3TestNS}}
+	ExpectWithOffset(1, client.IgnoreNotFound(k8sClient.Delete(ctx, hd))).NotTo(HaveOccurred())
+
+	cleanupBMHInNS(metal3TestNS, name)
+}
+
+var _ = Describe("BareMetalInstance Metal3 Integration", func() {
+	var ns *corev1.Namespace
+
+	BeforeEach(func() {
+		ns = &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: metal3TestNS}}
+		err := k8sClient.Create(ctx, ns)
+		if err != nil && client.IgnoreAlreadyExists(err) != nil {
+			Fail("failed to create test namespace: " + err.Error())
+		}
+	})
+
+	It("rejects changes to the complete network attachment value", func() {
+		cases := []struct {
+			name        string
+			attachments []v1alpha1.BareMetalNetworkAttachment
+			mutate      func(*v1alpha1.BareMetalInstance)
+		}{
+			{
+				name:        "add-security-group",
+				attachments: []v1alpha1.BareMetalNetworkAttachment{{SubnetRef: "subnet-a"}},
+				mutate: func(instance *v1alpha1.BareMetalInstance) {
+					instance.Spec.NetworkAttachments[0].SecurityGroupRefs = []string{"sg-a"}
+				},
+			},
+			{
+				name:        "change-security-group",
+				attachments: []v1alpha1.BareMetalNetworkAttachment{{SubnetRef: "subnet-a", SecurityGroupRefs: []string{"sg-a"}}},
+				mutate: func(instance *v1alpha1.BareMetalInstance) {
+					instance.Spec.NetworkAttachments[0].SecurityGroupRefs = []string{"sg-b"}
+				},
+			},
+			{
+				name:        "add-interface",
+				attachments: []v1alpha1.BareMetalNetworkAttachment{{SubnetRef: "subnet-a"}},
+				mutate: func(instance *v1alpha1.BareMetalInstance) {
+					instance.Spec.NetworkAttachments[0].Interface = "data-0"
+				},
+			},
+			{
+				name:        "add-primary",
+				attachments: []v1alpha1.BareMetalNetworkAttachment{{SubnetRef: "subnet-a"}},
+				mutate: func(instance *v1alpha1.BareMetalInstance) {
+					instance.Spec.NetworkAttachments[0].Primary = true
+				},
+			},
+			{
+				name:        "replace-subnet",
+				attachments: []v1alpha1.BareMetalNetworkAttachment{{SubnetRef: "subnet-a", Primary: true}},
+				mutate: func(instance *v1alpha1.BareMetalInstance) {
+					instance.Spec.NetworkAttachments[0].SubnetRef = "subnet-b"
+				},
+			},
+			{
+				name: "add-first-attachment",
+				mutate: func(instance *v1alpha1.BareMetalInstance) {
+					instance.Spec.NetworkAttachments = []v1alpha1.BareMetalNetworkAttachment{{SubnetRef: "subnet-a", Primary: true}}
+				},
+			},
+			{
+				name:        "remove-attachment",
+				attachments: []v1alpha1.BareMetalNetworkAttachment{{SubnetRef: "subnet-a", Primary: true}},
+				mutate: func(instance *v1alpha1.BareMetalInstance) {
+					instance.Spec.NetworkAttachments = nil
+				},
+			},
+		}
+
+		for _, testCase := range cases {
+			name := "attachment-contract-" + testCase.name
+			instance := &v1alpha1.BareMetalInstance{
+				ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: metal3TestNS},
+				Spec: v1alpha1.BareMetalInstanceSpec{
+					Selector:           v1alpha1.HostSelectorSpec{HostSelector: map[string]string{"type": "network-contract"}},
+					TemplateID:         shared.OsacNoopTemplate,
+					NetworkAttachments: testCase.attachments,
+				},
+			}
+			Expect(k8sClient.Create(ctx, instance)).To(Succeed())
+			DeferCleanup(func() { cleanupBMI(name) })
+
+			instance = getBMI(name)
+			testCase.mutate(instance)
+			err := k8sClient.Update(ctx, instance)
+			Expect(err).To(HaveOccurred(), testCase.name)
+			Expect(apierrors.IsInvalid(err)).To(BeTrue(), testCase.name)
+		}
+	})
+
+	It("rejects removing spec to bypass network attachment immutability", func() {
+		const name = "attachment-contract-remove-spec"
+		instance := &v1alpha1.BareMetalInstance{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: metal3TestNS},
+			Spec: v1alpha1.BareMetalInstanceSpec{
+				Selector:           v1alpha1.HostSelectorSpec{HostSelector: map[string]string{"type": "network-contract"}},
+				TemplateID:         shared.OsacNoopTemplate,
+				NetworkAttachments: []v1alpha1.BareMetalNetworkAttachment{{SubnetRef: "subnet-a", Primary: true}},
+			},
+		}
+		Expect(k8sClient.Create(ctx, instance)).To(Succeed())
+		DeferCleanup(func() { cleanupBMI(name) })
+
+		instance = getBMI(name)
+		err := k8sClient.Patch(ctx, instance, client.RawPatch(types.JSONPatchType, []byte(`[{"op":"remove","path":"/spec"}]`)))
+		Expect(apierrors.IsInvalid(err)).To(BeTrue())
+		Expect(err).To(MatchError(ContainSubstring("spec presence is immutable after creation")))
+	})
+
+	It("rejects two attachments and allows lifecycle, status, and metadata updates", func() {
+		invalid := &v1alpha1.BareMetalInstance{
+			ObjectMeta: metav1.ObjectMeta{Name: "attachment-contract-two", Namespace: metal3TestNS},
+			Spec: v1alpha1.BareMetalInstanceSpec{
+				Selector:   v1alpha1.HostSelectorSpec{HostSelector: map[string]string{"type": "network-contract"}},
+				TemplateID: shared.OsacNoopTemplate,
+				NetworkAttachments: []v1alpha1.BareMetalNetworkAttachment{
+					{SubnetRef: "subnet-a", Primary: true},
+					{SubnetRef: "subnet-b"},
+				},
+			},
+		}
+		err := k8sClient.Create(ctx, invalid)
+		Expect(err).To(HaveOccurred())
+		Expect(apierrors.IsInvalid(err)).To(BeTrue())
+
+		const name = "attachment-contract-lifecycle-update"
+		instance := &v1alpha1.BareMetalInstance{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: metal3TestNS},
+			Spec: v1alpha1.BareMetalInstanceSpec{
+				Selector:           v1alpha1.HostSelectorSpec{HostSelector: map[string]string{"type": "network-contract"}},
+				TemplateID:         shared.OsacNoopTemplate,
+				NetworkAttachments: []v1alpha1.BareMetalNetworkAttachment{{SubnetRef: "subnet-a", Primary: true}},
+			},
+		}
+		Expect(k8sClient.Create(ctx, instance)).To(Succeed())
+		DeferCleanup(func() { cleanupBMI(name) })
+
+		instance = getBMI(name)
+		instance.Spec.RunStrategy = v1alpha1.RunStrategyAlways
+		instance.Spec.RestartTrigger = 1
+		instance.SetFinalizers([]string{"osac.openshift.io/test-finalizer"})
+		instance.SetLabels(map[string]string{"contract-test": "allowed"})
+		Expect(k8sClient.Update(ctx, instance)).To(Succeed())
+
+		instance.Status.Phase = v1alpha1.BareMetalInstancePhaseProgressing
+		Expect(k8sClient.Status().Update(ctx, instance)).To(Succeed())
+	})
+
+	It("does not resubmit network provisioning after an immutable attachment update is rejected and continues status and deletion", func() {
+		const name = "immutable-network-reconcile"
+		instance := &v1alpha1.BareMetalInstance{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: metal3TestNS},
+			Spec: v1alpha1.BareMetalInstanceSpec{
+				Selector:   v1alpha1.HostSelectorSpec{HostSelector: map[string]string{"type": "network-reconcile"}},
+				TemplateID: shared.OsacNoopTemplate,
+				NetworkAttachments: []v1alpha1.BareMetalNetworkAttachment{{
+					SubnetRef: "subnet-a", Primary: true, SecurityGroupRefs: []string{"sg-a"},
+				}},
+			},
+		}
+		Expect(k8sClient.Create(ctx, instance)).To(Succeed())
+		DeferCleanup(func() { cleanupBMI(name) })
+
+		provisionCalls := 0
+		provisionPolls := 0
+		deprovisionCalls := 0
+		deprovisionPolls := 0
+		provider := &mockProvisioningProvider{
+			triggerProvisionFunc: func(_ context.Context, _ client.Object) (*provisioning.ProvisionResult, error) {
+				provisionCalls++
+				return &provisioning.ProvisionResult{JobID: "network-provision", InitialState: opv1alpha1.JobStatePending}, nil
+			},
+			getProvisionStatusFunc: func(_ context.Context, _ client.Object, jobID string) (provisioning.ProvisionStatus, error) {
+				provisionPolls++
+				return provisioning.ProvisionStatus{JobID: jobID, State: opv1alpha1.JobStateSucceeded, Message: "Network provisioned"}, nil
+			},
+			triggerDeprovisionFunc: func(_ context.Context, _ client.Object, _ []opv1alpha1.JobStatus) (*provisioning.DeprovisionResult, error) {
+				deprovisionCalls++
+				return &provisioning.DeprovisionResult{
+					Action:                 provisioning.DeprovisionTriggered,
+					JobID:                  "network-deprovision",
+					BlockDeletionOnFailure: true,
+				}, nil
+			},
+			getDeprovisionStatusFunc: func(_ context.Context, _ client.Object, jobID string) (provisioning.ProvisionStatus, error) {
+				deprovisionPolls++
+				return provisioning.ProvisionStatus{JobID: jobID, State: opv1alpha1.JobStateSucceeded, Message: "Network deprovisioned"}, nil
+			},
+		}
+		reconciler := newMetal3Reconciler()
+		reconciler.NetworkingProvider = provider
+
+		// Add the network finalizer, then dispatch exactly one provider job.
+		_, err := reconciler.reconcileNetworking(ctx, instance)
+		Expect(err).NotTo(HaveOccurred())
+		instance = getBMI(name)
+		Expect(controllerutil.ContainsFinalizer(instance, BareMetalInstanceNetworkingFinalizer)).To(BeTrue())
+		_, err = reconciler.reconcileNetworking(ctx, instance)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(provisionCalls).To(Equal(1))
+
+		// Admission rejects the attempted attachment mutation before reconcile.
+		instance = getBMI(name)
+		instance.Spec.NetworkAttachments[0].SecurityGroupRefs = []string{"sg-b"}
+		err = k8sClient.Update(ctx, instance)
+		Expect(err).To(HaveOccurred())
+		Expect(apierrors.IsInvalid(err)).To(BeTrue())
+
+		// The unchanged desired config polls the existing job and reports success.
+		instance = getBMI(name)
+		_, err = reconciler.reconcileNetworking(ctx, instance)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(provisionCalls).To(Equal(1))
+		Expect(provisionPolls).To(BeNumerically(">", 0))
+		condition := instance.GetStatusCondition(v1alpha1.HostConditionNetworkAttachmentsReady)
+		Expect(condition).NotTo(BeNil())
+		Expect(condition.Status).To(Equal(metav1.ConditionTrue))
+		// The outer Reconcile persists the condition after networking finishes.
+		Expect(k8sClient.Status().Update(ctx, instance)).To(Succeed())
+		instance = getBMI(name)
+		condition = instance.GetStatusCondition(v1alpha1.HostConditionNetworkAttachmentsReady)
+		Expect(condition).NotTo(BeNil())
+		Expect(condition.Status).To(Equal(metav1.ConditionTrue))
+		Expect(instance.Status.NetworkingJobs).To(HaveLen(1))
+
+		// Deletion still dispatches and polls the network cleanup job, then
+		// removes the networking finalizer and lets Kubernetes remove the BMI.
+		Expect(k8sClient.Delete(ctx, instance)).To(Succeed())
+		instance = getBMI(name)
+		_, done, err := reconciler.reconcileNetworkingDeletion(ctx, instance)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(done).To(BeFalse())
+		Expect(deprovisionCalls).To(Equal(1))
+		instance = getBMI(name)
+		_, done, err = reconciler.reconcileNetworkingDeletion(ctx, instance)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(done).To(BeTrue())
+		Expect(deprovisionPolls).To(BeNumerically(">", 0))
+		err = k8sClient.Get(ctx, types.NamespacedName{Namespace: metal3TestNS, Name: name}, &v1alpha1.BareMetalInstance{})
+		Expect(apierrors.IsNotFound(err)).To(BeTrue())
+	})
+
+	Describe("Allocation flow", func() {
+		const bmiName = "alloc-test-bmi"
+		const bmhName = "alloc-test-bmh"
+
+		AfterEach(func() {
+			cleanupBMI(bmiName)
+			cleanupBMH(bmhName)
+		})
+
+		It("should allocate a BMH and transition to Progressing", func() {
+			createMetal3BMH(bmhName, map[string]string{
+				inventory.Metal3HostTypeLabel: "gpu-node",
+			}, metal3api.OperationalStatusOK, metal3api.StateAvailable)
+
+			bmi := &v1alpha1.BareMetalInstance{
+				ObjectMeta: metav1.ObjectMeta{Name: bmiName, Namespace: metal3TestNS},
+				Spec: v1alpha1.BareMetalInstanceSpec{
+					Selector: v1alpha1.HostSelectorSpec{
+						HostSelector: map[string]string{"type": "gpu-node"},
+					},
+					TemplateID: shared.OsacNoopTemplate,
+				},
+			}
+			Expect(k8sClient.Create(ctx, bmi)).To(Succeed())
+
+			reconciler := newMetal3Reconciler()
+
+			// Reconcile 1: add inventory finalizer
+			reconcileN(reconciler, bmiName, 1)
+			bmi = getBMI(bmiName)
+			Expect(bmi.Finalizers).To(ContainElement(BareMetalInstanceInventoryFinalizer))
+
+			// Reconcile 2: FindFreeHost → set ExternalHostID
+			reconcileN(reconciler, bmiName, 1)
+			bmi = getBMI(bmiName)
+			Expect(bmi.Spec.ExternalHostID).To(Equal(metal3TestNS + "/" + bmhName))
+
+			// Reconcile 3: AssignHost → set HostClass, status persisted as Progressing
+			reconcileN(reconciler, bmiName, 1)
+			bmi = getBMI(bmiName)
+			Expect(bmi.Spec.HostClass).To(Equal(metal3HostClass))
+			Expect(bmi.Status.Phase).To(Equal(v1alpha1.BareMetalInstancePhaseProgressing))
+
+			// Verify BMH has consumerRef set
+			updatedBMH := getBMH(bmhName)
+			Expect(updatedBMH.Spec.ConsumerRef).NotTo(BeNil())
+			Expect(updatedBMH.Spec.ConsumerRef.Name).To(Equal(string(bmi.UID)))
+		})
+
+		It("retries allocation until an inspecting BMH becomes available", func() {
+			createMetal3BMH(bmhName, map[string]string{
+				inventory.Metal3HostTypeLabel: "gpu-node",
+			}, metal3api.OperationalStatusOK, metal3api.StateInspecting)
+
+			bmi := &v1alpha1.BareMetalInstance{
+				ObjectMeta: metav1.ObjectMeta{Name: bmiName, Namespace: metal3TestNS},
+				Spec: v1alpha1.BareMetalInstanceSpec{
+					Selector: v1alpha1.HostSelectorSpec{
+						HostSelector: map[string]string{"type": "gpu-node"},
+					},
+					TemplateID: shared.OsacNoopTemplate,
+				},
+			}
+			Expect(k8sClient.Create(ctx, bmi)).To(Succeed())
+
+			reconciler := newMetal3Reconciler()
+			reconcileN(reconciler, bmiName, 1) // inventory finalizer
+			result := reconcileN(reconciler, bmiName, 1)
+			Expect(result.RequeueAfter).To(Equal(DefaultNoFreeHostsPollIntervalDuration))
+			bmi = getBMI(bmiName)
+			Expect(bmi.Spec.ExternalHostID).To(BeEmpty())
+
+			bmh := getBMH(bmhName)
+			bmh.Status.Provisioning.State = metal3api.StateAvailable
+			Expect(k8sClient.Status().Update(ctx, bmh)).To(Succeed())
+
+			reconcileN(reconciler, bmiName, 2)
+			bmi = getBMI(bmiName)
+			Expect(bmi.Spec.ExternalHostID).To(Equal(metal3TestNS + "/" + bmhName))
+			Expect(bmi.Spec.HostClass).To(Equal(metal3HostClass))
+			Expect(bmi.Status.Phase).To(Equal(v1alpha1.BareMetalInstancePhaseProgressing))
+		})
+
+		It("continues reconciling when an assigned BMH unexpectedly deprovisions", func() {
+			createMetal3BMH(bmhName, map[string]string{
+				inventory.Metal3HostTypeLabel: "gpu-node",
+			}, metal3api.OperationalStatusOK, metal3api.StateAvailable)
+
+			bmi := &v1alpha1.BareMetalInstance{
+				ObjectMeta: metav1.ObjectMeta{Name: bmiName, Namespace: metal3TestNS},
+				Spec: v1alpha1.BareMetalInstanceSpec{
+					Selector: v1alpha1.HostSelectorSpec{
+						HostSelector: map[string]string{"type": "gpu-node"},
+					},
+					TemplateID: shared.OsacNoopTemplate,
+				},
+			}
+			Expect(k8sClient.Create(ctx, bmi)).To(Succeed())
+
+			reconciler := newMetal3Reconciler()
+			reconcileN(reconciler, bmiName, 2)
+			bmi = getBMI(bmiName)
+			Expect(bmi.Spec.ExternalHostID).To(Equal(metal3TestNS + "/" + bmhName))
+
+			bmh := getBMH(bmhName)
+			bmh.Status.Provisioning.State = metal3api.StateDeprovisioning
+			Expect(k8sClient.Status().Update(ctx, bmh)).To(Succeed())
+
+			// Assignment remains idempotent for the same consumer, and management
+			// reconciliation can complete instead of waiting forever on inventory.
+			reconcileN(reconciler, bmiName, 3)
+			bmi = getBMI(bmiName)
+			Expect(bmi.Spec.HostClass).To(Equal(metal3HostClass))
+			Expect(bmi.Status.Phase).To(Equal(v1alpha1.BareMetalInstancePhaseReady))
+		})
+
+		It("allocates a BMH whose referenced BMC credential Secret already exists", func() {
+			secret := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: "existing-bmc-credentials", Namespace: metal3TestNS},
+				Data: map[string][]byte{
+					"username": []byte("test-user"),
+					"password": []byte("test-value"),
+				},
+			}
+			Expect(k8sClient.Create(ctx, secret)).To(Succeed())
+			DeferCleanup(func() {
+				Expect(client.IgnoreNotFound(k8sClient.Delete(ctx, secret))).To(Succeed())
+			})
+
+			bmh := createMetal3BMH(bmhName, map[string]string{
+				inventory.Metal3HostTypeLabel: "gpu-node",
+			}, metal3api.OperationalStatusOK, metal3api.StateAvailable)
+			bmh.Spec.BMC.CredentialsName = secret.Name
+			Expect(k8sClient.Update(ctx, bmh)).To(Succeed())
+
+			bmi := &v1alpha1.BareMetalInstance{
+				ObjectMeta: metav1.ObjectMeta{Name: bmiName, Namespace: metal3TestNS},
+				Spec: v1alpha1.BareMetalInstanceSpec{
+					Selector: v1alpha1.HostSelectorSpec{
+						HostSelector: map[string]string{"type": "gpu-node"},
+					},
+					TemplateID: shared.OsacNoopTemplate,
+				},
+			}
+			Expect(k8sClient.Create(ctx, bmi)).To(Succeed())
+
+			reconciler := newMetal3Reconciler()
+			reconcileN(reconciler, bmiName, 5)
+			bmi = getBMI(bmiName)
+			Expect(bmi.Status.Phase).To(Equal(v1alpha1.BareMetalInstancePhaseReady))
+
+			persistedSecret := &corev1.Secret{}
+			Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(secret), persistedSecret)).To(Succeed())
+			Expect(persistedSecret.Data).To(Equal(secret.Data))
+		})
+	})
+
+	Describe("Provisioning retry flow", func() {
+		const bmiName = "retry-test-bmi"
+		const bmhName = "retry-test-bmh"
+		const providerError = "AAP workflow failed: inventory service unavailable"
+
+		AfterEach(func() {
+			cleanupBMI(bmiName)
+			cleanupBMH(bmhName)
+		})
+
+		newFailingProvider := func() *mockProvisioningProvider {
+			return &mockProvisioningProvider{
+				getProvisionStatusFunc: func(_ context.Context, _ client.Object, jobID string) (provisioning.ProvisionStatus, error) {
+					return provisioning.ProvisionStatus{
+						JobID:   jobID,
+						State:   opv1alpha1.JobStateFailed,
+						Message: providerError,
+					}, nil
+				},
+			}
+		}
+
+		It("keeps a failed provision attempt retrying through the public reconciler", func() {
+			createMetal3BMH(bmhName, map[string]string{
+				inventory.Metal3HostTypeLabel: "retry-node",
+			}, metal3api.OperationalStatusOK, metal3api.StateAvailable)
+
+			bmi := &v1alpha1.BareMetalInstance{
+				ObjectMeta: metav1.ObjectMeta{Name: bmiName, Namespace: metal3TestNS},
+				Spec: v1alpha1.BareMetalInstanceSpec{
+					Selector: v1alpha1.HostSelectorSpec{
+						HostSelector: map[string]string{"type": "retry-node"},
+					},
+					TemplateID: "image_provision",
+				},
+			}
+			Expect(k8sClient.Create(ctx, bmi)).To(Succeed())
+
+			reconciler := newMetal3Reconciler()
+			reconciler.ProvisioningProvider = newFailingProvider()
+
+			// Allocation (finalizer, find, assign) then the management finalizer.
+			reconcileN(reconciler, bmiName, 4)
+			bmi = getBMI(bmiName)
+			Expect(bmi.Spec.HostClass).To(Equal(metal3HostClass))
+
+			// Trigger the first provision attempt.
+			reconcileN(reconciler, bmiName, 1)
+
+			// The poll observes the provider failure: the persisted state must
+			// stay a retrying Progressing instance, never Failed or Ready.
+			reconcileN(reconciler, bmiName, 1)
+			bmi = getBMI(bmiName)
+			Expect(bmi.Status.Phase).To(Equal(v1alpha1.BareMetalInstancePhaseProgressing))
+			condition := bmi.GetStatusCondition(v1alpha1.HostConditionProvisionTemplateComplete)
+			Expect(condition).NotTo(BeNil())
+			Expect(condition.Status).To(Equal(metav1.ConditionFalse))
+			Expect(condition.Reason).To(Equal(v1alpha1.HostConditionReasonRetrying))
+			Expect(condition.Message).To(Equal(
+				"Provisioning retry scheduled after failed attempt: " + providerError))
+			Expect(bmi.Status.ProvisioningJobs).To(HaveLen(1))
+			Expect(bmi.Status.ProvisioningJobs[0].State).To(Equal(opv1alpha1.JobStateFailed))
+
+			// The next reconcile enters exponential backoff and stays retrying.
+			result := reconcileN(reconciler, bmiName, 1)
+			Expect(result.RequeueAfter).To(BeNumerically(">", 0))
+			bmi = getBMI(bmiName)
+			Expect(bmi.Status.Phase).To(Equal(v1alpha1.BareMetalInstancePhaseProgressing))
+			condition = bmi.GetStatusCondition(v1alpha1.HostConditionProvisionTemplateComplete)
+			Expect(condition.Reason).To(Equal(v1alpha1.HostConditionReasonRetrying))
+		})
+
+		It("migrates a persisted legacy template failure to retrying during backoff", func() {
+			createMetal3BMH(bmhName, map[string]string{
+				inventory.Metal3HostTypeLabel: "retry-node",
+			}, metal3api.OperationalStatusOK, metal3api.StateAvailable)
+
+			bmi := &v1alpha1.BareMetalInstance{
+				ObjectMeta: metav1.ObjectMeta{Name: bmiName, Namespace: metal3TestNS},
+				Spec: v1alpha1.BareMetalInstanceSpec{
+					Selector: v1alpha1.HostSelectorSpec{
+						HostSelector: map[string]string{"type": "retry-node"},
+					},
+					TemplateID: "image_provision",
+				},
+			}
+			Expect(k8sClient.Create(ctx, bmi)).To(Succeed())
+
+			reconciler := newMetal3Reconciler()
+			reconciler.ProvisioningProvider = newFailingProvider()
+
+			// Allocation, management finalizer, and the first job trigger.
+			reconcileN(reconciler, bmiName, 5)
+
+			// Simulate a pre-fix persisted CR: the job is terminally failed
+			// and the condition still carries the legacy TemplateFailed reason.
+			bmi = getBMI(bmiName)
+			Expect(bmi.Status.ProvisioningJobs).To(HaveLen(1))
+			bmi.Status.ProvisioningJobs[0].State = opv1alpha1.JobStateFailed
+			bmi.Status.ProvisioningJobs[0].Message = providerError
+			bmi.SetStatusCondition(
+				v1alpha1.HostConditionProvisionTemplateComplete,
+				metav1.ConditionFalse,
+				v1alpha1.HostConditionReasonTemplateFailed,
+				providerError,
+			)
+			Expect(k8sClient.Status().Update(ctx, bmi)).To(Succeed())
+
+			// The backoff reconcile migrates the condition without losing the
+			// backend error, and the instance stays Progressing.
+			result := reconcileN(reconciler, bmiName, 1)
+			Expect(result.RequeueAfter).To(BeNumerically(">", 0))
+			bmi = getBMI(bmiName)
+			Expect(bmi.Status.Phase).To(Equal(v1alpha1.BareMetalInstancePhaseProgressing))
+			condition := bmi.GetStatusCondition(v1alpha1.HostConditionProvisionTemplateComplete)
+			Expect(condition).NotTo(BeNil())
+			Expect(condition.Status).To(Equal(metav1.ConditionFalse))
+			Expect(condition.Reason).To(Equal(v1alpha1.HostConditionReasonRetrying))
+			Expect(condition.Message).To(Equal(
+				"Provisioning retry scheduled after failed attempt: " + providerError))
+		})
+	})
+
+	Describe("Power management flow", func() {
+		const bmiName = "power-test-bmi"
+		const bmhName = "power-test-bmh"
+
+		AfterEach(func() {
+			cleanupBMI(bmiName)
+			cleanupBMH(bmhName)
+		})
+
+		It("should manage power state and transition to Ready", func() {
+			createMetal3BMH(bmhName, map[string]string{
+				inventory.Metal3HostTypeLabel: "compute",
+			}, metal3api.OperationalStatusOK, metal3api.StateAvailable)
+
+			bmi := &v1alpha1.BareMetalInstance{
+				ObjectMeta: metav1.ObjectMeta{Name: bmiName, Namespace: metal3TestNS},
+				Spec: v1alpha1.BareMetalInstanceSpec{
+					Selector: v1alpha1.HostSelectorSpec{
+						HostSelector: map[string]string{"type": "compute"},
+					},
+					TemplateID:  shared.OsacNoopTemplate,
+					RunStrategy: v1alpha1.RunStrategyAlways,
+				},
+			}
+			Expect(k8sClient.Create(ctx, bmi)).To(Succeed())
+
+			reconciler := newMetal3Reconciler()
+
+			// Drive through allocation (3 reconciles: finalizer, find, assign)
+			reconcileN(reconciler, bmiName, 3)
+			bmi = getBMI(bmiName)
+			Expect(bmi.Spec.HostClass).To(Equal(metal3HostClass))
+
+			// Reconcile: add management finalizer
+			reconcileN(reconciler, bmiName, 1)
+			bmi = getBMI(bmiName)
+			Expect(bmi.Finalizers).To(ContainElement(BareMetalInstanceManagementFinalizer))
+
+			// Reconcile: GetPowerState (off) → SetPowerState (on) → requeue
+			result := reconcileN(reconciler, bmiName, 1)
+			Expect(result.RequeueAfter).To(Equal(DefaultManagementRecheckIntervalDuration))
+
+			// Verify BMH spec.online was patched to true
+			updatedBMH := getBMH(bmhName)
+			Expect(updatedBMH.Spec.Online).To(BeTrue())
+
+			// Simulate BMO reconciliation: update status.poweredOn
+			updatedBMH.Status.PoweredOn = true
+			Expect(k8sClient.Status().Update(ctx, updatedBMH)).To(Succeed())
+
+			// Reconcile twice: first verifies convergence (stale-read guard), second reaches Ready
+			reconcileN(reconciler, bmiName, 2)
+			bmi = getBMI(bmiName)
+			Expect(bmi.Status.Phase).To(Equal(v1alpha1.BareMetalInstancePhaseReady))
+			Expect(bmi.Status.RunStrategy).To(Equal(v1alpha1.RunStrategyAlways))
+
+			condition := bmi.GetStatusCondition(v1alpha1.HostConditionPowerSynced)
+			Expect(condition).NotTo(BeNil())
+			Expect(condition.Status).To(Equal(metav1.ConditionTrue))
+			Expect(condition.Reason).To(Equal(v1alpha1.HostConditionReasonPowerOn))
+		})
+
+		It("keeps a halted host powered off and transitions directly to Ready", func() {
+			createMetal3BMH(bmhName, map[string]string{
+				inventory.Metal3HostTypeLabel: "compute",
+			}, metal3api.OperationalStatusOK, metal3api.StateAvailable)
+
+			bmi := &v1alpha1.BareMetalInstance{
+				ObjectMeta: metav1.ObjectMeta{Name: bmiName, Namespace: metal3TestNS},
+				Spec: v1alpha1.BareMetalInstanceSpec{
+					Selector: v1alpha1.HostSelectorSpec{
+						HostSelector: map[string]string{"type": "compute"},
+					},
+					TemplateID:  shared.OsacNoopTemplate,
+					RunStrategy: v1alpha1.RunStrategyHalted,
+				},
+			}
+			Expect(k8sClient.Create(ctx, bmi)).To(Succeed())
+
+			reconciler := newMetal3Reconciler()
+			reconcileN(reconciler, bmiName, 5)
+
+			bmi = getBMI(bmiName)
+			Expect(bmi.Status.Phase).To(Equal(v1alpha1.BareMetalInstancePhaseReady))
+			Expect(bmi.Status.RunStrategy).To(Equal(v1alpha1.RunStrategyHalted))
+
+			bmh := getBMH(bmhName)
+			Expect(bmh.Spec.Online).To(BeFalse())
+			condition := bmi.GetStatusCondition(v1alpha1.HostConditionPowerSynced)
+			Expect(condition).NotTo(BeNil())
+			Expect(condition.Status).To(Equal(metav1.ConditionTrue))
+			Expect(condition.Reason).To(Equal(v1alpha1.HostConditionReasonPowerOff))
+		})
+	})
+
+	Describe("Metal3 error propagation", func() {
+		const bmiName = "metal3-error-bmi"
+		const bmhName = "metal3-error-bmh"
+
+		AfterEach(func() {
+			cleanupBMI(bmiName)
+			cleanupBMH(bmhName)
+		})
+
+		It("marks a progressing instance failed when its BMH enters an error state", func() {
+			createMetal3BMH(bmhName, map[string]string{
+				inventory.Metal3HostTypeLabel: "error-node",
+			}, metal3api.OperationalStatusOK, metal3api.StateAvailable)
+
+			bmi := &v1alpha1.BareMetalInstance{
+				ObjectMeta: metav1.ObjectMeta{Name: bmiName, Namespace: metal3TestNS},
+				Spec: v1alpha1.BareMetalInstanceSpec{
+					Selector: v1alpha1.HostSelectorSpec{
+						HostSelector: map[string]string{"type": "error-node"},
+					},
+					TemplateID: shared.OsacNoopTemplate,
+				},
+			}
+			Expect(k8sClient.Create(ctx, bmi)).To(Succeed())
+
+			reconciler := newMetal3Reconciler()
+			// Allocate the host and add the management finalizer. The instance is
+			// Progressing while Metal3 still reports a healthy, available host.
+			reconcileN(reconciler, bmiName, 4)
+			bmi = getBMI(bmiName)
+			Expect(bmi.Status.Phase).To(Equal(v1alpha1.BareMetalInstancePhaseProgressing))
+
+			// Simulate BMO/Ironic reporting a terminal host error through the BMH
+			// status subresource before power reconciliation completes.
+			bmh := getBMH(bmhName)
+			bmh.Status.OperationalStatus = metal3api.OperationalStatusError
+			bmh.Status.ErrorMessage = "Ironic could not reach the BMC"
+			Expect(k8sClient.Status().Update(ctx, bmh)).To(Succeed())
+
+			_, err := reconciler.Reconcile(ctx, ctrl.Request{
+				NamespacedName: types.NamespacedName{Name: bmiName, Namespace: metal3TestNS},
+			})
+			Expect(err).To(HaveOccurred())
+
+			bmi = getBMI(bmiName)
+			Expect(bmi.Status.Phase).To(Equal(v1alpha1.BareMetalInstancePhaseFailed))
+			condition := bmi.GetStatusCondition(v1alpha1.HostConditionPowerSynced)
+			Expect(condition).NotTo(BeNil())
+			Expect(condition.Status).To(Equal(metav1.ConditionFalse))
+			Expect(condition.Reason).To(Equal(v1alpha1.HostConditionReasonIronicAPIFailure))
+		})
+	})
+
+	Describe("Management finalizer conflict handling", func() {
+		const bmiName = "conflict-test-bmi"
+		const bmhName = "conflict-test-bmh"
+
+		AfterEach(func() {
+			cleanupBMI(bmiName)
+			cleanupBMH(bmhName)
+		})
+
+		// A conflict on the Update that adds the management finalizer is routine
+		// (concurrent modification / lagging cache read), not a real failure. It
+		// must requeue for retry, never mark the instance Failed — Failed is a
+		// no-requeue terminal state, so treating a transient conflict as Failed
+		// would permanently strand the instance.
+		It("should requeue without marking the instance Failed when the management finalizer add conflicts", func() {
+			createMetal3BMH(bmhName, map[string]string{
+				inventory.Metal3HostTypeLabel: "compute",
+			}, metal3api.OperationalStatusOK, metal3api.StateAvailable)
+
+			bmi := &v1alpha1.BareMetalInstance{
+				ObjectMeta: metav1.ObjectMeta{Name: bmiName, Namespace: metal3TestNS},
+				Spec: v1alpha1.BareMetalInstanceSpec{
+					Selector: v1alpha1.HostSelectorSpec{
+						HostSelector: map[string]string{
+							"type": "compute",
+						},
+					},
+					TemplateID:  shared.OsacNoopTemplate,
+					RunStrategy: v1alpha1.RunStrategyAlways,
+				},
+			}
+			Expect(k8sClient.Create(ctx, bmi)).To(Succeed())
+
+			// Inject exactly one conflict, on the Update that carries the management
+			// finalizer. Inventory/management backends keep using the raw client, so
+			// only the finalizer-add write is affected.
+			baseClient, err := client.NewWithWatch(cfg, client.Options{Scheme: k8sClient.Scheme()})
+			Expect(err).NotTo(HaveOccurred())
+
+			conflictInjected := false
+			conflictClient := interceptor.NewClient(baseClient, interceptor.Funcs{
+				Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+					if !conflictInjected {
+						if inst, ok := obj.(*v1alpha1.BareMetalInstance); ok &&
+							controllerutil.ContainsFinalizer(inst, BareMetalInstanceManagementFinalizer) {
+							conflictInjected = true
+							return apierrors.NewConflict(
+								schema.GroupResource{Group: "osac.openshift.io", Resource: "baremetalinstances"},
+								inst.Name, fmt.Errorf("the object has been modified"))
+						}
+					}
+					return c.Update(ctx, obj, opts...)
+				},
+			})
+
+			reconciler := NewBareMetalInstanceReconciler(
+				conflictClient,
+				k8sClient.Scheme(),
+				inventory.NewMetal3ClientForTest(k8sClient, metal3TestNS, metal3HostClass),
+				management.NewMetal3ClientForTest(k8sClient, metal3TestNS),
+				nil, nil, nil, nil,
+				0, 0, 0, 0, 0,
+			)
+
+			// Allocation (finalizer, find, assign) — no conflict yet.
+			reconcileN(reconciler, bmiName, 3)
+			bmi = getBMI(bmiName)
+			Expect(bmi.Spec.HostClass).To(Equal(metal3HostClass))
+
+			// This reconcile adds the management finalizer; the injected conflict
+			// makes the Update fail. Reconcile must surface the error (→ requeue)
+			// and leave the phase un-Failed.
+			_, err = reconciler.Reconcile(ctx, ctrl.Request{
+				NamespacedName: types.NamespacedName{Name: bmiName, Namespace: metal3TestNS},
+			})
+			Expect(err).To(HaveOccurred())
+			Expect(apierrors.IsConflict(err)).To(BeTrue())
+			Expect(conflictInjected).To(BeTrue())
+
+			bmi = getBMI(bmiName)
+			Expect(bmi.Status.Phase).NotTo(Equal(v1alpha1.BareMetalInstancePhaseFailed))
+
+			// Retry (no further injected conflicts): the finalizer is added and the
+			// instance recovers instead of being stuck in Failed.
+			reconcileN(reconciler, bmiName, 1)
+			bmi = getBMI(bmiName)
+			Expect(bmi.Finalizers).To(ContainElement(BareMetalInstanceManagementFinalizer))
+			Expect(bmi.Status.Phase).NotTo(Equal(v1alpha1.BareMetalInstancePhaseFailed))
+		})
+	})
+
+	Describe("Deallocation flow", func() {
+		const bmiName = "dealloc-test-bmi"
+		const bmhName = "dealloc-test-bmh"
+
+		AfterEach(func() {
+			cleanupBMI(bmiName)
+			cleanupBMH(bmhName)
+		})
+
+		It("should unassign the BMH and remove finalizers on deletion", func() {
+			createMetal3BMH(bmhName, map[string]string{
+				inventory.Metal3HostTypeLabel: "storage",
+			}, metal3api.OperationalStatusOK, metal3api.StateAvailable)
+
+			bmi := &v1alpha1.BareMetalInstance{
+				ObjectMeta: metav1.ObjectMeta{Name: bmiName, Namespace: metal3TestNS},
+				Spec: v1alpha1.BareMetalInstanceSpec{
+					Selector: v1alpha1.HostSelectorSpec{
+						HostSelector: map[string]string{"type": "storage"},
+					},
+					TemplateID: shared.OsacNoopTemplate,
+				},
+			}
+			Expect(k8sClient.Create(ctx, bmi)).To(Succeed())
+
+			reconciler := newMetal3Reconciler()
+
+			// Drive through allocation and management setup
+			// 3 reconciles for allocation + 1 for management finalizer + 1 for ready
+			reconcileN(reconciler, bmiName, 5)
+			bmi = getBMI(bmiName)
+			Expect(bmi.Status.Phase).To(Equal(v1alpha1.BareMetalInstancePhaseReady))
+			Expect(bmi.Finalizers).To(ContainElement(BareMetalInstanceInventoryFinalizer))
+			Expect(bmi.Finalizers).To(ContainElement(BareMetalInstanceManagementFinalizer))
+
+			// Verify BMH is assigned
+			updatedBMH := getBMH(bmhName)
+			Expect(updatedBMH.Spec.ConsumerRef).NotTo(BeNil())
+
+			// Delete the BareMetalInstance
+			Expect(k8sClient.Delete(ctx, bmi)).To(Succeed())
+
+			// Reconcile: management finalizer removed (noop template → skip deprovision),
+			// inventory cleanup: unassign + remove inventory finalizer — all in one reconcile
+			reconcileN(reconciler, bmiName, 1)
+
+			// Verify BMH is unassigned
+			updatedBMH = getBMH(bmhName)
+			Expect(updatedBMH.Spec.ConsumerRef).To(BeNil())
+
+			// Verify the BareMetalInstance is gone (finalizers removed → k8s garbage collects)
+			err := k8sClient.Get(ctx, types.NamespacedName{Name: bmiName, Namespace: metal3TestNS}, &v1alpha1.BareMetalInstance{})
+			Expect(err).To(HaveOccurred())
+			Expect(client.IgnoreNotFound(err)).To(Succeed())
+		})
+	})
+
+	Describe("Error cases", func() {
+		Describe("no matching BMH available", func() {
+			const bmiName = "no-host-bmi"
+
+			AfterEach(func() {
+				cleanupBMI(bmiName)
+			})
+
+			It("should set Failed phase and requeue", func() {
+				bmi := &v1alpha1.BareMetalInstance{
+					ObjectMeta: metav1.ObjectMeta{Name: bmiName, Namespace: metal3TestNS},
+					Spec: v1alpha1.BareMetalInstanceSpec{
+						Selector: v1alpha1.HostSelectorSpec{
+							HostSelector: map[string]string{"type": "nonexistent-type"},
+						},
+						TemplateID: shared.OsacNoopTemplate,
+					},
+				}
+				Expect(k8sClient.Create(ctx, bmi)).To(Succeed())
+
+				reconciler := newMetal3Reconciler()
+
+				// Reconcile 1: add finalizer
+				reconcileN(reconciler, bmiName, 1)
+
+				// Reconcile 2: FindFreeHost returns nil → Failed
+				result := reconcileN(reconciler, bmiName, 1)
+				Expect(result.RequeueAfter).To(Equal(DefaultNoFreeHostsPollIntervalDuration))
+
+				bmi = getBMI(bmiName)
+				Expect(bmi.Status.Phase).To(Equal(v1alpha1.BareMetalInstancePhaseFailed))
+			})
+		})
+
+		Describe("BMH taken by concurrent assignment", func() {
+			const bmiName = "taken-host-bmi"
+			const bmhName = "taken-host-bmh"
+
+			AfterEach(func() {
+				cleanupBMI(bmiName)
+				cleanupBMH(bmhName)
+			})
+
+			It("should unset ExternalHostID when BMH is already claimed", func() {
+				bmh := createMetal3BMH(bmhName, map[string]string{
+					inventory.Metal3HostTypeLabel: "contested",
+				}, metal3api.OperationalStatusOK, metal3api.StateAvailable)
+				bmh.Spec.ConsumerRef = &corev1.ObjectReference{
+					APIVersion: "osac.openshift.io/v1alpha1",
+					Kind:       "BareMetalInstance",
+					Name:       "other-instance",
+				}
+				Expect(k8sClient.Update(ctx, bmh)).To(Succeed())
+
+				bmi := &v1alpha1.BareMetalInstance{
+					ObjectMeta: metav1.ObjectMeta{Name: bmiName, Namespace: metal3TestNS},
+					Spec: v1alpha1.BareMetalInstanceSpec{
+						Selector: v1alpha1.HostSelectorSpec{
+							HostSelector: map[string]string{"type": "contested"},
+						},
+						TemplateID:     shared.OsacNoopTemplate,
+						ExternalHostID: metal3TestNS + "/" + bmhName,
+					},
+				}
+				Expect(k8sClient.Create(ctx, bmi)).To(Succeed())
+
+				reconciler := newMetal3Reconciler()
+
+				// Reconcile 1: add finalizer
+				reconcileN(reconciler, bmiName, 1)
+
+				// Reconcile 2: AssignHost returns nil (host taken) → ExternalHostID unset
+				reconcileN(reconciler, bmiName, 1)
+				bmi = getBMI(bmiName)
+				Expect(bmi.Spec.ExternalHostID).To(BeEmpty())
+			})
+		})
+
+		Describe("CRD discovery", func() {
+			It("should detect BareMetalHost CRD via the discovery API", func() {
+				dc, err := discovery.NewDiscoveryClientForConfig(cfg)
+				Expect(err).NotTo(HaveOccurred())
+				resources, err := dc.ServerResourcesForGroupVersion("metal3.io/v1alpha1")
+				Expect(err).NotTo(HaveOccurred())
+				Expect(resources).NotTo(BeNil())
+
+				found := false
+				for _, r := range resources.APIResources {
+					if r.Kind == "BareMetalHost" {
+						found = true
+						break
+					}
+				}
+				Expect(found).To(BeTrue(), "BareMetalHost should be discoverable via the API")
+			})
+
+			It("should fail when BareMetalHost CRD is not present", func() {
+				// Start a minimal envtest without BMH CRDs
+				miniEnv := &envtest.Environment{
+					CRDDirectoryPaths:     []string{filepath.Join("..", "..", "config", "crd", "bases")},
+					ErrorIfCRDPathMissing: false,
+					Scheme:                scheme.Scheme,
+				}
+				if getFirstFoundEnvTestBinaryDir() != "" {
+					miniEnv.BinaryAssetsDirectory = getFirstFoundEnvTestBinaryDir()
+				}
+				miniCfg, err := miniEnv.Start()
+				Expect(err).NotTo(HaveOccurred())
+				DeferCleanup(func() { _ = miniEnv.Stop() })
+
+				dc, err := discovery.NewDiscoveryClientForConfig(miniCfg)
+				Expect(err).NotTo(HaveOccurred())
+				_, err = dc.ServerResourcesForGroupVersion("metal3.io/v1alpha1")
+				Expect(err).To(HaveOccurred(), "metal3.io/v1alpha1 should not be available without BMH CRD")
+			})
+		})
+	})
+
+	Describe("NIC metadata flow", func() {
+		const bmiName = "nic-test-bmi"
+		const bmhName = "nic-test-bmh"
+
+		AfterEach(func() {
+			cleanupBMI(bmiName)
+			cleanupBMH(bmhName)
+		})
+
+		It("should populate status.hardware.nics from BareMetalHost hardware inspection", func() {
+			bmh := createMetal3BMH(bmhName, map[string]string{
+				inventory.Metal3HostTypeLabel: "gpu-node",
+			}, metal3api.OperationalStatusOK, metal3api.StateAvailable)
+			_ = bmh
+
+			bmi := &v1alpha1.BareMetalInstance{
+				ObjectMeta: metav1.ObjectMeta{Name: bmiName, Namespace: metal3TestNS},
+				Spec: v1alpha1.BareMetalInstanceSpec{
+					Selector: v1alpha1.HostSelectorSpec{
+						HostSelector: map[string]string{"osac.openshift.io/host-type": "gpu-node"},
+					},
+					TemplateID: shared.OsacNoopTemplate,
+				},
+			}
+			Expect(k8sClient.Create(ctx, bmi)).To(Succeed())
+
+			reconciler := newMetal3Reconciler()
+
+			// 3 reconciles for allocation + 1 for management finalizer + 1 for Ready
+			reconcileN(reconciler, bmiName, 5)
+			bmi = getBMI(bmiName)
+
+			Expect(bmi.Status.Phase).To(Equal(v1alpha1.BareMetalInstancePhaseReady))
+			Expect(bmi.Status.Hardware).NotTo(BeNil())
+			Expect(bmi.Status.Hardware.NICs).To(HaveLen(1))
+			Expect(bmi.Status.Hardware.NICs[0].MAC).To(Equal("aa:bb:cc:dd:ee:01"))
+		})
+	})
+})

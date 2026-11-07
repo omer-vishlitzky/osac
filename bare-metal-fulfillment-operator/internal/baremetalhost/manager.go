@@ -42,6 +42,7 @@ import (
 var (
 	bmcSecretManagedByLabel = shared.OsacPrefix + "/managed-by"
 	bmcSecretManagedByValue = shared.OsacDefaultManagedByValue
+	bmcSecretOwnerLabel     = shared.OsacPrefix + "/bare-metal-instance-uid"
 )
 
 // CreateParams holds the parameters for creating a BareMetalHost CR.
@@ -59,27 +60,25 @@ type CreateParams struct {
 // readiness checking. Any inventory backend that needs BMH CRs can
 // use this utility.
 //
-// secretClient is an uncached read+write client used for all BMC credential
-// Secret operations. Reading Secrets directly from the API server — rather than
-// the cached client — avoids caching (and therefore list/watch RBAC on) every
-// Secret in the cluster, so the operator needs only get/create/update/delete.
+// uncachedClient handles BMC credential Secrets and confirms BMH deletion
+// directly with the API server. Direct Secret access avoids cluster-wide
+// Secret caching and its list/watch RBAC requirements.
 type Manager struct {
-	client       client.Client
-	secretClient client.Client
-	namespace    string
+	client         client.Client
+	uncachedClient client.Client
+	namespace      string
 }
 
-// NewManager creates a manager for the given Metal3 namespace. secretClient
-// should be an uncached client (e.g. one built with client.New) so Secret
-// operations bypass the informer cache; if nil, the cached client is used.
-func NewManager(k8sClient client.Client, secretClient client.Client, namespace string) *Manager {
-	if secretClient == nil {
-		secretClient = k8sClient
+// NewManager creates a manager for the given Metal3 namespace. uncachedClient
+// should be built with client.New; if nil, the cached client is used.
+func NewManager(k8sClient client.Client, uncachedClient client.Client, namespace string) *Manager {
+	if uncachedClient == nil {
+		uncachedClient = k8sClient
 	}
 	return &Manager{
-		client:       k8sClient,
-		secretClient: secretClient,
-		namespace:    namespace,
+		client:         k8sClient,
+		uncachedClient: uncachedClient,
+		namespace:      namespace,
 	}
 }
 
@@ -148,7 +147,7 @@ func (m *Manager) CreateBMH(ctx context.Context, params CreateParams) error {
 // BMHExists checks whether a BareMetalHost CR exists in the configured namespace.
 func (m *Manager) BMHExists(ctx context.Context, name string) (bool, error) {
 	bmh := &metal3api.BareMetalHost{}
-	err := m.client.Get(ctx, client.ObjectKey{Namespace: m.namespace, Name: name}, bmh)
+	err := m.uncachedClient.Get(ctx, client.ObjectKey{Namespace: m.namespace, Name: name}, bmh)
 	if apierrors.IsNotFound(err) {
 		return false, nil
 	}
@@ -162,93 +161,114 @@ func (m *Manager) BMHExists(ctx context.Context, name string) (bool, error) {
 // Secret in the Metal3 namespace with the standard Metal3/BMO "username" and
 // "password" keys. The Secret is labeled so DeleteBMCSecret can safely tell
 // operator-created Secrets apart from admin-created ones. Idempotent: if the
-// Secret already exists its data and label are updated.
-func (m *Manager) EnsureBMCSecret(ctx context.Context, name, username, password string) error {
-	log := ctrllog.FromContext(ctx)
-
-	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: m.namespace},
-	}
-	result, err := controllerutil.CreateOrUpdate(ctx, m.secretClient, secret, func() error {
-		// Refuse to claim a Secret we did not create: overwriting an unlabeled
-		// (e.g. externally-created) Secret and stamping our label would later
-		// cause DeleteBMCSecret to delete it, violating the "never touch
-		// non-operator Secrets" invariant. A non-empty ResourceVersion means the
-		// Secret already existed (update path).
-		if secret.ResourceVersion != "" && secret.Labels[bmcSecretManagedByLabel] != bmcSecretManagedByValue {
-			return fmt.Errorf("BMC credentials Secret %s/%s already exists and is not operator-managed; refusing to overwrite", m.namespace, name)
-		}
-		if secret.Labels == nil {
-			secret.Labels = map[string]string{}
-		}
-		secret.Labels[bmcSecretManagedByLabel] = bmcSecretManagedByValue
-		secret.Type = corev1.SecretTypeOpaque
-		secret.Data = map[string][]byte{
-			"username": []byte(username),
-			"password": []byte(password),
-		}
-		return nil
-	})
+// Secret already exists its data and label are updated for the same BMI.
+func (m *Manager) EnsureBMCSecret(ctx context.Context, name, username, password, ownerUID string) error {
+	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: m.namespace}}
+	update := func() error { return m.updateBMCSecret(ctx, secret, username, password, ownerUID) }
+	result, err := controllerutil.CreateOrUpdate(ctx, m.uncachedClient, secret, update)
 	if err != nil {
 		return fmt.Errorf("failed to ensure BMC credentials Secret %s/%s: %w", m.namespace, name, err)
 	}
-
-	log.Info("Ensured BMC credentials Secret", "name", name, "namespace", m.namespace, "result", result)
+	ctrllog.FromContext(ctx).Info("Ensured BMC credentials Secret", "name", name, "namespace", m.namespace, "result", result)
 	return nil
 }
 
-// DeleteBMCSecret deletes a BMC credentials Secret by name, but ONLY if it is
-// operator-managed (carries the managed-by label). Admin-created Secrets and
-// missing Secrets are left untouched. Idempotent.
-func (m *Manager) DeleteBMCSecret(ctx context.Context, name string) error {
-	log := ctrllog.FromContext(ctx)
-
-	secret := &corev1.Secret{}
-	if err := m.secretClient.Get(ctx, client.ObjectKey{Namespace: m.namespace, Name: name}, secret); err != nil {
-		if apierrors.IsNotFound(err) {
-			return nil
-		}
-		return fmt.Errorf("failed to get BMC credentials Secret %s/%s: %w", m.namespace, name, err)
+func (m *Manager) updateBMCSecret(ctx context.Context, secret *corev1.Secret, username, password, ownerUID string) error {
+	if err := m.checkBMCSecretOwner(ctx, secret, ownerUID); err != nil {
+		return err
 	}
+	setBMCSecretLabels(secret, ownerUID)
+	secret.Type = corev1.SecretTypeOpaque
+	secret.Data = map[string][]byte{"username": []byte(username), "password": []byte(password)}
+	return nil
+}
 
-	if secret.Labels[bmcSecretManagedByLabel] != bmcSecretManagedByValue {
-		log.Info("BMC credentials Secret is not operator-managed, leaving it in place",
-			"name", name, "namespace", m.namespace)
+func setBMCSecretLabels(secret *corev1.Secret, ownerUID string) {
+	if secret.Labels == nil {
+		secret.Labels = map[string]string{}
+	}
+	secret.Labels[bmcSecretManagedByLabel] = bmcSecretManagedByValue
+	secret.Labels[bmcSecretOwnerLabel] = ownerUID
+}
+
+func (m *Manager) checkBMCSecretOwner(ctx context.Context, secret *corev1.Secret, ownerUID string) error {
+	if ownerUID == "" {
+		return fmt.Errorf("BMC credentials Secret %s/%s requires a BMI UID", m.namespace, secret.Name)
+	}
+	if secret.ResourceVersion == "" {
 		return nil
 	}
+	if secret.Labels[bmcSecretManagedByLabel] != bmcSecretManagedByValue {
+		return fmt.Errorf("BMC credentials Secret %s/%s is not operator-managed; refusing to modify or delete it", m.namespace, secret.Name)
+	}
+	owner := secret.Labels[bmcSecretOwnerLabel]
+	if owner == ownerUID {
+		return nil
+	}
+	if owner != "" {
+		return fmt.Errorf("BMC credentials Secret %s/%s is not owned by this BMI", m.namespace, secret.Name)
+	}
+	_, err := m.findOwnedBMH(ctx, strings.TrimSuffix(secret.Name, "-bmc-secret"), ownerUID)
+	return err
+}
 
-	if err := m.secretClient.Delete(ctx, secret); err != nil {
-		if apierrors.IsNotFound(err) {
-			return nil
-		}
+// DeleteBMCSecret deletes a generated Secret only for its BMI owner.
+func (m *Manager) DeleteBMCSecret(ctx context.Context, name, ownerUID string) error {
+	secret, err := m.findOwnedBMCSecret(ctx, name, ownerUID)
+	if err != nil || secret == nil {
+		return err
+	}
+	err = m.uncachedClient.Delete(ctx, secret, client.Preconditions{UID: &secret.UID, ResourceVersion: &secret.ResourceVersion})
+	if err != nil && !apierrors.IsNotFound(err) {
 		return fmt.Errorf("failed to delete BMC credentials Secret %s/%s: %w", m.namespace, name, err)
 	}
-	log.Info("Deleted operator-managed BMC credentials Secret", "name", name, "namespace", m.namespace)
+	return m.confirmBMCSecretDeletion(ctx, name)
+}
+
+func (m *Manager) findOwnedBMCSecret(ctx context.Context, name, ownerUID string) (*corev1.Secret, error) {
+	secret := &corev1.Secret{}
+	if err := m.uncachedClient.Get(ctx, client.ObjectKey{Namespace: m.namespace, Name: name}, secret); err != nil {
+		return nil, client.IgnoreNotFound(err)
+	}
+	if err := m.checkBMCSecretOwner(ctx, secret, ownerUID); err != nil {
+		return nil, err
+	}
+	return secret, nil
+}
+
+func (m *Manager) confirmBMCSecretDeletion(ctx context.Context, name string) error {
+	err := m.uncachedClient.Get(ctx, client.ObjectKey{Namespace: m.namespace, Name: name}, &corev1.Secret{})
+	if err == nil {
+		return fmt.Errorf("BMC credentials Secret %s/%s deletion is pending", m.namespace, name)
+	}
+	return client.IgnoreNotFound(err)
+}
+
+// DeleteBMH leaves a BMH with another consumerRef untouched.
+func (m *Manager) DeleteBMH(ctx context.Context, name, ownerUID string) error {
+	bmh, err := m.findOwnedBMH(ctx, name, ownerUID)
+	if err != nil || bmh == nil {
+		return err
+	}
+	err = m.uncachedClient.Delete(ctx, bmh, client.Preconditions{UID: &bmh.UID, ResourceVersion: &bmh.ResourceVersion})
+	if err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("failed to delete BareMetalHost %s/%s: %w", m.namespace, name, err)
+	}
 	return nil
 }
 
-// DeleteBMH deletes a BareMetalHost CR by name. Idempotent — ignores NotFound.
-// Does not delete BMC credentials Secrets (they are admin-managed and reusable).
-func (m *Manager) DeleteBMH(ctx context.Context, name string) error {
-	log := ctrllog.FromContext(ctx)
-
-	bmh := &metal3api.BareMetalHost{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: m.namespace,
-		},
+func (m *Manager) findOwnedBMH(ctx context.Context, name, ownerUID string) (*metal3api.BareMetalHost, error) {
+	if ownerUID == "" {
+		return nil, fmt.Errorf("BareMetalHost %s/%s requires a BMI UID", m.namespace, name)
 	}
-
-	if err := m.client.Delete(ctx, bmh); err != nil {
-		if apierrors.IsNotFound(err) {
-			log.Info("BareMetalHost already deleted", "name", name, "namespace", m.namespace)
-			return nil
-		}
-		return fmt.Errorf("failed to delete BareMetalHost %s/%s: %w", m.namespace, name, err)
+	bmh := &metal3api.BareMetalHost{}
+	if err := m.uncachedClient.Get(ctx, client.ObjectKey{Namespace: m.namespace, Name: name}, bmh); err != nil {
+		return nil, client.IgnoreNotFound(err)
 	}
-
-	log.Info("Deleted BareMetalHost", "name", name, "namespace", m.namespace)
-	return nil
+	if bmh.Spec.ConsumerRef == nil || bmh.Spec.ConsumerRef.Name != ownerUID {
+		return nil, fmt.Errorf("BareMetalHost %s/%s is not owned by this BMI", m.namespace, name)
+	}
+	return bmh, nil
 }
 
 // GetHardwareNICs returns the lowercased MAC addresses for the host's NICs,
@@ -299,18 +319,19 @@ func hardwareMACs(details *metal3api.HardwareDetails) []string {
 	return macs
 }
 
-// IsBMHReady checks whether the BMH has completed Metal3 registration and is
-// ready for power management. Returns true when the BMH provisioning state is
-// "available" and operational status is "OK". Returns false while the BMH is
-// in registering, inspecting, or preparing state. Returns an error if the BMH
+// IsBMHAvailable checks whether the BMH has completed Metal3 registration and
+// inspection and is available for allocation (not yet provisioned). Returns
+// true when the BMH provisioning state is "available" and operational status
+// is "OK". Returns false while the BMH is in registering, inspecting, or
+// preparing state, and once it is provisioned. Returns an error if the BMH
 // does not exist or has an error operational status. Callers distinguish
 // not-found from error-status via apierrors.IsNotFound(err).
-func (m *Manager) IsBMHReady(ctx context.Context, name string) (bool, error) {
+func (m *Manager) IsBMHAvailable(ctx context.Context, name string) (bool, error) {
 	log := ctrllog.FromContext(ctx)
 
 	bmh := &metal3api.BareMetalHost{}
 	if err := m.client.Get(ctx, client.ObjectKey{Namespace: m.namespace, Name: name}, bmh); err != nil {
-		// IsBMHReady runs right after CreateBMH, so a NotFound here is almost
+		// IsBMHAvailable runs right after CreateBMH, so a NotFound here is almost
 		// always the informer cache not having observed the just-created BMH yet.
 		// Treat it as "not ready" so the caller requeues rather than erroring.
 		// It's safe even if the BMH were genuinely absent: ensureBMHExists
@@ -330,7 +351,7 @@ func (m *Manager) IsBMHReady(ctx context.Context, name string) (bool, error) {
 	ready := bmh.Status.Provisioning.State == metal3api.StateAvailable &&
 		bmh.Status.OperationalStatus == metal3api.OperationalStatusOK
 
-	log.V(1).Info("BareMetalHost readiness check",
+	log.V(1).Info("BareMetalHost availability check",
 		"name", name,
 		"provisioningState", bmh.Status.Provisioning.State,
 		"operationalStatus", bmh.Status.OperationalStatus,

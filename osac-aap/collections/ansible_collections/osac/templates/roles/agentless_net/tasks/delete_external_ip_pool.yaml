@@ -1,0 +1,5 @@
+---
+- name: Remove AgentlessNet ExternalIPPool provider state
+  ansible.builtin.include_tasks: _external_ip_pool.yaml
+  vars:
+    agentless_net_pool_action: delete_external_ip_pool

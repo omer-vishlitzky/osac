@@ -22,24 +22,14 @@ import (
 	grpccodes "google.golang.org/grpc/codes"
 	grpcstatus "google.golang.org/grpc/status"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
-	publicv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/public/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
 	"github.com/osac-project/osac/fulfillment-service/internal/database/dao"
-	"github.com/osac-project/osac/fulfillment-service/internal/events"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
-
-// storageTierUnforwardableFilterFields: public field paths that live under backends[0] privately, so
-// filters referencing them can't be forwarded (protocol is excluded -- its path matches on both schemas).
-var storageTierUnforwardableFilterFields = []string{
-	"this.spec.max_read_bandwidth_mbs",
-	"this.spec.max_write_bandwidth_mbs",
-	"this.spec.encryption_enabled",
-}
 
 type StorageTiersServerBuilder struct {
 	logger             *slog.Logger
-	notifier           events.Notifier
 	attributionLogic   auth.AttributionLogic
 	tenancyLogic       auth.TenancyLogic
 	metricsRegisterer  prometheus.Registerer
@@ -54,10 +44,6 @@ type StorageTiersServer struct {
 	logger    *slog.Logger
 	delegate  privatev1.StorageTiersServer
 	outMapper *GenericMapper[*privatev1.StorageTier, *publicv1.StorageTier]
-
-	// filterValidator only validates against the PUBLIC schema to close a CEL-filter oracle (its
-	// Translate() result is unused) -- do not remove this as apparently-dead code.
-	filterValidator *dao.FilterTranslator
 }
 
 func NewStorageTiersServer() *StorageTiersServerBuilder {
@@ -67,12 +53,6 @@ func NewStorageTiersServer() *StorageTiersServerBuilder {
 // SetLogger sets the logger to use. This is mandatory.
 func (b *StorageTiersServerBuilder) SetLogger(value *slog.Logger) *StorageTiersServerBuilder {
 	b.logger = value
-	return b
-}
-
-// SetNotifier sets the notifier to use. This is optional.
-func (b *StorageTiersServerBuilder) SetNotifier(value events.Notifier) *StorageTiersServerBuilder {
-	b.notifier = value
 	return b
 }
 
@@ -121,7 +101,7 @@ func (b *StorageTiersServerBuilder) Build() (result *StorageTiersServer, err err
 		return
 	}
 
-	// spec is ignored here since it's hand-flattened in toPublicTier, not copied field-by-name:
+	// spec is ignored here since it's hand-mapped in toPublicTier, not copied field-by-name:
 	outMapper, err := NewGenericMapper[*privatev1.StorageTier, *publicv1.StorageTier]().
 		SetLogger(b.logger).
 		SetStrict(false).
@@ -131,23 +111,15 @@ func (b *StorageTiersServerBuilder) Build() (result *StorageTiersServer, err err
 		return
 	}
 
-	// Create the filter validator (see the field comment on StorageTiersServer for why):
-	filterValidator, err := dao.NewFilterTranslator().
-		SetLogger(b.logger).
-		SetDescriptor((*publicv1.StorageTier)(nil).ProtoReflect().Descriptor()).
-		Build()
-	if err != nil {
-		return
-	}
-
 	// Create the private server to delegate to:
+	// The DAO validates filters against the public schema at this boundary.
 	delegate, err := NewPrivateStorageTiersServer().
 		SetLogger(b.logger).
-		SetNotifier(b.notifier).
 		SetAttributionLogic(b.attributionLogic).
 		SetTenancyLogic(b.tenancyLogic).
 		SetMetricsRegisterer(b.metricsRegisterer).
 		SetStorageBackendsDAO(b.storageBackendsDAO).
+		SetFilterDesc((*publicv1.StorageTier)(nil).ProtoReflect().Descriptor()).
 		Build()
 	if err != nil {
 		return
@@ -155,10 +127,9 @@ func (b *StorageTiersServerBuilder) Build() (result *StorageTiersServer, err err
 
 	// Create and populate the object:
 	result = &StorageTiersServer{
-		logger:          b.logger,
-		delegate:        delegate,
-		outMapper:       outMapper,
-		filterValidator: filterValidator,
+		logger:    b.logger,
+		delegate:  delegate,
+		outMapper: outMapper,
 	}
 	return
 }
@@ -166,28 +137,6 @@ func (b *StorageTiersServerBuilder) Build() (result *StorageTiersServer, err err
 func (s *StorageTiersServer) List(ctx context.Context,
 	request *publicv1.StorageTiersListRequest) (response *publicv1.StorageTiersListResponse, err error) {
 	filter := request.GetFilter()
-	if filter != "" {
-		// Layer 1 (security): reject filters that don't even compile against the public schema. This
-		// is the fix for the CEL-filter oracle described on the filterValidator field.
-		_, err = s.filterValidator.Translate(ctx, filter)
-		if err != nil {
-			err = grpcstatus.Errorf(grpccodes.InvalidArgument, "invalid filter: %v", err)
-			return
-		}
-
-		// Layer 2 (correctness): reject filters that compile publicly but reference a field whose
-		// path doesn't match privately (see storageTierUnforwardableFilterFields).
-		var unforwardable bool
-		unforwardable, err = filterReferencesAnyField(filter, storageTierUnforwardableFilterFields...)
-		if err != nil {
-			err = grpcstatus.Errorf(grpccodes.InvalidArgument, "invalid filter: %v", err)
-			return
-		}
-		if unforwardable {
-			err = grpcstatus.Errorf(grpccodes.InvalidArgument, "filtering by bandwidth or encryption is not yet supported")
-			return
-		}
-	}
 
 	// Create private request with same parameters:
 	privateRequest := &privatev1.StorageTiersListRequest{}
@@ -254,8 +203,8 @@ func (s *StorageTiersServer) Get(ctx context.Context,
 	return
 }
 
-// toPublicTier flattens the private tier's single backend into the public spec; errMsg lets List/Get
-// report their own wording without leaking internal detail on failure.
+// toPublicTier maps a private tier to the public shape; errMsg lets List/Get report their own
+// wording without leaking internal detail on failure.
 func (s *StorageTiersServer) toPublicTier(ctx context.Context, privateTier *privatev1.StorageTier,
 	errMsg string) (*publicv1.StorageTier, error) {
 	publicTier := &publicv1.StorageTier{}
@@ -266,18 +215,14 @@ func (s *StorageTiersServer) toPublicTier(ctx context.Context, privateTier *priv
 	}
 
 	backends := privateTier.GetSpec().GetBackends()
-	if len(backends) != 1 {
+	if len(backends) == 0 {
 		s.logger.ErrorContext(ctx, "Storage tier has an unexpected number of backend associations",
 			slog.String("id", privateTier.GetId()), slog.Int("count", len(backends)))
 		return nil, grpcstatus.Errorf(grpccodes.Internal, "%s", errMsg)
 	}
-	backend := backends[0]
 	publicTier.SetSpec(publicv1.StorageTierSpec_builder{
-		Description:          privateTier.GetSpec().GetDescription(),
-		Protocol:             s.toPublicStorageProtocol(ctx, privateTier.GetSpec().GetProtocol()),
-		MaxReadBandwidthMbs:  backend.GetMaxReadBandwidthMbs(),
-		MaxWriteBandwidthMbs: backend.GetMaxWriteBandwidthMbs(),
-		EncryptionEnabled:    backend.GetEncryptionEnabled(),
+		Description: privateTier.GetSpec().GetDescription(),
+		Protocol:    s.toPublicStorageProtocol(ctx, privateTier.GetSpec().GetProtocol()),
 	}.Build())
 	return publicTier, nil
 }

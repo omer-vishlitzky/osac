@@ -1,5 +1,27 @@
 # BMaaS CI environment -- instance values for osac chart.
 
+# --- Service Enablement ---
+global:
+  osacDeploymentId: "ci/osac"
+  fulfillmentTrust:
+    enabled: false
+  services:
+    caas:
+      enabled: false
+    vmaas:
+      enabled: false
+    bmaas:
+      enabled: true
+    maas:
+      enabled: false
+  # Provider networking disabled: networking resources become READY without
+  # provider work. The osac chart renders the Netris Fabric Manager
+  # registration from fabricManager; no Netris connection settings are needed.
+  networking:
+    provisioningEnabled: false
+    fabricManager: netris
+    k8sManager: ""
+
 # --- Operator ---
 operator:
   image:
@@ -15,15 +37,14 @@ operator:
       key: token
   fulfillment:
     serverAddress: "fulfillment-internal-api:8001"
-    tokenFile: "/var/run/secrets/kubernetes.io/serviceaccount/token"
+    credentials:
+      secretName: fulfillment-controller-credentials
+      clientIdKey: client-id
+      clientSecretKey: client-secret
   controllers:
-    clusterOrder: false
-    computeInstance: false
     tenant: true
     networking: true
-    networkingProvisioning: false
     storage: true
-    bareMetalInstance: true
   hubAccess:
     enabled: true
   tenants:
@@ -36,8 +57,14 @@ service:
   internalHostname: ""  # Set dynamically by make install-osac
   variant: openshift
   images:
-    service: ghcr.io/osac-project/fulfillment-service:main
-    envoy: ghcr.io/osac-project/envoy:v1.33.0
+    service:
+      repository: ghcr.io/osac-project/fulfillment-service
+      tag: latest
+      pullPolicy: Always
+    envoy:
+      repository: ghcr.io/osac-project/envoy
+      tag: v1.33.0
+      pullPolicy: IfNotPresent
   certs:
     issuerRef:
       kind: ClusterIssuer
@@ -50,8 +77,6 @@ service:
     # install-osac sets --set global.clusterDomain=$(DOMAIN).
     emergencyServiceAccounts:
     - admin
-    - osac-operator
-    - osac-operator-controller-manager
     - template-publisher
     - osac-metering
     controllerCredentials:
@@ -115,13 +140,15 @@ service:
 ui:
   enabled: true
   images:
-    ui: ghcr.io/osac-project/osac-ui:v0.0.5
+    ui: ghcr.io/osac-project/osac-ui:latest
   api:
     fulfillment:
       certs:
         caBundle:
           configMap: ca-bundle
   auth:
+    # oidcIssuerURL defaults to match service.auth.issuerUrl -- set automatically
+    # by install-osac via --set ui.auth.oidcIssuerURL when global.clusterDomain is set.
     certs:
       caBundle:
         configMap: ca-bundle
@@ -148,6 +175,11 @@ aap:
     eeImage: "ghcr.io/osac-project/osac-aap:latest"
     projectGitUri: "https://github.com/osac-project/osac"
     projectGitBranch: "main"
+  instanceGroups:
+    clusterFulfillment:
+      enabled: true
+    networkFulfillment:
+      enabled: true
 
 # --- Validation ---
 validation:
@@ -155,7 +187,6 @@ validation:
 
 # --- Bare Metal Fulfillment Operator ---
 bmf:
-  enabled: true
   image:
     repository: ghcr.io/osac-project/bare-metal-fulfillment-operator
     tag: latest
@@ -163,7 +194,6 @@ bmf:
   env:
     aapUrl: "http://osac-aap/api/controller"
     aapInsecureSkipVerify: "true"
-    enableNetworkingProvisioning: "false"
   metal3:
     enabled: true
     namespace: host-inventory
@@ -173,26 +203,24 @@ bmf:
 hubAccess:
   enabled: true
 
-networkManagers:
-  - name: netris
-    role: fabric
-    description: "Netris SDN fabric manager"
-    capabilities: "ipv4"
+# --- Metering ---
+# The service itself is always deployed (chart default): the database wiring
+# in charts/osac/values.yaml points at the secrets the chart creates for the
+# bundled PostgreSQL. Only the test adapter is profile-specific.
+metering:
+  # Echo adapter -- test/development tool only. Consumes metering events from
+  # Kafka and exposes them via HTTP for E2E test assertions.
+  echoAdapter:
+    enabled: true
+    image:
+      repository: ghcr.io/osac-project/metering-echo-adapter
+      tag: latest
+      pullPolicy: Always
 
 # --- LVMS StorageBackend registration ---
 lvms:
   enabled: true
 
-# Bundled PostgreSQL: single-pod ephemeral database for testing.
-# Uses fsync=off — data is lost on restart. Not for production.
+# Bundled PostgreSQL for testing only; not intended for production.
 bundledPostgres:
   enabled: true
-
-# --- Bundled OpenBao (Vault-compatible secret store) ---
-bundledVault:
-  # Override podSecurityContext for OpenShift restricted-v2 SCC: omit numeric
-  # runAsUser/runAsGroup/fsGroup — the SCC allocates UIDs from the namespace UID
-  # range and resolves the named user automatically. A non-nil value here fully
-  # replaces the template default (runAsUser:100/runAsGroup:1000/fsGroup:1000).
-  podSecurityContext:
-    runAsNonRoot: true

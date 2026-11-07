@@ -17,21 +17,20 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"strings"
 
 	"github.com/prometheus/client_golang/prometheus"
 	grpccodes "google.golang.org/grpc/codes"
 	grpcstatus "google.golang.org/grpc/status"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
-	publicv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/public/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
-	"github.com/osac-project/osac/fulfillment-service/internal/events"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
 
 // RolesServerBuilder is a builder for creating instances of RolesServer.
 type RolesServerBuilder struct {
 	logger            *slog.Logger
-	notifier          events.Notifier
 	attributionLogic  auth.AttributionLogic
 	tenancyLogic      auth.TenancyLogic
 	metricsRegisterer prometheus.Registerer
@@ -57,12 +56,6 @@ func NewRolesServer() *RolesServerBuilder {
 // SetLogger sets the logger to use. This is mandatory.
 func (b *RolesServerBuilder) SetLogger(value *slog.Logger) *RolesServerBuilder {
 	b.logger = value
-	return b
-}
-
-// SetNotifier sets the notifier to use. This is optional.
-func (b *RolesServerBuilder) SetNotifier(value events.Notifier) *RolesServerBuilder {
-	b.notifier = value
 	return b
 }
 
@@ -113,7 +106,6 @@ func (b *RolesServerBuilder) Build() (result *RolesServer, err error) {
 
 	delegate, err := NewPrivateRolesServer().
 		SetLogger(b.logger).
-		SetNotifier(b.notifier).
 		SetAttributionLogic(b.attributionLogic).
 		SetTenancyLogic(b.tenancyLogic).
 		SetMetricsRegisterer(b.metricsRegisterer).
@@ -139,7 +131,12 @@ func (s *RolesServer) List(ctx context.Context,
 	if request.HasLimit() {
 		privateRequest.SetLimit(request.GetLimit())
 	}
-	privateRequest.SetFilter(request.GetFilter())
+	filter := "!(this.metadata.name.startsWith('cloud-provider'))"
+	if request.HasFilter() {
+		filter = "(" + request.GetFilter() + ") && " + filter
+	}
+
+	privateRequest.SetFilter(filter)
 	privateRequest.SetOrder(request.GetOrder())
 
 	privateResponse, err := s.delegate.List(ctx, privateRequest)
@@ -181,6 +178,10 @@ func (s *RolesServer) Get(ctx context.Context,
 	}
 
 	privateRole := privateResponse.GetObject()
+	if strings.HasPrefix(privateRole.GetMetadata().GetName(), "cloud-provider") {
+		err = grpcstatus.Errorf(grpccodes.NotFound, "role not found")
+		return
+	}
 	publicRole := &publicv1.Role{}
 	err = s.outMapper.Copy(ctx, privateRole, publicRole)
 	if err != nil {
@@ -212,7 +213,7 @@ func (s *RolesServer) Create(ctx context.Context,
 			"Failed to map public role to private",
 			slog.Any("error", err),
 		)
-		err = grpcstatus.Errorf(grpccodes.Internal, "failed to process role")
+		err = publicInputMappingError(err, "failed to process role")
 		return
 	}
 
@@ -243,6 +244,11 @@ func (s *RolesServer) Create(ctx context.Context,
 
 func (s *RolesServer) Update(ctx context.Context,
 	request *publicv1.RolesUpdateRequest) (response *publicv1.RolesUpdateResponse, err error) {
+	ctx = withPublicAPIView(ctx)
+	if err := validatePublicObjectMetadata(request.GetObject()); err != nil {
+		return nil, err
+	}
+
 	publicRole := request.GetObject()
 	if publicRole == nil {
 		err = grpcstatus.Errorf(grpccodes.InvalidArgument, "object is mandatory")
@@ -261,7 +267,7 @@ func (s *RolesServer) Update(ctx context.Context,
 			"Failed to map public role to private",
 			slog.Any("error", err),
 		)
-		err = grpcstatus.Errorf(grpccodes.Internal, "failed to process role")
+		err = publicInputMappingError(err, "failed to process role")
 		return
 	}
 

@@ -18,14 +18,34 @@ package main
 
 import (
 	"context"
+	"encoding/pem"
 	"errors"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2" //nolint:revive,staticcheck
 	. "github.com/onsi/gomega"    //nolint:revive,staticcheck
 
+	hypershiftv1beta1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
+	bmfov1alpha1 "github.com/osac-project/osac/bare-metal-fulfillment-operator/api/v1alpha1"
+	osacv1alpha1 "github.com/osac-project/osac/osac-operator/api/v1alpha1"
+	"github.com/osac-project/osac/osac-operator/internal/controller"
+	"github.com/osac-project/osac/osac-operator/pkg/provisioning"
+	corev1 "k8s.io/api/core/v1"
+	storagev1 "k8s.io/api/storage/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/rest"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/cluster"
+	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	mcmanager "sigs.k8s.io/multicluster-runtime/pkg/manager"
 	"sigs.k8s.io/multicluster-runtime/pkg/multicluster"
 )
@@ -55,15 +75,84 @@ func (m *mockProvider) Start(ctx context.Context, mgr multicluster.Aware) error 
 	return m.startFunc(ctx, mgr)
 }
 
-// mockManager implements mcmanager.Manager.Start for testing.
+// mockManager implements mcmanager.Manager.Start and GetProvider for testing.
 type mockManager struct {
 	mcmanager.Manager
+	provider  multicluster.Provider
 	startFunc func(ctx context.Context) error
 }
 
 func (m *mockManager) Start(ctx context.Context) error {
 	return m.startFunc(ctx)
 }
+
+// GetProvider returns the configured multicluster.Provider for testing.
+func (m *mockManager) GetProvider() multicluster.Provider {
+	return m.provider
+}
+
+var _ = Describe("discovery ignition TLS", func() {
+	BeforeEach(func() {
+		old, set := os.LookupEnv(envIgnitionTrustIngressCA)
+		Expect(os.Unsetenv(envIgnitionTrustIngressCA)).To(Succeed())
+		DeferCleanup(func() {
+			if set {
+				Expect(os.Setenv(envIgnitionTrustIngressCA, old)).To(Succeed())
+			} else {
+				Expect(os.Unsetenv(envIgnitionTrustIngressCA)).To(Succeed())
+			}
+		})
+	})
+
+	It("rejects an untrusted HTTPS endpoint", func() {
+		srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(`{"ignition":true}`))
+		}))
+		defer srv.Close()
+
+		fetcher, err := newDiscoveryIgnitionFetcher(nil)
+		Expect(err).NotTo(HaveOccurred())
+		_, err = fetcher.FetchIgnition(context.Background(), srv.URL)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("certificate"))
+	})
+
+	It("trusts the ingress CA from the OpenShift ConfigMap", func() {
+		srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(`{"ignition":true}`))
+		}))
+		defer srv.Close()
+		Expect(os.Setenv(envIgnitionTrustIngressCA, "true")).To(Succeed())
+		bundle := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw})
+		reader := fake.NewClientBuilder().WithScheme(clientgoscheme.Scheme).WithObjects(&corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Name: "default-ingress-cert", Namespace: "openshift-config-managed"},
+			Data:       map[string]string{"ca-bundle.crt": string(bundle)},
+		}).Build()
+
+		fetcher, err := newDiscoveryIgnitionFetcher(reader)
+		Expect(err).NotTo(HaveOccurred())
+		body, err := fetcher.FetchIgnition(context.Background(), srv.URL)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(string(body)).To(Equal(`{"ignition":true}`))
+	})
+
+	It("fails closed when the ingress CA ConfigMap is missing", func() {
+		Expect(os.Setenv(envIgnitionTrustIngressCA, "true")).To(Succeed())
+		_, err := newDiscoveryIgnitionFetcher(fake.NewClientBuilder().WithScheme(clientgoscheme.Scheme).Build())
+		Expect(err).To(HaveOccurred())
+	})
+
+	It("fails closed when the ingress CA bundle has no valid certificate", func() {
+		Expect(os.Setenv(envIgnitionTrustIngressCA, "true")).To(Succeed())
+		reader := fake.NewClientBuilder().WithScheme(clientgoscheme.Scheme).WithObjects(&corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Name: "default-ingress-cert", Namespace: "openshift-config-managed"},
+			Data:       map[string]string{"ca-bundle.crt": "invalid"},
+		}).Build()
+		_, err := newDiscoveryIgnitionFetcher(reader)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("certificate"))
+	})
+})
 
 var _ = Describe("ignoreCanceled", func() {
 	It("should return nil for context.Canceled", func() {
@@ -82,6 +171,166 @@ var _ = Describe("ignoreCanceled", func() {
 	It("should preserve real errors", func() {
 		realErr := errors.New("connection refused")
 		Expect(ignoreCanceled(realErr)).To(Equal(realErr))
+	})
+})
+
+var _ = Describe("clusterOrderStallThresholdsFromEnv", func() {
+	stallThresholdEnvironmentVariables := []string{
+		envClusterPreparingInfrastructureStallThreshold,
+		envClusterControlPlaneStartingStallThreshold,
+		envClusterWorkersJoiningStallThreshold,
+		envClusterWorkersJoiningStallThresholdOverrides,
+	}
+
+	BeforeEach(func() {
+		type environmentValue struct {
+			value string
+			set   bool
+		}
+
+		originalValues := make(map[string]environmentValue, len(stallThresholdEnvironmentVariables))
+		for _, environmentVariable := range stallThresholdEnvironmentVariables {
+			value, set := os.LookupEnv(environmentVariable)
+			originalValues[environmentVariable] = environmentValue{value: value, set: set}
+			Expect(os.Unsetenv(environmentVariable)).To(Succeed())
+		}
+		DeferCleanup(func() {
+			for environmentVariable, originalValue := range originalValues {
+				if originalValue.set {
+					Expect(os.Setenv(environmentVariable, originalValue.value)).To(Succeed())
+					continue
+				}
+				Expect(os.Unsetenv(environmentVariable)).To(Succeed())
+			}
+		})
+	})
+
+	It("uses production defaults when thresholds are not configured", func() {
+		thresholds := clusterOrderStallThresholdsFromEnv()
+
+		Expect(thresholds).To(Equal(controller.DefaultClusterOrderStallThresholds()))
+	})
+
+	It("accepts configured thresholds and valid per-host-type worker overrides", func() {
+		Expect(os.Setenv(envClusterPreparingInfrastructureStallThreshold, "10m")).To(Succeed())
+		Expect(os.Setenv(envClusterControlPlaneStartingStallThreshold, "25m")).To(Succeed())
+		Expect(os.Setenv(envClusterWorkersJoiningStallThreshold, "15m")).To(Succeed())
+		Expect(os.Setenv(envClusterWorkersJoiningStallThresholdOverrides,
+			`{"fast":"5m","slow":"40m","invalid":"not-a-duration","zero":"0s"}`)).To(Succeed())
+
+		thresholds := clusterOrderStallThresholdsFromEnv()
+
+		Expect(thresholds.PreparingInfrastructure).To(Equal(10 * time.Minute))
+		Expect(thresholds.ControlPlaneStarting).To(Equal(25 * time.Minute))
+		Expect(thresholds.WorkersJoining).To(Equal(15 * time.Minute))
+		Expect(thresholds.WorkersJoiningByInstanceType).To(Equal(map[string]time.Duration{
+			"fast": 5 * time.Minute,
+			"slow": 40 * time.Minute,
+		}))
+	})
+
+	It("keeps defaults when the worker override configuration is malformed", func() {
+		Expect(os.Setenv(envClusterWorkersJoiningStallThresholdOverrides, "not-json")).To(Succeed())
+
+		thresholds := clusterOrderStallThresholdsFromEnv()
+
+		Expect(thresholds).To(Equal(controller.DefaultClusterOrderStallThresholds()))
+	})
+})
+
+var _ = Describe("cluster upgrade timeouts", func() {
+	vars := []string{envClusterUpgradePendingTimeout, envClusterUpgradeControlPlaneTimeout,
+		envClusterUpgradeNodePoolPerNodeTimeout}
+	BeforeEach(func() {
+		for _, variable := range vars {
+			value, set := os.LookupEnv(variable)
+			Expect(os.Unsetenv(variable)).To(Succeed())
+			DeferCleanup(func() {
+				if set {
+					Expect(os.Setenv(variable, value)).To(Succeed())
+				} else {
+					Expect(os.Unsetenv(variable)).To(Succeed())
+				}
+			})
+		}
+	})
+
+	It("uses defaults and accepts positive duration overrides", func() {
+		Expect(clusterUpgradeTimeoutsFromEnv()).To(Equal(controller.DefaultClusterUpgradeTimeouts()))
+		Expect(os.Setenv(envClusterUpgradePendingTimeout, "2m")).To(Succeed())
+		Expect(os.Setenv(envClusterUpgradeControlPlaneTimeout, "5m")).To(Succeed())
+		Expect(os.Setenv(envClusterUpgradeNodePoolPerNodeTimeout, "3m")).To(Succeed())
+		Expect(clusterUpgradeTimeoutsFromEnv()).To(Equal(controller.ClusterUpgradeTimeouts{
+			Pending: 2 * time.Minute, ControlPlane: 5 * time.Minute, NodePoolPerNode: 3 * time.Minute,
+		}))
+		Expect(os.Setenv(envClusterUpgradePendingTimeout, "0s")).To(Succeed())
+		Expect(clusterUpgradeTimeoutsFromEnv().Pending).To(Equal(10 * time.Minute))
+	})
+})
+
+var _ = Describe("tenant CSI fulfillment configuration", func() {
+	BeforeEach(func() {
+		for _, variable := range []string{envFulfillmentEndpoint, envFulfillmentIssuerURL} {
+			variable := variable
+			originalValue, wasSet := os.LookupEnv(variable)
+			DeferCleanup(func() {
+				if wasSet {
+					Expect(os.Setenv(variable, originalValue)).To(Succeed())
+					return
+				}
+				Expect(os.Unsetenv(variable)).To(Succeed())
+			})
+			Expect(os.Unsetenv(variable)).To(Succeed())
+		}
+	})
+
+	It("reads endpoint and issuer values from the operator environment", func() {
+		Expect(os.Setenv(envFulfillmentEndpoint, "fulfillment-api.example.com:443")).To(Succeed())
+		Expect(os.Setenv(envFulfillmentIssuerURL, "https://keycloak.example.com/realms/osac")).To(Succeed())
+
+		endpoint, issuerURL := fulfillmentConfigFromEnv()
+		Expect(endpoint).To(Equal("fulfillment-api.example.com:443"))
+		Expect(issuerURL).To(Equal("https://keycloak.example.com/realms/osac"))
+	})
+})
+
+var _ = Describe("setupAddOnOperatorController", func() {
+	It("registers the add-on operator controller with the manager", func() {
+		scheme := runtime.NewScheme()
+		Expect(osacv1alpha1.AddToScheme(scheme)).To(Succeed())
+
+		localManager, err := ctrl.NewManager(&rest.Config{Host: "https://127.0.0.1"}, ctrl.Options{
+			Scheme:  scheme,
+			Metrics: metricsserver.Options{BindAddress: "0"},
+		})
+		Expect(err).NotTo(HaveOccurred())
+		manager, err := mcmanager.WithMultiCluster(localManager, nil)
+		Expect(err).NotTo(HaveOccurred())
+
+		variables := []string{envAAPURL, envAAPToken, envAAPTemplatePrefix, envClusterOrderNamespace}
+		originalValues := make(map[string]struct {
+			value string
+			set   bool
+		}, len(variables))
+		for _, variable := range variables {
+			value, set := os.LookupEnv(variable)
+			originalValues[variable] = struct {
+				value string
+				set   bool
+			}{value: value, set: set}
+			Expect(os.Unsetenv(variable)).To(Succeed())
+		}
+		DeferCleanup(func() {
+			for variable, originalValue := range originalValues {
+				if originalValue.set {
+					Expect(os.Setenv(variable, originalValue.value)).To(Succeed())
+					continue
+				}
+				Expect(os.Unsetenv(variable)).To(Succeed())
+			}
+		})
+
+		Expect(setupAddOnOperatorController(manager, provisioning.DefaultMaxJobHistory)).To(Succeed())
 	})
 })
 
@@ -286,5 +535,268 @@ var _ = Describe("parseVendorControllers", func() {
 		_, err := parseVendorControllers("vast=")
 		Expect(err).To(HaveOccurred())
 		Expect(err.Error()).To(ContainSubstring("backend and endpoint must not be empty"))
+	})
+})
+
+var _ = Describe("newVendorProvisionerRegistry", func() {
+	It("registers VAST and marks unsupported providers as unimplemented", func() {
+		client := fake.NewClientBuilder().Build()
+		registry, err := newVendorProvisionerRegistry(
+			client,
+			client,
+			"osac-system",
+			map[string]string{"vast": "vast.svc:50051", "netapp": "netapp.svc:50052"},
+		)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(registry).To(HaveLen(2))
+		Expect(registry["vast"]).To(BeAssignableToTypeOf(&controller.VastVendorProvisioner{}))
+		_, registered := registry["netapp"]
+		Expect(registered).To(BeTrue())
+		Expect(registry["netapp"]).To(BeNil())
+	})
+
+	It("registers LVMS from its configured provider key", func() {
+		client := fake.NewClientBuilder().Build()
+		registry, err := newVendorProvisionerRegistry(
+			client,
+			client,
+			"osac-system",
+			map[string]string{"lvms": "none"},
+		)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(registry).To(HaveLen(1))
+		Expect(registry["lvms"]).To(BeAssignableToTypeOf(&controller.LvmsVendorProvisioner{}))
+	})
+
+	It("keeps LVMS registered when VAST initialization fails", func() {
+		client := fake.NewClientBuilder().Build()
+		registry, err := newVendorProvisionerRegistry(
+			client,
+			client,
+			"",
+			map[string]string{"lvms": "none", "vast": "vast.svc:50051"},
+		)
+
+		Expect(err).To(MatchError(ContainSubstring("storage config namespace is required")))
+		Expect(registry).To(HaveLen(2))
+		Expect(registry["lvms"]).To(BeAssignableToTypeOf(&controller.LvmsVendorProvisioner{}))
+		Expect(registry["vast"]).To(BeNil())
+	})
+
+	It("marks future provider keys as unimplemented", func() {
+		client := fake.NewClientBuilder().Build()
+		registry, err := newVendorProvisionerRegistry(
+			client,
+			client,
+			"osac-system",
+			map[string]string{"netapp": "netapp.svc:50052"},
+		)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(registry).To(HaveLen(1))
+		Expect(registry["netapp"]).To(BeNil())
+	})
+})
+
+var _ = Describe("controllerFlags.validate", func() {
+	It("accepts all controllers enabled", func() {
+		f := &controllerFlags{
+			Tenant: true, Storage: true, Volume: true,
+			ComputeInstance: true, Cluster: true,
+			Networking: true, BareMetalInstance: true,
+		}
+		Expect(f.validate()).To(Succeed())
+	})
+
+	It("accepts CaaS with VMaaS", func() {
+		f := &controllerFlags{Cluster: true, ComputeInstance: true}
+		Expect(f.validate()).To(Succeed())
+	})
+
+	It("accepts CaaS with BMaaS", func() {
+		f := &controllerFlags{Cluster: true, BareMetalInstance: true}
+		Expect(f.validate()).To(Succeed())
+	})
+
+	It("accepts CaaS with both VMaaS and BMaaS", func() {
+		f := &controllerFlags{Cluster: true, ComputeInstance: true, BareMetalInstance: true}
+		Expect(f.validate()).To(Succeed())
+	})
+
+	It("rejects CaaS without VMaaS or BMaaS", func() {
+		f := &controllerFlags{Cluster: true, Tenant: true, Networking: true}
+		Expect(f.validate()).To(MatchError(ContainSubstring("ComputeInstance")))
+		Expect(f.validate()).To(MatchError(ContainSubstring("BareMetalInstance")))
+	})
+
+	It("accepts VMaaS without CaaS", func() {
+		f := &controllerFlags{ComputeInstance: true, Tenant: true}
+		Expect(f.validate()).To(Succeed())
+	})
+
+	It("accepts BMaaS without CaaS", func() {
+		f := &controllerFlags{BareMetalInstance: true, Tenant: true}
+		Expect(f.validate()).To(Succeed())
+	})
+
+	It("accepts no controllers enabled", func() {
+		f := &controllerFlags{}
+		Expect(f.validate()).To(Succeed())
+	})
+})
+
+var _ = Describe("targetClusterFromManager", func() {
+	It("returns LocalCluster when manager provider is nil", func() {
+		mgr := &mockManager{provider: nil}
+		Expect(targetClusterFromManager(mgr)).To(Equal(mcmanager.LocalCluster))
+	})
+
+	It("returns remote cluster name when manager provider is non-nil", func() {
+		mgr := &mockManager{provider: &mockProvider{}}
+		Expect(targetClusterFromManager(mgr)).To(Equal(multicluster.ClusterName(remoteClusterName)))
+	})
+})
+
+var _ = Describe("newClusterFromKubeconfig", func() {
+	var remoteScheme *runtime.Scheme
+
+	BeforeEach(func() {
+		localScheme := runtime.NewScheme()
+		remoteScheme = runtime.NewScheme()
+		addSchemesForRemoteControllers(localScheme, remoteScheme, true, true, true, true)
+	})
+
+	It("rejects empty or whitespace-only kubeconfig paths without falling back to in-cluster config", func() {
+		cl, err := newClusterFromKubeconfig("", remoteScheme)
+		Expect(err).To(MatchError(ContainSubstring("remote cluster kubeconfig path is empty")))
+		Expect(cl).To(BeNil())
+
+		cl, err = newClusterFromKubeconfig("   ", remoteScheme)
+		Expect(err).To(MatchError(ContainSubstring("remote cluster kubeconfig path is empty")))
+		Expect(cl).To(BeNil())
+	})
+
+	It("returns an error when the kubeconfig file does not exist", func() {
+		missingPath := filepath.Join(GinkgoT().TempDir(), "does-not-exist-kubeconfig")
+		cl, err := newClusterFromKubeconfig(missingPath, remoteScheme)
+		Expect(err).To(MatchError(ContainSubstring("build config from kubeconfig")))
+		Expect(cl).To(BeNil())
+	})
+
+	It("returns an error when the kubeconfig content is invalid", func() {
+		dir := GinkgoT().TempDir()
+
+		malformedPath := filepath.Join(dir, "malformed-kubeconfig")
+		Expect(os.WriteFile(malformedPath, []byte("not: [valid: yaml"), 0o600)).To(Succeed())
+		cl, err := newClusterFromKubeconfig(malformedPath, remoteScheme)
+		Expect(err).To(HaveOccurred())
+		Expect(cl).To(BeNil())
+
+		emptyConfigPath := filepath.Join(dir, "empty-config-kubeconfig")
+		Expect(os.WriteFile(emptyConfigPath, []byte("apiVersion: v1\nkind: Config\n"), 0o600)).To(Succeed())
+		cl, err = newClusterFromKubeconfig(emptyConfigPath, remoteScheme)
+		Expect(err).To(HaveOccurred())
+		Expect(cl).To(BeNil())
+	})
+
+	It("creates a cluster from a valid kubeconfig file with remoteScheme", func() {
+		testKubeconfigFixture := []byte(`apiVersion: v1
+kind: Config
+clusters:
+- name: remote
+  cluster:
+    server: https://127.0.0.1:6443
+contexts:
+- name: remote
+  context:
+    cluster: remote
+    user: remote
+current-context: remote
+users:
+- name: remote
+  user: {}
+`)
+		testKubeconfigPath := filepath.Join(GinkgoT().TempDir(), "valid-kubeconfig")
+		Expect(os.WriteFile(testKubeconfigPath, testKubeconfigFixture, 0o600)).To(Succeed())
+
+		cl, err := newClusterFromKubeconfig(testKubeconfigPath, remoteScheme)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(cl).NotTo(BeNil())
+		Expect(cl.GetScheme()).To(Equal(remoteScheme))
+
+		trailingSpacePath := filepath.Join(GinkgoT().TempDir(), "valid-kubeconfig ")
+		Expect(os.WriteFile(trailingSpacePath, testKubeconfigFixture, 0o600)).To(Succeed())
+
+		clWithTrailingSpace, err := newClusterFromKubeconfig(trailingSpacePath, remoteScheme)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(clWithTrailingSpace).NotTo(BeNil())
+		Expect(clWithTrailingSpace.GetScheme()).To(Equal(remoteScheme))
+	})
+})
+
+var _ = Describe("controllerFlags.validateRemoteCluster", func() {
+	It("rejects Cluster controller when remoteClusterKubeconfig is set", func() {
+		f := &controllerFlags{Cluster: true, ComputeInstance: true}
+		Expect(f.validateRemoteCluster("/etc/osac/remote-cluster-kubeconfig")).To(
+			MatchError(ContainSubstring("remote cluster kubeconfig option is not supported along with cluster controller")),
+		)
+	})
+
+	It("rejects BareMetalInstance controller when remoteClusterKubeconfig is set", func() {
+		f := &controllerFlags{BareMetalInstance: true, Tenant: true}
+		Expect(f.validateRemoteCluster("/etc/osac/remote-cluster-kubeconfig")).To(
+			MatchError(ContainSubstring(
+				"remote cluster kubeconfig option is not supported along with bare metal instance controller",
+			)),
+		)
+	})
+
+	It("rejects default enableAllIfNoneSet flags when remoteClusterKubeconfig is set", func() {
+		f := &controllerFlags{}
+		f.enableAllIfNoneSet()
+		Expect(f.validateRemoteCluster("/etc/osac/remote-cluster-kubeconfig")).To(HaveOccurred())
+	})
+
+	It("rejects whitespace-only remoteClusterKubeconfig instead of falling back to local mode", func() {
+		compatible := &controllerFlags{
+			Tenant:  true,
+			Storage: true,
+		}
+		Expect(compatible.validateRemoteCluster("   ")).To(
+			MatchError(ContainSubstring("remote cluster kubeconfig path is empty")),
+		)
+	})
+
+	It("accepts compatible controllers when remoteClusterKubeconfig is set and all combinations when empty", func() {
+		compatible := &controllerFlags{
+			Tenant:          true,
+			Storage:         true,
+			ComputeInstance: true,
+			Networking:      true,
+			Volume:          true,
+		}
+		Expect(compatible.validateRemoteCluster("/etc/osac/remote-cluster-kubeconfig")).To(Succeed())
+
+		all := &controllerFlags{}
+		all.enableAllIfNoneSet()
+		Expect(all.validateRemoteCluster("")).To(Succeed())
+	})
+})
+
+var _ = Describe("addSchemesForRemoteControllers", func() {
+	It("registers StorageClass on remoteScheme and HostedControlPlane/BareMetalInstance on localScheme", func() {
+		localScheme := runtime.NewScheme()
+		remoteScheme := runtime.NewScheme()
+		addSchemesForRemoteControllers(localScheme, remoteScheme, false, false, true, true)
+
+		Expect(remoteScheme.Recognizes(storagev1.SchemeGroupVersion.WithKind("StorageClass"))).To(BeTrue())
+		Expect(localScheme.Recognizes(hypershiftv1beta1.GroupVersion.WithKind("HostedControlPlane"))).To(BeTrue())
+		Expect(localScheme.Recognizes(bmfov1alpha1.GroupVersion.WithKind("BareMetalInstance"))).To(BeTrue())
+	})
+
+	It("registers HostedControlPlane on localScheme in local mode when storage is enabled without cluster", func() {
+		localScheme := runtime.NewScheme()
+		addSchemesForLocalControllers(localScheme, false, false, false, true, false, false)
+
+		Expect(localScheme.Recognizes(hypershiftv1beta1.GroupVersion.WithKind("HostedControlPlane"))).To(BeTrue())
 	})
 })

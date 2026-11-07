@@ -19,13 +19,15 @@ import (
 	"log/slog"
 	"slices"
 
-	publicv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/public/v1"
+	"github.com/osac-project/osac/fulfillment-service/internal/services"
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
 
 // CapabilitiesServerBuilder contains the data and logic needed to create a new capabilities server.
 type CapabilitiesServerBuilder struct {
 	logger                   *slog.Logger
 	authnTrustedTokenIssuers []string
+	serviceFlags             *services.Flags
 }
 
 // Make sure that we implement the interface:
@@ -37,6 +39,7 @@ type CapabilitiesServer struct {
 
 	logger                   *slog.Logger
 	authnTrustedTokenIssuers []string
+	serviceFlags             *services.Flags
 }
 
 // NewCapabilitiesServer creates a builder that can the be used to configure and create a new capabilities server.
@@ -47,6 +50,12 @@ func NewCapabilitiesServer() *CapabilitiesServerBuilder {
 // SetLogger sets the logger to use. This is mandatory.
 func (b *CapabilitiesServerBuilder) SetLogger(value *slog.Logger) *CapabilitiesServerBuilder {
 	b.logger = value
+	return b
+}
+
+// SetServiceFlags sets the services advertised by the server.
+func (b *CapabilitiesServerBuilder) SetServiceFlags(value *services.Flags) *CapabilitiesServerBuilder {
+	b.serviceFlags = value
 	return b
 }
 
@@ -73,6 +82,7 @@ func (b *CapabilitiesServerBuilder) Build() (result *CapabilitiesServer, err err
 	result = &CapabilitiesServer{
 		logger:                   b.logger,
 		authnTrustedTokenIssuers: authnTrustedTokenIssuers,
+		serviceFlags:             b.serviceFlags,
 	}
 	return
 }
@@ -84,6 +94,29 @@ func (s *CapabilitiesServer) Get(ctx context.Context,
 		Authn: &publicv1.AuthnCapabilities{
 			TrustedTokenIssuers: s.authnTrustedTokenIssuers,
 		},
+		EnabledServices: enabledPublicServiceTiers(s.serviceFlags),
 	}.Build()
 	return response, nil
+}
+
+func enabledPublicServiceTiers(flags *services.Flags) []publicv1.ServiceTier {
+	if flags == nil {
+		return nil
+	}
+
+	serviceNames := flags.EnabledServices()
+	result := make([]publicv1.ServiceTier, 0, len(serviceNames))
+	for _, serviceName := range serviceNames {
+		switch serviceName {
+		case "caas":
+			result = append(result, publicv1.ServiceTier_SERVICE_TIER_CAAS)
+		case "vmaas":
+			result = append(result, publicv1.ServiceTier_SERVICE_TIER_VMAAS)
+		case "bmaas":
+			result = append(result, publicv1.ServiceTier_SERVICE_TIER_BMAAS)
+		case "maas":
+			result = append(result, publicv1.ServiceTier_SERVICE_TIER_MAAS)
+		}
+	}
+	return result
 }

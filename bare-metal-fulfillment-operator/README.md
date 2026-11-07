@@ -46,6 +46,34 @@ networkClass: openstack
 - `hostClass` — host management class to use
 - `networkClass` — network class to use
 
+### Logical port MAC mappings
+
+IP discovery asks the inventory client for an administrator-supplied mapping
+from OSAC logical port names to physical MAC addresses. Each key must match the
+network attachment's `interface` and the catalog port name, as defined by the
+[BMaaS networking design](https://github.com/osac-project/enhancement-proposals/blob/main/enhancements/OSAC-1437-bmaas-networking/design.md).
+Inventory backends provide these sources:
+
+| Backend | Source | Value format |
+|---------|--------|--------------|
+| Metal3 | BareMetalHost annotation `osac.openshift.io/interface-macs` | JSON string |
+| BCM | Device `extra_values["osac_interface_macs"]` | JSON object or JSON string |
+| OpenStack | Ironic node `extra["osac_interface_macs"]` | JSON object |
+
+For example, an object mapping is `{"data-0":"52:54:00:16:04:83"}`. For
+string-valued BCM metadata, the equivalent device field is:
+
+```json
+{"extra_values":{"osac_interface_macs":"{\"data-0\":\"52:54:00:16:04:83\"}"}}
+```
+
+BCM returns an empty mapping when its extra value is absent, null, or an empty
+string, or when an explicit empty object is configured.
+Backends return an empty mapping when none is configured, and an error for
+malformed data or backend failures. IP discovery retains its server-name lease
+matching fallback when the requested logical port has no MAC or lookup fails.
+Physical interface names and NIC ordering do not supply a logical mapping.
+
 ### Management
 
 The operator reads management configuration to connect to backend management
@@ -265,3 +293,27 @@ Unless required by applicable law or agreed to in writing, software distributed
 under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
 CONDITIONS OF ANY KIND, either express or implied. See the License for the
 specific language governing permissions and limitations under the License.
+
+### Provider-networking startup configuration
+
+BMF reads `OSAC_ENABLE_NETWORKING_PROVISIONING` once at startup, independently
+of AAP credential availability, and logs the loaded value. The default is now
+`true` (previously `false`); empty or invalid input also defaults to `true`,
+with a diagnostic for invalid input. Helm installations use the shared boolean
+`global.networking.provisioningEnabled`. The removed `env.enableNetworkingProvisioning`
+key is rejected. See the [shared configuration and upgrade guide](../osac-installer/docs/network-backend.md#shared-provider-networking-provisioning-setting)
+for coordinated rollout and migration from mixed settings.
+When `secretAPI.url` is set, BMF reads Fulfillment's saved installation value
+through the authenticated private API before reconciliation. It exits if
+Fulfillment cannot be reached or if the value differs. An empty URL selects
+standalone mode, as used by the BMF integration suite. The chart mounts the Fulfillment client
+credentials for this check even when NetBox is disabled. The CA bundle is
+optional: set `secretAPI.caBundle.configMap` to a ConfigMap in the BMF namespace
+when Fulfillment's certificate is not trusted by the system CA bundle. The OSAC
+installer configures its shared `ca-bundle` ConfigMap explicitly.
+For a standalone installation, set `secretAPI.issuerUrl` to the Keycloak
+issuer reachable from the BMF pod and create the
+`fulfillment-controller-credentials` Secret with `client-id` and
+`client-secret` keys before starting BMF. The Secret volume is optional to
+Kubernetes so a missing Secret produces a clear startup error; BMF still
+refuses to reconcile without valid credentials.

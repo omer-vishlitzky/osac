@@ -22,35 +22,37 @@ import (
 	grpccodes "google.golang.org/grpc/codes"
 	grpcstatus "google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
-	"github.com/osac-project/osac/fulfillment-service/internal/events"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
 // TierResolution holds the result of resolving a StorageTier name to a
-// concrete backend and protocol. Backend is the StorageBackend's provider
-// (e.g. "vast"), matching Volume.status.backend's documented contract and the
-// vendor routing keys ("vast", "pure", "ontap", ...) that osac-csi-driver's
-// Helm-templated --vendor-controllers/--vendor-sockets maps use -- those maps
-// can't be keyed by the StorageBackend's server-generated id, since that id
-// doesn't exist yet when the chart values are authored.
+// provider and protocol. Provider is the StorageBackend's provider (e.g. "vast"),
+// matching the vendor routing keys ("vast", "netapp", "pure", ...) that
+// osac-csi-driver's Helm-templated --vendor-controllers/--vendor-sockets maps use.
 type TierResolution struct {
-	Backend  string
+	Provider string
 	Protocol privatev1.StorageProtocol
 }
 
-// TierResolverFunc resolves a StorageTier name to a backend and protocol.
+const (
+	lvmsProvider        = "lvms"
+	nodeTopologySegment = "osac.io/node"
+)
+
+// TierResolverFunc resolves a StorageTier name to a provider and protocol.
 type TierResolverFunc func(ctx context.Context, tierName string) (*TierResolution, error)
 
 type PrivateVolumesServerBuilder struct {
 	logger            *slog.Logger
-	notifier          events.Notifier
 	attributionLogic  auth.AttributionLogic
 	tenancyLogic      auth.TenancyLogic
 	metricsRegisterer prometheus.Registerer
 	tierResolver      TierResolverFunc
+	filterDesc        protoreflect.MessageDescriptor
 }
 
 var _ privatev1.VolumesServer = (*PrivateVolumesServer)(nil)
@@ -69,11 +71,6 @@ func NewPrivateVolumesServer() *PrivateVolumesServerBuilder {
 
 func (b *PrivateVolumesServerBuilder) SetLogger(value *slog.Logger) *PrivateVolumesServerBuilder {
 	b.logger = value
-	return b
-}
-
-func (b *PrivateVolumesServerBuilder) SetNotifier(value events.Notifier) *PrivateVolumesServerBuilder {
-	b.notifier = value
 	return b
 }
 
@@ -97,6 +94,15 @@ func (b *PrivateVolumesServerBuilder) SetTierResolver(value TierResolverFunc) *P
 	return b
 }
 
+// SetFilterDesc sets the protobuf message descriptor used to validate and translate CEL filter
+// expressions. When unset the DAO defaults to the private Volume descriptor. The public volumes
+// server sets this to the public Volume descriptor so that callers can only filter on fields that
+// are visible through the public API.
+func (b *PrivateVolumesServerBuilder) SetFilterDesc(value protoreflect.MessageDescriptor) *PrivateVolumesServerBuilder {
+	b.filterDesc = value
+	return b
+}
+
 func (b *PrivateVolumesServerBuilder) Build() (result *PrivateVolumesServer, err error) {
 	if b.logger == nil {
 		err = errors.New("logger is mandatory")
@@ -106,18 +112,16 @@ func (b *PrivateVolumesServerBuilder) Build() (result *PrivateVolumesServer, err
 		err = errors.New("tenancy logic is mandatory")
 		return
 	}
-	if b.tierResolver == nil {
-		err = errors.New("tier resolver is mandatory")
-		return
-	}
+	// tierResolver is required only for the mutating Create path; the read-only public volumes
+	// server builds this delegate without one. Its absence is enforced in Create instead of here.
 
 	generic, err := NewGenericServer[*privatev1.Volume]().
 		SetLogger(b.logger).
 		SetService(privatev1.Volumes_ServiceDesc.ServiceName).
-		SetNotifier(b.notifier).
 		SetAttributionLogic(b.attributionLogic).
 		SetTenancyLogic(b.tenancyLogic).
 		SetMetricsRegisterer(b.metricsRegisterer).
+		SetFilterDesc(b.filterDesc).
 		Build()
 	if err != nil {
 		return
@@ -147,6 +151,11 @@ func (s *PrivateVolumesServer) Create(ctx context.Context,
 	request *privatev1.VolumesCreateRequest) (response *privatev1.VolumesCreateResponse, err error) {
 	vol := request.GetObject()
 
+	if s.tierResolver == nil {
+		err = grpcstatus.Errorf(grpccodes.Internal, "tier resolver is not configured for this server")
+		return
+	}
+
 	err = s.validateVolumeCreate(vol)
 	if err != nil {
 		return
@@ -156,6 +165,14 @@ func (s *PrivateVolumesServer) Create(ctx context.Context,
 	if err != nil {
 		return
 	}
+	if resolved.Provider == lvmsProvider {
+		topology := vol.GetSpec().GetTopology()
+		if topology == nil || topology.GetSegments()[nodeTopologySegment] == "" {
+			err = grpcstatus.Errorf(grpccodes.FailedPrecondition,
+				`node-local volume requires topology.segments["%s"]`, nodeTopologySegment)
+			return
+		}
+	}
 
 	if vol.GetStatus() == nil {
 		vol.SetStatus(&privatev1.VolumeStatus{})
@@ -164,7 +181,7 @@ func (s *PrivateVolumesServer) Create(ctx context.Context,
 	// populated only by the operator feedback path after vendor provisioning.
 	vol.GetStatus().SetVendorContext(nil)
 	vol.GetStatus().SetState(privatev1.VolumeState_VOLUME_STATE_CREATING)
-	vol.GetStatus().SetBackend(resolved.Backend)
+	vol.GetStatus().SetProvider(resolved.Provider)
 	vol.GetStatus().SetProtocol(resolved.Protocol)
 
 	vol.SetId("")
@@ -254,15 +271,35 @@ func applyVolumeUpdate(base, update *privatev1.Volume, mask *fieldmaskpb.FieldMa
 			base.GetSpec().SetSizeGib(update.GetSpec().GetSizeGib())
 		case "spec.access_mode":
 			base.GetSpec().SetAccessMode(update.GetSpec().GetAccessMode())
+		case "spec.topology":
+			if topology := update.GetSpec().GetTopology(); topology != nil {
+				base.GetSpec().SetTopology(proto.Clone(topology).(*privatev1.VolumeTopology))
+			} else {
+				base.GetSpec().SetTopology(nil)
+			}
+		case "spec.topology.segments":
+			if base.GetSpec().GetTopology() == nil {
+				base.GetSpec().SetTopology(&privatev1.VolumeTopology{})
+			}
+			src := update.GetSpec().GetTopology().GetSegments()
+			dst := make(map[string]string, len(src))
+			for k, v := range src {
+				dst[k] = v
+			}
+			base.GetSpec().GetTopology().SetSegments(dst)
+		case "status.provider":
+			base.GetStatus().SetProvider(update.GetStatus().GetProvider())
+		case "status.protocol":
+			base.GetStatus().SetProtocol(update.GetStatus().GetProtocol())
 		default:
 			// Unknown paths are handled by the generic update layer.
 		}
 	}
 }
 
-// validateVolumeImmutability checks that immutable spec fields have not been changed.
-// storage_tier, size_gib, and access_mode are immutable after creation because they are
-// provisioned directly into the vendor CSI call and cannot be modified post-creation.
+// validateVolumeImmutability checks that immutable volume fields have not been changed.
+// storage_tier, size_gib, access_mode, provider, and protocol are immutable after creation because
+// they are provisioned directly into the vendor CSI call and cannot be modified post-creation.
 func validateVolumeImmutability(merged, existing *privatev1.Volume) error {
 	if merged.GetSpec().GetStorageTier() != existing.GetSpec().GetStorageTier() {
 		return grpcstatus.Errorf(grpccodes.InvalidArgument,
@@ -275,6 +312,20 @@ func validateVolumeImmutability(merged, existing *privatev1.Volume) error {
 	if merged.GetSpec().GetAccessMode() != existing.GetSpec().GetAccessMode() {
 		return grpcstatus.Errorf(grpccodes.InvalidArgument,
 			"field 'spec.access_mode' is immutable and cannot be changed after creation")
+	}
+	if !proto.Equal(merged.GetSpec().GetTopology(), existing.GetSpec().GetTopology()) {
+		return grpcstatus.Errorf(grpccodes.InvalidArgument,
+			"field 'spec.topology' is immutable and cannot be changed after creation")
+	}
+	if existing.GetStatus().GetProvider() != "" &&
+		merged.GetStatus().GetProvider() != existing.GetStatus().GetProvider() {
+		return grpcstatus.Errorf(grpccodes.InvalidArgument,
+			"field 'status.provider' is immutable and cannot be changed after creation")
+	}
+	if existing.GetStatus().GetProtocol() != privatev1.StorageProtocol_STORAGE_PROTOCOL_UNSPECIFIED &&
+		merged.GetStatus().GetProtocol() != existing.GetStatus().GetProtocol() {
+		return grpcstatus.Errorf(grpccodes.InvalidArgument,
+			"field 'status.protocol' is immutable and cannot be changed after creation")
 	}
 	return nil
 }

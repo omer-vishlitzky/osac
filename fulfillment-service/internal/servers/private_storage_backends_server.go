@@ -23,16 +23,13 @@ import (
 	grpcstatus "google.golang.org/grpc/status"
 	"google.golang.org/protobuf/reflect/protoreflect"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
 	"github.com/osac-project/osac/fulfillment-service/internal/database/dao"
-	"github.com/osac-project/osac/fulfillment-service/internal/events"
-	"github.com/osac-project/osac/fulfillment-service/internal/references"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
 type PrivateStorageBackendsServerBuilder struct {
 	logger            *slog.Logger
-	notifier          events.Notifier
 	attributionLogic  auth.AttributionLogic
 	tenancyLogic      auth.TenancyLogic
 	metricsRegisterer prometheus.Registerer
@@ -55,11 +52,6 @@ func NewPrivateStorageBackendsServer() *PrivateStorageBackendsServerBuilder {
 
 func (b *PrivateStorageBackendsServerBuilder) SetLogger(value *slog.Logger) *PrivateStorageBackendsServerBuilder {
 	b.logger = value
-	return b
-}
-
-func (b *PrivateStorageBackendsServerBuilder) SetNotifier(value events.Notifier) *PrivateStorageBackendsServerBuilder {
-	b.notifier = value
 	return b
 }
 
@@ -105,8 +97,6 @@ func (b *PrivateStorageBackendsServerBuilder) Build() (result *PrivateStorageBac
 	s.generic, err = NewGenericServer[*privatev1.StorageBackend]().
 		SetLogger(b.logger).
 		SetService(privatev1.StorageBackends_ServiceDesc.ServiceName).
-		SetNotifier(b.notifier).
-		SetRedactFunc(s.redact).
 		SetAttributionLogic(b.attributionLogic).
 		SetTenancyLogic(b.tenancyLogic).
 		SetMetricsRegisterer(b.metricsRegisterer).
@@ -129,20 +119,6 @@ func (b *PrivateStorageBackendsServerBuilder) Build() (result *PrivateStorageBac
 	// Return the server:
 	result = s
 	return
-}
-
-// redact clears sensitive fields from the storage backend before it is included in event notification payloads.
-func (s *PrivateStorageBackendsServer) redact(object *privatev1.StorageBackend) *privatev1.StorageBackend {
-	spec := object.GetSpec()
-	if spec == nil {
-		return object
-	}
-	credentials := spec.GetCredentials()
-	if credentials == nil {
-		return object
-	}
-	credentials.SetPassword("")
-	return object
 }
 
 func (s *PrivateStorageBackendsServer) List(ctx context.Context,
@@ -190,22 +166,7 @@ func (s *PrivateStorageBackendsServer) Update(ctx context.Context,
 		return
 	}
 
-	getRequest := &privatev1.StorageBackendsGetRequest{}
-	getRequest.SetId(id)
-	var getResponse *privatev1.StorageBackendsGetResponse
-	err = s.generic.Get(ctx, getRequest, &getResponse)
-	if err != nil {
-		return
-	}
-
-	existingSB := getResponse.GetObject()
-
-	err = s.validateStorageBackendUpdate(ctx, request, existingSB)
-	if err != nil {
-		return
-	}
-
-	err = s.generic.Update(ctx, request, &response)
+	err = s.generic.UpdateWithValidation(ctx, request, &response, s.validateStorageBackendUpdate)
 	return
 }
 
@@ -215,11 +176,7 @@ func (s *PrivateStorageBackendsServer) Delete(ctx context.Context,
 	return
 }
 
-const (
-	passwordField       = "spec.credentials.password"
-	passwordSecretField = "spec.credentials.password_secret"
-	passwordExclusive   = "password and password_secret are mutually exclusive"
-)
+const passwordExclusive = "password and password_secret are mutually exclusive"
 
 func (s *PrivateStorageBackendsServer) validateStorageBackendCreate(ctx context.Context,
 	sb *privatev1.StorageBackend) error {
@@ -230,25 +187,32 @@ func (s *PrivateStorageBackendsServer) validateStorageBackendCreate(ctx context.
 	if sb.GetMetadata() == nil || sb.GetMetadata().GetName() == "" {
 		return grpcstatus.Errorf(grpccodes.InvalidArgument, "field 'metadata.name' is required")
 	}
-	if err := s.validatePasswordExactlyOne(sb.GetSpec().GetCredentials()); err != nil {
-		return err
-	}
-	return s.validatePasswordSecret(ctx, sb.GetSpec().GetCredentials())
+	return s.validateStorageBackendCredentials(ctx, sb.GetSpec())
 }
 
 func (s *PrivateStorageBackendsServer) validateStorageBackendUpdate(ctx context.Context,
-	request *privatev1.StorageBackendsUpdateRequest, existingSB *privatev1.StorageBackend) error {
-
-	newSB := request.GetObject()
-	if newSB.GetSpec().GetProvider() != "" && newSB.GetSpec().GetProvider() != existingSB.GetSpec().GetProvider() {
+	candidate, current *privatev1.StorageBackend) error {
+	if candidate.GetSpec().GetProvider() != "" && candidate.GetSpec().GetProvider() != current.GetSpec().GetProvider() {
 		return grpcstatus.Errorf(grpccodes.InvalidArgument,
 			"field 'spec.provider' is immutable and cannot be changed from '%s' to '%s'",
-			existingSB.GetSpec().GetProvider(), newSB.GetSpec().GetProvider())
+			current.GetSpec().GetProvider(), candidate.GetSpec().GetProvider())
 	}
-	if err := s.validatePasswordMutualExclusionForUpdate(request, existingSB); err != nil {
-		return err
+	if candidate.GetSpec().GetCspManaged() != current.GetSpec().GetCspManaged() {
+		return grpcstatus.Errorf(grpccodes.InvalidArgument,
+			"field 'spec.csp_managed' is immutable and cannot be changed")
 	}
-	return s.validatePasswordSecret(ctx, newSB.GetSpec().GetCredentials())
+	return s.validateStorageBackendCredentials(ctx, candidate.GetSpec())
+}
+
+func (s *PrivateStorageBackendsServer) validateStorageBackendCredentials(ctx context.Context,
+	spec *privatev1.StorageBackendSpec) error {
+	creds := spec.GetCredentials()
+	if !spec.GetCspManaged() || creds != nil {
+		if err := s.validatePasswordExactlyOne(creds); err != nil {
+			return err
+		}
+	}
+	return s.validatePasswordSecret(ctx, creds)
 }
 
 func credentialsPasswordSet(creds *privatev1.StorageBackendCredentials) bool {
@@ -276,40 +240,6 @@ func (s *PrivateStorageBackendsServer) validatePasswordExactlyOne(
 	return nil
 }
 
-func (s *PrivateStorageBackendsServer) validatePasswordMutualExclusionForUpdate(
-	request *privatev1.StorageBackendsUpdateRequest, existingSB *privatev1.StorageBackend) error {
-	creds := request.GetObject().GetSpec().GetCredentials()
-	if credentialsPasswordSet(creds) && credentialsPasswordSecretSet(creds) {
-		return grpcstatus.Errorf(grpccodes.InvalidArgument, passwordExclusive)
-	}
-
-	mask := request.GetUpdateMask()
-	if mask == nil || len(mask.GetPaths()) == 0 {
-		return s.validatePasswordExactlyOne(creds)
-	}
-
-	existingCreds := existingSB.GetSpec().GetCredentials()
-
-	// Simulate post-merge state: masked fields come from request, others from existing.
-	hasPassword := credentialsPasswordSet(creds)
-	if !updateIncludesField(mask, passwordField) {
-		hasPassword = credentialsPasswordSet(existingCreds)
-	}
-	hasSecret := credentialsPasswordSecretSet(creds)
-	if !updateIncludesField(mask, passwordSecretField) {
-		hasSecret = credentialsPasswordSecretSet(existingCreds)
-	}
-
-	if hasPassword && hasSecret {
-		return grpcstatus.Errorf(grpccodes.InvalidArgument, passwordExclusive)
-	}
-	if !hasPassword && !hasSecret {
-		return grpcstatus.Errorf(grpccodes.InvalidArgument,
-			"exactly one of password or password_secret must be set")
-	}
-	return nil
-}
-
 func (s *PrivateStorageBackendsServer) validatePasswordSecret(ctx context.Context,
 	creds *privatev1.StorageBackendCredentials) error {
 	if creds == nil {
@@ -322,19 +252,10 @@ func (s *PrivateStorageBackendsServer) validatePasswordSecret(ctx context.Contex
 	if ref.GetId() == "" && ref.GetName() == "" {
 		return grpcstatus.Errorf(grpccodes.InvalidArgument, "password_secret must specify id or name")
 	}
-	resolved, err := references.NewDAOLookupFunc(s.secretsDao)(ctx, "", "", ref.GetId(), ref.GetName())
+	resolved, err := resolveSecretReferenceOfType(ctx, s.logger, s.secretsDao, ref,
+		"password_secret", privatev1.SecretType_SECRET_TYPE_VALUE)
 	if err != nil {
-		var deniedErr *dao.ErrDenied
-		if errors.As(err, &deniedErr) {
-			return grpcstatus.Errorf(grpccodes.PermissionDenied, "%s", deniedErr.Reason)
-		}
-		var nf interface{ IsNotFound() bool }
-		if errors.As(err, &nf) && nf.IsNotFound() {
-			return grpcstatus.Errorf(grpccodes.InvalidArgument,
-				"there is no secret with identifier or name '%s'", refKey(ref))
-		}
-		s.logger.ErrorContext(ctx, "Failed to resolve password_secret reference", "error", err)
-		return grpcstatus.Errorf(grpccodes.Internal, "failed to resolve password_secret reference")
+		return err
 	}
 	resolvedRef := &privatev1.SecretLocalReference{}
 	resolvedRef.SetId(resolved.ID)

@@ -22,8 +22,9 @@ import (
 	grpccodes "google.golang.org/grpc/codes"
 	grpcstatus "google.golang.org/grpc/status"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
+	"github.com/osac-project/osac/fulfillment-service/internal/auth"
 	"github.com/osac-project/osac/fulfillment-service/internal/database/dao"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
 // lookupClusterVersionByName returns the ClusterVersion with the given metadata.name.
@@ -53,20 +54,38 @@ func lookupClusterVersionByName(
 	return response.GetItems()[0], nil
 }
 
-// validateClusterVersionUsability validates that a ClusterVersion is usable for cluster creation.
-// Returns an error if the version is disabled, deleted, or in OBSOLETE state.
-func validateClusterVersionUsability(cv *privatev1.ClusterVersion, versionName string) error {
-	if cv.GetMetadata().HasDeletionTimestamp() {
-		return grpcstatus.Errorf(grpccodes.InvalidArgument,
-			"cluster version '%s' has been deleted", versionName)
+// getClusterVersionByID loads a stored ClusterVersion by its canonical ID.
+func getClusterVersionByID(
+	ctx context.Context,
+	clusterVersionsDao *dao.GenericDAO[*privatev1.ClusterVersion],
+	id string,
+) (*privatev1.ClusterVersion, error) {
+	version, err := getReferenceResource(ctx, clusterVersionsDao, id)
+	if err != nil {
+		return nil, resourceLookupError(err, "cluster version", id, "", grpccodes.InvalidArgument)
+	}
+	if err := validateResourceNotDeleted("cluster version", id, "", version.GetMetadata()); err != nil {
+		return nil, err
+	}
+	return version, nil
+}
+
+// validateResolvedClusterVersion validates that a resolved ClusterVersion can be used.
+func validateResolvedClusterVersion(cv *privatev1.ClusterVersion, identifier, source string) error {
+	if err := validateResourceNotDeleted("cluster version", identifier, source, cv.GetMetadata()); err != nil {
+		return err
 	}
 	if cv.GetSpec().HasEnabled() && !cv.GetSpec().GetEnabled() {
 		return grpcstatus.Errorf(grpccodes.InvalidArgument,
-			"cluster version '%s' is disabled", versionName)
+			"cluster version '%s'%s is disabled", identifier, source)
 	}
 	if cv.GetSpec().GetState() == privatev1.ClusterVersionState_CLUSTER_VERSION_STATE_OBSOLETE {
 		return grpcstatus.Errorf(grpccodes.InvalidArgument,
-			"cluster version '%s' is obsolete and cannot be used", versionName)
+			"cluster version '%s'%s is obsolete and cannot be used", identifier, source)
+	}
+	if refKey(cv.GetSpec().GetDiskImage()) == "" {
+		return grpcstatus.Errorf(grpccodes.FailedPrecondition,
+			"cluster version '%s'%s does not have a disk image attached", identifier, source)
 	}
 	return nil
 }
@@ -82,7 +101,7 @@ func lookupAndValidateClusterVersion(
 	if err != nil {
 		return err
 	}
-	return validateClusterVersionUsability(cv, versionName)
+	return validateResolvedClusterVersion(cv, versionName, "")
 }
 
 // buildClusterVersionReference creates a ClusterVersionReference from a ClusterVersion.
@@ -90,16 +109,18 @@ func buildClusterVersionReference(cv *privatev1.ClusterVersion) *privatev1.Clust
 	ref := &privatev1.ClusterVersionReference{}
 	ref.SetId(cv.GetId())
 	ref.SetName(cv.GetMetadata().GetName())
+	ref.SetShared(cv.GetMetadata().GetTenant() == auth.SharedTenant)
+	ref.SetProject(cv.GetMetadata().GetProject())
 	return ref
 }
 
 // resolveDefaultClusterVersion looks up the system default ClusterVersion (spec.is_default == true),
-// validates it is usable, and returns a ClusterVersionReference.
+// validates it is usable, and returns it.
 func resolveDefaultClusterVersion(
 	ctx context.Context,
 	logger *slog.Logger,
 	clusterVersionsDao *dao.GenericDAO[*privatev1.ClusterVersion],
-) (*privatev1.ClusterVersionReference, error) {
+) (*privatev1.ClusterVersion, error) {
 	response, err := clusterVersionsDao.List().
 		SetFilter("this.spec.is_default == true && !has(this.metadata.deletion_timestamp)").
 		SetLimit(1).
@@ -112,7 +133,7 @@ func resolveDefaultClusterVersion(
 			"failed to look up default cluster version")
 	}
 	if len(response.GetItems()) == 0 {
-		return nil, grpcstatus.Errorf(grpccodes.InvalidArgument,
+		return nil, grpcstatus.Errorf(grpccodes.FailedPrecondition,
 			"no version specified and no system default version is configured")
 	}
 	if response.GetTotal() > 1 {
@@ -122,8 +143,8 @@ func resolveDefaultClusterVersion(
 	}
 	cv := response.GetItems()[0]
 	versionName := cv.GetMetadata().GetName()
-	if err := validateClusterVersionUsability(cv, versionName); err != nil {
+	if err := validateResolvedClusterVersion(cv, versionName, ""); err != nil {
 		return nil, err
 	}
-	return buildClusterVersionReference(cv), nil
+	return cv, nil
 }

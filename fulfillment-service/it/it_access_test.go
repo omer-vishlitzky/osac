@@ -21,8 +21,8 @@ import (
 	grpccodes "google.golang.org/grpc/codes"
 	grpcstatus "google.golang.org/grpc/status"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
-	publicv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/public/v1"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
 
 var _ = Describe("Access control", func() {
@@ -42,12 +42,6 @@ var _ = Describe("Access control", func() {
 		It("Allows regular users to list clusters", func() {
 			client := publicv1.NewClustersClient(tool.ExternalView().UserConn())
 			_, err := client.List(ctx, publicv1.ClustersListRequest_builder{}.Build())
-			Expect(err).ToNot(HaveOccurred())
-		})
-
-		It("Allows regular users to list host types", func() {
-			client := publicv1.NewHostTypesClient(tool.ExternalView().UserConn())
-			_, err := client.List(ctx, publicv1.HostTypesListRequest_builder{}.Build())
 			Expect(err).ToNot(HaveOccurred())
 		})
 
@@ -109,12 +103,6 @@ var _ = Describe("Access control", func() {
 			Expect(err).ToNot(HaveOccurred())
 		})
 
-		It("Allows admin users to list host types", func() {
-			client := publicv1.NewHostTypesClient(tool.ExternalView().AdminConn())
-			_, err := client.List(ctx, publicv1.HostTypesListRequest_builder{}.Build())
-			Expect(err).ToNot(HaveOccurred())
-		})
-
 		It("Allows admin users to list compute instance templates", func() {
 			client := publicv1.NewComputeInstanceTemplatesClient(tool.ExternalView().AdminConn())
 			_, err := client.List(ctx, publicv1.ComputeInstanceTemplatesListRequest_builder{}.Build())
@@ -135,12 +123,6 @@ var _ = Describe("Access control", func() {
 	})
 
 	Describe("Private API", func() {
-		It("Allows admin users to list host types", func() {
-			client := privatev1.NewHostTypesClient(tool.InternalView().AdminConn())
-			_, err := client.List(ctx, privatev1.HostTypesListRequest_builder{}.Build())
-			Expect(err).ToNot(HaveOccurred())
-		})
-
 		It("Allows admin users to list cluster templates", func() {
 			client := privatev1.NewClusterTemplatesClient(tool.InternalView().AdminConn())
 			_, err := client.List(ctx, privatev1.ClusterTemplatesListRequest_builder{}.Build())
@@ -175,15 +157,6 @@ var _ = Describe("Access control", func() {
 			client := privatev1.NewClusterVersionsClient(tool.InternalView().AdminConn())
 			_, err := client.List(ctx, privatev1.ClusterVersionsListRequest_builder{}.Build())
 			Expect(err).ToNot(HaveOccurred())
-		})
-
-		It("Denies regular users access to host types", func() {
-			client := privatev1.NewHostTypesClient(tool.InternalView().UserConn())
-			_, err := client.List(ctx, privatev1.HostTypesListRequest_builder{}.Build())
-			Expect(err).To(HaveOccurred())
-			status, ok := grpcstatus.FromError(err)
-			Expect(ok).To(BeTrue())
-			Expect(status.Code()).To(Equal(grpccodes.PermissionDenied))
 		})
 
 		It("Denies regular users access to cluster templates", func() {

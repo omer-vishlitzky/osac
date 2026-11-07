@@ -1,26 +1,45 @@
 ---
-# ExternalIP deletion — removes the /32 IPAM subnet that reserved the IP
+# Release the /32 reservation osac-eip-<ExternalIP id> of the ExternalIP. A
+# reservation that is already gone is a success; one of another tenant or site
+# is a final error and is not deleted.
+- name: Release the ExternalIP on Netris
+  block:
+    - name: Check the settings
+      ansible.builtin.include_tasks: _settings.yaml
+      vars:
+        netris_require: [controller, credentials, site, tenant]
 
-- name: Extract ExternalIP name
-  ansible.builtin.set_fact:
-    eip_name: "{{ external_ip.metadata.name }}"
+    - name: Check the task input
+      ansible.builtin.include_tasks: _input.yaml
+      vars:
+        netris_require_parents: [external_ip_pool]
 
-- name: Display deletion information
-  ansible.builtin.debug:
-    msg: "Deleting Netris IPAM subnet for ExternalIP '{{ eip_name }}'"
+    - name: Build the object names
+      ansible.builtin.include_tasks: _names.yaml
 
-- name: Ensure Netris auth
-  ansible.builtin.include_role:
-    name: netris.controller.auth
-  when: netris_session_cookie is not defined
+    - name: Log in to Netris
+      ansible.builtin.include_role:
+        name: netris.controller.auth
+      when: netris_session_cookie is not defined
 
-- name: Delete /32 IPAM subnet from Netris controller
-  ansible.builtin.include_role:
-    name: netris.controller.ipam
-    tasks_from: delete_subnet
-  vars:
-    ipam_name: "{{ eip_name }}"
+    - name: Release the address
+      osac.templates.netris_external_ip:
+        operation: external_ip.release
+        resource: "{{ osac_job_vars.resource }}"
+        pool: "{{ osac_job_vars.external_ip_pool }}"
+        reservation_name: "{{ netris_names.eip_reservation }}"
+        controller_url: "{{ netris_controller_url }}"
+        session_cookie: "{{ netris_session_cookie }}"
+        site_id: "{{ netris_site_id | int }}"
+        tenant_id: "{{ netris_tenant_id | int }}"
+        timeout: "{{ netris_timeout | default(30) }}"
+        validate_certs: "{{ netris_validate_certs | default(true) }}"
+        ca_path: "{{ netris_ca_path | default(omit, true) }}"
+      register: _netris_eip
+      ignore_errors: true
 
-- name: Display deletion result
-  ansible.builtin.debug:
-    msg: "IPAM subnet '{{ eip_name }}' deletion completed"
+    - name: Stop when the module cannot continue
+      ansible.builtin.include_tasks: _eip_module_result.yaml
+  rescue:
+    - name: Report the error
+      ansible.builtin.include_tasks: _rescue.yaml

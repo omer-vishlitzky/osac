@@ -1,0 +1,33 @@
+---
+# Kubernetes delete_subnet: the owner Subnet removes the VirtualNetwork's hub
+# network and waits until it is gone, which releases the claim; the next Subnet
+# created in the VirtualNetwork claims a new one (no handover). Any other
+# Subnet changes nothing. The VirtualNetwork namespace and SecurityGroup
+# policies stay: they belong to the VirtualNetwork and its groups.
+- name: Run cudn_evpn delete_subnet
+  block:
+    - name: Plan the task
+      ansible.builtin.include_tasks: _plan.yaml
+
+    - name: Read the VirtualNetwork's hub network
+      kubernetes.core.k8s_info:
+        api_version: k8s.ovn.org/v1
+        kind: ClusterUserDefinedNetwork
+        name: "{{ cudn_evpn.cudn_name }}"
+      register: _cudn_evpn_live
+
+    - name: Delete the hub network this Subnet owns and wait until it is gone
+      when:
+        - _cudn_evpn_live.resources | length > 0
+        - (_meta.labels | default({}))[cudn_evpn.labels.vn] | default('') == cudn_evpn.vn_id
+        - (_meta.labels | default({}))[cudn_evpn.labels.tenant] | default('') == cudn_evpn.tenant
+        - (_meta.annotations | default({}))[cudn_evpn.owner_subnet_annotation] | default('') == cudn_evpn.subnet_id
+      ansible.builtin.include_tasks: _delete.yaml
+      vars:
+        _cudn: "{{ _cudn_evpn_live.resources | first | default({}) }}"
+        _meta: "{{ _cudn.metadata | default({}) }}"
+        cudn_evpn_object: "{{ _cudn | combine({'apiVersion': 'k8s.ovn.org/v1', 'kind': 'ClusterUserDefinedNetwork'}) }}"
+
+  rescue:
+    - name: Report the failure to OSAC
+      ansible.builtin.include_tasks: _fail.yaml

@@ -6,6 +6,8 @@
 # between the umbrella chart's own templates and its subcharts without
 # duplicating it as separate --set flags per value.
 global:
+  # Required stable identity for this OSAC/fulfillment-service deployment.
+  osacDeploymentId: ""
   # [REQUIRED on OpenShift, via --set global.clusterDomain=$(oc get ingresses.config/cluster -o jsonpath='{.spec.domain}')]
   # Backs the tpl-templated defaults below (service.auth.issuerUrl,
   # service.idp.url, service.vault.keycloakIssuerUrl) so they automatically
@@ -13,14 +15,88 @@ global:
   # OpenShift cluster. Leave empty for platforms (e.g. kind) that set these
   # three values explicitly instead.
   clusterDomain: ""
+  # Resolved external fulfillment endpoint shared with operator trust sync and
+  # tenant-cluster CSI provisioning. Leave empty to derive
+  # <service.externalHostname>:443 for OpenShift.
+  fulfillment:
+    endpoint: ""
+  fulfillmentTrust:
+    # Enables trust reconciliation for tenant-scoped ClusterOrders.
+    # Enable only when tenant CSI trust support is deployed.
+    enabled: false
+    tenantNamespace: osac-csi
+  # --- Service Enablement ---
+  # Controls which service tiers are active across all OSAC components.
+  # When all are true (the default), OSAC operates as a full-stack cloud.
+  # Disabling a tier stops its gRPC/REST endpoints, operator controllers,
+  # and dependent infrastructure (e.g. BMF operator for BMaaS).
+  services:
+    caas:
+      enabled: true
+    vmaas:
+      enabled: true
+    bmaas:
+      enabled: true
+    maas:
+      enabled: true
+  # Networking settings (unified networking design). provisioningEnabled is
+  # fixed at installation. fabricManager names the provider's Fabric Manager
+  # registration (a ConfigMap the admin applies; it is not a Helm value) and
+  # has no default. The installer's NetworkClass step creates the NetworkClass
+  # from these values; none of them can change after installation.
+  networking:
+    # Run networking jobs through the network managers. false: VirtualNetworks,
+    # Subnets, SecurityGroups, ExternalIPPools and FabricDomains become READY
+    # without provider work (reason ProvisioningDisabled); ExternalIPs,
+    # ExternalIPAttachments and NATGateways are not offered.
+    provisioningEnabled: true
+    # Canonical IPv4 CIDRs of the provider's infrastructure (management,
+    # provisioning and node networks).
+    excludedIpv4Cidrs: []
+    # [REQUIRED] Registration name of the provider's Fabric Manager.
+    fabricManager: ""
+    # OSAC Kubernetes Manager; required with VMaaS. "" or cudn_evpn.
+    k8sManager: ""
+    # Groups allowed to create, update, or delete the customer-managed Netris
+    # CA ConfigMap named by
+    # aap.instanceGroups.networkFulfillment.config.NETRIS_CA_CONFIGMAP.
+    # system:masters is the break-glass group of the system:admin certificate;
+    # system:cluster-admins holds the built-in cluster-admin subjects. An
+    # identity-provider group bound directly to cluster-admin is in neither,
+    # so add each such group here explicitly.
+    caBundle:
+      adminGroups:
+        - "system:masters"
+        - "system:cluster-admins"
+    networkClass:
+      defaults:
+        virtualNetworkIPv4CIDR: 10.200.0.0/16
+        subnetIPv4CIDR: 10.200.0.0/20
+        ingressRules: []
+        egressRules:
+        - protocol: PROTOCOL_ALL
+          ipv4Cidr: 0.0.0.0/0
+      eastWestCapabilities:
+        supportsEastWestEthernet: false
+      # Optional Subnet address plan; without it the installer derives one
+      # from the enabled services and k8sManager. Shares are multiples of
+      # 0.0625 that sum to 1.
+      # addressPlan:
+      #   overlay: 0.5
+      #   fabric: 0.25
+      #   lbVip: 0.25
 
+# Used by the validation and CA identity hook Jobs. With Netris CA validation
+# enabled the image must provide kubectl, sh, grep, mktemp, rm and openssl (the
+# hooks fail with ERROR: NETRIS_CA_* instead of skipping the checks).
 cliImage: quay.io/openshift/origin-cli:4.20.0
 
 # Shared PostgreSQL host for the db-init hook.
 dbInit:
   host: "postgres.osac-infra.svc.cluster.local"
 
-# Kafka cluster coordinates for per-instance topic/user creation.
+# Kafka cluster coordinates for per-instance topic/user creation. Set enabled
+# to false when service.kafka.connection targets an external Kafka cluster.
 kafka:
   enabled: true
   clusterName: osac-kafka
@@ -36,7 +112,7 @@ operator:
   enabled: true
   image:
     repository: ghcr.io/osac-project/osac-operator
-    tag: latest  # PLACEHOLDER -- overwritten at release time by publish-charts.yaml
+    tag: latest  # PLACEHOLDER -- overwritten at release time by osac-build-and-publish.yaml
     pullPolicy: Always
   replicaCount: 1
   resources:
@@ -52,19 +128,44 @@ operator:
     insecureSkipVerify: "true"
     statusPollInterval: "30s"
     templatePrefix: "osac"
+  ignition:
+    trustIngressCA: false
+  stall:
+    preparingInfrastructureThreshold: "15m"
+    controlPlaneStartingThreshold: "30m"
+    workersJoiningThreshold: "20m"
+    workersJoiningByInstanceType: {}
+  upgradeTimeouts:
+    pending: "10m"
+    controlPlane: "40m"
+    nodePoolPerNode: "20m"
   fulfillment:
     serverAddress: "fulfillment-internal-api:8001"
-    tokenFile: "/var/run/secrets/kubernetes.io/serviceaccount/token"
+    credentials:
+      secretName: fulfillment-controller-credentials
+      clientIdKey: client-id
+      clientSecretKey: client-secret
+    tls:
+      caBundle:
+        configMap: ca-bundle
+        key: bundle.pem
+    configMap:
+      name: "osac-fulfillment-config"
+      optional: false
   controllers:
-    clusterOrder: true
-    computeInstance: true
     tenant: true
     networking: true
-    bareMetalInstance: true
     storage: true
+  # Provider-to-endpoint map consumed by the Volume controller. Node-local
+  # providers such as LVMS use "none" because they do not dial a vendor gRPC endpoint.
+  vendorControllers: {}
   configSecret:
     name: "osac-config"
     optional: true
+  # Set together to configure the operator to use a remote VMaaS cluster.
+  remoteClusterKubeconfig: ""
+  remoteClusterKubeconfigSecretName: ""
+  remoteClusterKubeconfigSecretKey: kubeconfig
   hubAccess:
     enabled: false
 
@@ -72,13 +173,40 @@ operator:
 service:
   enabled: true
   variant: openshift
+  controller:
+    # Enable full synchronization in fulfillment controllers.
+    sync: true
   # [REQUIRED] Hostname for the external API Route (e.g. fulfillment-api-osac.apps.mycluster.example.com)
   externalHostname: ""
   # [REQUIRED] Hostname for the internal API Route (e.g. fulfillment-internal-api-osac.apps.mycluster.example.com)
   internalHostname: ""
+  mcp:
+    enabled: false
+    externalHostname: ""
+    # OpenShift Routes use HTTPS port 443; custom external ports are supported on Kind.
+    externalPort: 443
+    # The OAuth resource URL is the MCP HTTPS root URL ending in /.
+    exchangeClientId: ""
+    exchangeCredentialsSecret: ""
+    resources:
+      requests:
+        cpu: 50m
+        memory: 128Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
   images:
-    service: ghcr.io/osac-project/fulfillment-service:latest  # PLACEHOLDER -- overwritten at release time by publish-charts.yaml
-    envoy: ghcr.io/osac-project/envoy:v1.33.0
+    service:
+      repository: ghcr.io/osac-project/fulfillment-service
+      tag: latest  # PLACEHOLDER -- overwritten at release time by osac-build-and-publish.yaml
+      pullPolicy: Always
+    envoy:
+      repository: ghcr.io/osac-project/envoy
+      tag: v1.33.0
+      pullPolicy: IfNotPresent
+  eventPublisher:
+    enabled: true
+    topicRetention: "-1s"
   certs:
     issuerRef:
       kind: ClusterIssuer
@@ -110,16 +238,17 @@ service:
     headers: false
     bodies: false
   vault:
-    # Vault API endpoint. tpl is applied at render time, so
-    # {{ .Release.Namespace }} expands to the actual install namespace --
-    # correct by default for the in-cluster bundled OpenBao service on any
-    # namespace. Leave empty to disable Vault integration entirely (no
-    # --vault-endpoint flag is passed to the controller when endpoint is
-    # empty, even if credentials are configured). Override with a real
-    # external Vault URL when not using the bundled OpenBao.
-    endpoint: "https://openbao.{{ .Release.Namespace }}.svc.cluster.local:8200"
+    # Vault API endpoint. Points to the osac-infra namespace by default,
+    # where bundled OpenBao is deployed after OSAC-4916. Leave empty to
+    # disable Vault integration entirely (no --vault-endpoint flag is
+    # passed to the controller when endpoint is empty, even if credentials
+    # are configured). Override with an external Vault URL when not using
+    # the bundled OpenBao.
+    endpoint: "https://openbao.osac-infra.svc.cluster.local:8200"
     namespace: osac
     kvMountPath: secret
+    # Transit engine mount path within ordinary tenant namespaces.
+    transitMountPath: transit
     lifecycleRole: ""
     lifecycleMountPath: "jwt"
     keycloakClientId: ""
@@ -134,6 +263,24 @@ service:
     caBundle:
       configMap: ""
     credentials: []
+  # Kafka connection used by the fulfillment service. The defaults target the
+  # in-cluster cluster named by kafka.clusterName in kafka.clusterNamespace
+  # and the Secret copied from the fulfillment KafkaUser. To use an external
+  # Kafka cluster, set the top-level kafka.enabled to false and override
+  # service.kafka.connection with sources for that cluster. TLS trust uses
+  # service.certs.caBundle; include the broker CA in that bundle when it is not
+  # already trusted.
+  kafka:
+    connection:
+    - secret:
+        name: fulfillment-service-kafka
+        items:
+        - key: brokers
+          param: brokers
+        - key: user
+          param: user
+        - key: password
+          param: password
 
 # --- AAP ---
 aap:
@@ -153,7 +300,7 @@ aap:
       imagePullPolicy: IfNotPresent
   bootstrap:
     enabled: true
-    image: ghcr.io/osac-project/osac-aap:latest  # PLACEHOLDER -- overwritten at release time by publish-charts.yaml
+    image: ghcr.io/osac-project/osac-aap:latest  # PLACEHOLDER -- overwritten at release time by osac-build-and-publish.yaml
     backoffLimit: 15
     readinessConsecutiveSuccesses: 3
     gateway:
@@ -163,75 +310,40 @@ aap:
   configAsCode:
     manifestSecret: "config-as-code-manifest-ig"
     secret: "config-as-code-ig"
+    # Maximum number of add-on operator jobs allowed to run concurrently.
+    addonOperatorMaxConcurrentJobs: 50
     eeImage: ""
     projectGitUri: ""
     projectGitBranch: ""
-    importAgentsEnabled: false
-    importBcmAgentsEnabled: false
-  importAgents:
-    servers: []
-  importBcmAgents:
-    cert: ""
-    key: ""
+    remoteClusterKubeconfigSecretName: ""
+    remoteClusterKubeconfigSecretKey: kubeconfig
   instanceGroups:
     clusterFulfillment:
       enabled: false
       config:
-        NETWORK_CLASS: ""
-        NETWORK_STEPS_COLLECTION: ""
-        DNS_CLASS: ""
+        DNS_CLASS: "dns.route53.dns"
         DNS_ZONE: ""
-        NETRIS_CONTROLLER_URL: ""
-        NETRIS_USERNAME: ""
-        NETRIS_SITE_ID: ""
-        NETRIS_TENANT_ID: ""
-        NETRIS_TENANT_NAME: ""
-        NETRIS_MGMT_VPC_ID: ""
-        NETRIS_MGMT_VPC_NAME: ""
-        NETRIS_RESOURCE_CLASS_MAP: ""
-        SERVER_SSH_BASTION_HOST: ""
-        SERVER_SSH_BASTION_USER: ""
-        SERVER_SSH_USER: ""
-        SERVER_MGMT_ROUTE_DESTINATION: ""
-        SERVER_MGMT_ROUTE_GATEWAY: ""
         EXTERNAL_ACCESS_BASE_DOMAIN: ""
         EXTERNAL_ACCESS_SUPPORTED_BASE_DOMAINS: ""
         EXTERNAL_ACCESS_API_INTERNAL_NETWORK: ""
         HOSTED_CLUSTER_BASE_DOMAIN: ""
         HOSTED_CLUSTER_CONTROLLER_AVAILABILITY_POLICY: ""
         HOSTED_CLUSTER_INFRASTRUCTURE_AVAILABILITY_POLICY: ""
-        PARKING_VNET_NAME: ""
-        IMPORT_AGENTS_NAMESPACE: ""
-        IMPORT_AGENTS_INFRAENV_NAME: ""
-        IMPORT_AGENTS_PULL_SECRET_NAME: ""
-        IMPORT_AGENTS_DISABLE_BMC_CERT_VERIFICATION: ""
-        BCM_API_URL: ""
-        BCM_VALIDATE_CERTS: "true"
-        BCM_DISABLE_BMC_CERT_VERIFICATION: "false"
       secret:
-        NETRIS_PASSWORD: ""
         AWS_ACCESS_KEY_ID: ""
         AWS_SECRET_ACCESS_KEY: ""
-        SERVER_SSH_KEY: ""
-        SERVER_SSH_BASTION_KEY: ""
+    # ConfigMap and Secret network-fulfillment-ig: network manager settings
+    # and credentials, written verbatim. Keys start with the registration
+    # name in upper case (for example NETRIS_CONTROLLER_URL). Required with
+    # provisioningEnabled.
     networkFulfillment:
-      enabled: false
-      config:
-        NETRIS_CONTROLLER_URL: ""
-        NETRIS_USERNAME: ""
-        NETRIS_SITE_ID: ""
-        NETRIS_TENANT_ID: ""
-        NETRIS_TENANT_NAME: ""
-      secret:
-        NETRIS_PASSWORD: ""
+      enabled: true
+      config: {}
+      secret: {}
     storageFulfillment:
       enabled: false
       config:
         STORAGE_SNAPSHOTS_ENABLED: ""
-      secret:
-        VAST_ENDPOINT: ""
-        VAST_USERNAME: ""
-        VAST_PASSWORD: ""
     publishTemplates:
       enabled: true
       config:
@@ -242,6 +354,8 @@ aap:
 ui:
   enabled: true
   externalHostname: ""
+  route:
+    enabled: true
   api:
     fulfillment:
       url: https://fulfillment-internal-api:8001
@@ -250,42 +364,62 @@ ui:
           configMap: ca-bundle
   auth:
     oidcClientId: osac-ui
+    # OIDC issuer URL for gRPC reflection authentication. Must match service.auth.issuerUrl.
+    # tpl is NOT applied at render time for subcharts -- set this explicitly in each
+    # environment's values file or via --set in the install-osac Makefile target.
+    oidcIssuerURL: ""
     certs:
       caBundle:
         configMap: ca-bundle
   log:
     level: info
   images:
-    ui: ghcr.io/osac-project/osac-ui:latest  # PLACEHOLDER -- overwritten at release time by publish-charts.yaml
+    ui: ghcr.io/osac-project/osac-ui:latest  # PLACEHOLDER -- overwritten at release time by osac-build-and-publish.yaml
+    pullPolicy: auto
 
 # --- Metering ---
+# Always deployed: billing is not optional. The event publisher writes usage
+# events unconditionally, so an install without metering silently loses
+# revenue. The database wiring points at the secrets this chart's
+# workload-db-secrets template creates for the configured DB host.
 metering:
-  enabled: false
   image:
     repository: ghcr.io/osac-project/metering-service
-    tag: latest  # PLACEHOLDER -- overwritten at release time by publish-charts.yaml
+    tag: latest  # PLACEHOLDER -- overwritten at release time by osac-build-and-publish.yaml
     pullPolicy: Always
-
-# --- CSI Driver ---
-csiDriver:
-  enabled: false
-  image:
-    repository: ghcr.io/osac-project/osac-csi-driver
-    tag: latest  # PLACEHOLDER -- overwritten at release time by publish-charts.yaml
-    pullPolicy: Always
-
-# --- CSI Backends ---
-csiBackends: {}
+  # Outside systems that read every tenant's heartbeat topics with their own
+  # credentials. Each entry names one reader and no tenant; the reader name is
+  # also its Kafka consumer group, where lag is reported. The grant covers the
+  # osac.metering.heartbeat. topic prefix, so a new tenant needs no chart
+  # change. Add or remove an entry and run helm upgrade to grant or revoke; no
+  # OSAC service restarts. This is a list of objects, so the Enclave Wizard
+  # renders no control for it; operators set it in values.
+  readers: []
+  database:
+    connection:
+    - secret:
+        name: osac-db-metering-config
+        items:
+        - key: url
+          param: url
+    - secret:
+        name: osac-db-metering-client-cert
+        items:
+        - key: tls.crt
+          param: sslcert
+        - key: tls.key
+          param: sslkey
+        - key: ca.crt
+          param: sslrootcert
 
 # --- Bare Metal Fulfillment Operator CRDs ---
 bmfCrds: {}
 
 # --- Bare Metal Fulfillment Operator ---
 bmf:
-  enabled: true
   image:
     repository: ghcr.io/osac-project/bare-metal-fulfillment-operator
-    tag: latest  # PLACEHOLDER -- overwritten at release time by publish-charts.yaml
+    tag: latest  # PLACEHOLDER -- overwritten at release time by osac-build-and-publish.yaml
     pullPolicy: Always
   replicaCount: 1
   resources:
@@ -302,6 +436,8 @@ bmf:
     inventoryConfig: "osac-inventory-config"
     managementConfig: "osac-management-config"
     osClouds: "osac-os-clouds"
+    netboxToken: "osac-netbox-token"
+    netboxCA: "osac-netbox-ca"
   # Kind/IT only -- see templates/bmf-metal3-test-secrets.yaml
   testBackend:
     metal3:
@@ -328,60 +464,58 @@ bmf:
     insecureSkipVerify: false
     hostClass: "bcm"
     bmhNamespace: ""
+  secretAPI:
+    url: "https://fulfillment-internal-api:8001"
+    # Keep aligned with service.auth.issuerUrl; tpl resolves the cluster domain at render time.
+    issuerUrl: "https://keycloak-keycloak.{{ .Values.global.clusterDomain }}/realms/osac"
+    caBundle:
+      configMap: "ca-bundle"
+      key: "bundle.pem"
+  netbox:
+    enabled: false
+    bmhNamespace: ""
+    url: ""
+    tokenSecretKey: "token"
+    tokenValue: ""
+    caCert: ""
+    allowInsecureHTTP: false
   metal3:
     enabled: false
+    # Namespace where Metal3 inventory reads BareMetalHost resources.
     namespace: ""
     hostClass: "metal3"
 
-# --- Validation hooks ---
+# --- Install preflight ---
+# Checks run while Helm renders the chart (helm install, helm upgrade and
+# --dry-run=server) and stop the install before anything is created when a
+# prerequisite is missing. The report is the ConfigMap <release>-preflight-report
+# and, on a failed render, the OSAC-PREFLIGHT-JSON line on stderr.
+# validation.enabled=false skips every check; the report still lists them.
 validation:
   enabled: true
 
-# --- Network Manager ConfigMaps ---
-# Each entry creates a ConfigMap for the osac-operator dispatcher to discover.
-# networkManagers:
-#   - name: netris
-#     role: fabric        # "fabric" or "k8s"
-#     description: "Netris SDN fabric manager"
-#     capabilities: "ipv4"
-#   - name: cudn_localnet
-#     role: k8s
-#     description: "CUDN LocalNet k8s manager"
-#     capabilities: "ipv4,ipv6,dualStack"
-networkManagers: []
-
-# --- MetalLB Address Pool ---
-metallb:
-  enabled: false
-  addressCIDR: "192.168.40.0/24"
+preflight:
+  # enforce: blocking findings stop the install (default).
+  # report:  findings are recorded but never stop the install; use with
+  #          helm ... --dry-run=server for a read-only report.
+  # strict:  warnings stop the install too.
+  mode: enforce
+  # Skip a check by id, with the reason. Ids are in files/preflight/catalog.yaml.
+  # Example:
+  #   skip:
+  #     cert-issuer-ready: "the issuer is created by GitOps after this install"
+  skip: {}
 
 hubAccess:
   enabled: false
 
-bundledVault:
-  enabled: true
-  devRootToken: "dev-root-token"
-  image: "ghcr.io/openbao/openbao:2.6.2"
-  # podSecurityContext: {}
-  # Leave absent (nil) to use the template's built-in standard-Kubernetes defaults
-  # (runAsNonRoot: true, runAsUser: 100, runAsGroup: 1000, fsGroup: 1000).
-  # On OpenShift with restricted-v2 SCC, set this to just {runAsNonRoot: true}
-  # in the profile's instance.yaml — the SCC allocates UIDs from the namespace
-  # UID range and resolves the named user automatically. Any non-nil value here
-  # FULLY REPLACES the template default (no Helm key-merge), so partial overrides
-  # must include every key you want rendered.
-  resources:
-    limits:
-      cpu: 500m
-      memory: 512Mi
-    requests:
-      cpu: 100m
-      memory: 256Mi
-
 clusterVersions:
   enabled: false
   versions: []
-  # Example:
+  # Default versions require a diskImage; non-default versions may omit it.
+  # DiskImages are shared Linux registry images, created before the version.
+  # Existing named records are retained without updates.
+  # Example (development/CI image; use your own artifact in production):
   # enabled: true
   # versions:
   # - version: "4.20.0"
@@ -389,44 +523,13 @@ clusterVersions:
   # - version: "4.22.0"
   #   image: "quay.io/openshift-release-dev/ocp-release:4.22.0-multi"
   #   default: true
+  #   diskImage:
+  #     name: rhcos-4-22
+  #     sourceRef: oci://quay.io/osac-project/rhcos:4.22.0
+  #     architecture: [ARCHITECTURE_AMD64]
 
 lvms:
   # Register LVMS as a local StorageBackend + StorageTier in the fulfillment service
   # after install. For CI/development environments only — production deployments
   # should use their own storage operators (Ceph, Pure, VAST, etc.).
   enabled: false
-
-networkClass:
-  # Create a NetworkClass in the fulfillment service after install. At least one of
-  # k8sManager/fabricManager must be set when enabled — the corresponding manager
-  # must already be registered via operator.networkManagers (see that chart's values).
-  #
-  # Enabled by default with fabricManager: cudn_net, matching operator.networkManagers'
-  # own cudn_net fabric manager (enabled by default) as the platform default NetworkClass --
-  # every install needs a default NetworkClass for VirtualNetwork/tenant onboarding to work.
-  enabled: true
-  # [REQUIRED when enabled] Human-friendly short title — the fulfillment service
-  # rejects NetworkClass creation without one (NC-VAL-02).
-  title: "CUDN Network Implementation"
-  description: >-
-    Provisions networking resources using ClusterUserDefinedNetwork (CUDN) on OpenShift.
-    Handles both VirtualNetwork (logical grouping) and Subnet (CUDN + Namespace creation).
-  k8sManager: ""
-  fabricManager: "cudn_net"
-  isDefault: true
-  defaults:
-    # Tenant-onboarding defaults: without these, this being the default NetworkClass
-    # does not auto-create a VirtualNetwork/Subnet/SecurityGroup for new tenants, and
-    # ComputeInstance creation without explicit network_attachments will fail.
-    virtualNetworkIPv4CIDR: "10.200.0.0/16"
-    subnetIPv4CIDR: "10.200.0.0/20"
-    enableNatGateway: false
-    egressRules:
-    - protocol: PROTOCOL_ALL
-      ipv4Cidr: "0.0.0.0/0"
-  # Example override (k8s-only profile — switches the default NetworkClass's
-  # manager from cudn_net to k8s_only instead of adding a second NetworkClass,
-  # since only one NetworkClass may exist per deployment):
-  # title: "K8s-only networking"
-  # fabricManager: ""
-  # k8sManager: "k8s_only"

@@ -21,8 +21,11 @@ import (
 	"crypto/tls"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
+	"time"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
@@ -31,6 +34,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/certwatcher"
@@ -43,6 +47,7 @@ import (
 	"sigs.k8s.io/yaml"
 
 	metal3api "github.com/metal3-io/baremetal-operator/apis/metal3.io/v1alpha1"
+
 	osacv1alpha1 "github.com/osac-project/osac/bare-metal-fulfillment-operator/api/v1alpha1"
 	"github.com/osac-project/osac/bare-metal-fulfillment-operator/internal/baremetalhost"
 	"github.com/osac-project/osac/bare-metal-fulfillment-operator/internal/bcmclient"
@@ -52,6 +57,7 @@ import (
 	"github.com/osac-project/osac/bare-metal-fulfillment-operator/internal/inventory"
 	"github.com/osac-project/osac/bare-metal-fulfillment-operator/internal/management"
 	"github.com/osac-project/osac/bare-metal-fulfillment-operator/internal/profile"
+	"github.com/osac-project/osac/bare-metal-fulfillment-operator/internal/secretapi"
 	"github.com/osac-project/osac/osac-operator/pkg/aap"
 	"github.com/osac-project/osac/osac-operator/pkg/provisioning"
 	// +kubebuilder:scaffold:imports
@@ -73,13 +79,13 @@ const (
 	envProfileConfigPath    = "OSAC_PROFILE_CONFIG_PATH"
 	envMaxJobHistory        = "OSAC_MAX_JOB_HISTORY"
 
-	envHostReadyPollInterval     = "OSAC_HOST_READY_POLL_INTERVAL"
-	envHostDeletionPollInterval  = "OSAC_HOST_DELETION_POLL_INTERVAL"
-	envNoFreeHostsPollInterval   = "OSAC_NO_FREE_HOSTS_POLL_INTERVAL"
-	envTryLockFailPollInterval   = "OSAC_TRY_LOCK_FAIL_POLL_INTERVAL"
-	envManagementRecheckInterval = "OSAC_MANAGEMENT_RECHECK_INTERVAL"
-	envProvisionPollInterval     = "OSAC_PROVISION_POLL_INTERVAL"
-	envHostReadinessPollInterval = "OSAC_HOST_READINESS_POLL_INTERVAL"
+	envHostReadyPollInterval        = "OSAC_HOST_READY_POLL_INTERVAL"
+	envHostDeletionPollInterval     = "OSAC_HOST_DELETION_POLL_INTERVAL"
+	envNoFreeHostsPollInterval      = "OSAC_NO_FREE_HOSTS_POLL_INTERVAL"
+	envTryLockFailPollInterval      = "OSAC_TRY_LOCK_FAIL_POLL_INTERVAL"
+	envManagementRecheckInterval    = "OSAC_MANAGEMENT_RECHECK_INTERVAL"
+	envProvisionPollInterval        = "OSAC_PROVISION_POLL_INTERVAL"
+	envHostAvailabilityPollInterval = "OSAC_HOST_AVAILABILITY_POLL_INTERVAL"
 
 	envAAPURL                       = "OSAC_AAP_URL"
 	envAAPToken                     = "OSAC_AAP_TOKEN"
@@ -87,6 +93,12 @@ const (
 	envAAPInsecureSkipVerify        = "OSAC_AAP_INSECURE_SKIP_VERIFY"
 	envAAPTemplatePrefix            = "OSAC_AAP_TEMPLATE_PREFIX"
 	envEnableNetworkingProvisioning = "OSAC_ENABLE_NETWORKING_PROVISIONING"
+
+	envSecretAPIURL              = "OSAC_SECRET_API_URL"
+	envSecretAPIIssuerURL        = "OSAC_SECRET_API_ISSUER_URL"
+	envSecretAPIClientIDFile     = "OSAC_SECRET_API_CLIENT_ID_FILE"
+	envSecretAPIClientSecretFile = "OSAC_SECRET_API_CLIENT_SECRET_FILE"
+	envSecretAPICAFile           = "OSAC_SECRET_API_CA_FILE"
 )
 
 func init() {
@@ -130,8 +142,14 @@ func main() {
 	flag.Parse()
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+	networkingProvisioningEnabled := loadNetworkingProvisioning()
+	setupLog.Info("networking provisioning feature gate", "enabled", networkingProvisioningEnabled)
 
 	ctx := ctrl.SetupSignalHandler()
+	if err := checkInstallationProvisioning(ctx, networkingProvisioningEnabled); err != nil {
+		setupLog.Error(err, "unable to verify installation networking setting")
+		os.Exit(1)
+	}
 
 	// if the enable-http2 flag is false (the default), http/2 should be disabled
 	// due to its vulnerabilities. More specifically, disabling http/2 will
@@ -235,6 +253,9 @@ func main() {
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         enableLeaderElection,
 		LeaderElectionID:       "89c2406a.openshift.io",
+		LeaseDuration:          ptr.To(35 * time.Second),
+		RenewDeadline:          ptr.To(25 * time.Second),
+		RetryPeriod:            ptr.To(5 * time.Second),
 		Cache: cache.Options{
 			ByObject: map[client.Object]cache.ByObject{
 				&osacv1alpha1.BareMetalPool{}: {
@@ -289,8 +310,7 @@ func main() {
 			os.Exit(1)
 		}
 
-		enableNetworkingProvisioning := helpers.GetEnvWithDefault(envEnableNetworkingProvisioning, false)
-		if enableNetworkingProvisioning {
+		if networkingProvisioningEnabled {
 			// Networking provisioning (onboard) and deprovisioning (offboard) are both a
 			// port move; the single move playbook derives the direction from the CR.
 			networkingProvider = provisioning.NewAAPProvider(
@@ -459,7 +479,13 @@ func setupBareMetalInstanceController(
 	if err != nil {
 		return err
 	}
-
+	if closer, ok := inventoryClient.(io.Closer); ok {
+		context.AfterFunc(ctx, func() {
+			if closeErr := closer.Close(); closeErr != nil {
+				setupLog.Error(closeErr, "Failed to close inventory client")
+			}
+		})
+	}
 	managementClient, err := management.NewClient(ctx, &managementConfig)
 	if err != nil {
 		return fmt.Errorf("failed to create management client: %w", err)
@@ -484,9 +510,9 @@ func setupBareMetalInstanceController(
 		envProvisionPollInterval,
 		controller.DefaultProvisionPollIntervalDuration,
 	)
-	hostReadinessPollInterval := helpers.GetEnvWithDefault(
-		envHostReadinessPollInterval,
-		controller.DefaultHostReadinessPollIntervalDuration,
+	hostAvailabilityPollInterval := helpers.GetEnvWithDefault(
+		envHostAvailabilityPollInterval,
+		controller.DefaultHostAvailabilityPollIntervalDuration,
 	)
 	maxConcurrentReconciles := helpers.GetEnvWithDefault(
 		envBareMetalInstanceMaxConcurrentReconcile,
@@ -507,7 +533,7 @@ func setupBareMetalInstanceController(
 		tryLockFailPollInterval,
 		managementRecheckInterval,
 		provisionPollInterval,
-		hostReadinessPollInterval,
+		hostAvailabilityPollInterval,
 	).SetupWithManager(mgr, maxConcurrentReconciles); err != nil {
 		return fmt.Errorf("baremetalinstance controller: %w", err)
 	}
@@ -520,8 +546,11 @@ func createInventoryClient(
 	managementCfg *management.Config,
 	mgr ctrl.Manager,
 ) (inventory.Client, error) {
-	if inventoryCfg.Type == "bcm" {
+	switch inventoryCfg.Type {
+	case "bcm":
 		return createBCMInventoryClient(ctx, inventoryCfg, managementCfg, mgr)
+	case "netbox":
+		return createNetBoxInventoryClient(ctx, inventoryCfg, managementCfg, mgr)
 	}
 
 	inventoryClient, err := inventory.NewClient(ctx, inventoryCfg)
@@ -532,6 +561,79 @@ func createInventoryClient(
 		return nil, fmt.Errorf("unsupported inventory type %q", inventoryCfg.Type)
 	}
 	return inventoryClient, nil
+}
+
+const metal3Backend = "metal3"
+
+func validateNetBoxManagementConfig(managementCfg *management.Config) error {
+	if managementCfg == nil || managementCfg.Type != metal3Backend {
+		return fmt.Errorf("NetBox backend requires management.type=%s", metal3Backend)
+	}
+	return nil
+}
+
+func createNetBoxInventoryClient(
+	ctx context.Context,
+	inventoryCfg *inventory.Config,
+	managementCfg *management.Config,
+	mgr ctrl.Manager,
+) (inventory.Client, error) {
+	if err := validateNetBoxInventoryConfig(inventoryCfg, managementCfg); err != nil {
+		return nil, err
+	}
+	bmhManager, err := createMetal3BMHManager(managementCfg, mgr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to configure Metal3 BMH manager for NetBox: %w", err)
+	}
+	return createNetBoxInventoryClientWithManager(ctx, inventoryCfg, bmhManager)
+}
+
+func validateNetBoxInventoryConfig(inventoryCfg *inventory.Config, managementCfg *management.Config) error {
+	if inventoryCfg.HostClass != metal3Backend {
+		return fmt.Errorf(
+			"NetBox backend requires inventory.hostClass=%s (got %q)",
+			metal3Backend,
+			inventoryCfg.HostClass,
+		)
+	}
+	return validateNetBoxManagementConfig(managementCfg)
+}
+
+func createNetBoxInventoryClientWithManager(
+	ctx context.Context,
+	inventoryCfg *inventory.Config,
+	bmhManager *baremetalhost.Manager,
+) (inventory.Client, error) {
+	netBoxAPI, err := inventory.NewNetBoxAPI(inventoryCfg)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create NetBox inventory client: %w", err)
+	}
+	secretsClient, err := createSecretAPIClientFromEnv()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create Secret API client for NetBox inventory: %w", err)
+	}
+	setupLog.Info("BMH manager configured", "namespace", bmhManager.Namespace())
+
+	credentialsReader := inventory.NewNetBoxCredentialResolver(secretsClient)
+	netBoxClient := inventory.NewNetBoxClient(netBoxAPI, bmhManager, inventoryCfg.HostClass, credentialsReader)
+	return netBoxClient, nil
+}
+
+func createSecretAPIClientFromEnv() (inventory.SecretAPIClient, error) {
+	if strings.TrimSpace(os.Getenv(envSecretAPIURL)) == "" {
+		return nil, fmt.Errorf("%s is required", envSecretAPIURL)
+	}
+	secretsClient, err := secretapi.New(secretapi.Config{
+		Endpoint:         os.Getenv(envSecretAPIURL),
+		IssuerURL:        os.Getenv(envSecretAPIIssuerURL),
+		ClientIDFile:     os.Getenv(envSecretAPIClientIDFile),
+		ClientSecretFile: os.Getenv(envSecretAPIClientSecretFile),
+		CAFile:           os.Getenv(envSecretAPICAFile),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to configure Secret API client (%s): %w", envSecretAPIURL, err)
+	}
+	return secretsClient, nil
 }
 
 func createBCMInventoryClient(
@@ -563,24 +665,18 @@ func createBCMInventoryClient(
 		return nil, fmt.Errorf("failed to create bcm client: %w", err)
 	}
 
-	var bmhMgr *baremetalhost.Manager
-	if managementCfg.Type == "metal3" {
-		ns, err := management.ParseMetal3ManagementNamespace(managementCfg)
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse metal3 namespace for BMH manager: %w", err)
+	if managementCfg == nil || managementCfg.Type != metal3Backend {
+		managementType := ""
+		if managementCfg != nil {
+			managementType = managementCfg.Type
 		}
-		// Uncached read+write client for BMC credential Secrets: keeps Secret
-		// access off the cluster-wide informer (no list/watch), so the operator
-		// needs only get/create/update/delete on Secrets in the BMH namespace.
-		secretClient, err := client.New(mgr.GetConfig(), client.Options{Scheme: mgr.GetScheme(), Mapper: mgr.GetRESTMapper()})
-		if err != nil {
-			return nil, fmt.Errorf("failed to create uncached Secret client: %w", err)
-		}
-		bmhMgr = baremetalhost.NewManager(mgr.GetClient(), secretClient, ns)
-		setupLog.Info("BMH manager configured", "namespace", ns)
-	} else {
-		return nil, fmt.Errorf("BCM inventory requires Metal3 management backend (got %q)", managementCfg.Type)
+		return nil, fmt.Errorf("BCM inventory requires Metal3 management backend (got %q)", managementType)
 	}
+	bmhMgr, err := createMetal3BMHManager(managementCfg, mgr)
+	if err != nil {
+		return nil, err
+	}
+	setupLog.Info("BMH manager configured", "namespace", bmhMgr.Namespace())
 
 	client := inventory.NewBCMClient(bcmClient, bmhMgr, inventoryCfg.HostClass)
 
@@ -598,4 +694,27 @@ func createBCMInventoryClient(
 	}
 
 	return client, nil
+}
+
+func createMetal3BMHManager(
+	managementCfg *management.Config,
+	mgr ctrl.Manager,
+) (*baremetalhost.Manager, error) {
+	ns, err := management.ParseMetal3ManagementNamespace(managementCfg)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse metal3 namespace for BMH manager: %w", err)
+	}
+	if mgr == nil {
+		return nil, fmt.Errorf("kubernetes manager is required to create Metal3 BMH manager")
+	}
+
+	// Keep BMC credential Secret access off the cluster-wide informer. The
+	// uncached client avoids Secret list/watch permissions and limits access to
+	// the operations performed by the BMH manager.
+	secretClient, err := client.New(mgr.GetConfig(), client.Options{Scheme: mgr.GetScheme(), Mapper: mgr.GetRESTMapper()})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create uncached Secret client: %w", err)
+	}
+
+	return baremetalhost.NewManager(mgr.GetClient(), secretClient, ns), nil
 }

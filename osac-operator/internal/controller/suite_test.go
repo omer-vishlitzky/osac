@@ -22,10 +22,12 @@ import (
 	"path/filepath"
 	"runtime"
 	"testing"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2" //nolint:revive,staticcheck
 	. "github.com/onsi/gomega"    //nolint:revive,staticcheck
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -37,9 +39,9 @@ import (
 	mcmanager "sigs.k8s.io/multicluster-runtime/pkg/manager"
 
 	hypershiftv1beta1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
-	bmfov1alpha1 "github.com/osac-project/osac/bare-metal-fulfillment-operator/api/v1alpha1"
-	ovnv1 "github.com/ovn-org/ovn-kubernetes/go-controller/pkg/crd/userdefinednetwork/v1"
 	kubevirtv1 "kubevirt.io/api/core/v1"
+
+	bmfov1alpha1 "github.com/osac-project/osac/bare-metal-fulfillment-operator/api/v1alpha1"
 
 	osacv1alpha1 "github.com/osac-project/osac/osac-operator/api/v1alpha1"
 	"github.com/osac-project/osac/osac-operator/pkg/provisioning"
@@ -52,11 +54,46 @@ import (
 var (
 	cfg           *rest.Config
 	k8sClient     client.Client
+	indexedClient client.Client
 	testMcManager mcmanager.Manager
 	testEnv       *envtest.Environment
 	ctx           context.Context
 	cancel        context.CancelFunc
 )
+
+// indexedAutoExternalIPCleanupTestClient routes cleanup resource lists through
+// the manager cache while keeping mutations and unrelated reads on envtest's client.
+type indexedAutoExternalIPCleanupTestClient struct {
+	client.Client
+	indexedReader client.Reader
+}
+
+func (c indexedAutoExternalIPCleanupTestClient) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
+	switch list.(type) {
+	case *osacv1alpha1.ExternalIPAttachmentList, *osacv1alpha1.ExternalIPList:
+		return c.indexedReader.List(ctx, list, opts...)
+	default:
+		return c.Client.List(ctx, list, opts...)
+	}
+}
+
+func autoExternalIPCleanupTestClient() client.Client {
+	return indexedAutoExternalIPCleanupTestClient{Client: k8sClient, indexedReader: indexedClient}
+}
+
+func waitForIndexedClientObject(obj client.Object) {
+	cached := obj.DeepCopyObject().(client.Object)
+	Eventually(func() error {
+		return indexedClient.Get(ctx, client.ObjectKeyFromObject(obj), cached)
+	}).WithTimeout(5 * time.Second).Should(Succeed())
+}
+
+func waitForIndexedClientObjectGone(obj client.Object) {
+	Eventually(func() bool {
+		cached := obj.DeepCopyObject().(client.Object)
+		return apierrors.IsNotFound(indexedClient.Get(ctx, client.ObjectKeyFromObject(obj), cached))
+	}).WithTimeout(5 * time.Second).Should(BeTrue())
+}
 
 func TestControllers(t *testing.T) {
 	RegisterFailHandler(Fail)
@@ -85,6 +122,26 @@ var _ = BeforeSuite(func() {
 		BinaryAssetsDirectory: filepath.Join("..", "..", "bin", "k8s",
 			fmt.Sprintf("1.31.0-%s-%s", runtime.GOOS, runtime.GOARCH)),
 	}
+	crdOptions := envtest.CRDInstallOptions{
+		Paths: testEnv.CRDDirectoryPaths, ErrorIfPathMissing: true,
+	}
+	Expect(envtest.ReadCRDFiles(&crdOptions)).To(Succeed())
+	// Preserve HostedCluster version status, which the checked-in fake CRD
+	// does not describe.
+	for _, crd := range crdOptions.CRDs {
+		if crd.Name != "hostedclusters.hypershift.openshift.io" {
+			continue
+		}
+		for i := range crd.Spec.Versions {
+			properties := crd.Spec.Versions[i].Schema.OpenAPIV3Schema.Properties
+			status := properties["status"]
+			preserveUnknown := true
+			status.XPreserveUnknownFields = &preserveUnknown
+			properties["status"] = status
+		}
+	}
+	testEnv.CRDs = crdOptions.CRDs
+	testEnv.CRDDirectoryPaths = nil
 
 	var err error
 	// cfg is defined in this file globally.
@@ -93,9 +150,6 @@ var _ = BeforeSuite(func() {
 	Expect(cfg).NotTo(BeNil())
 
 	err = osacv1alpha1.AddToScheme(scheme.Scheme)
-	Expect(err).NotTo(HaveOccurred())
-
-	err = ovnv1.AddToScheme(scheme.Scheme)
 	Expect(err).NotTo(HaveOccurred())
 
 	err = kubevirtv1.AddToScheme(scheme.Scheme)
@@ -119,6 +173,8 @@ var _ = BeforeSuite(func() {
 		Metrics: metricsserver.Options{BindAddress: "0"},
 	})
 	Expect(err).NotTo(HaveOccurred())
+	Expect(RegisterAutoExternalIPAttachmentOwnerIndex(localMgr.GetFieldIndexer())).To(Succeed())
+	indexedClient = localMgr.GetClient()
 	testMcManager, err = mcmanager.WithMultiCluster(localMgr, nil)
 	Expect(err).NotTo(HaveOccurred())
 	go func() {
@@ -168,7 +224,7 @@ func newTestComputeInstanceSpec(templateID string) osacv1alpha1.ComputeInstanceS
 			SourceType: osacv1alpha1.ImageSourceTypeRegistry,
 			SourceRef:  "quay.io/fedora/fedora-coreos:stable",
 		},
-		Cores:     4,
+		VCPUs:     4,
 		MemoryGiB: 8,
 		BootDisk: osacv1alpha1.DiskSpec{
 			SizeGiB:     30,

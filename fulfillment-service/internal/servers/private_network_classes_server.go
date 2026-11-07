@@ -18,87 +18,24 @@ import (
 	"errors"
 	"log/slog"
 	"net/netip"
-	"sort"
 
 	"github.com/prometheus/client_golang/prometheus"
 	grpccodes "google.golang.org/grpc/codes"
 	grpcstatus "google.golang.org/grpc/status"
-	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protoreflect"
-	"google.golang.org/protobuf/types/known/fieldmaskpb"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
 	"github.com/osac-project/osac/fulfillment-service/internal/database/dao"
-	"github.com/osac-project/osac/fulfillment-service/internal/events"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
-// findDefaultNetworkClass returns the current default NetworkClass using the provided DAO, or nil if none is set.
-// If multiple defaults exist (invariant violation), it returns the newest and logs a warning.
-func findDefaultNetworkClass(ctx context.Context, logger *slog.Logger, ncDao *dao.GenericDAO[*privatev1.NetworkClass]) (*privatev1.NetworkClass, error) {
-	listResponse, err := ncDao.List().
-		SetFilter("this.is_default == true").
-		Do(ctx)
-	if err != nil {
-		return nil, err
-	}
-	// Exclude soft-deleted records — the DAO does not filter these automatically, and a
-	// recently-deleted default NC must not be returned as the active default.
-	var items []*privatev1.NetworkClass
-	for _, nc := range listResponse.GetItems() {
-		if !nc.GetMetadata().HasDeletionTimestamp() {
-			items = append(items, nc)
-		}
-	}
-	if len(items) == 0 {
-		return nil, nil
-	}
-	// Sort newest-first so that the invariant-violation fallback is deterministic.
-	sort.Slice(items, func(i, j int) bool {
-		ti := items[i].GetMetadata().GetCreationTimestamp().AsTime()
-		tj := items[j].GetMetadata().GetCreationTimestamp().AsTime()
-		return ti.After(tj)
-	})
-	if len(items) > 1 {
-		logger.WarnContext(ctx, "multiple default NetworkClasses found, using newest",
-			slog.Int("count", len(items)),
-		)
-	}
-	return items[0], nil
-}
-
-// checkSingleNetworkClass enforces the "one NetworkClass per deployment" invariant (unified
-// networking design, OSAC-1433): NetworkClass is a provider-level singleton, and tenants never
-// interact with it directly. Returns a FailedPrecondition error if a non-deleted NetworkClass
-// already exists.
-//
-// This is a fast, clear-error-message check for the common (non-racing) case. The
-// network_classes_singleton unique partial index (migration 106) is the authoritative,
-// race-free enforcement — see the AlreadyExists remap in Create().
-func (s *PrivateNetworkClassesServer) checkSingleNetworkClass(ctx context.Context) error {
-	listResponse, err := s.generic.dao.List().
-		SetFilter("!has(this.metadata.deletion_timestamp)").
-		SetLimit(1).
-		Do(ctx)
-	if err != nil {
-		s.logger.ErrorContext(ctx, "Failed to check for existing NetworkClass", slog.Any("error", err))
-		return grpcstatus.Errorf(grpccodes.Internal, "failed to check for existing NetworkClass")
-	}
-	if items := listResponse.GetItems(); len(items) > 0 {
-		return grpcstatus.Errorf(grpccodes.FailedPrecondition,
-			"only one NetworkClass per deployment is allowed (existing NetworkClass id '%s')",
-			items[0].GetId())
-	}
-	return nil
-}
-
 type PrivateNetworkClassesServerBuilder struct {
-	logger            *slog.Logger
-	notifier          events.Notifier
-	attributionLogic  auth.AttributionLogic
-	tenancyLogic      auth.TenancyLogic
-	metricsRegisterer prometheus.Registerer
-	filterDesc        protoreflect.MessageDescriptor
+	logger             *slog.Logger
+	attributionLogic   auth.AttributionLogic
+	tenancyLogic       auth.TenancyLogic
+	metricsRegisterer  prometheus.Registerer
+	filterDesc         protoreflect.MessageDescriptor
+	networkingSettings *NetworkingSettings
 }
 
 var _ privatev1.NetworkClassesServer = (*PrivateNetworkClassesServer)(nil)
@@ -106,8 +43,11 @@ var _ privatev1.NetworkClassesServer = (*PrivateNetworkClassesServer)(nil)
 type PrivateNetworkClassesServer struct {
 	privatev1.UnimplementedNetworkClassesServer
 
-	logger  *slog.Logger
-	generic *GenericServer[*privatev1.NetworkClass]
+	logger            *slog.Logger
+	generic           *GenericServer[*privatev1.NetworkClass]
+	settings          NetworkingSettings
+	virtualNetworkDao *dao.GenericDAO[*privatev1.VirtualNetwork]
+	externalIPPoolDao *dao.GenericDAO[*privatev1.ExternalIPPool]
 }
 
 func NewPrivateNetworkClassesServer() *PrivateNetworkClassesServerBuilder {
@@ -116,11 +56,6 @@ func NewPrivateNetworkClassesServer() *PrivateNetworkClassesServerBuilder {
 
 func (b *PrivateNetworkClassesServerBuilder) SetLogger(value *slog.Logger) *PrivateNetworkClassesServerBuilder {
 	b.logger = value
-	return b
-}
-
-func (b *PrivateNetworkClassesServerBuilder) SetNotifier(value events.Notifier) *PrivateNetworkClassesServerBuilder {
-	b.notifier = value
 	return b
 }
 
@@ -148,6 +83,13 @@ func (b *PrivateNetworkClassesServerBuilder) SetFilterDesc(value protoreflect.Me
 	return b
 }
 
+// SetNetworkingSettings sets the networking installation settings. This is optional; the default is
+// DefaultNetworkingSettings.
+func (b *PrivateNetworkClassesServerBuilder) SetNetworkingSettings(value NetworkingSettings) *PrivateNetworkClassesServerBuilder {
+	b.networkingSettings = &value
+	return b
+}
+
 func (b *PrivateNetworkClassesServerBuilder) Build() (result *PrivateNetworkClassesServer, err error) {
 	// Check parameters:
 	if b.logger == nil {
@@ -158,12 +100,19 @@ func (b *PrivateNetworkClassesServerBuilder) Build() (result *PrivateNetworkClas
 		err = errors.New("tenancy logic is mandatory")
 		return
 	}
+	virtualNetworkDao, err := newGuardDAO[*privatev1.VirtualNetwork](b.logger)
+	if err != nil {
+		return
+	}
+	externalIPPoolDao, err := newGuardDAO[*privatev1.ExternalIPPool](b.logger)
+	if err != nil {
+		return
+	}
 
 	// Create the generic server:
 	generic, err := NewGenericServer[*privatev1.NetworkClass]().
 		SetLogger(b.logger).
 		SetService(privatev1.NetworkClasses_ServiceDesc.ServiceName).
-		SetNotifier(b.notifier).
 		SetAttributionLogic(b.attributionLogic).
 		SetTenancyLogic(b.tenancyLogic).
 		SetMetricsRegisterer(b.metricsRegisterer).
@@ -176,8 +125,11 @@ func (b *PrivateNetworkClassesServerBuilder) Build() (result *PrivateNetworkClas
 
 	// Create and populate the object:
 	result = &PrivateNetworkClassesServer{
-		logger:  b.logger,
-		generic: generic,
+		logger:            b.logger,
+		generic:           generic,
+		settings:          resolveNetworkingSettings(b.networkingSettings),
+		virtualNetworkDao: virtualNetworkDao,
+		externalIPPoolDao: externalIPPoolDao,
 	}
 	return
 }
@@ -196,117 +148,88 @@ func (s *PrivateNetworkClassesServer) Get(ctx context.Context,
 
 func (s *PrivateNetworkClassesServer) Create(ctx context.Context,
 	request *privatev1.NetworkClassesCreateRequest) (response *privatev1.NetworkClassesCreateResponse, err error) {
-	// Validate before creating:
-	err = s.validateNetworkClass(ctx, request.GetObject(), nil)
-	if err != nil {
+	nc := request.GetObject()
+	if nc == nil {
+		err = grpcstatus.Errorf(grpccodes.InvalidArgument, "network class is mandatory")
+		return
+	}
+	if err = rejectOutputStatusOnCreate(nc.HasStatus()); err != nil {
+		return
+	}
+	if err = s.validateNetworkClass(nc); err != nil {
 		return
 	}
 
-	// Set status to READY on creation since NetworkClass has no backend provisioning.
-	nc := request.GetObject()
-	if nc.Status == nil {
-		nc.Status = &privatev1.NetworkClassStatus{}
+	// The gate: no other NetworkClass record exists, also one being deleted. The network_classes_singleton unique
+	// index (all rows) is the race-free enforcement; GenericServer maps its violation to FAILED_PRECONDITION.
+	if err = s.checkSingleNetworkClass(ctx); err != nil {
+		return
 	}
-	nc.Status.SetState(privatev1.NetworkClassState_NETWORK_CLASS_STATE_READY)
 
 	// Clear any caller-provided ID so the DAO always generates a UUID.
 	nc.SetId("")
-
-	// Auto-derive metadata.name from fabric_manager (falling back to k8s_manager) if not set.
-	if nc.GetMetadata().GetName() == "" && networkClassIdentitySource(nc) != "" {
+	nc.SetStatus(privatev1.NetworkClassStatus_builder{
+		State: privatev1.NetworkClassState_NETWORK_CLASS_STATE_PENDING,
+	}.Build())
+	if nc.GetMetadata().GetName() == "" {
 		if nc.GetMetadata() == nil {
 			nc.SetMetadata(&privatev1.Metadata{})
 		}
-		nc.GetMetadata().SetName(toDNSLabel(networkClassIdentitySource(nc)))
+		nc.GetMetadata().SetName(toDNSLabel(nc.GetFabricManager()))
 	}
-
-	// Default-swap: if this NC is being created as the default, unset all existing defaults.
-	// Both the old-default unset(s) and the new-NC persist share this request's database transaction via ctx.
-	if nc.GetIsDefault() {
-		err = s.clearExistingDefaults(ctx, "")
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	// A concurrent Create can race past checkSingleNetworkClass and hit the
-	// network_classes_singleton unique partial index (migration 106); when creating a
-	// default NC, a concurrent default-swap can also hit network_classes_single_default
-	// (migration 32). GenericServer.Create maps either of those constraint violations to
-	// FailedPrecondition (keyed on the actual PostgreSQL constraint name, not on this
-	// request's is_default flag), so no remapping is needed here. A gRPC AlreadyExists
-	// from this call means the ordinary per-name uniqueness index was violated instead.
 	err = s.generic.Create(ctx, request, &response)
 	return
 }
 
+// checkSingleNetworkClass enforces "one NetworkClass per deployment": no other NetworkClass record exists, including
+// one being deleted.
+func (s *PrivateNetworkClassesServer) checkSingleNetworkClass(ctx context.Context) error {
+	listResponse, err := s.generic.dao.List().SetLimit(1).Do(ctx)
+	if err != nil {
+		s.logger.ErrorContext(ctx, "Failed to check for existing NetworkClass", slog.Any("error", err))
+		return grpcstatus.Errorf(grpccodes.Internal, "failed to check for existing NetworkClass")
+	}
+	if items := listResponse.GetItems(); len(items) > 0 {
+		return grpcstatus.Errorf(grpccodes.FailedPrecondition,
+			"only one NetworkClass per deployment is allowed (existing NetworkClass id '%s')",
+			items[0].GetId())
+	}
+	return nil
+}
+
+// Update writes status only: the NetworkClass spec, address plan included, is immutable after creation.
 func (s *PrivateNetworkClassesServer) Update(ctx context.Context,
 	request *privatev1.NetworkClassesUpdateRequest) (response *privatev1.NetworkClassesUpdateResponse, err error) {
-	// Get existing object for immutability validation:
-	id := request.GetObject().GetId()
-	if id == "" {
+	if request.GetObject().GetId() == "" {
 		err = grpcstatus.Errorf(grpccodes.InvalidArgument, "object identifier is mandatory")
 		return
 	}
-
-	getRequest := &privatev1.NetworkClassesGetRequest{}
-	getRequest.SetId(id)
-	var getResponse *privatev1.NetworkClassesGetResponse
-	err = s.generic.Get(ctx, getRequest, &getResponse)
-	if err != nil {
-		return
-	}
-
-	existingNC := getResponse.GetObject()
-
-	// Merge the update into the existing object so that required-field
-	// validation works correctly for partial updates (field mask).
-	merged := cloneNetworkClass(existingNC)
-	err = s.applyNetworkClassUpdate(merged, request.GetObject(), request.GetUpdateMask())
-	if err != nil {
-		return
-	}
-
-	// Validate the merged result against the original for immutability checks:
-	err = s.validateNetworkClass(ctx, merged, existingNC)
-	if err != nil {
-		return
-	}
-
-	// Default-swap: if the update sets is_default=true AND the field is actually being applied
-	// (nil mask = full update, or "is_default" is in the mask), unset all other existing defaults.
-	// Both the old-default unset(s) and the NC persist share this request's database transaction via ctx.
-	if request.GetObject().HasIsDefault() && request.GetObject().GetIsDefault() {
-		shouldSwap := true
-		if mask := request.GetUpdateMask(); mask != nil && len(mask.GetPaths()) > 0 {
-			shouldSwap = false
-			for _, path := range mask.GetPaths() {
-				if path == "is_default" {
-					shouldSwap = true
-					break
-				}
-			}
-		}
-		if shouldSwap {
-			err = s.clearExistingDefaults(ctx, id)
-			if err != nil {
-				return nil, err
-			}
-		}
-	}
-
-	// NOTE: On the Update path, a concurrent default-swap UniqueViolation is normalized
-	// to gRPC Internal by GenericServer (the DAO Update does not catch UniqueViolation,
-	// and GenericServer wraps unknown errors as Internal). We cannot distinguish the
-	// constraint violation from other Internal errors at this layer. The error is
-	// normalized (no raw DB details leak), but the message is opaque. Fixing this
-	// requires GenericServer to preserve pgconn errors in the chain.
-	err = s.generic.Update(ctx, request, &response)
+	err = s.generic.UpdateWithCandidatePreparation(ctx, request, &response,
+		func(ctx context.Context, current, candidate *privatev1.NetworkClass) error {
+			return validateNetworkingStatusOnlyUpdate("NetworkClass", current, candidate)
+		})
 	return
 }
 
 func (s *PrivateNetworkClassesServer) Delete(ctx context.Context,
 	request *privatev1.NetworkClassesDeleteRequest) (response *privatev1.NetworkClassesDeleteResponse, err error) {
+	networkClass, err := lockLifecycleResource(ctx, s.generic.dao, request.GetId(), "NetworkClass")
+	if err != nil {
+		return
+	}
+	// A NetworkClass has no DELETING state: the deletion timestamp marks the accepted delete.
+	if deleteAlreadyAccepted(networkClass.GetMetadata()) {
+		response = &privatev1.NetworkClassesDeleteResponse{}
+		return
+	}
+	if err = rejectDeleteIfAnyExists(ctx, s.virtualNetworkDao, "VirtualNetwork", "NetworkClass",
+		networkClass.GetId()); err != nil {
+		return
+	}
+	if err = rejectDeleteIfAnyExists(ctx, s.externalIPPoolDao, "ExternalIPPool", "NetworkClass",
+		networkClass.GetId()); err != nil {
+		return
+	}
 	err = s.generic.Delete(ctx, request, &response)
 	return
 }
@@ -317,155 +240,72 @@ func (s *PrivateNetworkClassesServer) Signal(ctx context.Context,
 	return
 }
 
-// clearExistingDefaults fetches all NetworkClasses with is_default == true, except the one with
-// the given excludeID, and clears the is_default flag on each. Used during default-swap to ensure
-// only one default exists at a time even if the invariant was previously violated.
-//
-// Concurrent default-swap requests are safe: the unique partial index network_classes_single_default
-// (migration 28) prevents two concurrent transactions from both committing is_default=true.
-// The losing transaction receives a unique constraint violation from the database.
-func (s *PrivateNetworkClassesServer) clearExistingDefaults(ctx context.Context, excludeID string) error {
-	listResponse, err := s.generic.dao.List().
-		SetFilter("this.is_default == true").
-		Do(ctx)
-	if err != nil {
-		s.logger.ErrorContext(ctx, "Failed to list default NetworkClasses",
-			slog.Any("error", err),
-		)
-		return grpcstatus.Errorf(grpccodes.Internal, "failed to clear existing default NetworkClasses")
-	}
-	for _, nc := range listResponse.GetItems() {
-		if nc.GetId() == excludeID {
-			continue
-		}
-		// Skip soft-deleted NCs: calling dao.Update on a soft-deleted NC with no finalizers
-		// triggers archiving (generic_dao_update.go), which is an unintended side effect.
-		if nc.GetMetadata().HasDeletionTimestamp() {
-			continue
-		}
-		s.logger.InfoContext(ctx, "unsetting previous default NetworkClass",
-			"old_default_id", nc.GetId(),
-		)
-		nc.ClearIsDefault()
-		_, err = s.generic.dao.Update().SetObject(nc).Do(ctx)
-		if err != nil {
-			s.logger.ErrorContext(ctx, "Failed to clear default on NetworkClass",
-				slog.String("network_class_id", nc.GetId()),
-				slog.Any("error", err),
-			)
-			return grpcstatus.Errorf(grpccodes.Internal, "failed to clear existing default NetworkClasses")
-		}
-	}
-	return nil
-}
-
-// validateNetworkClass validates the NetworkClass object.
-func (s *PrivateNetworkClassesServer) validateNetworkClass(ctx context.Context,
-	newNC *privatev1.NetworkClass, existingNC *privatev1.NetworkClass) error {
-
-	if newNC == nil {
-		return grpcstatus.Errorf(grpccodes.InvalidArgument, "network class is mandatory")
-	}
-
-	// NC-VAL-09: enforce one NetworkClass per deployment (Create only). The unified networking
-	// design (OSAC-1433) specifies NetworkClass as a provider-level singleton that tenants never
-	// interact with directly. existingNC is nil only on the Create path (Update always fetches
-	// and passes the existing object), so this never runs for Update.
-	if existingNC == nil {
-		if err := s.checkSingleNetworkClass(ctx); err != nil {
-			return err
-		}
-	}
-
-	// NC-VAL-02: title is required
-	if newNC.GetTitle() == "" {
+// validateNetworkClass validates a NetworkClass create.
+func (s *PrivateNetworkClassesServer) validateNetworkClass(nc *privatev1.NetworkClass) error {
+	if nc.GetTitle() == "" {
 		return grpcstatus.Errorf(grpccodes.InvalidArgument, "field 'title' is required")
 	}
-
-	// NC-VAL-03: Validate capabilities consistency
-	caps := newNC.GetCapabilities()
-	if caps != nil {
-		// If dual-stack is supported, both IPv4 and IPv6 must be supported
-		if caps.GetSupportsDualStack() && (!caps.GetSupportsIpv4() || !caps.GetSupportsIpv6()) {
-			return grpcstatus.Errorf(grpccodes.InvalidArgument,
-				"if 'capabilities.supports_dual_stack' is true, both 'supports_ipv4' and 'supports_ipv6' must be true")
-		}
+	if nc.GetFabricManager() == "" {
+		return grpcstatus.Errorf(grpccodes.InvalidArgument, "field 'fabric_manager' is required")
 	}
-
-	// NC-VAL-04: Check immutable fields (only on Update)
-	if existingNC != nil {
-		// NC-VAL-06: fabric_manager is immutable once set (but can be set for the first time)
-		if existingNC.HasFabricManager() && newNC.GetFabricManager() != existingNC.GetFabricManager() {
-			return grpcstatus.Errorf(grpccodes.InvalidArgument,
-				"field 'fabric_manager' is immutable and cannot be changed from '%s' to '%s'",
-				existingNC.GetFabricManager(), newNC.GetFabricManager())
-		}
-
-		// NC-VAL-07: k8s_manager is immutable once set (but can be set for the first time)
-		if existingNC.HasK8SManager() && newNC.GetK8SManager() != existingNC.GetK8SManager() {
-			return grpcstatus.Errorf(grpccodes.InvalidArgument,
-				"field 'k8s_manager' is immutable and cannot be changed from '%s' to '%s'",
-				existingNC.GetK8SManager(), newNC.GetK8SManager())
-		}
+	if nc.HasK8SManager() && nc.GetK8SManager() == "" {
+		return grpcstatus.Errorf(grpccodes.InvalidArgument, "field 'k8s_manager' must not be empty when set")
 	}
+	defaults := nc.GetSpec().GetDefaults()
+	if defaults == nil {
+		return grpcstatus.Errorf(grpccodes.InvalidArgument, "field 'spec.defaults' is required")
+	}
+	if err := validateNetworkDefaults(defaults); err != nil {
+		return err
+	}
+	return s.validateAddressPlanAndDefaults(nc)
+}
 
-	// NC-VAL-05: at least one of fabric_manager or k8s_manager is required
-	if !hasAnyManager(newNC) {
+// validateAddressPlanAndDefaults checks the address plan and the defaults that depend on it or on the installation
+// settings: the default Subnet meets the plan's prefix limit, and the default VirtualNetwork CIDR doesn't overlap an
+// excluded range.
+func (s *PrivateNetworkClassesServer) validateAddressPlanAndDefaults(nc *privatev1.NetworkClass) error {
+	limit, err := addressPlanPrefixLimit(nc.GetSpec().GetAddressPlan())
+	if err != nil {
+		return err
+	}
+	defaults := nc.GetSpec().GetDefaults()
+	subnetPrefix, err := netip.ParsePrefix(defaults.GetSubnetIpv4Cidr())
+	if err != nil {
+		return grpcstatus.Errorf(grpccodes.InvalidArgument, "defaults.subnet_ipv4_cidr: %v", err)
+	}
+	if subnetPrefix.Bits() > limit {
 		return grpcstatus.Errorf(grpccodes.InvalidArgument,
-			"at least one of 'fabric_manager' or 'k8s_manager' is required")
+			"defaults.subnet_ipv4_cidr '%s' exceeds the address plan prefix limit /%d",
+			defaults.GetSubnetIpv4Cidr(), limit)
 	}
-
-	// NC-VAL-08: Validate defaults if present
-	if defaults := newNC.GetSpec().GetDefaults(); defaults != nil {
-		if err := validateNetworkDefaults(defaults); err != nil {
-			return err
-		}
+	vnPrefix, err := netip.ParsePrefix(defaults.GetVirtualNetworkIpv4Cidr())
+	if err != nil {
+		return grpcstatus.Errorf(grpccodes.InvalidArgument, "defaults.virtual_network_ipv4_cidr: %v", err)
 	}
-
+	if excluded, overlaps := s.settings.firstExcludedOverlap(vnPrefix); overlaps {
+		return grpcstatus.Errorf(grpccodes.InvalidArgument,
+			"defaults.virtual_network_ipv4_cidr '%s' overlaps the excluded range %s",
+			defaults.GetVirtualNetworkIpv4Cidr(), excluded)
+	}
 	return nil
-}
-
-// hasAnyManager reports whether the NetworkClass has at least one of fabric_manager
-// or k8s_manager set to a non-empty value. Using the Has* presence helpers is not enough:
-// they only test whether the optional field is present, so an explicitly empty string
-// (e.g. fabric_manager: "") would incorrectly pass validation here and then be treated as
-// absent everywhere else (e.g. by the osac-operator dispatcher/resolver).
-func hasAnyManager(nc *privatev1.NetworkClass) bool {
-	return nc.GetFabricManager() != "" || nc.GetK8SManager() != ""
-}
-
-// networkClassIdentitySource returns the value used to derive a NetworkClass's metadata.name
-// when the caller doesn't set one explicitly: fabric_manager if set, otherwise k8s_manager.
-// NC-VAL-05 (hasAnyManager) guarantees at least one of the two is non-empty on any NetworkClass
-// that has passed validation, so this never falls back to an empty string in practice.
-func networkClassIdentitySource(nc *privatev1.NetworkClass) string {
-	if fm := nc.GetFabricManager(); fm != "" {
-		return fm
-	}
-	return nc.GetK8SManager()
-}
-
-// cloneNetworkClass creates a deep copy of a NetworkClass.
-func cloneNetworkClass(nc *privatev1.NetworkClass) *privatev1.NetworkClass {
-	return proto.Clone(nc).(*privatev1.NetworkClass)
 }
 
 // validateNetworkDefaults validates the NetworkDefaults configuration.
 func validateNetworkDefaults(defaults *privatev1.NetworkDefaults) error {
+	if defaults.GetVirtualNetworkIpv4Cidr() == "" {
+		return grpcstatus.Errorf(grpccodes.InvalidArgument,
+			"field 'spec.defaults.virtual_network_ipv4_cidr' is required")
+	}
+	if defaults.GetSubnetIpv4Cidr() == "" {
+		return grpcstatus.Errorf(grpccodes.InvalidArgument, "field 'spec.defaults.subnet_ipv4_cidr' is required")
+	}
 	if err := validateDefaultCIDRPair(
 		defaults.GetVirtualNetworkIpv4Cidr(), defaults.GetSubnetIpv4Cidr(),
-		cidrIPv4, "virtual_network_ipv4_cidr", "subnet_ipv4_cidr",
+		"virtual_network_ipv4_cidr", "subnet_ipv4_cidr",
 	); err != nil {
 		return err
 	}
-
-	if err := validateDefaultCIDRPair(
-		defaults.GetVirtualNetworkIpv6Cidr(), defaults.GetSubnetIpv6Cidr(),
-		cidrIPv6, "virtual_network_ipv6_cidr", "subnet_ipv6_cidr",
-	); err != nil {
-		return err
-	}
-
 	for i, rule := range defaults.GetIngressRules() {
 		if err := validateSecurityRule(rule, "defaults.ingress", i); err != nil {
 			return err
@@ -476,88 +316,22 @@ func validateNetworkDefaults(defaults *privatev1.NetworkDefaults) error {
 			return err
 		}
 	}
-
 	return nil
 }
 
-// validateDefaultCIDRPair validates a VN/Subnet CIDR pair within NetworkDefaults.
-func validateDefaultCIDRPair(vnCIDR, subnetCIDR, ipVersion, vnField, subnetField string) error {
-	var vnPrefix netip.Prefix
-	if vnCIDR != "" {
-		parsed, err := parseAndValidateCIDR(vnCIDR, ipVersion)
-		if err != nil {
-			return grpcstatus.Errorf(grpccodes.InvalidArgument,
-				"defaults.%s: %v", vnField, err)
-		}
-		vnPrefix, err = netip.ParsePrefix(parsed)
-		if err != nil {
-			return grpcstatus.Errorf(grpccodes.Internal,
-				"defaults.%s: failed to re-parse validated CIDR '%s': %v", vnField, parsed, err)
-		}
+// validateDefaultCIDRPair validates the canonical default VirtualNetwork and Subnet CIDRs and their containment.
+func validateDefaultCIDRPair(vnCIDR, subnetCIDR, vnField, subnetField string) error {
+	if _, err := parseAndValidateCanonicalCIDR(vnCIDR, cidrIPv4); err != nil {
+		return grpcstatus.Errorf(grpccodes.InvalidArgument, "defaults.%s: %v", vnField, err)
 	}
-
-	if subnetCIDR != "" {
-		if vnCIDR == "" {
-			return grpcstatus.Errorf(grpccodes.InvalidArgument,
-				"defaults.%s requires defaults.%s to be set", subnetField, vnField)
-		}
-
-		_, err := parseAndValidateCIDR(subnetCIDR, ipVersion)
-		if err != nil {
-			return grpcstatus.Errorf(grpccodes.InvalidArgument,
-				"defaults.%s: %v", subnetField, err)
-		}
-
-		subnetPrefix, err := netip.ParsePrefix(subnetCIDR)
-		if err != nil {
-			return grpcstatus.Errorf(grpccodes.Internal,
-				"defaults.%s: failed to re-parse validated CIDR '%s': %v", subnetField, subnetCIDR, err)
-		}
-		subnetWithinVN := vnPrefix.Contains(subnetPrefix.Addr()) && subnetPrefix.Bits() >= vnPrefix.Bits()
-		if !subnetWithinVN {
-			return grpcstatus.Errorf(grpccodes.InvalidArgument,
-				"defaults.%s '%s' is not within defaults.%s '%s'",
-				subnetField, subnetCIDR, vnField, vnCIDR)
-		}
+	if _, err := parseAndValidateCanonicalCIDR(subnetCIDR, cidrIPv4); err != nil {
+		return grpcstatus.Errorf(grpccodes.InvalidArgument, "defaults.%s: %v", subnetField, err)
 	}
-
-	return nil
-}
-
-// applyNetworkClassUpdate applies the update fields onto the base object,
-// respecting the field mask. If no mask is provided, all fields from the
-// update are applied.
-func (s *PrivateNetworkClassesServer) applyNetworkClassUpdate(base, update *privatev1.NetworkClass,
-	mask *fieldmaskpb.FieldMask) error {
-	if mask == nil || len(mask.GetPaths()) == 0 {
-		proto.Merge(base, update)
-		// proto.Merge appends repeated fields and recursively merges nested messages instead of
-		// replacing them. Since the nil-mask case represents a full object replacement, take
-		// capabilities and spec from the update object wholesale when set, so that unset boolean
-		// capability flags, disable_capabilities, and repeated fields (security rules) are
-		// replaced rather than merged with the previous values.
-		if update.GetCapabilities() != nil {
-			base.SetCapabilities(proto.Clone(update.GetCapabilities()).(*privatev1.NetworkClassCapabilities))
-		}
-		if update.GetSpec() != nil {
-			base.SetSpec(proto.Clone(update.GetSpec()).(*privatev1.NetworkClassSpec))
-		}
-		return nil
-	}
-
-	// Reuse the same reflection-based mask-application mechanism that generic.Update uses for the
-	// persisted write, so this validation preview can never diverge from what actually gets saved.
-	fieldPaths, err := s.generic.compilePaths(mask.GetPaths())
-	if err != nil {
-		return err
-	}
-	for _, fieldPath := range fieldPaths {
-		value, ok := fieldPath.Get(update)
-		if ok {
-			fieldPath.Set(base, value)
-		} else {
-			fieldPath.Clear(base)
-		}
+	vnPrefix := netip.MustParsePrefix(vnCIDR)
+	subnetPrefix := netip.MustParsePrefix(subnetCIDR)
+	if !vnPrefix.Contains(subnetPrefix.Addr()) || subnetPrefix.Bits() < vnPrefix.Bits() {
+		return grpcstatus.Errorf(grpccodes.InvalidArgument,
+			"defaults.%s '%s' is not within defaults.%s '%s'", subnetField, subnetCIDR, vnField, vnCIDR)
 	}
 	return nil
 }

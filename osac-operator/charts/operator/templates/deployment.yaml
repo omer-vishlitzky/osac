@@ -5,6 +5,12 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "osac-operator.labels" . | nindent 4 }}
+{{- if and .Values.remoteClusterKubeconfig (not .Values.remoteClusterKubeconfigSecretName) }}
+{{- fail "remoteClusterKubeconfigSecretName is required when remoteClusterKubeconfig is set" }}
+{{- end }}
+{{- if and .Values.remoteClusterKubeconfigSecretName (not .Values.remoteClusterKubeconfig) }}
+{{- fail "remoteClusterKubeconfig is required when remoteClusterKubeconfigSecretName is set" }}
+{{- end }}
 spec:
   replicas: {{ .Values.replicaCount }}
   selector:
@@ -29,7 +35,8 @@ spec:
         args:
           - --leader-elect
           - --health-probe-bind-address=:8081
-          - --grpc-insecure
+          - --metrics-bind-address=:8443
+          - --fulfillment-ca-file=/etc/ca-bundle/bundle.pem
         image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
         imagePullPolicy: {{ .Values.image.pullPolicy }}
         envFrom:
@@ -58,18 +65,72 @@ spec:
           - name: OSAC_AAP_STATUS_POLL_INTERVAL
             value: {{ .Values.aap.statusPollInterval | quote }}
           {{- end }}
+          {{- if .Values.aap.organization }}
+          - name: OSAC_AAP_ORGANIZATION
+            value: {{ .Values.aap.organization | quote }}
+          {{- end }}
           {{- if .Values.aap.templatePrefix }}
           - name: OSAC_AAP_TEMPLATE_PREFIX
             value: {{ .Values.aap.templatePrefix | quote }}
           {{- end }}
-          {{- if .Values.networkManagers.capabilitiesSyncInterval }}
-          - name: OSAC_NETWORK_CLASS_SYNC_INTERVAL
-            value: {{ .Values.networkManagers.capabilitiesSyncInterval | quote }}
+          {{- if .Values.stall.preparingInfrastructureThreshold }}
+          - name: OSAC_CLUSTER_PREPARING_INFRASTRUCTURE_STALL_THRESHOLD
+            value: {{ .Values.stall.preparingInfrastructureThreshold | quote }}
           {{- end }}
+          {{- if .Values.stall.controlPlaneStartingThreshold }}
+          - name: OSAC_CLUSTER_CONTROL_PLANE_STARTING_STALL_THRESHOLD
+            value: {{ .Values.stall.controlPlaneStartingThreshold | quote }}
+          {{- end }}
+          {{- if .Values.stall.workersJoiningThreshold }}
+          - name: OSAC_CLUSTER_WORKERS_JOINING_STALL_THRESHOLD
+            value: {{ .Values.stall.workersJoiningThreshold | quote }}
+          {{- end }}
+          {{- if .Values.stall.workersJoiningByInstanceType }}
+          - name: OSAC_CLUSTER_WORKERS_JOINING_STALL_THRESHOLD_OVERRIDES
+            value: {{ .Values.stall.workersJoiningByInstanceType | toJson | quote }}
+          {{- end }}
+          - name: OSAC_CLUSTER_UPGRADE_PENDING_TIMEOUT
+            value: {{ .Values.upgradeTimeouts.pending | quote }}
+          - name: OSAC_CLUSTER_UPGRADE_CONTROL_PLANE_TIMEOUT
+            value: {{ .Values.upgradeTimeouts.controlPlane | quote }}
+          - name: OSAC_CLUSTER_UPGRADE_NODE_POOL_PER_NODE_TIMEOUT
+            value: {{ .Values.upgradeTimeouts.nodePoolPerNode | quote }}
+          {{- if .Values.fulfillment.serverAddress }}
           - name: OSAC_FULFILLMENT_SERVER_ADDRESS
-            value: {{ .Values.fulfillment.serverAddress | default "fulfillment-internal-api:8001" | quote }}
-          - name: OSAC_FULFILLMENT_TOKEN_FILE
-            value: {{ .Values.fulfillment.tokenFile | default "/var/run/secrets/kubernetes.io/serviceaccount/token" | quote }}
+            value: {{ .Values.fulfillment.serverAddress | quote }}
+          - name: OSAC_FULFILLMENT_CLIENT_ID
+            valueFrom:
+              secretKeyRef:
+                name: {{ .Values.fulfillment.credentials.secretName | required "fulfillment.credentials.secretName is required" }}
+                key: {{ .Values.fulfillment.credentials.clientIdKey | required "fulfillment.credentials.clientIdKey is required" }}
+          - name: OSAC_FULFILLMENT_CLIENT_SECRET
+            valueFrom:
+              secretKeyRef:
+                name: {{ .Values.fulfillment.credentials.secretName | required "fulfillment.credentials.secretName is required" }}
+                key: {{ .Values.fulfillment.credentials.clientSecretKey | required "fulfillment.credentials.clientSecretKey is required" }}
+          {{- end }}
+          {{- with .Values.remoteClusterKubeconfig }}
+          - name: OSAC_REMOTE_CLUSTER_KUBECONFIG
+            value: {{ . | quote }}
+          {{- end }}
+          {{- if .Values.fulfillment.configMap.name }}
+          - name: OSAC_FULFILLMENT_ENDPOINT
+            valueFrom:
+              configMapKeyRef:
+                name: {{ .Values.fulfillment.configMap.name }}
+                key: OSAC_FULFILLMENT_ENDPOINT
+                optional: true
+          - name: OSAC_FULFILLMENT_ISSUER_URL
+            valueFrom:
+              configMapKeyRef:
+                name: {{ .Values.fulfillment.configMap.name }}
+                key: OSAC_FULFILLMENT_ISSUER_URL
+                optional: {{ .Values.fulfillment.configMap.optional }}
+          {{- end }}
+          {{- if .Values.ignition.trustIngressCA }}
+          - name: OSAC_IGNITION_TRUST_INGRESS_CA
+            value: "true"
+          {{- end }}
           - name: OSAC_CLUSTER_ORDER_NAMESPACE
             valueFrom:
               fieldRef:
@@ -99,21 +160,25 @@ spec:
               fieldRef:
                 fieldPath: metadata.namespace
           - name: OSAC_ENABLE_CLUSTER_CONTROLLER
-            value: {{ .Values.controllers.clusterOrder | quote }}
+            value: {{ include "osac-operator.controllerEnabled" (list . "clusterOrder" "caas") | quote }}
+          - name: OSAC_ENABLE_FULFILLMENT_TRUST_RECONCILER
+            value: {{ .Values.global.fulfillmentTrust.enabled | default false | quote }}
+          - name: OSAC_FULFILLMENT_TRUST_TENANT_NAMESPACE
+            value: {{ .Values.global.fulfillmentTrust.tenantNamespace | quote }}
           - name: OSAC_ENABLE_COMPUTE_INSTANCE_CONTROLLER
-            value: {{ .Values.controllers.computeInstance | quote }}
+            value: {{ include "osac-operator.controllerEnabled" (list . "computeInstance" "vmaas") | quote }}
           - name: OSAC_ENABLE_TENANT_CONTROLLER
             value: {{ .Values.controllers.tenant | quote }}
           - name: OSAC_ENABLE_NETWORKING_CONTROLLER
             value: {{ .Values.controllers.networking | quote }}
           - name: OSAC_ENABLE_BAREMETAL_INSTANCE_CONTROLLER
-            value: {{ .Values.controllers.bareMetalInstance | quote }}
+            value: {{ include "osac-operator.controllerEnabled" (list . "bareMetalInstance" "bmaas") | quote }}
           - name: OSAC_ENABLE_STORAGE_CONTROLLER
             value: {{ .Values.controllers.storage | quote }}
           - name: OSAC_ENABLE_VOLUME_CONTROLLER
             value: {{ .Values.controllers.volume | quote }}
-          - name: OSAC_ENABLE_NETWORKING_PROVISIONING
-            value: {{ .Values.controllers.networkingProvisioning | default false | quote }}
+          - name: OSAC_PROVISIONING_ENABLED
+            value: {{ dig "networking" "provisioningEnabled" true (.Values.global | default dict) | quote }}
 {{- if .Values.vendorControllers }}
 {{- $pairs := list }}
 {{- range $k, $v := .Values.vendorControllers }}
@@ -142,5 +207,30 @@ spec:
           periodSeconds: 10
         resources:
           {{- toYaml .Values.resources | nindent 10 }}
+        volumeMounts:
+          - name: fulfillment-ca-bundle
+            mountPath: /etc/ca-bundle
+            readOnly: true
+        {{- if .Values.remoteClusterKubeconfigSecretName }}
+          - name: remote-kubeconfig
+            mountPath: {{ dir .Values.remoteClusterKubeconfig | quote }}
+            readOnly: true
+        {{- end }}
+      volumes:
+        - name: fulfillment-ca-bundle
+          configMap:
+            name: {{ .Values.fulfillment.tls.caBundle.configMap | required "fulfillment.tls.caBundle.configMap is required" }}
+            items:
+              - key: {{ .Values.fulfillment.tls.caBundle.key | required "fulfillment.tls.caBundle.key is required" }}
+                path: bundle.pem
+
+      {{- if .Values.remoteClusterKubeconfigSecretName }}
+        - name: remote-kubeconfig
+          secret:
+            secretName: {{ .Values.remoteClusterKubeconfigSecretName }}
+            items:
+              - key: {{ .Values.remoteClusterKubeconfigSecretKey | default "kubeconfig" | quote }}
+                path: {{ base .Values.remoteClusterKubeconfig | quote }}
+      {{- end }}
       serviceAccountName: {{ include "osac-operator.serviceAccountName" . }}
       terminationGracePeriodSeconds: 10

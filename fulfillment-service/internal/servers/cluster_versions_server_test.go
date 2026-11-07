@@ -18,10 +18,13 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"go.uber.org/mock/gomock"
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
-	publicv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/public/v1"
+	"github.com/osac-project/osac/fulfillment-service/internal/auth"
+	"github.com/osac-project/osac/fulfillment-service/internal/database/dao"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
 
 var _ = Describe("Public cluster versions server", func() {
@@ -35,11 +38,21 @@ var _ = Describe("Public cluster versions server", func() {
 		BeforeEach(func() {
 			var err error
 
+			// ClusterVersions are platform-scoped. Exercise them with a caller whose
+			// default tenant is shared.
+			sharedTenancy := auth.NewMockTenancyLogic(ctrl)
+			sharedTenancy.EXPECT().DetermineAssignableTenants(gomock.Any()).
+				Return(auth.AllTenants, nil).AnyTimes()
+			sharedTenancy.EXPECT().DetermineDefaultTenant(gomock.Any()).
+				Return(auth.SharedTenant, nil).AnyTimes()
+			sharedTenancy.EXPECT().DetermineVisibility(gomock.Any()).
+				Return(auth.TotalVisibility(), nil).AnyTimes()
+
 			// Create the public server:
 			publicServer, err = NewClusterVersionsServer().
 				SetLogger(logger).
 				SetAttributionLogic(attribution).
-				SetTenancyLogic(tenancy).
+				SetTenancyLogic(sharedTenancy).
 				Build()
 			Expect(err).ToNot(HaveOccurred())
 
@@ -47,16 +60,32 @@ var _ = Describe("Public cluster versions server", func() {
 			privateServer, err = NewPrivateClusterVersionsServer().
 				SetLogger(logger).
 				SetAttributionLogic(attribution).
+				SetTenancyLogic(sharedTenancy).
+				Build()
+			Expect(err).ToNot(HaveOccurred())
+
+			// These visibility tests use valid versions with a common available disk image.
+			diskImagesDao, err := dao.NewGenericDAO[*privatev1.DiskImage]().
+				SetLogger(logger).
 				SetTenancyLogic(tenancy).
 				Build()
 			Expect(err).ToNot(HaveOccurred())
+			diskImage, err := diskImagesDao.Create().SetObject(privatev1.DiskImage_builder{
+				Metadata: privatev1.Metadata_builder{Name: "public-cluster-version-image", Tenant: auth.SharedTenant}.Build(),
+				Spec: privatev1.DiskImageSpec_builder{
+					Lifecycle: privatev1.DiskImageLifecycle_DISK_IMAGE_LIFECYCLE_AVAILABLE,
+				}.Build(),
+			}.Build()).Do(ctx)
+			Expect(err).ToNot(HaveOccurred())
+			diskImageRef := privatev1.DiskImageReference_builder{Id: diskImage.GetObject().GetId()}.Build()
 
 			// Helper to create a cluster version via the private server.
 			createClusterVersion = func(name string, version string,
 				opts ...func(*privatev1.ClusterVersionSpec_builder)) *privatev1.ClusterVersion {
 				spec := privatev1.ClusterVersionSpec_builder{
-					Version: version,
-					Image:   "quay.io/ocp:" + version,
+					Version:   version,
+					Image:     "quay.io/ocp:" + version,
+					DiskImage: diskImageRef,
 				}
 				for _, opt := range opts {
 					opt(&spec)

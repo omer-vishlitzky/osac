@@ -1,108 +1,230 @@
 ---
-# Subnet maps to a Netris IPAM subnet + V-Net
-# Creates an IPAM subnet under the parent VN's allocation, then a V-Net with gateway
-
-- name: Extract Subnet configuration
-  ansible.builtin.set_fact:
-    subnet_name: "{{ subnet.metadata.name }}"
-    subnet_ipv4_cidr: "{{ subnet.spec.ipv4Cidr | default('') }}"
-    subnet_virtual_network_id: "{{ subnet.spec.virtualNetwork | default('') }}"
-
-- name: Look up VirtualNetwork CR by UUID label
-  kubernetes.core.k8s_info:
-    api_version: osac.openshift.io/v1alpha1
-    kind: VirtualNetwork
-    namespace: "{{ subnet.metadata.namespace }}"
-    label_selectors:
-      - "osac.openshift.io/virtualnetwork-uuid={{ subnet_virtual_network_id }}"
-  register: _vn_lookup
-
-- name: Fail if VirtualNetwork CR not found
-  ansible.builtin.fail:
-    msg: >-
-      VirtualNetwork with UUID '{{ subnet_virtual_network_id }}' not found in namespace '{{ subnet.metadata.namespace }}'.
-  when: _vn_lookup.resources | length == 0
-
-- name: Set VirtualNetwork CR name
-  ansible.builtin.set_fact:
-    subnet_virtual_network_name: "{{ _vn_lookup.resources[0].metadata.name }}"
-
-- name: Look up parent VPC by name
-  ansible.builtin.include_role:
-    name: netris.controller.vpc
-    tasks_from: read
-  vars:
-    vpc_name: "{{ subnet_virtual_network_name }}"
-
-- name: Set parent VPC
-  ansible.builtin.set_fact:
-    _parent_vpc: "{{ netris_vpc }}"
-
-- name: Fail if parent VPC not found
-  ansible.builtin.fail:
-    msg: >-
-      Parent VPC '{{ subnet_virtual_network_name }}' not found in Netris controller.
-      Ensure the VirtualNetwork has been created before creating a Subnet.
-  when: _parent_vpc is none
-
-- name: Compute gateway and DHCP range from subnet CIDR
-  when: subnet_ipv4_cidr | length > 0
+# Subnet -> Netris IPAM subnet osac-sn-<id> and V-Net osac-sn-<id> in the VPC
+# osac-vn-<VN id>. With a network type the V-Net's vxlanID is returned as the
+# l2_vni of an evpn network segment, after the VPC's VNI is checked against
+# virtual_network.status.l3Vni. The gateway and DHCP follow netris_vnet_plan
+# (see netris_evpn_vnet_gateway_mode in defaults). Get-or-create by name; a
+# V-Net whose gateway or DHCP differs is updated with the full body. With a
+# network type the DHCP of an existing V-Net is left alone: a bare-metal
+# attachment switches it on (apply_network_attachment) and a rerun must keep it.
+- name: Create the Subnet on Netris
   block:
-    - name: Set gateway IP (first usable address)
+    - name: Check the settings
+      ansible.builtin.include_tasks: _settings.yaml
+      vars:
+        netris_require: [controller, credentials, site, tenant]
+
+    - name: Check the task input
+      ansible.builtin.include_tasks: _input.yaml
+      vars:
+        netris_require_parents: [virtual_network]
+
+    - name: Check the network type
+      ansible.builtin.include_tasks: _network_type.yaml
+
+    - name: Build the object names
+      ansible.builtin.include_tasks: _names.yaml
+
+    - name: Plan the gateway and DHCP of the V-Net
       ansible.builtin.set_fact:
-        _gateway_ip: "{{ subnet_ipv4_cidr | ansible.utils.ipaddr('next_usable') }}"
-        _gateway_cidr: >-
-          {{ subnet_ipv4_cidr | ansible.utils.ipaddr('next_usable') }}/{{ subnet_ipv4_cidr | ansible.utils.ipaddr('prefix') }}
-        _last_usable: "{{ subnet_ipv4_cidr | ansible.utils.ipaddr('last_usable') }}"
+        _netris_plan: "{{ osac_job_vars | osac.templates.netris_vnet_plan(netris_evpn_vnet_gateway_mode) }}"
 
-    - name: Compute DHCP range (second usable to last usable)
+    - name: Stop on an invalid Subnet input
+      vars:
+        netris_fail:
+          message: "Netris invalid task input: {{ _netris_plan.error }}"
+          retryable: false
+      when: _netris_plan.error | length > 0
+      ansible.builtin.include_tasks: _fail.yaml
+
+    - name: Look up the VPC of the VirtualNetwork
+      ansible.builtin.include_role:
+        name: netris.controller.vpc
+        tasks_from: read
+      vars:
+        vpc_name: "{{ netris_names.vpc }}"
+        vpc_tenant_id: "{{ netris_tenant_id | int }}"
+
+    - name: Wait for the VPC of the VirtualNetwork
+      vars:
+        netris_fail:
+          message: >-
+            Netris VPC {{ netris_names.vpc }} does not exist yet; the VirtualNetwork
+            must be created first. OSAC retries the task.
+          retryable: true
+      when: netris_vpc is not mapping
+      ansible.builtin.include_tasks: _fail.yaml
+
+    - name: Check the L3 VNI of the VPC
+      when: netris_network_type == 'evpn'
+      block:
+        - name: Read the L3 VNI
+          ansible.builtin.set_fact:
+            _netris_vni: "{{ netris_vpc.vni | default(none) | osac.templates.netris_vni_check('VPC ' ~ netris_names.vpc) }}"
+
+        - name: Stop on a missing or unusable L3 VNI
+          vars:
+            netris_fail:
+              message: "{{ _netris_vni.error }}"
+              retryable: "{{ _netris_vni.retryable }}"
+          when: _netris_vni.error | length > 0
+          ansible.builtin.include_tasks: _fail.yaml
+
+        - name: Stop when the VPC is not the one OSAC recorded
+          vars:
+            _recorded: "{{ (osac_job_vars.virtual_network.status | default({}, true)).l3Vni | default('none', true) }}"
+            netris_fail:
+              message: >-
+                Netris VPC {{ netris_names.vpc }} has L3 VNI {{ _netris_vni.vni }}, but the
+                VirtualNetwork recorded {{ _recorded }}. The VPC was replaced outside OSAC.
+              retryable: false
+          when: _recorded | string != _netris_vni.vni | string
+          ansible.builtin.include_tasks: _fail.yaml
+
+    - name: List the V-Nets with the name of the Subnet
+      ansible.builtin.include_role:
+        name: netris.controller.vnet
+        tasks_from: read
+      vars:
+        vnet_name: "{{ netris_names.vnet }}"
+
+    # Check the owner before the first write: a V-Net with our name in another
+    # tenant or VPC must not leave an IPAM subnet of ours behind. A list entry
+    # without its VPC or tenant is read by ID; if the owner is still unknown
+    # the task fails closed.
+    - name: Sort the V-Nets with the name of the Subnet by known owner
+      vars:
+        _same: "{{ netris_vnets | selectattr('name', 'equalto', netris_names.vnet) | list }}"
+        _known: "{{ _same | selectattr('vpc.id', 'defined') | selectattr('tenant.id', 'defined') | list }}"
       ansible.builtin.set_fact:
-        _dhcp_start: "{{ subnet_ipv4_cidr | ansible.utils.ipaddr('2') | ansible.utils.ipaddr('address') }}"
-        _dhcp_end: "{{ _last_usable }}"
+        _netris_vnets_known: "{{ _known }}"
+        _netris_vnets_unknown: "{{ _same | difference(_known) }}"
 
-- name: Display Subnet information
-  ansible.builtin.debug:
-    msg:
-      - "Creating Netris IPAM subnet + V-Net for Subnet '{{ subnet_name }}'"
-      - "VirtualNetwork: {{ subnet_virtual_network_name }} (VPC ID: {{ _parent_vpc.id }})"
-      - "IPv4 CIDR: {{ subnet_ipv4_cidr }}"
-      - "Gateway: {{ _gateway_cidr | default('none') }}"
-      - "DHCP range: {{ _dhcp_start | default('none') }} - {{ _dhcp_end | default('none') }}"
+    - name: Read the V-Nets whose list entry omits the owner
+      ansible.builtin.include_tasks: _read_vnet_detail.yaml
+      vars:
+        _netris_vnet_read_id: "{{ item.id }}"
+      loop: "{{ _netris_vnets_unknown }}"
+      loop_control:
+        label: "{{ item.id }}"
 
-- name: Create IPAM subnet in Netris controller
-  ansible.builtin.include_role:
-    name: netris.controller.ipam
-    tasks_from: create_subnet
-  vars:
-    ipam_name: "{{ subnet_name }}"
-    ipam_cidr: "{{ subnet_ipv4_cidr }}"
-    ipam_purpose: "common"
-    ipam_site_id: "{{ netris_site_id }}"
-    ipam_tenant_id: "{{ netris_tenant_id }}"
-    ipam_vpc_id: "{{ _parent_vpc.id }}"
+    - name: Classify the V-Nets by owner
+      vars:
+        _all: "{{ _netris_vnets_known + (_netris_vnet_details | default([])) }}"
+        _decided: "{{ _all | selectattr('vpc.id', 'defined') | selectattr('tenant.id', 'defined') | list }}"
+      ansible.builtin.set_fact:
+        _netris_vnets_unproven: "{{ _all | difference(_decided) }}"
+        _netris_vnets_owned: >-
+          {{ _decided | selectattr('vpc.id', 'equalto', netris_vpc.id | int)
+             | selectattr('tenant.id', 'equalto', netris_tenant_id | int) | list }}
+        _netris_vnets_foreign: >-
+          {{ _decided | difference(_decided | selectattr('vpc.id', 'equalto', netris_vpc.id | int)
+             | selectattr('tenant.id', 'equalto', netris_tenant_id | int) | list) }}
 
-- name: Display IPAM subnet creation result
-  ansible.builtin.debug:
-    msg: >-
-      IPAM subnet '{{ subnet_name }}' {{ (ipam_already_existed | default(false)) | ternary('already exists', 'created successfully') }}
-      (ID: {{ ipam_subnet_id | default('unknown') }})
+    - name: Stop when the owner of a V-Net with the name cannot be proven
+      vars:
+        netris_fail:
+          message: >-
+            Netris V-Net {{ netris_names.vnet }} exists but its VPC or tenant is not reported;
+            refusing to create the Subnet next to it. OSAC does not retry.
+          retryable: false
+      when: _netris_vnets_unproven | length > 0
+      ansible.builtin.include_tasks: _fail.yaml
 
-- name: Create V-Net in Netris controller
-  ansible.builtin.include_role:
-    name: netris.controller.vnet
-    tasks_from: create
-  vars:
-    vnet_name: "{{ subnet_name }}"
-    vnet_vpc_id: "{{ _parent_vpc.id }}"
-    vnet_site_id: "{{ netris_site_id }}"
-    vnet_tenant_id: "{{ netris_tenant_id }}"
-    vnet_gateway: "{{ _gateway_cidr | default(omit) }}"
-    vnet_dhcp_enabled: true
-    vnet_dhcp_start_ip: "{{ _dhcp_start | default(omit) }}"
-    vnet_dhcp_end_ip: "{{ _dhcp_end | default(omit) }}"
+    - name: Stop when the V-Net name belongs to another tenant or VPC
+      vars:
+        netris_fail:
+          message: >-
+            Netris V-Net {{ netris_names.vnet }} already exists in another tenant or VPC;
+            refusing to reuse it. OSAC does not retry.
+          retryable: false
+      when: _netris_vnets_owned | length == 0 and _netris_vnets_foreign | length > 0
+      ansible.builtin.include_tasks: _fail.yaml
 
-- name: Display V-Net creation result
-  ansible.builtin.debug:
-    msg: >-
-      V-Net '{{ subnet_name }}' {{ (vnet_already_existed | default(false)) | ternary('already exists', 'created successfully') }}
-      (ID: {{ vnet_id | default('unknown') }})
+    - name: Create the IPAM subnet
+      ansible.builtin.include_role:
+        name: netris.controller.ipam
+        tasks_from: create_subnet
+      vars:
+        ipam_name: "{{ netris_names.subnet_ipam }}"
+        ipam_cidr: "{{ osac_job_vars.resource.spec.ipv4Cidr }}"
+        ipam_purpose: common
+        ipam_site_id: "{{ netris_site_id | int }}"
+        ipam_tenant_id: "{{ netris_tenant_id | int }}"
+        ipam_vpc_id: "{{ netris_vpc.id }}"
+
+    - name: Create the V-Net with a gateway
+      when: _netris_plan.gateway | length > 0
+      ansible.builtin.include_role:
+        name: netris.controller.vnet
+        tasks_from: create
+      vars:
+        vnet_name: "{{ netris_names.vnet }}"
+        vnet_vpc_id: "{{ netris_vpc.id }}"
+        vnet_site_id: "{{ netris_site_id | int }}"
+        vnet_tenant_id: "{{ netris_tenant_id | int }}"
+        vnet_gateway: "{{ _netris_plan.gateway }}"
+        vnet_dhcp_enabled: "{{ _netris_plan.dhcp_start | length > 0 }}"
+        vnet_dhcp_start_ip: "{{ _netris_plan.dhcp_start }}"
+        vnet_dhcp_end_ip: "{{ _netris_plan.dhcp_end }}"
+
+    - name: Create the V-Net without a gateway
+      when: _netris_plan.gateway | length == 0
+      ansible.builtin.include_role:
+        name: netris.controller.vnet
+        tasks_from: create
+      vars:
+        vnet_name: "{{ netris_names.vnet }}"
+        vnet_vpc_id: "{{ netris_vpc.id }}"
+        vnet_site_id: "{{ netris_site_id | int }}"
+        vnet_tenant_id: "{{ netris_tenant_id | int }}"
+
+    - name: Read the V-Net
+      ansible.builtin.include_role:
+        name: netris.controller.vnet
+        tasks_from: read_by_id
+
+    - name: Compare the gateway of the V-Net with the plan
+      ansible.builtin.set_fact:
+        _netris_gateway: "{{ netris_vnet_detail | osac.templates.netris_vnet_gateway_update(_netris_plan, netris_network_type == 'evpn') }}"
+
+    - name: Update the gateway and DHCP of an existing V-Net
+      when: not _netris_gateway.matches
+      block:
+        - name: Put the full V-Net body
+          ansible.builtin.include_role:
+            name: netris.controller.vnet
+            tasks_from: update
+          vars:
+            vnet_body: "{{ _netris_gateway.body }}"
+
+        - name: Read the V-Net again
+          ansible.builtin.include_role:
+            name: netris.controller.vnet
+            tasks_from: read_by_id
+
+    - name: Check the L2 VNI of the V-Net
+      when: netris_network_type == 'evpn'
+      block:
+        - name: Read the L2 VNI
+          ansible.builtin.set_fact:
+            _netris_l2: "{{ netris_vnet_detail.vxlanID | default(none) | osac.templates.netris_vni_check('V-Net ' ~ netris_names.vnet) }}"
+
+        - name: Stop on a missing or unusable L2 VNI
+          vars:
+            netris_fail:
+              message: "{{ _netris_l2.error }}"
+              retryable: "{{ _netris_l2.retryable }}"
+          when: _netris_l2.error | length > 0
+          ansible.builtin.include_tasks: _fail.yaml
+
+        - name: Return the network segment to OSAC
+          ansible.builtin.include_tasks: _publish.yaml
+          vars:
+            netris_result:
+              network_segment:
+                type: evpn
+                l2_vni: "{{ _netris_l2.vni }}"
+  rescue:
+    - name: Report the error
+      ansible.builtin.include_tasks: _rescue.yaml

@@ -24,7 +24,7 @@ runs:
   steps:
   - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16  # v6
     with:
-      go-version: '1.26.3'
+      go-version: '1.27.1'
       # Without this, setup-go looks for go.sum at the repo root by
       # default -- this is a mono-repo, every component's go.sum lives in
       # its own subdirectory, so the built-in module cache silently never
@@ -33,6 +33,10 @@ runs:
   - name: Download Go modules
     shell: bash
     working-directory: ${{ inputs.working-directory }}
+    env:
+      # Work around HTTP/2 INTERNAL_ERROR stream resets from proxy.golang.org
+      # during long downloads (see osac-test-infra#543).
+      GODEBUG: http2client=0
     run: |
       for i in 1 2 3; do
         go mod download && exit 0
@@ -46,11 +50,13 @@ runs:
   - id: ginkgo-cache
     uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25  # v5
     with:
-      key: ginkgo-${{ hashFiles(format('{0}/go.mod', inputs.working-directory)) }}
+      key: ginkgo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles(format('{0}/go.mod', inputs.working-directory)) }}
       path: ~/go/bin/ginkgo
   - if: steps.ginkgo-cache.outputs.cache-hit != 'true'
     shell: bash
     working-directory: ${{ inputs.working-directory }}
+    env:
+      GODEBUG: http2client=0
     run: |
       module="github.com/onsi/ginkgo/v2"
       version=$(go list -f '{{ .Version }}' -m "${module}")

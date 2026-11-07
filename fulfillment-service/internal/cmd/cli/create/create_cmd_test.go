@@ -20,8 +20,6 @@ import (
 	"github.com/spf13/cobra"
 	"google.golang.org/protobuf/proto"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
-	publicv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/public/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/cmd/cli/create/baremetalinstancecatalogitem"
 	"github.com/osac-project/osac/fulfillment-service/internal/cmd/cli/create/baremetalinstancetype"
 	"github.com/osac-project/osac/fulfillment-service/internal/cmd/cli/create/cluster"
@@ -29,11 +27,17 @@ import (
 	"github.com/osac-project/osac/fulfillment-service/internal/cmd/cli/create/clusterversion"
 	"github.com/osac-project/osac/fulfillment-service/internal/cmd/cli/create/computeinstance"
 	"github.com/osac-project/osac/fulfillment-service/internal/cmd/cli/create/computeinstancecatalogitem"
+	"github.com/osac-project/osac/fulfillment-service/internal/cmd/cli/create/externalip"
+	"github.com/osac-project/osac/fulfillment-service/internal/cmd/cli/create/externalipattachment"
+	"github.com/osac-project/osac/fulfillment-service/internal/cmd/cli/create/fabricdomain"
 	"github.com/osac-project/osac/fulfillment-service/internal/cmd/cli/create/hub"
+	"github.com/osac-project/osac/fulfillment-service/internal/cmd/cli/create/natgateway"
 	"github.com/osac-project/osac/fulfillment-service/internal/cmd/cli/create/secret"
 	"github.com/osac-project/osac/fulfillment-service/internal/cmd/cli/create/securitygroup"
 	"github.com/osac-project/osac/fulfillment-service/internal/cmd/cli/create/subnet"
 	"github.com/osac-project/osac/fulfillment-service/internal/cmd/cli/create/virtualnetwork"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
 
 var _ = Describe("Create command", func() {
@@ -50,7 +54,11 @@ var _ = Describe("Create command", func() {
 		Entry("clusterversion", clusterversion.Cmd, (*privatev1.ClusterVersion)(nil)),
 		Entry("computeinstance", computeinstance.Cmd, (*publicv1.ComputeInstance)(nil)),
 		Entry("computeinstancecatalogitem", computeinstancecatalogitem.Cmd, (*publicv1.ComputeInstanceCatalogItem)(nil)),
+		Entry("externalip", externalip.Cmd, (*publicv1.ExternalIP)(nil)),
+		Entry("externalipattachment", externalipattachment.Cmd, (*publicv1.ExternalIPAttachment)(nil)),
+		Entry("fabricdomain", fabricdomain.Cmd, (*publicv1.FabricDomain)(nil)),
 		Entry("hub", hub.Cmd, (*privatev1.Hub)(nil)),
+		Entry("natgateway", natgateway.Cmd, (*publicv1.NATGateway)(nil)),
 		Entry("virtualnetwork", virtualnetwork.Cmd, (*publicv1.VirtualNetwork)(nil)),
 		Entry("subnet", subnet.Cmd, (*publicv1.Subnet)(nil)),
 		Entry("secret", secret.Cmd, (*publicv1.Secret)(nil)),
@@ -75,7 +83,11 @@ var _ = Describe("Create command", func() {
 				"clusterversion",
 				"computeinstance",
 				"computeinstancecatalogitem",
+				"externalip",
+				"externalipattachment",
+				"fabricdomain",
 				"hub",
+				"natgateway",
 				"virtualnetwork",
 				"subnet",
 				"secret",

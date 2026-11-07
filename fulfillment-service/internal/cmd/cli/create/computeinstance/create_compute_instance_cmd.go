@@ -18,6 +18,7 @@ import (
 	"embed"
 	"errors"
 	"fmt"
+	"google.golang.org/grpc"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -33,14 +34,16 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
-	publicv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/public/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/cmd/cli/create/fieldutil"
+	"github.com/osac-project/osac/fulfillment-service/internal/cmd/cli/create/metautil"
 	"github.com/osac-project/osac/fulfillment-service/internal/cmd/cli/create/netutil"
+	"github.com/osac-project/osac/fulfillment-service/internal/cmd/cli/lookup"
 	"github.com/osac-project/osac/fulfillment-service/internal/config"
 	"github.com/osac-project/osac/fulfillment-service/internal/exit"
 	"github.com/osac-project/osac/fulfillment-service/internal/logging"
 	"github.com/osac-project/osac/fulfillment-service/internal/reflection"
 	"github.com/osac-project/osac/fulfillment-service/internal/terminal"
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
 
 //go:embed templates
@@ -110,10 +113,10 @@ func Cmd() *cobra.Command {
 		diskImageFlagHelp,
 	)
 	flags.StringVar(
-		&runner.args.sshPublicKey,
-		"ssh-public-key",
+		&runner.args.sshKey,
+		"ssh-key",
 		"",
-		sshPublicKeyFlagHelp,
+		sshKeyFlagHelp,
 	)
 	flags.Int32Var(
 		&runner.args.bootDiskSizeGiB,
@@ -145,6 +148,12 @@ func Cmd() *cobra.Command {
 		"",
 		userDataFlagHelp,
 	)
+	flags.StringVar(
+		&runner.args.userDataSecret,
+		"user-data-secret",
+		"",
+		userDataSecretFlagHelp,
+	)
 	flags.StringArrayVar(
 		&runner.args.networkAttachments,
 		"network-attachment",
@@ -165,6 +174,7 @@ func Cmd() *cobra.Command {
 	)
 
 	result.MarkFlagsMutuallyExclusive("catalog-item", "template")
+	result.MarkFlagsMutuallyExclusive("user-data", "user-data-secret")
 	result.MarkFlagsOneRequired("catalog-item", "template")
 	return result
 }
@@ -179,19 +189,23 @@ type runnerContext struct {
 		setFields               []string
 		instanceType            string
 		diskImage               string
-		sshPublicKey            string
+		sshKey                  string
 		bootDiskSizeGiB         int32
 		bootDiskStorageTier     string
 		additionalDisks         []string
 		runStrategy             string
 		userData                string
+		userDataSecret          string
 		networkAttachments      []string
 		externalIPAttachment    bool
 	}
 	logger                 *slog.Logger
+	parsedSSHKeyRef        *publicv1.SecretReference
 	console                *terminal.Console
 	settings               *config.Settings
+	networkAttachment      *publicv1.ComputeNetworkAttachment
 	templatesClient        publicv1.ComputeInstanceTemplatesClient
+	catalogItemsClient     publicv1.ComputeInstanceCatalogItemsClient
 	computeInstancesClient publicv1.ComputeInstancesClient
 }
 
@@ -243,12 +257,18 @@ func (c *runnerContext) run(cmd *cobra.Command, args []string) error {
 	}
 	defer conn.Close()
 
+	// Resolve the names of the network attachment before anything is created:
+	if err := c.resolveNetworkAttachment(ctx, conn); err != nil {
+		return err
+	}
+
 	// Create the reflection helper:
 	helper, err := reflection.NewHelper().
 		SetLogger(c.logger).
 		SetConnection(conn).
 		AddPackages(c.settings.Packages()).
 		SetTenantFunc(config.TenantFromContext).
+		SetProjectFunc(config.ProjectFromContext).
 		Build()
 	if err != nil {
 		return fmt.Errorf("failed to create reflection tool: %w", err)
@@ -257,11 +277,26 @@ func (c *runnerContext) run(cmd *cobra.Command, args []string) error {
 
 	// Create the gRPC clients:
 	c.templatesClient = publicv1.NewComputeInstanceTemplatesClient(conn)
+	c.catalogItemsClient = publicv1.NewComputeInstanceCatalogItemsClient(conn)
 	c.computeInstancesClient = publicv1.NewComputeInstancesClient(conn)
 
 	if c.args.catalogItem != "" {
-		// Catalog item path: skip template lookup entirely (per D-04).
-		specResult, specErr := c.buildSpecFromCatalogItem(c.args.catalogItem)
+		// Catalog item path: resolve an ID or visible name, then skip template lookup (per D-04).
+		catalogItem, err := lookup.Find(c.args.catalogItem, "compute instance catalog item",
+			func(filter string, limit int32) ([]*publicv1.ComputeInstanceCatalogItem, error) {
+				response, err := c.catalogItemsClient.List(ctx, publicv1.ComputeInstanceCatalogItemsListRequest_builder{
+					Filter: proto.String(filter),
+					Limit:  proto.Int32(limit),
+				}.Build())
+				if err != nil {
+					return nil, fmt.Errorf("failed to list catalog items: %w", err)
+				}
+				return response.GetItems(), nil
+			})
+		if err != nil {
+			return err
+		}
+		specResult, specErr := c.buildSpecFromCatalogItem(catalogItem.GetId())
 		if specErr != nil {
 			return specErr
 		}
@@ -273,11 +308,8 @@ func (c *runnerContext) run(cmd *cobra.Command, args []string) error {
 		}
 
 		computeInstance := publicv1.ComputeInstance_builder{
-			Metadata: publicv1.Metadata_builder{
-				Name:   c.args.name,
-				Tenant: c.settings.Tenant(),
-			}.Build(),
-			Spec: specResult,
+			Metadata: metautil.ForCreate(ctx, c.args.name).Build(),
+			Spec:     specResult,
 		}.Build()
 
 		response, err := c.computeInstancesClient.Create(ctx, publicv1.ComputeInstancesCreateRequest_builder{
@@ -330,10 +362,8 @@ func (c *runnerContext) run(cmd *cobra.Command, args []string) error {
 
 	// Prepare the compute instance:
 	computeInstance := publicv1.ComputeInstance_builder{
-		Metadata: publicv1.Metadata_builder{
-			Name: c.args.name,
-		}.Build(),
-		Spec: spec,
+		Metadata: metautil.ForCreate(ctx, c.args.name).Build(),
+		Spec:     spec,
 	}.Build()
 
 	// Create the compute instance:
@@ -354,6 +384,21 @@ func (c *runnerContext) run(cmd *cobra.Command, args []string) error {
 	c.console.Infof(ctx, "Created compute instance '%s'.\n", computeInstance.Id)
 
 	return nil
+}
+
+func (c *runnerContext) sshKeyReference() (*publicv1.SecretReference, error) {
+	if c.args.sshKey == "" {
+		return nil, nil
+	}
+	if c.parsedSSHKeyRef != nil {
+		return c.parsedSSHKeyRef, nil
+	}
+	ref, err := fieldutil.ParseSSHKeyFlag(c.args.sshKey)
+	if err != nil {
+		return nil, err
+	}
+	c.parsedSSHKeyRef = ref
+	return ref, nil
 }
 
 // findTemplate finds a compute instance template by identifier or name. It tries to find by identifier or name using a
@@ -734,10 +779,12 @@ func (c *runnerContext) buildSpec(templateID string,
 		spec.DiskImage = &publicv1.DiskImageReference{Name: c.args.diskImage}
 	}
 	if c.args.instanceType != "" {
-		spec.InstanceType = &publicv1.InstanceTypeReference{Name: c.args.instanceType}
+		spec.InstanceType = &publicv1.InstanceTypeReference{Id: c.args.instanceType}
 	}
-	if c.args.sshPublicKey != "" {
-		spec.SshPublicKey = proto.String(c.args.sshPublicKey)
+	if sshKey, err := c.sshKeyReference(); err != nil {
+		return nil, err
+	} else if sshKey != nil {
+		spec.SshKey = sshKey
 	}
 	disk, err := c.buildBootDisk()
 	if err != nil {
@@ -761,7 +808,10 @@ func (c *runnerContext) buildSpec(templateID string,
 		spec.RunStrategy = &rs
 	}
 	if c.args.userData != "" {
-		spec.UserData = proto.String(c.args.userData)
+		spec.UserDataSource = publicv1.UserDataSource_builder{Inline: proto.String(c.args.userData)}.Build()
+	}
+	if c.args.userDataSecret != "" {
+		spec.UserDataSource = publicv1.UserDataSource_builder{Secret: publicv1.SecretLocalReference_builder{Name: c.args.userDataSecret}.Build()}.Build()
 	}
 	if err := c.applyNetworkingFlags(&spec); err != nil {
 		return nil, err
@@ -770,16 +820,17 @@ func (c *runnerContext) buildSpec(templateID string,
 }
 
 // buildBootDisk returns a boot disk from CLI flags, or nil if neither size nor storage tier was set.
-// A size-only boot disk is allowed because the server may resolve its tier from a catalog item or template.
+// Either field alone is allowed because the server may resolve the missing field from a catalog item or template.
 func (c *runnerContext) buildBootDisk() (*publicv1.ComputeInstanceDisk, error) {
 	if c.args.bootDiskSizeGiB <= 0 && c.args.bootDiskStorageTier == "" {
 		return nil, nil
 	}
-	if c.args.bootDiskSizeGiB <= 0 {
-		return nil, fmt.Errorf("--boot-disk-size is required when --boot-disk-storage-tier is set")
+	builder := publicv1.ComputeInstanceDisk_builder{}
+	if c.args.bootDiskSizeGiB < 0 {
+		return nil, fmt.Errorf("--boot-disk-size must be greater than zero")
 	}
-	builder := publicv1.ComputeInstanceDisk_builder{
-		SizeGib: proto.Int32(c.args.bootDiskSizeGiB),
+	if c.args.bootDiskSizeGiB > 0 {
+		builder.SizeGib = proto.Int32(c.args.bootDiskSizeGiB)
 	}
 	if c.args.bootDiskStorageTier != "" {
 		builder.StorageTier = publicv1.StorageTierReference_builder{
@@ -789,86 +840,35 @@ func (c *runnerContext) buildBootDisk() (*publicv1.ComputeInstanceDisk, error) {
 	return builder.Build(), nil
 }
 
-// applyNetworkingFlags sets spec.network_attachments from CLI flags.
-func (c *runnerContext) applyNetworkingFlags(spec *publicv1.ComputeInstanceSpec_builder) error {
+// resolveNetworkAttachment parses the --network-attachment flag, at most once, and resolves its names to IDs.
+func (c *runnerContext) resolveNetworkAttachment(ctx context.Context, conn grpc.ClientConnInterface) error {
 	if len(c.args.networkAttachments) == 0 {
 		return nil
 	}
-
-	attachments := make([]*publicv1.ComputeNetworkAttachment, 0, len(c.args.networkAttachments))
-	for _, raw := range c.args.networkAttachments {
-		na, err := parseNetworkAttachmentFlag(raw)
-		if err != nil {
-			return err
-		}
-		attachments = append(attachments, na)
+	if len(c.args.networkAttachments) > 1 {
+		return fmt.Errorf("at most one --network-attachment is supported")
 	}
-	spec.NetworkAttachments = attachments
+	flag, err := netutil.ParseNetworkAttachmentFlag(c.args.networkAttachments[0], false)
+	if err != nil {
+		return err
+	}
+	subnet, groups, err := netutil.ResolveNetworkAttachment(ctx, conn, flag)
+	if err != nil {
+		return err
+	}
+	c.networkAttachment = publicv1.ComputeNetworkAttachment_builder{
+		Subnet:         subnet,
+		SecurityGroups: groups,
+	}.Build()
 	return nil
 }
 
-// parseMainSubnetOnly parses the subnet portion of --network-attachment (no security-groups clause): either a bare id
-// or exactly subnet=<id>, optionally with a single comma between other parts only if we add more keys later.
-func parseMainSubnetOnly(main string) (string, error) {
-	main = strings.TrimSpace(strings.TrimSuffix(main, ","))
-	if main == "" {
-		return "", fmt.Errorf("--network-attachment must include a subnet or subnet=<id>")
+// applyNetworkingFlags sets spec.network_attachments from the resolved --network-attachment flag.
+func (c *runnerContext) applyNetworkingFlags(spec *publicv1.ComputeInstanceSpec_builder) error {
+	if c.networkAttachment != nil {
+		spec.NetworkAttachments = []*publicv1.ComputeNetworkAttachment{c.networkAttachment}
 	}
-	if !strings.Contains(main, "=") {
-		return main, nil
-	}
-	var subnet string
-	for _, fragment := range strings.Split(main, ",") {
-		fragment = strings.TrimSpace(fragment)
-		if fragment == "" {
-			continue
-		}
-		key, val, ok := strings.Cut(fragment, "=")
-		if !ok {
-			return "", fmt.Errorf("invalid --network-attachment fragment %q (expected key=value)", fragment)
-		}
-		key = strings.TrimSpace(strings.ToLower(key))
-		val = strings.TrimSpace(val)
-		if val == "" {
-			return "", fmt.Errorf("invalid --network-attachment fragment %q (value is empty)", fragment)
-		}
-		if key != "subnet" {
-			return "", fmt.Errorf("unknown key %q before security-groups (use subnet)", key)
-		}
-		if subnet != "" {
-			return "", fmt.Errorf("subnet appears more than once in --network-attachment %q", main)
-		}
-		subnet = val
-	}
-	if subnet == "" {
-		return "", fmt.Errorf("--network-attachment %q must include subnet=... or be a bare subnet id", main)
-	}
-	return subnet, nil
-}
-
-// parseNetworkAttachmentFlag parses one --network-attachment value: a bare subnet id, or subnet=<id> with optional
-// security-groups=/security_groups= suffix (commas allowed in the group list).
-func parseNetworkAttachmentFlag(s string) (*publicv1.ComputeNetworkAttachment, error) {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return nil, fmt.Errorf("empty --network-attachment value")
-	}
-	prefix, securityGroups, hadGroups := netutil.ExtractSecurityGroupListSuffix(s)
-	subnet, err := parseMainSubnetOnly(prefix)
-	if err != nil {
-		return nil, err
-	}
-	if !hadGroups && !strings.Contains(s, "=") {
-		return publicv1.ComputeNetworkAttachment_builder{Subnet: &publicv1.SubnetLocalReference{Id: s}}.Build(), nil
-	}
-	sgRefs := make([]*publicv1.SecurityGroupLocalReference, len(securityGroups))
-	for i, sg := range securityGroups {
-		sgRefs[i] = &publicv1.SecurityGroupLocalReference{Id: sg}
-	}
-	return publicv1.ComputeNetworkAttachment_builder{
-		Subnet:         &publicv1.SubnetLocalReference{Id: subnet},
-		SecurityGroups: sgRefs,
-	}.Build(), nil
+	return nil
 }
 
 // buildSpecFromCatalogItem builds the spec for catalog-item-based creation.
@@ -880,10 +880,12 @@ func (c *runnerContext) buildSpecFromCatalogItem(catalogItemID string) (*publicv
 		spec.DiskImage = &publicv1.DiskImageReference{Name: c.args.diskImage}
 	}
 	if c.args.instanceType != "" {
-		spec.InstanceType = &publicv1.InstanceTypeReference{Name: c.args.instanceType}
+		spec.InstanceType = &publicv1.InstanceTypeReference{Id: c.args.instanceType}
 	}
-	if c.args.sshPublicKey != "" {
-		spec.SshPublicKey = proto.String(c.args.sshPublicKey)
+	if sshKey, err := c.sshKeyReference(); err != nil {
+		return nil, err
+	} else if sshKey != nil {
+		spec.SshKey = sshKey
 	}
 	disk, err := c.buildBootDisk()
 	if err != nil {
@@ -907,7 +909,10 @@ func (c *runnerContext) buildSpecFromCatalogItem(catalogItemID string) (*publicv
 		spec.RunStrategy = &rs
 	}
 	if c.args.userData != "" {
-		spec.UserData = proto.String(c.args.userData)
+		spec.UserDataSource = publicv1.UserDataSource_builder{Inline: proto.String(c.args.userData)}.Build()
+	}
+	if c.args.userDataSecret != "" {
+		spec.UserDataSource = publicv1.UserDataSource_builder{Secret: publicv1.SecretLocalReference_builder{Name: c.args.userDataSecret}.Build()}.Build()
 	}
 	if err := c.applyNetworkingFlags(&spec); err != nil {
 		return nil, err
@@ -917,7 +922,10 @@ func (c *runnerContext) buildSpecFromCatalogItem(catalogItemID string) (*publicv
 
 // parseAdditionalDisks parses disk specifications in key=value format:
 // "size=100,storage-tier=standard".
-func parseAdditionalDisks(diskArgs []string) ([]*publicv1.ComputeInstanceDisk, error) {
+func parseAdditionalDisks(diskArgs []string) (*publicv1.ComputeInstanceDiskList, error) {
+	if len(diskArgs) == 1 && strings.TrimSpace(diskArgs[0]) == "" {
+		return publicv1.ComputeInstanceDiskList_builder{}.Build(), nil
+	}
 	disks := make([]*publicv1.ComputeInstanceDisk, 0, len(diskArgs))
 	for _, arg := range diskArgs {
 		arg = strings.TrimSpace(arg)
@@ -981,7 +989,7 @@ func parseAdditionalDisks(diskArgs []string) ([]*publicv1.ComputeInstanceDisk, e
 
 		disks = append(disks, disk.Build())
 	}
-	return disks, nil
+	return publicv1.ComputeInstanceDiskList_builder{Items: disks}.Build(), nil
 }
 
 // validTemplateParameter contains the information about a valid template parameter, for use in the error messages that
@@ -1051,11 +1059,13 @@ _NAME_ - Name of the compute instance.
 
 const templateFlagHelp = `
 _TEMPLATE_ - Template identifier or name. Mutually exclusive with
-{{ bt }}--catalog-item{{ bt }}.
+{{ bt }}--catalog-item{{ bt }}. If a name matches more than one visible template,
+use its identifier.
 `
 
 const catalogItemFlagHelp = `
-_ID_ - Catalog item identifier. Mutually exclusive with
+_ID_OR_NAME_ - Catalog item identifier or name. If a name matches more than
+one visible item, use its identifier. Mutually exclusive with
 {{ bt }}--template{{ bt }}.
 `
 
@@ -1071,16 +1081,17 @@ times.
 `
 
 const instanceTypeFlagHelp = `
-_NAME_ - Instance type name. Specifies the compute resource
-configuration for this instance.
+_ID_OR_NAME_ - Instance type identifier or name. Specifies the compute resource
+configuration for this instance. Instance type identifiers are their names.
 `
 
 const diskImageFlagHelp = `
 _NAME_ - DiskImage resource name to use for this compute instance.
 `
 
-const sshPublicKeyFlagHelp = `
-_KEY_ - SSH public key.
+const sshKeyFlagHelp = `
+_NAME_ or {{ bt }}name=<name>[,project=<project>]{{ bt }} - Secret name containing an SSH public key.
+A bare name is equivalent to {{ bt }}name=<name>,project=""{{ bt }} and selects the tenant's unnamed project.
 `
 
 const bootDiskSizeFlagHelp = `
@@ -1096,7 +1107,8 @@ _SPEC_ - Additional disk specification. Accepts two formats:
 {{ bt }}size=<GiB>,storage-tier=<name>{{ bt }} specifies disk size and storage tier name.
 The storage tier is required for every additional disk.
 
-Can be specified multiple times to add more than one disk.
+Can be specified multiple times to add more than one disk. With a Catalog Item,
+{{ bt }}--additional-disk ""{{ bt }} requests no additional disks and ignores the item default.
 `
 
 const runStrategyFlagHelp = `
@@ -1105,15 +1117,28 @@ _STRATEGY_ - Run strategy, for example {{ bt }}Always{{ bt }} or
 `
 
 const userDataFlagHelp = `
-_DATA_ - User data for the compute instance, for example cloud-init or
-ignition configuration.
+_DATA_ - User data for the compute instance. For Linux DiskImages, this is
+cloud-init or ignition configuration. For Windows DiskImages, the content is
+treated as an Unattend.xml answer file and must be well-formed XML.
+`
+
+const userDataSecretFlagHelp = `
+_NAME_ - Name of a Secret resource containing user data for the compute
+instance. For Linux DiskImages, content is cloud-init or ignition configuration.
+For Windows DiskImages, the content is treated as an Unattend.xml answer file
+and must be well-formed XML. The secret must exist in the same tenant. See also
+{{ bt }}osac create secret{{ bt }}. Mutually exclusive with
+{{ bt }}--user-data{{ bt }}.
 `
 
 const networkAttachmentFlagHelp = `
-_SPEC_ - Per-NIC network attachment. The value can be a plain subnet ID, or a
-comma-separated specification in the format
-{{ bt }}subnet=ID[,security-groups=ID,ID...]{{ bt }}. Can be
-specified multiple times to attach multiple NICs.
+_SPEC_ - Network attachment of the instance, at most one. The value can be a
+plain subnet name or ID, or a comma-separated specification in the format
+{{ bt }}[subnet=NAME][,security-groups=NAME,NAME...]{{ bt }}; names and IDs
+are accepted. Every part is optional: without a subnet the tenant's default
+subnet is used, and without security groups the tenant's default security
+group is used when the subnet is in the tenant's default virtual network.
+Without the flag the tenant defaults are used.
 `
 
 const externalIPAttachmentFlagHelp = `

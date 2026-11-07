@@ -14,6 +14,7 @@ language governing permissions and limitations under the License.
 package servers
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/google/uuid"
@@ -24,10 +25,16 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
+	"github.com/osac-project/osac/fulfillment-service/internal/auth"
+	"github.com/osac-project/osac/fulfillment-service/internal/database"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
 var _ = Describe("Private external IP pools server", func() {
+	BeforeEach(func() {
+		seedNetworkClass(privatev1.NetworkClassState_NETWORK_CLASS_STATE_READY)
+	})
+
 	Describe("Creation", func() {
 		It("Can be built if all the required parameters are set", func() {
 			server, err := NewPrivateExternalIPPoolsServer().
@@ -250,7 +257,8 @@ var _ = Describe("Private external IP pools server", func() {
 				Id: poolID,
 			}.Build())
 			Expect(err).To(HaveOccurred())
-			Expect(err.Error()).To(ContainSubstring("external IP(s) are still allocated"))
+			Expect(grpcstatus.Code(err)).To(Equal(grpccodes.FailedPrecondition))
+			Expect(err.Error()).To(ContainSubstring("still reference it"))
 		})
 
 		It("Allows deletion when no ExternalIPs reference the pool", func() {
@@ -370,7 +378,7 @@ var _ = Describe("Private external IP pools server", func() {
 				Expect(err.Error()).To(ContainSubstring("IPv6"))
 			})
 
-			It("canonicalizes non-canonical CIDRs on Create", func() {
+			It("rejects non-canonical CIDRs on Create", func() {
 				pool := privatev1.ExternalIPPool_builder{
 					Metadata: privatev1.Metadata_builder{
 						Name: "test-pool-ip-family",
@@ -382,8 +390,8 @@ var _ = Describe("Private external IP pools server", func() {
 				}.Build()
 
 				err := poolsServer.validateCreate(ctx, pool)
-				Expect(err).ToNot(HaveOccurred())
-				Expect(pool.GetSpec().GetCidrs()).To(Equal([]string{"10.0.1.0/24"}))
+				Expect(err).To(HaveOccurred())
+				Expect(err.Error()).To(ContainSubstring("canonical"))
 			})
 		})
 
@@ -412,9 +420,8 @@ var _ = Describe("Private external IP pools server", func() {
 				Expect(err).To(HaveOccurred())
 				status, ok := grpcstatus.FromError(err)
 				Expect(ok).To(BeTrue())
-				Expect(status.Code()).To(Equal(grpccodes.AlreadyExists))
+				Expect(status.Code()).To(Equal(grpccodes.InvalidArgument))
 				Expect(err.Error()).To(ContainSubstring("overlaps"))
-				Expect(err.Error()).To(ContainSubstring("pool-a"))
 			})
 
 			It("accepts a pool with a non-overlapping CIDR", func() {
@@ -447,7 +454,7 @@ var _ = Describe("Private external IP pools server", func() {
 		})
 
 		Context("Intra-pool CIDR overlap detection", func() {
-			It("rejects a pool whose second CIDR is a subset of the first", func() {
+			It("rejects a pool with multiple CIDRs", func() {
 				pool := privatev1.ExternalIPPool_builder{
 					Metadata: privatev1.Metadata_builder{
 						Name: "test-pool-intra-pool-overlap",
@@ -463,7 +470,7 @@ var _ = Describe("Private external IP pools server", func() {
 				status, ok := grpcstatus.FromError(err)
 				Expect(ok).To(BeTrue())
 				Expect(status.Code()).To(Equal(grpccodes.InvalidArgument))
-				Expect(err.Error()).To(ContainSubstring("overlaps"))
+				Expect(err.Error()).To(ContainSubstring("exactly one"))
 			})
 		})
 
@@ -532,7 +539,6 @@ var _ = Describe("Private external IP pools server", func() {
 				status, ok := grpcstatus.FromError(err)
 				Expect(ok).To(BeTrue())
 				Expect(status.Code()).To(Equal(grpccodes.InvalidArgument))
-				Expect(err.Error()).To(ContainSubstring("cidrs"))
 				Expect(err.Error()).To(ContainSubstring("immutable"))
 			})
 
@@ -564,7 +570,6 @@ var _ = Describe("Private external IP pools server", func() {
 				Expect(ok).To(BeTrue())
 				Expect(status.Code()).To(Equal(grpccodes.InvalidArgument))
 				Expect(err.Error()).To(ContainSubstring("ip_family"))
-				Expect(err.Error()).To(ContainSubstring("immutable"))
 			})
 
 			It("Rejects update of the name of ExternalIPPool (spec fields omitted)", func() {
@@ -598,6 +603,47 @@ var _ = Describe("Private external IP pools server", func() {
 				Expect(ok).To(BeTrue())
 				Expect(status.Code()).To(Equal(grpccodes.InvalidArgument))
 				Expect(err.Error()).To(ContainSubstring("immutable"))
+			})
+
+			It("rejects changing a stored ExternalIPPool's tenant and preserves the stored object", func() {
+				createResponse, err := poolsServer.Create(ctx, privatev1.ExternalIPPoolsCreateRequest_builder{
+					Object: privatev1.ExternalIPPool_builder{
+						Metadata: privatev1.Metadata_builder{
+							Name:   "tenant-immutable-pool",
+							Tenant: testTenant,
+						}.Build(),
+						Spec: privatev1.ExternalIPPoolSpec_builder{
+							Cidrs:    []string{"10.0.0.0/24"},
+							IpFamily: privatev1.IPFamily_IP_FAMILY_IPV4,
+						}.Build(),
+					}.Build(),
+				}.Build())
+				Expect(err).ToNot(HaveOccurred())
+				id := createResponse.GetObject().GetId()
+
+				// Tenant immutability is enforced by the database trigger, which aborts the
+				// current transaction, so the rejected update runs inside a savepoint.
+				tx, txErr := database.TxFromContext(ctx)
+				Expect(txErr).ToNot(HaveOccurred())
+				txErr = tx.Savepoint(ctx, func(savepointCtx context.Context) error {
+					_, updateErr := poolsServer.Update(savepointCtx, privatev1.ExternalIPPoolsUpdateRequest_builder{
+						Object: privatev1.ExternalIPPool_builder{
+							Id:       id,
+							Metadata: privatev1.Metadata_builder{Tenant: auth.SharedTenant}.Build(),
+						}.Build(),
+						UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"metadata.tenant"}},
+					}.Build())
+					return updateErr
+				})
+				Expect(txErr).To(HaveOccurred())
+				Expect(grpcstatus.Code(txErr)).To(Equal(grpccodes.InvalidArgument))
+				Expect(txErr.Error()).To(ContainSubstring("immutable"))
+				Expect(txErr.Error()).To(ContainSubstring("tenant"))
+
+				stored, getErr := poolsServer.Get(ctx, privatev1.ExternalIPPoolsGetRequest_builder{Id: id}.Build())
+				Expect(getErr).ToNot(HaveOccurred())
+				Expect(stored.GetObject().GetMetadata().GetTenant()).To(Equal(testTenant))
+				Expect(stored.GetObject().GetSpec().GetCidrs()).To(Equal([]string{"10.0.0.0/24"}))
 			})
 		})
 	})

@@ -4,7 +4,7 @@
     bmh_patch:
       spec:
         image:
-          url: "{{ template_params.imageURL }}"
+          url: "{{ ('oci://' ~ template_params.imageURL) if (template_params.imageSourceType | default('') == 'registry' and not template_params.imageURL.startswith('oci://')) else template_params.imageURL }}"
         online: true
 
 - name: Add checksum to BMH patch for non-OCI images
@@ -61,3 +61,15 @@
              }
            })
          }, recursive=True) }}
+
+- name: Add fallback root disk to BMH patch
+  when:
+    - fallback_root_disk | default('') | length > 0
+    - not (bmh_info.spec.rootDeviceHints | default({}))
+  ansible.builtin.set_fact:
+    bmh_patch: >-
+      {{ bmh_patch | combine(
+           {'metadata': {'resourceVersion': bmh_info.metadata.resourceVersion,
+                         'annotations': {'osac.openshift.io/fallback-root-device': fallback_root_disk}},
+            'spec': {'rootDeviceHints': {'deviceName': fallback_root_disk}}},
+           recursive=True) }}

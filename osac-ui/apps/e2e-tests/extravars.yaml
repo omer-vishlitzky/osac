@@ -1,0 +1,51 @@
+# Non-sensitive seed values for the VMaaS UI tests.
+#
+# The deployment URL and Keycloak credentials must be supplied through
+# OSAC_UI_BASE_URL, OSAC_ADMIN_USERNAME, and OSAC_ADMIN_PASSWORD.
+
+tenant_name: 'tenant1'
+# The break-glass password is replaced with tenant_password, or tenant_name
+# when tenant_password is not set.
+
+catalog:
+  name: 'catalog-item-e2e'
+  # The UI displays the template metadata.name, not its resource ID.
+  template: 'ocp-virt-vm'
+  description: 'Catalog item created through the UI for E2E testing.'
+  type: 'Virtual Machine'
+  status: 'Live'
+  usage: 'Global public'
+  fields:
+    instance_type:
+      name: 'instance-type-e2e'
+    boot_disk:
+      size_gib: 80
+    disk_image:
+      name: 'disk-image-e2e'
+
+instance_type:
+  name: 'instance-type-e2e'
+  description: 'Instance type created by e2e test'
+  vcpus: 4
+  memory_gib: 8
+
+disk_image:
+  # Playwright appends a per-run suffix so teardown only targets this run's image.
+  name: 'disk-image-e2e'
+  source_type: 'Registry'
+  source_ref: 'quay.io/containerdisks/fedora:41'
+  guest_os_family: 'Linux'
+  architectures:
+    - 'amd64'
+  scope: 'Global'
+
+storage_tier:
+  name: 'storage-tier-e2e'
+  description: 'Storage tier created by e2e test'
+  backend: 'local'
+  protocol: 'Block'
+
+lifecycle_actions:
+  - 'Deprecate'
+  - 'Obsolete'
+  - 'Reactivate'

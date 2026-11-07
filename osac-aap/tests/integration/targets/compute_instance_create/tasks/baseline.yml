@@ -14,7 +14,11 @@
       ansible.builtin.set_fact:
         osac_job_vars:
           resource: "{{ test_compute_instance }}"
-        tenant_target_namespace: "computeinstance-test-vm-work"
+          vm_network:
+            namespace: test-subnet
+            networks: [{name: tenant, pod: {}}]
+            interfaces: [{name: tenant, binding: {name: l2bridge}}]
+            labels: {osac.openshift.io/compute-instance-id: 3c0b9d2e-1111-4a5b-9c7d-2e4f6a8b0c12}
         tenant_storage_class_storage_classes:
           - name: "test-storage-class"
             tier: "local"
@@ -44,12 +48,84 @@
           - compute_instance_name == "test-vm"
         fail_msg: "Compute instance name not extracted correctly"
 
-    - name: Verify tenant target namespace determined
+    - name: Verify subnet target namespace supplied
       ansible.builtin.assert:
         that:
-          - tenant_target_namespace is defined
-          - tenant_target_namespace == "computeinstance-test-vm-work"
-        fail_msg: "Tenant target namespace not set correctly"
+          - compute_instance_target_namespace == 'test-subnet'
+        fail_msg: >-
+          compute_instance_target_namespace is '{{ compute_instance_target_namespace | default('<unset>') }}',
+          expected osac_job_vars.vm_network.namespace 'test-subnet'
+
+    - name: Show the VM network wiring
+      ansible.builtin.debug:
+        msg: >-
+          networks={{ vm_template_spec.networks | default('<unset>') }}
+          interfaces={{ vm_template_spec.domain.devices.interfaces | default('<unset>') }}
+          labels={{ default_vm_labels | default('<unset>') }}
+
+    - name: Verify the VM template spec uses vm_network.networks unchanged
+      ansible.builtin.assert:
+        that:
+          - vm_template_spec.networks == osac_job_vars.vm_network.networks
+        fail_msg: >-
+          vm_template_spec.networks is {{ vm_template_spec.networks | default('<unset>') }},
+          expected osac_job_vars.vm_network.networks {{ osac_job_vars.vm_network.networks }}
+
+    - name: Verify the VM template spec uses vm_network.interfaces unchanged
+      ansible.builtin.assert:
+        that:
+          - vm_template_spec.domain.devices.interfaces == osac_job_vars.vm_network.interfaces
+        fail_msg: >-
+          vm_template_spec.domain.devices.interfaces is
+          {{ vm_template_spec.domain.devices.interfaces | default('<unset>') }},
+          expected osac_job_vars.vm_network.interfaces {{ osac_job_vars.vm_network.interfaces }}
+
+    - name: Verify the VM labels carry the compute-instance-id label of vm_network.labels
+      ansible.builtin.assert:
+        that:
+          - >-
+            default_vm_labels['osac.openshift.io/compute-instance-id'] | default('')
+            == '3c0b9d2e-1111-4a5b-9c7d-2e4f6a8b0c12'
+        fail_msg: >-
+          default_vm_labels is {{ default_vm_labels | default('<unset>') }}; it must include
+          osac.openshift.io/compute-instance-id=3c0b9d2e-1111-4a5b-9c7d-2e4f6a8b0c12 from vm_network.labels
+
+    - name: Exercise namespaced resource creation in the resolved subnet namespace
+      block:
+        - name: Create a test ConfigMap in the VM target namespace
+          kubernetes.core.k8s:
+            kubeconfig: "{{ remote_cluster_kubeconfig | default(omit) }}"
+            state: present
+            definition:
+              apiVersion: v1
+              kind: ConfigMap
+              metadata:
+                name: test-vm-placement
+                namespace: "{{ compute_instance_target_namespace }}"
+
+        - name: Read the test ConfigMap from the VM target namespace
+          kubernetes.core.k8s_info:
+            kubeconfig: "{{ remote_cluster_kubeconfig | default(omit) }}"
+            api_version: v1
+            kind: ConfigMap
+            name: test-vm-placement
+            namespace: "{{ compute_instance_target_namespace }}"
+          register: placement_configmap
+
+        - name: Verify resource placement
+          ansible.builtin.assert:
+            that:
+              - placement_configmap.resources | length == 1
+              - placement_configmap.resources[0].metadata.namespace == 'test-subnet'
+      always:
+        - name: Remove the test ConfigMap
+          kubernetes.core.k8s:
+            kubeconfig: "{{ remote_cluster_kubeconfig | default(omit) }}"
+            state: absent
+            api_version: v1
+            kind: ConfigMap
+            name: test-vm-placement
+            namespace: "{{ compute_instance_target_namespace }}"
 
     - name: Verify template ID extracted
       ansible.builtin.assert:

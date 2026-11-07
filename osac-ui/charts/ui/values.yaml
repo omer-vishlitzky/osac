@@ -1,0 +1,48 @@
+# This defines the hostname for the OpenShift Route. When not set, the hostname is automatically assigned by OpenShift.
+externalHostname:
+
+# Route is the OpenShift ingress. Disable it when another ingress resource
+# (for example a Gateway API HTTPRoute on Kind) exposes the UI Service.
+route:
+  enabled: true
+
+api:
+  fulfillment:
+    url: https://fulfillment-api:8000
+    # Certificate configuration for Fulfillment API
+    certs:
+      # This defines the trusted CA certificates bundle. It must be the name of a configmap in the release namespace
+      # that contains trusted CA certificates in PEM format.
+      caBundle:
+        configMap:
+
+# Authentication and authorization configuration:
+auth:
+  oidcClientId: osac-ui
+  # OIDC issuer URL (e.g. https://keycloak.example.com/realms/osac). Required.
+  # In osac deployments set this to match service.auth.issuerUrl in the osac-installer
+  oidcIssuerURL: ""
+  # Name of the Secret containing the osac-ui-backend Keycloak client secret
+  # (key: client-secret). Created automatically by the osac-infra Helm chart
+  serviceAccount:
+    credentialsSecret: "osac-ui-backend-credentials"
+  # Certificate configuration for Auth
+  certs:
+    # This defines the trusted CA certificates bundle. It must be the name of a configmap in the release namespace
+    # that contains trusted CA certificates in PEM format.
+    caBundle:
+      configMap:
+
+# Logging configuration:
+log:
+
+  # This defines the log level for all components. Valid values are 'debug', 'info', 'warn', and 'error'.
+  #
+  # Note that setting this to 'debug' will significantly increase the size of logs and may impact service performance.
+  level: info
+
+# Image configuration:
+images:
+  ui: ghcr.io/osac-project/osac-ui:main  # PLACEHOLDER -- overwritten at release time by osac-build-and-publish.yaml
+  # "auto" leaves the field unset so Kubernetes selects its tag-based default.
+  pullPolicy: auto

@@ -21,12 +21,14 @@ import (
 	. "github.com/onsi/ginkgo/v2/dsl/table"
 	. "github.com/onsi/gomega"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	grpcstatus "google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 
-	publicv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/public/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/packages"
 	"github.com/osac-project/osac/fulfillment-service/internal/testing"
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
 
 type testTenantKey struct{}
@@ -38,6 +40,17 @@ func testTenantFromContext(ctx context.Context) string {
 
 func testTenantIntoContext(ctx context.Context, tenant string) context.Context {
 	return context.WithValue(ctx, testTenantKey{}, tenant)
+}
+
+type testProjectKey struct{}
+
+func testProjectFromContext(ctx context.Context) string {
+	v, _ := ctx.Value(testProjectKey{}).(string)
+	return v
+}
+
+func testProjectIntoContext(ctx context.Context, project string) context.Context {
+	return context.WithValue(ctx, testProjectKey{}, project)
 }
 
 var _ = Describe("Reflection helper", func() {
@@ -158,7 +171,7 @@ var _ = Describe("Reflection helper", func() {
 				"diskimage",
 				"externalip",
 				"externalipattachment",
-				"hosttype",
+				"fabricdomain",
 				"identityprovider",
 				"instancetype",
 				"natgateway",
@@ -168,10 +181,12 @@ var _ = Describe("Reflection helper", func() {
 				"rolebinding",
 				"secret",
 				"securitygroup",
+				"serviceaccount",
 				"subnet",
 				"tenant",
 				"user",
 				"virtualnetwork",
+				"volume",
 			))
 		})
 
@@ -190,7 +205,7 @@ var _ = Describe("Reflection helper", func() {
 				"diskimages",
 				"externalipattachments",
 				"externalips",
-				"hosttypes",
+				"fabricdomains",
 				"identityproviders",
 				"instancetypes",
 				"natgateways",
@@ -200,12 +215,68 @@ var _ = Describe("Reflection helper", func() {
 				"rolebindings",
 				"secrets",
 				"securitygroups",
+				"serviceaccounts",
 				"subnets",
 				"tenants",
 				"users",
 				"virtualnetworks",
+				"volumes",
 			))
 		})
+
+		DescribeTable(
+			"recognizes public networking resources without update support as immutable",
+			func(objectType string) {
+				objectHelper := helper.Lookup(objectType)
+				Expect(objectHelper).ToNot(BeNil())
+				Expect(objectHelper.IsUpdatable()).To(BeFalse())
+			},
+			Entry("VirtualNetwork", "virtualnetwork"),
+			Entry("Subnet", "subnet"),
+			Entry("ExternalIP", "externalip"),
+			Entry("ExternalIPAttachment", "externalipattachment"),
+			Entry("NATGateway", "natgateway"),
+		)
+
+		It("recognizes public SecurityGroups as updatable for rule editing", func() {
+			objectHelper := helper.Lookup("securitygroup")
+			Expect(objectHelper).ToNot(BeNil())
+			Expect(objectHelper.IsUpdatable()).To(BeTrue())
+		})
+
+		It("rejects updates for a public networking resource without invoking gRPC", func() {
+			objectHelper := helper.Lookup("virtualnetwork")
+			Expect(objectHelper).ToNot(BeNil())
+			Expect(objectHelper.IsUpdatable()).To(BeFalse())
+
+			_, err := objectHelper.Update(ctx, &publicv1.VirtualNetwork{Id: "virtual-network-1"})
+			status, ok := grpcstatus.FromError(err)
+			Expect(ok).To(BeTrue())
+			Expect(status.Code()).To(Equal(codes.FailedPrecondition))
+			Expect(status.Message()).To(ContainSubstring("immutable"))
+		})
+
+		DescribeTable(
+			"keeps private networking updates available for status and feedback",
+			func(objectType string) {
+				privateHelper, err := NewHelper().
+					SetLogger(logger).
+					SetConnection(connection).
+					AddPackage(packages.PrivateV1, 1).
+					Build()
+				Expect(err).ToNot(HaveOccurred())
+
+				objectHelper := privateHelper.Lookup(objectType)
+				Expect(objectHelper).ToNot(BeNil())
+				Expect(objectHelper.IsUpdatable()).To(BeTrue())
+			},
+			Entry("VirtualNetwork", "virtualnetwork"),
+			Entry("Subnet", "subnet"),
+			Entry("SecurityGroup", "securitygroup"),
+			Entry("ExternalIP", "externalip"),
+			Entry("ExternalIPAttachment", "externalipattachment"),
+			Entry("NATGateway", "natgateway"),
+		)
 
 		DescribeTable(
 			"Lookup by object type",
@@ -228,11 +299,6 @@ var _ = Describe("Reflection helper", func() {
 				"Cluster in singular upper case",
 				"CLUSTER",
 				"osac.public.v1.Cluster",
-			),
-			Entry(
-				"Host type in plural",
-				"hosttypes",
-				"osac.public.v1.HostType",
 			),
 			Entry(
 				"Tenant in singular",
@@ -271,11 +337,6 @@ var _ = Describe("Reflection helper", func() {
 				"osac.public.v1.ClusterTemplate",
 			),
 			Entry(
-				"Host type",
-				"hosttype",
-				"osac.public.v1.HostType",
-			),
-			Entry(
 				"Compute instance template",
 				"computeinstancetemplate",
 				"osac.public.v1.ComputeInstanceTemplate",
@@ -304,11 +365,6 @@ var _ = Describe("Reflection helper", func() {
 				"Cluster template",
 				"clustertemplate",
 				&publicv1.ClusterTemplate{},
-			),
-			Entry(
-				"Host type",
-				"hosttype",
-				&publicv1.HostType{},
 			),
 		)
 
@@ -404,8 +460,8 @@ var _ = Describe("Reflection helper", func() {
 							Spec: publicv1.ClusterSpec_builder{
 								NodeSets: map[string]*publicv1.ClusterNodeSet{
 									"xyz": publicv1.ClusterNodeSet_builder{
-										HostType: publicv1.HostTypeReference_builder{Id: "acme_1tib"}.Build(),
-										Size:     proto.Int32(3),
+										BaremetalInstanceType: publicv1.BareMetalInstanceTypeReference_builder{Id: "acme_1tib"}.Build(),
+										Size:                  proto.Int32(3),
 									}.Build(),
 								},
 							}.Build(),
@@ -417,8 +473,8 @@ var _ = Describe("Reflection helper", func() {
 							Spec: publicv1.ClusterSpec_builder{
 								NodeSets: map[string]*publicv1.ClusterNodeSet{
 									"xyz": publicv1.ClusterNodeSet_builder{
-										HostType: publicv1.HostTypeReference_builder{Id: "acme_1tib"}.Build(),
-										Size:     proto.Int32(3),
+										BaremetalInstanceType: publicv1.BareMetalInstanceTypeReference_builder{Id: "acme_1tib"}.Build(),
+										Size:                  proto.Int32(3),
 									}.Build(),
 								},
 							}.Build(),
@@ -438,8 +494,8 @@ var _ = Describe("Reflection helper", func() {
 				Spec: publicv1.ClusterSpec_builder{
 					NodeSets: map[string]*publicv1.ClusterNodeSet{
 						"xyz": publicv1.ClusterNodeSet_builder{
-							HostType: publicv1.HostTypeReference_builder{Id: "acme_1tib"}.Build(),
-							Size:     proto.Int32(3),
+							BaremetalInstanceType: publicv1.BareMetalInstanceTypeReference_builder{Id: "acme_1tib"}.Build(),
+							Size:                  proto.Int32(3),
 						}.Build(),
 					},
 				}.Build(),
@@ -452,8 +508,8 @@ var _ = Describe("Reflection helper", func() {
 					Spec: publicv1.ClusterSpec_builder{
 						NodeSets: map[string]*publicv1.ClusterNodeSet{
 							"xyz": publicv1.ClusterNodeSet_builder{
-								HostType: publicv1.HostTypeReference_builder{Id: "acme_1tib"}.Build(),
-								Size:     proto.Int32(3),
+								BaremetalInstanceType: publicv1.BareMetalInstanceTypeReference_builder{Id: "acme_1tib"}.Build(),
+								Size:                  proto.Int32(3),
 							}.Build(),
 						},
 					}.Build(),
@@ -486,8 +542,8 @@ var _ = Describe("Reflection helper", func() {
 							Spec: publicv1.ClusterSpec_builder{
 								NodeSets: map[string]*publicv1.ClusterNodeSet{
 									"xyz": publicv1.ClusterNodeSet_builder{
-										HostType: publicv1.HostTypeReference_builder{Id: "acme_1tib"}.Build(),
-										Size:     proto.Int32(3),
+										BaremetalInstanceType: publicv1.BareMetalInstanceTypeReference_builder{Id: "acme_1tib"}.Build(),
+										Size:                  proto.Int32(3),
 									}.Build(),
 								},
 							}.Build(),
@@ -503,7 +559,7 @@ var _ = Describe("Reflection helper", func() {
 			// Use the helper to send the request, and verify the response:
 			objectHelper := helper.Lookup("cluster")
 			Expect(objectHelper).ToNot(BeNil())
-			object, err := objectHelper.Update(ctx, publicv1.Cluster_builder{
+			result, err := objectHelper.Update(ctx, publicv1.Cluster_builder{
 				Id: "123",
 				Spec: publicv1.ClusterSpec_builder{
 					NodeSets: map[string]*publicv1.ClusterNodeSet{
@@ -514,20 +570,91 @@ var _ = Describe("Reflection helper", func() {
 				}.Build(),
 			}.Build())
 			Expect(err).ToNot(HaveOccurred())
+			Expect(result.Warnings).To(BeEmpty())
 			Expect(proto.Equal(
-				object,
+				result.Object,
 				publicv1.Cluster_builder{
 					Id: "123",
 					Spec: publicv1.ClusterSpec_builder{
 						NodeSets: map[string]*publicv1.ClusterNodeSet{
 							"xyz": publicv1.ClusterNodeSet_builder{
-								HostType: publicv1.HostTypeReference_builder{Id: "acme_1tib"}.Build(),
-								Size:     proto.Int32(3),
+								BaremetalInstanceType: publicv1.BareMetalInstanceTypeReference_builder{Id: "acme_1tib"}.Build(),
+								Size:                  proto.Int32(3),
 							}.Build(),
 						},
 					}.Build(),
 				}.Build(),
 			)).To(BeTrue())
+		})
+
+		It("Computes an explicit map mask for a removed final label", func() {
+			// Register a clusters server that responds to the update request:
+			publicv1.RegisterClustersServer(server.Registrar(), &testing.ClustersServerFuncs{
+				UpdateFunc: func(ctx context.Context, request *publicv1.ClustersUpdateRequest,
+				) (response *publicv1.ClustersUpdateResponse, err error) {
+					defer GinkgoRecover()
+					// An emptied labels map is indistinguishable from
+					// omission without an explicit mask:
+					Expect(request.GetUpdateMask().GetPaths()).To(ConsistOf("metadata.labels"))
+					response = publicv1.ClustersUpdateResponse_builder{
+						Object: request.GetObject(),
+					}.Build()
+					return
+				},
+			})
+
+			// Start the server:
+			server.Start()
+
+			// Use the helper to remove the final label, and verify that the
+			// computed mask reaches the wire:
+			objectHelper := helper.Lookup("cluster")
+			Expect(objectHelper).ToNot(BeNil())
+			original := publicv1.Cluster_builder{
+				Id: "123",
+				Metadata: publicv1.Metadata_builder{
+					Labels: map[string]string{"team": "x"},
+				}.Build(),
+			}.Build()
+			edited := proto.Clone(original).(*publicv1.Cluster)
+			edited.GetMetadata().SetLabels(map[string]string{})
+			_, err := objectHelper.UpdateWithMask(ctx, original, edited)
+			Expect(err).ToNot(HaveOccurred())
+		})
+
+		It("Computes an explicit map mask for a removed final annotation", func() {
+			// Register a clusters server that responds to the update request:
+			publicv1.RegisterClustersServer(server.Registrar(), &testing.ClustersServerFuncs{
+				UpdateFunc: func(ctx context.Context, request *publicv1.ClustersUpdateRequest,
+				) (response *publicv1.ClustersUpdateResponse, err error) {
+					defer GinkgoRecover()
+					// An emptied annotations map is indistinguishable from
+					// omission without an explicit mask:
+					Expect(request.GetUpdateMask().GetPaths()).To(ConsistOf("metadata.annotations"))
+					response = publicv1.ClustersUpdateResponse_builder{
+						Object: request.GetObject(),
+					}.Build()
+					return
+				},
+			})
+
+			// Start the server:
+			server.Start()
+
+			// Use the helper to remove the final annotation, and verify that
+			// the computed mask reaches the wire:
+			objectHelper := helper.Lookup("cluster")
+			Expect(objectHelper).ToNot(BeNil())
+			original := publicv1.Cluster_builder{
+				Id: "123",
+				Metadata: publicv1.Metadata_builder{
+					Annotations: map[string]string{"note": "x"},
+				}.Build(),
+			}.Build()
+			edited := proto.Clone(original).(*publicv1.Cluster)
+			edited.GetMetadata().SetAnnotations(map[string]string{})
+			_, err := objectHelper.UpdateWithMask(ctx, original, edited)
+			Expect(err).ToNot(HaveOccurred())
 		})
 
 		It("Invokes delete method", func() {
@@ -744,10 +871,10 @@ var _ = Describe("Reflection helper", func() {
 			Expect(helper.Lookup("virtualnetwork").IsTenantScoped()).To(BeTrue())
 			Expect(helper.Lookup("subnet").IsTenantScoped()).To(BeTrue())
 			Expect(helper.Lookup("project").IsTenantScoped()).To(BeTrue())
+			Expect(helper.Lookup("serviceaccount").IsTenantScoped()).To(BeTrue())
 		})
 
 		It("Reports platform-scoped types correctly", func() {
-			Expect(helper.Lookup("hosttype").IsTenantScoped()).To(BeFalse())
 			Expect(helper.Lookup("tenant").IsTenantScoped()).To(BeFalse())
 			Expect(helper.Lookup("role").IsTenantScoped()).To(BeFalse())
 		})
@@ -763,6 +890,45 @@ var _ = Describe("Reflection helper", func() {
 				// if it is not tenant-scoped.
 				_ = objectHelper.IsTenantScoped()
 			}
+		})
+
+		It("Reports project-scoped types correctly", func() {
+			Expect(helper.Lookup("cluster").IsProjectScoped()).To(BeTrue())
+			Expect(helper.Lookup("computeinstance").IsProjectScoped()).To(BeTrue())
+			Expect(helper.Lookup("project").IsProjectScoped()).To(BeTrue())
+			Expect(helper.Lookup("serviceaccount").IsProjectScoped()).To(BeFalse())
+		})
+
+		It("Reports platform-scoped types as not project-scoped", func() {
+			// Platform-scoped types share the same Metadata message but are not
+			// conceptually project-scoped. Marking them project-scoped would inject
+			// a project filter on List that hides these resources when a project is
+			// selected.
+			Expect(helper.Lookup("tenant").IsProjectScoped()).To(BeFalse())
+			Expect(helper.Lookup("role").IsProjectScoped()).To(BeFalse())
+		})
+
+		It("Sets and gets project on cluster metadata", func() {
+			objectHelper := helper.Lookup("cluster")
+			Expect(objectHelper).ToNot(BeNil())
+			object := publicv1.Cluster_builder{
+				Metadata: publicv1.Metadata_builder{
+					Name: "my-cluster",
+				}.Build(),
+			}.Build()
+			objectHelper.SetProject(object, "team-a.frontend")
+			Expect(objectHelper.GetProject(object)).To(Equal("team-a.frontend"))
+		})
+
+		It("Returns empty project when none is set", func() {
+			objectHelper := helper.Lookup("cluster")
+			Expect(objectHelper).ToNot(BeNil())
+			object := publicv1.Cluster_builder{
+				Metadata: publicv1.Metadata_builder{
+					Name: "my-cluster",
+				}.Build(),
+			}.Build()
+			Expect(objectHelper.GetProject(object)).To(BeEmpty())
 		})
 
 		It("Does not inject tenant filter when no tenant in context", func() {
@@ -787,6 +953,189 @@ var _ = Describe("Reflection helper", func() {
 			})
 			Expect(err).ToNot(HaveOccurred())
 			Expect(capturedFilter).To(Equal(`this.metadata.name == "my-cluster"`))
+		})
+
+		It("Injects project filter into list when project is in context", func() {
+			var capturedFilter string
+			publicv1.RegisterClustersServer(server.Registrar(), &testing.ClustersServerFuncs{
+				ListFunc: func(ctx context.Context, request *publicv1.ClustersListRequest,
+				) (response *publicv1.ClustersListResponse, err error) {
+					capturedFilter = request.GetFilter()
+					response = publicv1.ClustersListResponse_builder{
+						Size:  0,
+						Total: 0,
+					}.Build()
+					return
+				},
+			})
+			server.Start()
+
+			projectHelper, err := NewHelper().
+				SetLogger(logger).
+				SetConnection(connection).
+				AddPackage(packages.PublicV1, 1).
+				SetTenantFunc(testTenantFromContext).
+				SetProjectFunc(testProjectFromContext).
+				Build()
+			Expect(err).ToNot(HaveOccurred())
+
+			projectCtx := testProjectIntoContext(ctx, "team-a")
+			objectHelper := projectHelper.Lookup("cluster")
+			Expect(objectHelper).ToNot(BeNil())
+			_, err = objectHelper.List(projectCtx, ListOptions{})
+			Expect(err).ToNot(HaveOccurred())
+			Expect(capturedFilter).To(Equal(`this.metadata.project == "team-a"`))
+		})
+
+		It("Combines project filter with user-provided filter", func() {
+			var capturedFilter string
+			publicv1.RegisterClustersServer(server.Registrar(), &testing.ClustersServerFuncs{
+				ListFunc: func(ctx context.Context, request *publicv1.ClustersListRequest,
+				) (response *publicv1.ClustersListResponse, err error) {
+					capturedFilter = request.GetFilter()
+					response = publicv1.ClustersListResponse_builder{
+						Size:  0,
+						Total: 0,
+					}.Build()
+					return
+				},
+			})
+			server.Start()
+
+			projectHelper, err := NewHelper().
+				SetLogger(logger).
+				SetConnection(connection).
+				AddPackage(packages.PublicV1, 1).
+				SetTenantFunc(testTenantFromContext).
+				SetProjectFunc(testProjectFromContext).
+				Build()
+			Expect(err).ToNot(HaveOccurred())
+
+			projectCtx := testProjectIntoContext(ctx, "team-a")
+			objectHelper := projectHelper.Lookup("cluster")
+			Expect(objectHelper).ToNot(BeNil())
+			_, err = objectHelper.List(projectCtx, ListOptions{
+				Filter: `this.metadata.name == "my-cluster"`,
+			})
+			Expect(err).ToNot(HaveOccurred())
+			Expect(capturedFilter).To(Equal(
+				`this.metadata.project == "team-a" && (this.metadata.name == "my-cluster")`,
+			))
+		})
+
+		It("Combines tenant and project filters together", func() {
+			var capturedFilter string
+			publicv1.RegisterClustersServer(server.Registrar(), &testing.ClustersServerFuncs{
+				ListFunc: func(ctx context.Context, request *publicv1.ClustersListRequest,
+				) (response *publicv1.ClustersListResponse, err error) {
+					capturedFilter = request.GetFilter()
+					response = publicv1.ClustersListResponse_builder{
+						Size:  0,
+						Total: 0,
+					}.Build()
+					return
+				},
+			})
+			server.Start()
+
+			projectHelper, err := NewHelper().
+				SetLogger(logger).
+				SetConnection(connection).
+				AddPackage(packages.PublicV1, 1).
+				SetTenantFunc(testTenantFromContext).
+				SetProjectFunc(testProjectFromContext).
+				Build()
+			Expect(err).ToNot(HaveOccurred())
+
+			bothCtx := testTenantIntoContext(ctx, "acme")
+			bothCtx = testProjectIntoContext(bothCtx, "team-a")
+			objectHelper := projectHelper.Lookup("cluster")
+			Expect(objectHelper).ToNot(BeNil())
+			_, err = objectHelper.List(bothCtx, ListOptions{})
+			Expect(err).ToNot(HaveOccurred())
+			Expect(capturedFilter).To(Equal(
+				`this.metadata.project == "team-a" && (this.metadata.tenant == "acme")`,
+			))
+		})
+
+		It("Does not inject project filter when no project in context", func() {
+			var capturedFilter string
+			publicv1.RegisterClustersServer(server.Registrar(), &testing.ClustersServerFuncs{
+				ListFunc: func(ctx context.Context, request *publicv1.ClustersListRequest,
+				) (response *publicv1.ClustersListResponse, err error) {
+					capturedFilter = request.GetFilter()
+					response = publicv1.ClustersListResponse_builder{
+						Size:  0,
+						Total: 0,
+					}.Build()
+					return
+				},
+			})
+			server.Start()
+
+			projectHelper, err := NewHelper().
+				SetLogger(logger).
+				SetConnection(connection).
+				AddPackage(packages.PublicV1, 1).
+				SetTenantFunc(testTenantFromContext).
+				SetProjectFunc(testProjectFromContext).
+				Build()
+			Expect(err).ToNot(HaveOccurred())
+
+			objectHelper := projectHelper.Lookup("cluster")
+			Expect(objectHelper).ToNot(BeNil())
+			_, err = objectHelper.List(ctx, ListOptions{
+				Filter: `this.metadata.name == "my-cluster"`,
+			})
+			Expect(err).ToNot(HaveOccurred())
+			Expect(capturedFilter).To(Equal(`this.metadata.name == "my-cluster"`))
+		})
+
+		It("Properly escapes project names containing special characters in CEL filter", func() {
+			var capturedFilter string
+			publicv1.RegisterClustersServer(server.Registrar(), &testing.ClustersServerFuncs{
+				ListFunc: func(ctx context.Context, request *publicv1.ClustersListRequest,
+				) (response *publicv1.ClustersListResponse, err error) {
+					capturedFilter = request.GetFilter()
+					response = publicv1.ClustersListResponse_builder{
+						Size:  0,
+						Total: 0,
+					}.Build()
+					return
+				},
+			})
+			server.Start()
+
+			projectHelper, err := NewHelper().
+				SetLogger(logger).
+				SetConnection(connection).
+				AddPackage(packages.PublicV1, 1).
+				SetTenantFunc(testTenantFromContext).
+				SetProjectFunc(testProjectFromContext).
+				Build()
+			Expect(err).ToNot(HaveOccurred())
+
+			projectCtx := testProjectIntoContext(ctx, `proj"with"quotes`)
+			objectHelper := projectHelper.Lookup("cluster")
+			Expect(objectHelper).ToNot(BeNil())
+			_, err = objectHelper.List(projectCtx, ListOptions{})
+			Expect(err).ToNot(HaveOccurred())
+			Expect(capturedFilter).To(Equal(`this.metadata.project == "proj\"with\"quotes"`))
+		})
+
+		It("Excludes all platform-scoped types from project scoping", func() {
+			// Platform-scoped types must NOT be marked project-scoped, even though
+			// they share the Metadata message that has a project field. If they were
+			// project-scoped, List would inject a project filter that hides these
+			// resources when a project is selected.
+			for _, name := range helper.Names() {
+				objectHelper := helper.Lookup(name)
+				Expect(objectHelper).ToNot(BeNil(), "Lookup failed for %s", name)
+				if !objectHelper.IsTenantScoped() {
+					Expect(objectHelper.IsProjectScoped()).To(BeFalse(),
+						"platform-scoped type %q must not be project-scoped", name)
+				}
+			}
 		})
 
 		It("Sorts types according to package order when adding packages", func() {

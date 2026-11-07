@@ -1,20 +1,25 @@
 package driver
 
 import (
+	"bytes"
 	"context"
 	"net"
+	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	csi "github.com/container-storage-interface/spec/lib/go/csi"
-	"github.com/osac-project/osac/osac-csi-driver/pkg/fulfillment"
-	"github.com/osac-project/osac/osac-csi-driver/pkg/proxy"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"k8s.io/klog/v2"
+
+	"github.com/osac-project/osac/osac-csi-driver/pkg/fulfillment"
+	"github.com/osac-project/osac/osac-csi-driver/pkg/proxy"
 )
 
 // --- mocks ---
@@ -184,6 +189,9 @@ func TestCreateVolume_Success(t *testing.T) {
 			if params.Tenant != "my-tenant" {
 				t.Errorf("expected tenant 'my-tenant', got %q", params.Tenant)
 			}
+			if params.Project != "my-project" {
+				t.Errorf("expected project 'my-project', got %q", params.Project)
+			}
 			if params.ClusterID != "test-cluster" {
 				t.Errorf("expected clusterID 'test-cluster', got %q", params.ClusterID)
 			}
@@ -201,7 +209,7 @@ func TestCreateVolume_Success(t *testing.T) {
 	resp, err := cs.CreateVolume(context.Background(), &csi.CreateVolumeRequest{
 		Name:               "pvc-123",
 		VolumeCapabilities: defaultCaps(),
-		Parameters:         map[string]string{"tier": "gold", "tenant": "my-tenant"},
+		Parameters:         map[string]string{"tier": "gold", "tenant": "my-tenant", "project": "my-project"},
 		CapacityRange:      &csi.CapacityRange{RequiredBytes: 1024},
 	})
 	if err != nil {
@@ -222,11 +230,114 @@ func TestCreateVolume_Success(t *testing.T) {
 	}
 }
 
+func TestCreateVolume_LVMSTopology(t *testing.T) {
+	vol := availableVolume("vol-lvms", "pvc-lvms")
+	vol.Provider = "lvms"
+	vol.Backend = "lvms"
+	vol.VendorVolumeID = "topolvm-volume-1"
+
+	var gotParams fulfillment.CreateVolumeParams
+	vc := &mockVolumeClient{
+		createVolumeFn: func(_ context.Context, params fulfillment.CreateVolumeParams) (*fulfillment.VolumeInfo, error) {
+			gotParams = params
+			return vol, nil
+		},
+	}
+	cs := newTestController(vc)
+
+	resp, err := cs.CreateVolume(context.Background(), &csi.CreateVolumeRequest{
+		Name:               "pvc-lvms",
+		VolumeCapabilities: defaultCaps(),
+		Parameters:         map[string]string{"osac.tier": "local"},
+		AccessibilityRequirements: &csi.TopologyRequirement{
+			Preferred: []*csi.Topology{
+				{Segments: map[string]string{"osac.io/node": "worker-1"}},
+				{Segments: map[string]string{"osac.io/node": "worker-2"}},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if gotParams.Topology == nil {
+		t.Fatal("expected preferred topology to reach fulfillment")
+	}
+	if got := gotParams.Topology.Segments["osac.io/node"]; got != "worker-1" {
+		t.Errorf("topology node = %q, want worker-1", got)
+	}
+
+	accessible := resp.GetVolume().GetAccessibleTopology()
+	if len(accessible) != 1 {
+		t.Fatalf("expected one accessible topology, got %d", len(accessible))
+	}
+	if got := accessible[0].GetSegments()["osac.io/node"]; got != "worker-1" {
+		t.Errorf("accessible topology node = %q, want worker-1", got)
+	}
+	if got := resp.GetVolume().GetVolumeContext()["osac.topolvm-volume-id"]; got != "topolvm-volume-1" {
+		t.Errorf("osac.topolvm-volume-id = %q, want topolvm-volume-1", got)
+	}
+}
+
+func TestCreateVolume_VASTHasNoAccessibleTopology(t *testing.T) {
+	vol := availableVolume("vol-vast", "pvc-vast")
+	vol.Provider = "vast"
+	vol.Backend = "vast"
+
+	vc := &mockVolumeClient{
+		createVolumeFn: func(_ context.Context, _ fulfillment.CreateVolumeParams) (*fulfillment.VolumeInfo, error) {
+			return vol, nil
+		},
+	}
+	cs := newTestController(vc)
+
+	resp, err := cs.CreateVolume(context.Background(), &csi.CreateVolumeRequest{
+		Name:               "pvc-vast",
+		VolumeCapabilities: defaultCaps(),
+		Parameters:         map[string]string{"osac.tier": "network"},
+		AccessibilityRequirements: &csi.TopologyRequirement{
+			Preferred: []*csi.Topology{{Segments: map[string]string{"osac.io/node": "worker-1"}}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := resp.GetVolume().GetAccessibleTopology(); len(got) != 0 {
+		t.Errorf("expected no accessible topology for VAST, got %#v", got)
+	}
+	if _, ok := resp.GetVolume().GetVolumeContext()["osac.topolvm-volume-id"]; ok {
+		t.Error("did not expect osac.topolvm-volume-id for VAST")
+	}
+}
+
+func TestCreateVolume_LVMSMissingTopologyReturnsFailedPrecondition(t *testing.T) {
+	vol := availableVolume("vol-lvms", "pvc-lvms")
+	vol.Provider = "lvms"
+	vol.Backend = "lvms"
+
+	vc := &mockVolumeClient{
+		createVolumeFn: func(_ context.Context, _ fulfillment.CreateVolumeParams) (*fulfillment.VolumeInfo, error) {
+			return vol, nil
+		},
+	}
+	cs := newTestController(vc)
+
+	_, err := cs.CreateVolume(context.Background(), &csi.CreateVolumeRequest{
+		Name:               "pvc-lvms",
+		VolumeCapabilities: defaultCaps(),
+		Parameters:         map[string]string{"osac.tier": "local"},
+	})
+	assertCode(t, err, codes.FailedPrecondition)
+}
+
 func TestCreateVolume_DefaultTenant(t *testing.T) {
 	vc := &mockVolumeClient{
 		createVolumeFn: func(_ context.Context, params fulfillment.CreateVolumeParams) (*fulfillment.VolumeInfo, error) {
 			if params.Tenant != "default" {
 				t.Errorf("expected default tenant, got %q", params.Tenant)
+			}
+			if params.Project != "" {
+				t.Errorf("expected default project, got %q", params.Project)
 			}
 			return availableVolume("vol-1", "pvc-123"), nil
 		},
@@ -292,6 +403,12 @@ func TestCreateVolume_AlreadyExists(t *testing.T) {
 			if params.NameFilter != "pvc-123" {
 				t.Errorf("expected name filter 'pvc-123', got %q", params.NameFilter)
 			}
+			if params.TenantFilter == nil || *params.TenantFilter != "default" {
+				t.Errorf("expected default tenant filter, got %v", params.TenantFilter)
+			}
+			if params.ProjectFilter == nil || *params.ProjectFilter != "" {
+				t.Errorf("expected default project filter, got %v", params.ProjectFilter)
+			}
 			return []*fulfillment.VolumeInfo{vol}, nil
 		},
 	}
@@ -308,6 +425,31 @@ func TestCreateVolume_AlreadyExists(t *testing.T) {
 	if resp.Volume.VolumeId != "existing-vol" {
 		t.Errorf("expected volume ID 'existing-vol', got %q", resp.Volume.VolumeId)
 	}
+}
+
+func TestCreateVolume_AlreadyExistsWithDifferentProject(t *testing.T) {
+	vc := &mockVolumeClient{
+		createVolumeFn: func(_ context.Context, _ fulfillment.CreateVolumeParams) (*fulfillment.VolumeInfo, error) {
+			return nil, status.Error(codes.AlreadyExists, "already exists")
+		},
+		listVolumesFn: func(_ context.Context, params fulfillment.ListVolumesParams) ([]*fulfillment.VolumeInfo, error) {
+			if params.TenantFilter == nil || *params.TenantFilter != "my-tenant" {
+				t.Errorf("expected tenant filter 'my-tenant', got %v", params.TenantFilter)
+			}
+			if params.ProjectFilter == nil || *params.ProjectFilter != "project-a" {
+				t.Errorf("expected project filter 'project-a', got %v", params.ProjectFilter)
+			}
+			return nil, nil
+		},
+	}
+	cs := newTestController(vc)
+
+	_, err := cs.CreateVolume(context.Background(), &csi.CreateVolumeRequest{
+		Name:               "pvc-123",
+		VolumeCapabilities: defaultCaps(),
+		Parameters:         map[string]string{"tier": "gold", "tenant": "my-tenant", "project": "project-a"},
+	})
+	assertCode(t, err, codes.AlreadyExists)
 }
 
 func TestCreateVolume_AlreadyExistsDifferentCapacity(t *testing.T) {
@@ -375,10 +517,18 @@ func TestCreateVolume_AlreadyExistsNotFoundViaList(t *testing.T) {
 		VolumeCapabilities: defaultCaps(),
 		Parameters:         map[string]string{"tier": "gold"},
 	})
-	assertCode(t, err, codes.Internal)
+	assertCode(t, err, codes.AlreadyExists)
 }
 
 func TestCreateVolume_ErrorState(t *testing.T) {
+	var logOutput bytes.Buffer
+	klog.SetOutput(&logOutput)
+	klog.LogToStderr(false)
+	defer func() {
+		klog.SetOutput(os.Stderr)
+		klog.LogToStderr(true)
+	}()
+
 	vc := &mockVolumeClient{
 		createVolumeFn: func(_ context.Context, _ fulfillment.CreateVolumeParams) (*fulfillment.VolumeInfo, error) {
 			return &fulfillment.VolumeInfo{
@@ -388,8 +538,9 @@ func TestCreateVolume_ErrorState(t *testing.T) {
 		},
 		getVolumeFn: func(_ context.Context, volumeID string) (*fulfillment.VolumeInfo, error) {
 			return &fulfillment.VolumeInfo{
-				ID:    volumeID,
-				State: fulfillment.VolumeStateError,
+				ID:      volumeID,
+				State:   fulfillment.VolumeStateError,
+				Message: "insufficient vg1 capacity",
 			}, nil
 		},
 	}
@@ -401,6 +552,13 @@ func TestCreateVolume_ErrorState(t *testing.T) {
 		Parameters:         map[string]string{"tier": "gold"},
 	})
 	assertCode(t, err, codes.Internal)
+	if got, want := status.Convert(err).Message(), "volume provisioning failed"; got != want {
+		t.Fatalf("error message = %q, want %q", got, want)
+	}
+	klog.Flush()
+	if strings.Contains(logOutput.String(), "insufficient vg1 capacity") {
+		t.Fatalf("CSI driver logged the detailed fulfillment message: %s", logOutput.String())
+	}
 }
 
 func TestCreateVolume_ContextCancelled(t *testing.T) {
@@ -476,6 +634,9 @@ func TestCreateVolume_CreateError(t *testing.T) {
 		Parameters:         map[string]string{"tier": "gold"},
 	})
 	assertCode(t, err, codes.Unavailable)
+	if got, want := status.Convert(err).Message(), "volume provisioning failed"; got != want {
+		t.Fatalf("error message = %q, want %q", got, want)
+	}
 }
 
 // --- DeleteVolume tests ---
@@ -733,14 +894,14 @@ func TestControllerPublishVolume_Error(t *testing.T) {
 // needs no controller-side attach, so publish is a no-op and no vendor
 // controller is dialed.
 func TestControllerPublishVolume_NoAttachBackendIsNoop(t *testing.T) {
-	cs := newTestControllerWithVendor(&mockVolumeClient{}, map[string]string{"local": noAttachEndpoint})
+	cs := newTestControllerWithVendor(&mockVolumeClient{}, map[string]string{"lvms": noAttachEndpoint})
 
 	resp, err := cs.ControllerPublishVolume(context.Background(), &csi.ControllerPublishVolumeRequest{
 		VolumeId:         "vol-1",
 		NodeId:           "node-1",
 		VolumeCapability: singleCap(),
 		VolumeContext: map[string]string{
-			"osac.backend":   "local",
+			"osac.backend":   "lvms",
 			"osac.volume-id": "vendor-vol-1",
 		},
 	})
@@ -894,11 +1055,11 @@ func TestControllerUnpublishVolume_NoAttachBackendIsNoop(t *testing.T) {
 	vc := &mockVolumeClient{
 		getVolumeFn: func(_ context.Context, volumeID string) (*fulfillment.VolumeInfo, error) {
 			vol := availableVolume(volumeID, "pvc-123")
-			vol.Backend = "local"
+			vol.Backend = "lvms"
 			return vol, nil
 		},
 	}
-	cs := newTestControllerWithVendor(vc, map[string]string{"local": noAttachEndpoint})
+	cs := newTestControllerWithVendor(vc, map[string]string{"lvms": noAttachEndpoint})
 
 	_, err := cs.ControllerUnpublishVolume(context.Background(), &csi.ControllerUnpublishVolumeRequest{
 		VolumeId: "vol-1",

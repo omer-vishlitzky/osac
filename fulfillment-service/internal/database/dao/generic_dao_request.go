@@ -61,6 +61,51 @@ type archiveArgs struct {
 	data            []byte
 }
 
+type storedObject struct {
+	id              string
+	name            string
+	creationTs      time.Time
+	deletionTs      time.Time
+	finalizers      []string
+	creator         string
+	tenant          string
+	project         string
+	labelsData      []byte
+	annotationsData []byte
+	version         int32
+	data            []byte
+}
+
+func (r *request[O]) objectFromRow(row storedObject) (O, error) {
+	var zero O
+	object := r.cloneObject(r.newObject())
+	if err := r.unmarshalData(row.data, object); err != nil {
+		return zero, err
+	}
+	labels, err := r.unmarshalMap(row.labelsData)
+	if err != nil {
+		return zero, err
+	}
+	annotations, err := r.unmarshalMap(row.annotationsData)
+	if err != nil {
+		return zero, err
+	}
+	r.setMetadata(object, r.makeMetadata(makeMetadataArgs{
+		creationTs:  row.creationTs,
+		deletionTs:  row.deletionTs,
+		finalizers:  row.finalizers,
+		creator:     row.creator,
+		tenant:      row.tenant,
+		project:     row.project,
+		name:        row.name,
+		labels:      labels,
+		annotations: annotations,
+		version:     row.version,
+	}))
+	object.SetId(row.id)
+	return object, nil
+}
+
 // archive moves a deleted object to the archived table and removes it from the main table.
 func (r *request[O]) archive(ctx context.Context, args archiveArgs) error {
 	sql := fmt.Sprintf(
@@ -218,10 +263,25 @@ func (r *request[O]) addVisibilityFilter(ctx context.Context) (result bool, err 
 	//
 	// Tenants that are not visible are omitted. If the user can see tenant 'b' but not tenant 'a', the filter will
 	// not mention tenant 'a'.
+	//
+	// If the user has tenant admin access to a tenant, project-level filtering is skipped for that tenant.
 	tenants := r.visibility.VisibleTenants()
 	filters := 0
 	fmt.Fprintf(&r.sql.filter, "(")
 	for _, tenant := range tenants {
+		if filters > 0 {
+			fmt.Fprintf(&r.sql.filter, " or ")
+		}
+		index := len(r.sql.params) + 1
+		r.sql.params = append(r.sql.params, tenant)
+
+		// If the user has tenant admin access, skip project-level filtering for this tenant
+		if r.visibility.HasTenantAdminAccess(tenant) {
+			fmt.Fprintf(&r.sql.filter, "tenant = $%d", index)
+			filters++
+			continue
+		}
+
 		projects := r.visibility.VisibleProjects(tenant)
 		named := make([]string, 0, len(projects))
 		for _, project := range projects {
@@ -229,20 +289,45 @@ func (r *request[O]) addVisibilityFilter(ctx context.Context) (result bool, err 
 				named = append(named, project)
 			}
 		}
-		if filters > 0 {
-			fmt.Fprintf(&r.sql.filter, " or ")
-		}
-		index := len(r.sql.params) + 1
-		r.sql.params = append(r.sql.params, tenant)
 		if len(named) == 0 {
-			fmt.Fprintf(&r.sql.filter, "tenant = $%d and project = ''", index)
+			// For the Projects table, match the default project by name=''.
+			// For all other tables, match resources in the default project by project=''.
+			// The distinction is necessary because:
+			// - Projects table: name column stores the project's own name
+			// - Other tables: name column stores the resource's metadata.name
+			if r.dao.table == "projects" {
+				// Only match the default project (name='') for this tenant.
+				// Without the name filter, this would incorrectly match all top-level projects
+				// (which have an empty parent project='').
+				fmt.Fprintf(&r.sql.filter, "tenant = $%d and name = ''", index)
+			} else {
+				// Match resources that belong to the default project (project='')
+				fmt.Fprintf(&r.sql.filter, "tenant = $%d and project = ''", index)
+			}
 		} else {
 			r.sql.params = append(r.sql.params, named)
-			fmt.Fprintf(
-				&r.sql.filter,
-				"tenant = $%d and (project = '' or $%d::ltree[] @> project)",
-				index, index+1,
-			)
+			// Match rows where:
+			// For Projects table:
+			//   1. name='' (the default project)
+			//   2. name is in the visible projects list (exact match)
+			//   3. project (parent) is covered by visible projects (descendant match via ltree)
+			// For other tables:
+			//   1. project='' (resources in the default project)
+			//   2. project is in the visible projects list (exact match)
+			//   3. project is a descendant of visible projects (descendant match via ltree)
+			if r.dao.table == "projects" {
+				fmt.Fprintf(
+					&r.sql.filter,
+					"tenant = $%d and (name = '' or name = any($%d) or $%d::ltree[] @> project)",
+					index, index+1, index+1,
+				)
+			} else {
+				fmt.Fprintf(
+					&r.sql.filter,
+					"tenant = $%d and (project = '' or project = any($%d) or $%d::ltree[] @> project)",
+					index, index+1, index+1,
+				)
+			}
 		}
 		filters++
 	}
@@ -324,17 +409,6 @@ func (r *request[O]) unmarshalData(data []byte, object O) error {
 	return r.dao.unmarshalOptions.Unmarshal(data, object)
 }
 
-func (r *request[O]) fireEvent(ctx context.Context, event Event) error {
-	event.Table = r.dao.table
-	for _, eventCallback := range r.dao.eventCallbacks {
-		err := eventCallback(ctx, event)
-		if err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 func (r *request[O]) getFinalizers(metadata metadataIface) []string {
 	if metadata == nil {
 		return []string{}
@@ -385,7 +459,7 @@ func (r *request[O]) queryRow(ctx context.Context, op opType, sql string, args .
 			"Running SQL operation",
 			slog.String("type", string(op)),
 			slog.String("sql", r.cleanSQL(sql)),
-			slog.Any("parameters", args),
+			slog.Int("parameter_count", len(args)),
 		)
 	}
 	return r.tx.QueryRow(ctx, sql, args...)
@@ -400,7 +474,7 @@ func (r *request[O]) query(ctx context.Context, op opType, sql string, args ...a
 			"Running SQL operation",
 			slog.String("type", string(op)),
 			slog.String("sql", r.cleanSQL(sql)),
-			slog.Any("parameters", args),
+			slog.Int("parameter_count", len(args)),
 		)
 	}
 	rows, err = r.tx.Query(ctx, sql, args...)
@@ -416,7 +490,7 @@ func (r *request[O]) exec(ctx context.Context, op opType, sql string, args ...an
 			"Running SQL operation",
 			slog.String("type", string(op)),
 			slog.String("sql", r.cleanSQL(sql)),
-			slog.Any("parameters", args),
+			slog.Int("parameter_count", len(args)),
 		)
 	}
 	start := time.Now()

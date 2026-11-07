@@ -13,16 +13,14 @@ language governing permissions and limitations under the License.
 
 package securitygroup
 
-//go:generate mockgen -source=../../api/osac/private/v1/security_groups_service_grpc.pb.go -destination=security_groups_client_mock.go -package=securitygroup SecurityGroupsClient
+//go:generate mockgen -destination=security_groups_client_mock.go -package=securitygroup github.com/osac-project/osac/proto/gen/osac/private/v1 SecurityGroupsClient
 
 import (
 	"context"
 	"errors"
 	"fmt"
 	"log/slog"
-	"math/rand/v2"
 	"slices"
-	"strings"
 
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/proto"
@@ -31,12 +29,11 @@ import (
 
 	osacv1alpha1 "github.com/osac-project/osac/osac-operator/api/v1alpha1"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/controllers"
 	"github.com/osac-project/osac/fulfillment-service/internal/controllers/finalizers"
-	"github.com/osac-project/osac/fulfillment-service/internal/kubernetes/annotations"
 	"github.com/osac-project/osac/fulfillment-service/internal/kubernetes/labels"
 	"github.com/osac-project/osac/fulfillment-service/internal/masks"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
 // objectPrefix is the prefix that will be used in the `generateName` field of the resources created in the hub.
@@ -51,9 +48,9 @@ type FunctionBuilder struct {
 
 type function struct {
 	logger               *slog.Logger
-	hubCache             controllers.HubCache
 	securityGroupsClient privatev1.SecurityGroupsClient
-	hubsClient           privatev1.HubsClient
+	networkingHubReader  controllers.NetworkingHubReader
+	hubCache             controllers.HubCache
 	maskCalculator       *masks.Calculator
 }
 
@@ -104,11 +101,19 @@ func (b *FunctionBuilder) Build() (result controllers.ReconcilerFunction[*privat
 		return
 	}
 
+	networkingHubReader, err := controllers.NewNetworkingHubReader().
+		SetNetworkClassesClient(privatev1.NewNetworkClassesClient(b.connection)).
+		SetHubCache(b.hubCache).
+		Build()
+	if err != nil {
+		return nil, err
+	}
+
 	// Create and populate the object:
 	object := &function{
 		logger:               b.logger,
 		securityGroupsClient: privatev1.NewSecurityGroupsClient(b.connection),
-		hubsClient:           privatev1.NewHubsClient(b.connection),
+		networkingHubReader:  networkingHubReader,
 		hubCache:             b.hubCache,
 		maskCalculator:       masks.NewCalculator().Build(),
 	}
@@ -128,6 +133,16 @@ func (r *function) run(ctx context.Context, securityGroup *privatev1.SecurityGro
 	} else {
 		err = t.update(ctx)
 	}
+	var hubResolutionRetryErr error
+	if err != nil {
+		handled, retry := controllers.HandleResourceNetworkingHubResolutionError(err, t.setPending, t.setFailed)
+		if handled {
+			if retry {
+				hubResolutionRetryErr = err
+			}
+			err = nil
+		}
+	}
 	if err != nil {
 		return err
 	}
@@ -141,7 +156,10 @@ func (r *function) run(ctx context.Context, securityGroup *privatev1.SecurityGro
 		UpdateMask: updateMask,
 	}.Build())
 
-	return err
+	if err != nil {
+		return err
+	}
+	return hubResolutionRetryErr
 }
 
 func (t *task) update(ctx context.Context) error {
@@ -159,9 +177,21 @@ func (t *task) update(ctx context.Context) error {
 		return err
 	}
 
-	// Select a hub:
+	// Resolve the hub. The CR is created (or adopted by its label) before status.hub is written, at the end of the
+	// run, so a restart between the two never creates a second CR.
 	if err := t.selectHub(ctx); err != nil {
 		return err
+	}
+	t.securityGroup.GetStatus().SetHub(t.hubId)
+
+	// Prepare the changes to the spec:
+	// Stored objects may predate the IPv4-only contract. Reject any legacy or incomplete
+	// rule before it can be converted into an empty CIDR, which downstream providers may
+	// interpret as an unrestricted 0.0.0.0/0 rule.
+	spec, err := t.buildSpec()
+	if err != nil {
+		t.setFailed(err)
+		return nil
 	}
 
 	// Get the K8S object:
@@ -170,21 +200,16 @@ func (t *task) update(ctx context.Context) error {
 		return err
 	}
 
-	// Prepare the changes to the spec:
-	spec := t.buildSpec()
-
 	// Create or update the Kubernetes object:
 	if object == nil {
 		object := &osacv1alpha1.SecurityGroup{
 			ObjectMeta: metav1.ObjectMeta{
 				Namespace:    t.hubNamespace,
 				GenerateName: objectPrefix,
-				Labels: map[string]string{
+				Labels: labels.MergeTrustedExternalIPLifecycleLabels(map[string]string{
 					labels.SecurityGroupUuid: t.securityGroup.GetId(),
-				},
-				Annotations: map[string]string{
-					annotations.Tenant: t.securityGroup.GetMetadata().GetTenant(),
-				},
+				}, t.securityGroup.GetMetadata().GetLabels(), t.securityGroup.GetMetadata().GetCreator() == "system"),
+				Annotations: controllers.AutomaticCRAnnotations(t.securityGroup.GetMetadata()),
 			},
 			Spec: spec,
 		}
@@ -233,12 +258,25 @@ func (t *task) validateTenant() error {
 }
 
 func (t *task) delete(ctx context.Context) (err error) {
-	if err = t.selectHub(ctx); err != nil {
-		if errors.Is(err, controllers.ErrHubNotFound) {
-			controllers.RemoveFinalizerOnDecommissionedHub(ctx, t.r.logger, t.hubId, "security_group_id", t.securityGroup.GetId(), t.removeFinalizer)
-			return nil
+	// Delete from the Hub where this resource was created. Older security groups do not
+	// have a stored Hub assignment, so use the canonical Hub as a best-effort fallback.
+	t.hubId = t.securityGroup.GetStatus().GetHub()
+	if t.hubId == "" {
+		if err = t.selectHub(ctx); err != nil {
+			if errors.Is(err, controllers.ErrHubNotFound) || errors.Is(err, controllers.ErrCanonicalHubNotFound) {
+				controllers.RemoveFinalizerOnDecommissionedHub(ctx, t.r.logger, t.hubId, "security_group_id", t.securityGroup.GetId(), t.removeFinalizer)
+				return nil
+			}
+			return
 		}
-		return
+	} else {
+		if err = t.getHub(ctx); err != nil {
+			if errors.Is(err, controllers.ErrHubNotFound) {
+				controllers.RemoveFinalizerOnDecommissionedHub(ctx, t.r.logger, t.hubId, "security_group_id", t.securityGroup.GetId(), t.removeFinalizer)
+				return nil
+			}
+			return
+		}
 	}
 
 	// Check if the K8S object still exists:
@@ -280,23 +318,27 @@ func (t *task) delete(ctx context.Context) (err error) {
 	}
 
 	// Don't remove finalizer — K8s object still exists with finalizers being processed.
-	return
+	return controllers.RequeueAfterKubernetesDeletion("security group")
 }
 
 func (t *task) selectHub(ctx context.Context) error {
-	response, err := t.r.hubsClient.List(ctx, privatev1.HubsListRequest_builder{}.Build())
+	resolution, err := controllers.ResolveResourceNetworkingHub(ctx, t.r.networkingHubReader, t.securityGroup.GetStatus().GetHub())
+	t.hubId = resolution.HubID
 	if err != nil {
 		return err
 	}
-	if len(response.Items) == 0 {
-		return errors.New("there are no hubs")
-	}
-	t.hubId = response.Items[rand.IntN(len(response.Items))].GetId()
 	t.r.logger.DebugContext(
 		ctx,
-		"Selected hub",
+		"Resolved canonical networking hub",
 		slog.String("id", t.hubId),
 	)
+	t.hubNamespace = resolution.Namespace
+	t.hubClient = resolution.Client
+	return nil
+}
+
+func (t *task) getHub(ctx context.Context) error {
+	t.hubId = t.securityGroup.GetStatus().GetHub()
 	hubEntry, err := t.r.hubCache.Get(ctx, t.hubId)
 	if err != nil {
 		return err
@@ -361,6 +403,14 @@ func (t *task) removeFinalizer() {
 	}
 }
 
+func (t *task) setPending(err error) {
+	if !t.securityGroup.HasStatus() {
+		t.securityGroup.SetStatus(&privatev1.SecurityGroupStatus{})
+	}
+	t.securityGroup.GetStatus().SetState(privatev1.SecurityGroupState_SECURITY_GROUP_STATE_PENDING)
+	t.securityGroup.GetStatus().SetMessage(err.Error())
+}
+
 func (t *task) setFailed(err error) {
 	if !t.securityGroup.HasStatus() {
 		t.securityGroup.SetStatus(&privatev1.SecurityGroupStatus{})
@@ -371,7 +421,7 @@ func (t *task) setFailed(err error) {
 
 // buildSpec constructs the spec for the Kubernetes SecurityGroup object based on the
 // security group from the database.
-func (t *task) buildSpec() osacv1alpha1.SecurityGroupSpec {
+func (t *task) buildSpec() (osacv1alpha1.SecurityGroupSpec, error) {
 	spec := osacv1alpha1.SecurityGroupSpec{
 		VirtualNetwork: controllers.RefKeyStr(t.securityGroup.GetSpec().GetVirtualNetwork()),
 	}
@@ -379,57 +429,35 @@ func (t *task) buildSpec() osacv1alpha1.SecurityGroupSpec {
 	// Add ingress rules if present:
 	ingressRules := t.securityGroup.GetSpec().GetIngress()
 	if len(ingressRules) > 0 {
-		spec.IngressRules = convertRules(ingressRules)
+		var err error
+		spec.IngressRules, err = convertRules(ingressRules, true)
+		if err != nil {
+			return spec, err
+		}
 	}
 
 	// Add egress rules if present:
 	egressRules := t.securityGroup.GetSpec().GetEgress()
 	if len(egressRules) > 0 {
-		spec.EgressRules = convertRules(egressRules)
+		var err error
+		spec.EgressRules, err = convertRules(egressRules, false)
+		if err != nil {
+			return spec, err
+		}
 	}
 
-	return spec
+	return spec, nil
 }
 
 // convertRules converts a slice of proto SecurityRule messages to a slice of typed
-// SecurityRule structs for the Kubernetes SecurityGroup object.
-func convertRules(rules []*privatev1.SecurityRule) []osacv1alpha1.SecurityRule {
-	result := make([]osacv1alpha1.SecurityRule, 0, len(rules))
-	for _, rule := range rules {
-		r := osacv1alpha1.SecurityRule{
-			Protocol: osacv1alpha1.SecurityGroupProtocol(protocolToString(rule.GetProtocol())),
-		}
-		if rule.HasPortFrom() {
-			portFrom := int32(rule.GetPortFrom())
-			r.PortFrom = &portFrom
-		}
-		if rule.HasPortTo() {
-			portTo := int32(rule.GetPortTo())
-			r.PortTo = &portTo
-		}
-		if rule.HasIpv4Cidr() {
-			r.SourceCIDR = rule.GetIpv4Cidr()
-		}
-		if rule.HasIpv6Cidr() {
-			r.DestinationCIDR = rule.GetIpv6Cidr()
-		}
-		result = append(result, r)
-	}
-	return result
+// SecurityRule structs for the Kubernetes SecurityGroup object. The proto has a
+// single IPv4 CIDR field whose meaning depends on direction: ingress is sourced
+// from the CIDR, while egress is destined for it.
+func convertRules(rules []*privatev1.SecurityRule, ingress bool) ([]osacv1alpha1.SecurityRule, error) {
+	return controllers.ConvertSecurityRules(rules, ingress)
 }
 
 // protocolToString converts a Protocol enum value to a lowercase string matching the K8s CR enum.
 func protocolToString(p privatev1.Protocol) string {
-	switch p {
-	case privatev1.Protocol_PROTOCOL_TCP:
-		return "tcp"
-	case privatev1.Protocol_PROTOCOL_UDP:
-		return "udp"
-	case privatev1.Protocol_PROTOCOL_ICMP:
-		return "icmp"
-	case privatev1.Protocol_PROTOCOL_ALL:
-		return "all"
-	default:
-		return strings.ToLower(p.String())
-	}
+	return controllers.ProtocolName(p)
 }

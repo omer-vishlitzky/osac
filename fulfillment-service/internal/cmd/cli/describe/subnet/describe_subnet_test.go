@@ -19,7 +19,7 @@ import (
 	. "github.com/onsi/ginkgo/v2/dsl/core"
 	. "github.com/onsi/gomega"
 
-	publicv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/public/v1"
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
 
 func formatSubnet(s *publicv1.Subnet) string {
@@ -30,6 +30,16 @@ func formatSubnet(s *publicv1.Subnet) string {
 
 var _ = Describe("Describe Subnet", func() {
 	Describe("Rendering tests", func() {
+		It("shows capability independently of READY", func() {
+			subnet := publicv1.Subnet_builder{Status: publicv1.SubnetStatus_builder{
+				State: publicv1.SubnetState_SUBNET_STATE_READY, ComputeInstanceSupported: new(false),
+				ComputeInstanceUnsupportedReason: "Fabric-only Subnet",
+			}.Build()}.Build()
+			output := formatSubnet(subnet)
+			Expect(output).To(MatchRegexp(`VM supported:\s+false`))
+			Expect(output).To(ContainSubstring("Fabric-only Subnet"))
+			Expect(output).To(ContainSubstring("READY"))
+		})
 		It("should display all fields when set", func() {
 			msg := "Subnet ready"
 			s := publicv1.Subnet_builder{
@@ -40,7 +50,6 @@ var _ = Describe("Describe Subnet", func() {
 				Spec: publicv1.SubnetSpec_builder{
 					VirtualNetwork: publicv1.VirtualNetworkLocalReference_builder{Id: "vnet-abc123"}.Build(),
 					Ipv4Cidr:       new("10.0.1.0/24"),
-					Ipv6Cidr:       new("2001:db8::/64"),
 				}.Build(),
 				Status: publicv1.SubnetStatus_builder{
 					State:   publicv1.SubnetState_SUBNET_STATE_READY,
@@ -53,7 +62,6 @@ var _ = Describe("Describe Subnet", func() {
 			Expect(output).To(ContainSubstring("example-subnet"))
 			Expect(output).To(ContainSubstring("vnet-abc123"))
 			Expect(output).To(ContainSubstring("10.0.1.0/24"))
-			Expect(output).To(ContainSubstring("2001:db8::/64"))
 			Expect(output).To(ContainSubstring("READY"))
 			Expect(output).To(ContainSubstring("Subnet ready"))
 		})
@@ -77,13 +85,12 @@ var _ = Describe("Describe Subnet", func() {
 				Id: "subnet-003",
 				Spec: publicv1.SubnetSpec_builder{
 					VirtualNetwork: publicv1.VirtualNetworkLocalReference_builder{Id: "vnet-abc123"}.Build(),
-					Ipv6Cidr:       new("2001:db8::/64"),
 				}.Build(),
 			}.Build()
 
 			output := formatSubnet(s)
 			Expect(output).To(MatchRegexp(`IPv4 CIDR:\s+-`))
-			Expect(output).To(ContainSubstring("2001:db8::/64"))
+			Expect(output).NotTo(ContainSubstring("IPv6"))
 		})
 
 		It("should strip SUBNET_STATE_ prefix from state", func() {
@@ -100,20 +107,6 @@ var _ = Describe("Describe Subnet", func() {
 			output := formatSubnet(s)
 			Expect(output).To(ContainSubstring("READY"))
 			Expect(output).NotTo(ContainSubstring("SUBNET_STATE_"))
-		})
-
-		It("should show '-' for IPv6 CIDR when not set", func() {
-			s := publicv1.Subnet_builder{
-				Id: "subnet-006",
-				Spec: publicv1.SubnetSpec_builder{
-					VirtualNetwork: publicv1.VirtualNetworkLocalReference_builder{Id: "vnet-abc123"}.Build(),
-					Ipv4Cidr:       new("10.0.1.0/24"),
-				}.Build(),
-			}.Build()
-
-			output := formatSubnet(s)
-			Expect(output).To(ContainSubstring("10.0.1.0/24"))
-			Expect(output).To(MatchRegexp(`IPv6 CIDR:\s+-`))
 		})
 
 		It("should show '-' for message when status has no message", func() {

@@ -23,11 +23,11 @@ import (
 	"github.com/spf13/cobra"
 	"google.golang.org/protobuf/proto"
 
-	publicv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/public/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/cmd/cli/lookup"
 	"github.com/osac-project/osac/fulfillment-service/internal/config"
 	"github.com/osac-project/osac/fulfillment-service/internal/logging"
 	"github.com/osac-project/osac/fulfillment-service/internal/terminal"
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
 
 // Cmd creates the command to describe a security group.
@@ -128,7 +128,7 @@ func renderRules(w io.Writer, label string, rules []*publicv1.SecurityRule) {
 
 	fmt.Fprintf(w, "%s:\n", label)
 	ruleWriter := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-	fmt.Fprintf(ruleWriter, "  PROTOCOL\tPORT-FROM\tPORT-TO\tIPV4-CIDR\tIPV6-CIDR\n")
+	fmt.Fprintf(ruleWriter, "  PROTOCOL\tPORT-FROM\tPORT-TO\tIPV4-CIDR\n")
 	for _, rule := range rules {
 		protocol := strings.ToLower(strings.TrimPrefix(rule.GetProtocol().String(), "PROTOCOL_"))
 
@@ -147,12 +147,7 @@ func renderRules(w io.Writer, label string, rules []*publicv1.SecurityRule) {
 			ipv4Cidr = v
 		}
 
-		ipv6Cidr := "-"
-		if v := rule.GetIpv6Cidr(); v != "" {
-			ipv6Cidr = v
-		}
-
-		fmt.Fprintf(ruleWriter, "  %s\t%s\t%s\t%s\t%s\n", protocol, portFrom, portTo, ipv4Cidr, ipv6Cidr)
+		fmt.Fprintf(ruleWriter, "  %s\t%s\t%s\t%s\n", protocol, portFrom, portTo, ipv4Cidr)
 	}
 	ruleWriter.Flush()
 }

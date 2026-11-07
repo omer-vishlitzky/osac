@@ -29,9 +29,9 @@ columns:
 - header: IPV4-CIDR
   value: "has(this.spec.ipv4_cidr)? this.spec.ipv4_cidr: '-'"
 
-- header: IPV6-CIDR
-  value: "has(this.spec.ipv6_cidr)? this.spec.ipv6_cidr: '-'"
-
 - header: STATE
   value: this.status.state
   type: osac.public.v1.SubnetState
+
+- header: VM-SUPPORTED
+  value: "has(this.status.compute_instance_supported)? string(this.status.compute_instance_supported): 'unknown'"

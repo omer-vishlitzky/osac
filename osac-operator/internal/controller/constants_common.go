@@ -29,26 +29,9 @@ const (
 	// osacPrefix is the prefix used to identify osac resources
 	osacPrefix string = "osac.openshift.io"
 
-	// osacImplementationStrategyAnnotation is the annotation key for the network implementation strategy.
-	// This is derived from the NetworkClass and used by AAP playbooks to select the appropriate role
-	// (e.g., "cudn" -> cudn_virtual_network or cudn_subnet role).
-	osacImplementationStrategyAnnotation = osacPrefix + "/implementation-strategy"
-
-	// osacK8sImplementationStrategyAnnotation persists the k8s manager's name for
-	// dual-dispatch resources (currently only Subnet). Set in handleUpdate alongside
-	// osacImplementationStrategyAnnotation (which always holds the fabric manager's
-	// name for these resources) whenever the resolved DispatchPlan has a k8s target,
-	// and read directly by handleDeprovisioning to build the k8s DeprovisionTarget
-	// without re-resolving the DispatchPlan against a parent VirtualNetwork that may
-	// already be gone at delete time.
-	osacK8sImplementationStrategyAnnotation = osacPrefix + "/k8s-implementation-strategy"
-
-	// osacExternalIPPoolNameAnnotation is the K8s resource name of the parent ExternalIPPool.
-	// set on ExternalIP CRs
-	osacExternalIPPoolNameAnnotation = osacPrefix + "/externalippool-name"
-
-	conditionReasonConfigurationApplied  = "ConfigurationApplied"
-	conditionMessageConfigurationApplied = "Controller has processed the current spec"
-
 	labelValueTrue = "true"
+
+	// fieldName and fieldAddress are keys of unstructured objects and job inputs.
+	fieldName    = "name"
+	fieldAddress = "address"
 )

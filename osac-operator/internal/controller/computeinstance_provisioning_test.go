@@ -18,15 +18,12 @@ package controller
 
 import (
 	"context"
-	"errors"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	mcmanager "sigs.k8s.io/multicluster-runtime/pkg/manager"
 
 	osacv1alpha1 "github.com/osac-project/osac/osac-operator/api/v1alpha1"
 	"github.com/osac-project/osac/osac-operator/pkg/provisioning"
@@ -34,11 +31,14 @@ import (
 
 // mockProvisioningProvider implements the ProvisioningProvider interface for testing
 type mockProvisioningProvider struct {
-	name                     string
-	triggerProvisionFunc     func(ctx context.Context, resource client.Object) (*provisioning.ProvisionResult, error)
-	getProvisionStatusFunc   func(ctx context.Context, resource client.Object, jobID string) (provisioning.ProvisionStatus, error)
-	triggerDeprovisionFunc   func(ctx context.Context, resource client.Object, provisionJobs []osacv1alpha1.JobStatus) (*provisioning.DeprovisionResult, error)
-	getDeprovisionStatusFunc func(ctx context.Context, resource client.Object, jobID string) (provisioning.ProvisionStatus, error)
+	name                                  string
+	triggerProvisionFunc                  func(ctx context.Context, resource client.Object) (*provisioning.ProvisionResult, error)
+	getProvisionStatusFunc                func(ctx context.Context, resource client.Object, jobID string) (provisioning.ProvisionStatus, error)
+	getProvisionStatusWithExtraVarsFunc   func(ctx context.Context, resource client.Object, jobID string) (provisioning.ProvisionStatusWithExtraVars, error)
+	triggerDeprovisionFunc                func(ctx context.Context, resource client.Object, provisionJobs []osacv1alpha1.JobStatus) (*provisioning.DeprovisionResult, error)
+	getDeprovisionStatusFunc              func(ctx context.Context, resource client.Object, jobID string) (provisioning.ProvisionStatus, error)
+	getDeprovisionStatusWithExtraVarsFunc func(ctx context.Context, resource client.Object, jobID string) (provisioning.ProvisionStatusWithExtraVars, error)
+	findJobByLaunchIDFunc                 func(ctx context.Context, resource client.Object, jobType osacv1alpha1.JobType, launchID string) (provisioning.ProvisionStatus, bool, error)
 }
 
 func (m *mockProvisioningProvider) TriggerProvision(ctx context.Context, resource client.Object) (*provisioning.ProvisionResult, error) {
@@ -63,6 +63,16 @@ func (m *mockProvisioningProvider) GetProvisionStatus(ctx context.Context, resou
 	}, nil
 }
 
+func (m *mockProvisioningProvider) GetProvisionStatusWithExtraVars(
+	ctx context.Context, resource client.Object, jobID string,
+) (provisioning.ProvisionStatusWithExtraVars, error) {
+	if m.getProvisionStatusWithExtraVarsFunc != nil {
+		return m.getProvisionStatusWithExtraVarsFunc(ctx, resource, jobID)
+	}
+	status, err := m.GetProvisionStatus(ctx, resource, jobID)
+	return provisioning.ProvisionStatusWithExtraVars{ProvisionStatus: status}, err
+}
+
 func (m *mockProvisioningProvider) TriggerDeprovision(ctx context.Context, resource client.Object, provisionJobs []osacv1alpha1.JobStatus) (*provisioning.DeprovisionResult, error) {
 	if m.triggerDeprovisionFunc != nil {
 		return m.triggerDeprovisionFunc(ctx, resource, provisionJobs)
@@ -85,6 +95,28 @@ func (m *mockProvisioningProvider) GetDeprovisionStatus(ctx context.Context, res
 	}, nil
 }
 
+func (m *mockProvisioningProvider) GetDeprovisionStatusWithExtraVars(
+	ctx context.Context, resource client.Object, jobID string,
+) (provisioning.ProvisionStatusWithExtraVars, error) {
+	if m.getDeprovisionStatusWithExtraVarsFunc != nil {
+		return m.getDeprovisionStatusWithExtraVarsFunc(ctx, resource, jobID)
+	}
+	status, err := m.GetDeprovisionStatus(ctx, resource, jobID)
+	return provisioning.ProvisionStatusWithExtraVars{ProvisionStatus: status}, err
+}
+
+func (m *mockProvisioningProvider) FindJobByLaunchID(
+	ctx context.Context,
+	resource client.Object,
+	jobType osacv1alpha1.JobType,
+	launchID string,
+) (provisioning.ProvisionStatus, bool, error) {
+	if m.findJobByLaunchIDFunc != nil {
+		return m.findJobByLaunchIDFunc(ctx, resource, jobType, launchID)
+	}
+	return provisioning.ProvisionStatus{}, false, nil
+}
+
 func (m *mockProvisioningProvider) Name() string {
 	if m.name != "" {
 		return m.name
@@ -92,432 +124,173 @@ func (m *mockProvisioningProvider) Name() string {
 	return "mock"
 }
 
-var _ = Describe("ComputeInstance Provisioning", func() {
-	var reconciler *ComputeInstanceReconciler
-	var instance *osacv1alpha1.ComputeInstance
-	ctx := context.Background()
-
-	BeforeEach(func() {
-		instance = &osacv1alpha1.ComputeInstance{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      "test-instance",
-				Namespace: "default",
-			},
-			Spec:   newTestComputeInstanceSpec("test_template"),
-			Status: osacv1alpha1.ComputeInstanceStatus{DesiredConfigVersion: "initial"},
+var _ = Describe("ComputeInstance running config", func() {
+	runningInstance := func(phase osacv1alpha1.ComputeInstancePhaseType, applied, restartRequired bool) *osacv1alpha1.ComputeInstance {
+		conditionStatus := func(value bool) metav1.ConditionStatus {
+			if value {
+				return metav1.ConditionTrue
+			}
+			return metav1.ConditionFalse
 		}
-		reconciler = NewComputeInstanceReconciler(testMcManager, "", "", "", &mockProvisioningProvider{}, 30*time.Second, provisioning.DefaultMaxJobHistory, mcmanager.LocalCluster)
+		return &osacv1alpha1.ComputeInstance{
+			ObjectMeta: metav1.ObjectMeta{
+				Labels: map[string]string{osacComputeInstanceTypeNameLabel: "standard-8-32"},
+			},
+			Status: osacv1alpha1.ComputeInstanceStatus{
+				Phase:                phase,
+				DesiredConfigVersion: "v2",
+				RunningConfigVersion: "v1",
+				RunningConfigSince:   &metav1.Time{Time: time.Now().Add(-time.Hour).UTC()},
+				Conditions: []metav1.Condition{
+					{
+						Type:               string(osacv1alpha1.ComputeInstanceConditionConfigurationApplied),
+						Status:             conditionStatus(applied),
+						Reason:             "AsExpected",
+						LastTransitionTime: metav1.NewTime(time.Now().UTC()),
+					},
+					{
+						Type:               string(osacv1alpha1.ComputeInstanceConditionRestartRequired),
+						Status:             conditionStatus(restartRequired),
+						Reason:             "AsExpected",
+						LastTransitionTime: metav1.NewTime(time.Now().UTC()),
+					},
+				},
+			},
+		}
+	}
+
+	It("records the version and time when the new configuration is running", func() {
+		instance := runningInstance(osacv1alpha1.ComputeInstancePhaseRunning, true, false)
+		previous := instance.Status.RunningConfigSince.Time
+
+		recordRunningConfig(instance)
+
+		Expect(instance.Status.RunningConfigVersion).To(Equal("v2"))
+		Expect(instance.Status.RunningConfigSince).ToNot(BeNil())
+		Expect(instance.Status.RunningConfigSince.Time).ToNot(Equal(previous))
 	})
 
-	Context("handleProvisioning", func() {
-		It("should skip when latest job succeeded with matching ConfigVersion", func() {
-			instance.Status.DesiredConfigVersion = "v1"
-			instance.Status.ProvisioningJobs = []osacv1alpha1.JobStatus{
-				{
-					JobID:         "completed-job",
-					Type:          osacv1alpha1.JobTypeProvision,
-					Timestamp:     metav1.NewTime(time.Now().UTC()),
-					State:         osacv1alpha1.JobStateSucceeded,
-					ConfigVersion: "v1",
-				},
-			}
+	It("does not re-record while the running configuration is unchanged", func() {
+		instance := runningInstance(osacv1alpha1.ComputeInstancePhaseRunning, true, false)
+		recordRunningConfig(instance)
+		recorded := instance.Status.RunningConfigSince.Time
 
-			result, err := reconciler.handleProvisioning(ctx, instance)
-			Expect(err).NotTo(HaveOccurred())
-			Expect(result.RequeueAfter).To(BeZero())
-		})
+		recordRunningConfig(instance)
 
-		It("should trigger provision when no job ID exists", func() {
-			provider := &mockProvisioningProvider{
-				triggerProvisionFunc: func(ctx context.Context, resource client.Object) (*provisioning.ProvisionResult, error) {
-					return &provisioning.ProvisionResult{
-						JobID:        "new-job-123",
-						InitialState: osacv1alpha1.JobStatePending,
-						Message:      "Provisioning job triggered",
-					}, nil
-				},
-			}
-			reconciler.ProvisioningProvider = provider
-
-			result, err := reconciler.handleProvisioning(ctx, instance)
-			Expect(err).NotTo(HaveOccurred())
-			Expect(result.RequeueAfter).To(Equal(30 * time.Second))
-			latestProvisionJob := provisioning.FindLatestJobByType(instance.Status.ProvisioningJobs, osacv1alpha1.JobTypeProvision)
-			Expect(latestProvisionJob).NotTo(BeNil())
-			Expect(latestProvisionJob.JobID).To(Equal("new-job-123"))
-			Expect(latestProvisionJob.State).To(Equal(osacv1alpha1.JobStatePending))
-			Expect(latestProvisionJob.Message).To(Equal("Provisioning job triggered"))
-		})
-
-		It("should handle rate limit error on trigger", func() {
-			provider := &mockProvisioningProvider{
-				triggerProvisionFunc: func(ctx context.Context, resource client.Object) (*provisioning.ProvisionResult, error) {
-					return nil, &provisioning.RateLimitError{RetryAfter: 5 * time.Second}
-				},
-			}
-			reconciler.ProvisioningProvider = provider
-
-			result, err := reconciler.handleProvisioning(ctx, instance)
-			Expect(err).NotTo(HaveOccurred())
-			Expect(result.RequeueAfter).To(Equal(5 * time.Second))
-			// Rate limit error should not create a job
-			latestProvisionJob := provisioning.FindLatestJobByType(instance.Status.ProvisioningJobs, osacv1alpha1.JobTypeProvision)
-			Expect(latestProvisionJob).To(BeNil())
-		})
-
-		It("should propagate trigger error", func() {
-			provider := &mockProvisioningProvider{
-				triggerProvisionFunc: func(ctx context.Context, resource client.Object) (*provisioning.ProvisionResult, error) {
-					return nil, errors.New("trigger failed")
-				},
-			}
-			reconciler.ProvisioningProvider = provider
-
-			_, err := reconciler.handleProvisioning(ctx, instance)
-			Expect(err).To(HaveOccurred())
-			Expect(err.Error()).To(ContainSubstring("trigger failed"))
-		})
-
-		It("should poll for status when job ID exists and job is running", func() {
-			instance.Status.ProvisioningJobs = []osacv1alpha1.JobStatus{
-				{
-					JobID:     "existing-job-456",
-					Type:      osacv1alpha1.JobTypeProvision,
-					Timestamp: metav1.NewTime(time.Now().UTC()),
-					State:     osacv1alpha1.JobStatePending,
-				},
-			}
-			provider := &mockProvisioningProvider{
-				getProvisionStatusFunc: func(ctx context.Context, resource client.Object, jobID string) (provisioning.ProvisionStatus, error) {
-					Expect(jobID).To(Equal("existing-job-456"))
-					return provisioning.ProvisionStatus{
-						JobID:   jobID,
-						State:   osacv1alpha1.JobStateRunning,
-						Message: "Job is running",
-					}, nil
-				},
-			}
-			reconciler.ProvisioningProvider = provider
-
-			result, err := reconciler.handleProvisioning(ctx, instance)
-			Expect(err).NotTo(HaveOccurred())
-			Expect(result.RequeueAfter).To(Equal(30 * time.Second))
-			latestProvisionJob := provisioning.FindLatestJobByType(instance.Status.ProvisioningJobs, osacv1alpha1.JobTypeProvision)
-			Expect(latestProvisionJob).NotTo(BeNil())
-			Expect(latestProvisionJob.State).To(Equal(osacv1alpha1.JobStateRunning))
-			Expect(latestProvisionJob.Message).To(Equal("Job is running"))
-		})
-
-		It("should complete when job succeeds", func() {
-			instance.Status.ProvisioningJobs = []osacv1alpha1.JobStatus{
-				{
-					JobID:     "successful-job-789",
-					Type:      osacv1alpha1.JobTypeProvision,
-					Timestamp: metav1.NewTime(time.Now().UTC()),
-					State:     osacv1alpha1.JobStatePending,
-				},
-			}
-			provider := &mockProvisioningProvider{
-				getProvisionStatusFunc: func(ctx context.Context, resource client.Object, jobID string) (provisioning.ProvisionStatus, error) {
-					return provisioning.ProvisionStatus{
-						JobID:             jobID,
-						State:             osacv1alpha1.JobStateSucceeded,
-						Message:           "Job completed",
-						ReconciledVersion: "v1.2.3",
-					}, nil
-				},
-			}
-			reconciler.ProvisioningProvider = provider
-
-			result, err := reconciler.handleProvisioning(ctx, instance)
-			Expect(err).NotTo(HaveOccurred())
-			Expect(result.RequeueAfter).To(BeZero())
-			latestProvisionJob := provisioning.FindLatestJobByType(instance.Status.ProvisioningJobs, osacv1alpha1.JobTypeProvision)
-			Expect(latestProvisionJob).NotTo(BeNil())
-			Expect(latestProvisionJob.State).To(Equal(osacv1alpha1.JobStateSucceeded))
-		})
-
-		It("should set phase to Failed when job fails and no VM exists (first-time provisioning)", func() {
-			instance.Status.ProvisioningJobs = []osacv1alpha1.JobStatus{
-				{
-					JobID:     "failed-job-999",
-					Type:      osacv1alpha1.JobTypeProvision,
-					Timestamp: metav1.NewTime(time.Now().UTC()),
-					State:     osacv1alpha1.JobStatePending,
-				},
-			}
-			provider := &mockProvisioningProvider{
-				getProvisionStatusFunc: func(ctx context.Context, resource client.Object, jobID string) (provisioning.ProvisionStatus, error) {
-					return provisioning.ProvisionStatus{
-						JobID:        jobID,
-						State:        osacv1alpha1.JobStateFailed,
-						Message:      "Job failed",
-						ErrorDetails: "Playbook execution failed",
-					}, nil
-				},
-			}
-			reconciler.ProvisioningProvider = provider
-
-			result, err := reconciler.handleProvisioning(ctx, instance)
-			Expect(err).NotTo(HaveOccurred())
-			Expect(result.RequeueAfter).To(BeZero())
-			latestProvisionJob := provisioning.FindLatestJobByType(instance.Status.ProvisioningJobs, osacv1alpha1.JobTypeProvision)
-			Expect(latestProvisionJob).NotTo(BeNil())
-			Expect(latestProvisionJob.State).To(Equal(osacv1alpha1.JobStateFailed))
-			Expect(latestProvisionJob.Message).To(ContainSubstring("Job failed"))
-			Expect(latestProvisionJob.Message).To(ContainSubstring("Playbook execution failed"))
-			// No VM exists yet: phase is set to Failed to signal the provisioning failure.
-			Expect(instance.Status.Phase).To(Equal(osacv1alpha1.ComputeInstancePhaseFailed))
-		})
-
-		It("should set Provisioned=False condition with error message when job fails", func() {
-			instance.Status.ProvisioningJobs = []osacv1alpha1.JobStatus{
-				{
-					JobID:     "failed-job-cond",
-					Type:      osacv1alpha1.JobTypeProvision,
-					Timestamp: metav1.NewTime(time.Now().UTC()),
-					State:     osacv1alpha1.JobStateRunning,
-				},
-			}
-			provider := &mockProvisioningProvider{
-				getProvisionStatusFunc: func(_ context.Context, _ client.Object, jobID string) (provisioning.ProvisionStatus, error) {
-					return provisioning.ProvisionStatus{
-						JobID:        jobID,
-						State:        osacv1alpha1.JobStateFailed,
-						Message:      "Job failed",
-						ErrorDetails: "Ansible traceback: role xyz failed",
-					}, nil
-				},
-			}
-			reconciler.ProvisioningProvider = provider
-
-			_, err := reconciler.handleProvisioning(ctx, instance)
-			Expect(err).NotTo(HaveOccurred())
-
-			cond := apimeta.FindStatusCondition(instance.Status.Conditions, string(osacv1alpha1.ComputeInstanceConditionProvisioned))
-			Expect(cond).NotTo(BeNil())
-			Expect(cond.Status).To(Equal(metav1.ConditionFalse))
-			Expect(cond.Reason).To(Equal(osacv1alpha1.ReasonProvisioningFailed))
-			Expect(cond.Message).To(ContainSubstring("Ansible traceback"))
-		})
-
-		It("should preserve existing phase when job fails and VM already exists (re-provisioning)", func() {
-			// The VM exists from a previous successful provision. A re-provision job
-			// was triggered (e.g. spec changed) and has now failed. The phase should
-			// stay as reported by KubeVirt rather than being overridden to Failed,
-			// since the VM itself is still operational.
-			instance.Status.Phase = osacv1alpha1.ComputeInstancePhaseRunning
-			instance.Status.VirtualMachineReference = &osacv1alpha1.VirtualMachineReferenceType{
-				Namespace:                  "tenant-ns",
-				KubeVirtVirtualMachineName: "existing-vm",
-			}
-			instance.Status.ProvisioningJobs = []osacv1alpha1.JobStatus{
-				{
-					JobID:     "reprovision-failed-job",
-					Type:      osacv1alpha1.JobTypeProvision,
-					Timestamp: metav1.NewTime(time.Now().UTC()),
-					State:     osacv1alpha1.JobStatePending,
-				},
-			}
-			provider := &mockProvisioningProvider{
-				getProvisionStatusFunc: func(ctx context.Context, resource client.Object, jobID string) (provisioning.ProvisionStatus, error) {
-					return provisioning.ProvisionStatus{
-						JobID:        jobID,
-						State:        osacv1alpha1.JobStateFailed,
-						Message:      "Re-provisioning job failed",
-						ErrorDetails: "Playbook execution failed",
-					}, nil
-				},
-			}
-			reconciler.ProvisioningProvider = provider
-
-			result, err := reconciler.handleProvisioning(ctx, instance)
-			Expect(err).NotTo(HaveOccurred())
-			Expect(result.RequeueAfter).To(BeZero())
-			latestProvisionJob := provisioning.FindLatestJobByType(instance.Status.ProvisioningJobs, osacv1alpha1.JobTypeProvision)
-			Expect(latestProvisionJob).NotTo(BeNil())
-			Expect(latestProvisionJob.State).To(Equal(osacv1alpha1.JobStateFailed))
-			// VM still exists: phase is preserved as Running (driven by KubeVirt).
-			// The failed job is visible in status.jobs.
-			Expect(instance.Status.Phase).To(Equal(osacv1alpha1.ComputeInstancePhaseRunning))
-		})
-
-		It("should handle status check error", func() {
-			instance.Status.ProvisioningJobs = []osacv1alpha1.JobStatus{
-				{
-					JobID:     "error-job-111",
-					Type:      osacv1alpha1.JobTypeProvision,
-					Timestamp: metav1.NewTime(time.Now().UTC()),
-					State:     osacv1alpha1.JobStatePending,
-				},
-			}
-			provider := &mockProvisioningProvider{
-				getProvisionStatusFunc: func(ctx context.Context, resource client.Object, jobID string) (provisioning.ProvisionStatus, error) {
-					return provisioning.ProvisionStatus{}, errors.New("API unavailable")
-				},
-			}
-			reconciler.ProvisioningProvider = provider
-
-			result, err := reconciler.handleProvisioning(ctx, instance)
-			Expect(err).NotTo(HaveOccurred())
-			Expect(result.RequeueAfter).To(Equal(30 * time.Second))
-			latestProvisionJob := provisioning.FindLatestJobByType(instance.Status.ProvisioningJobs, osacv1alpha1.JobTypeProvision)
-			Expect(latestProvisionJob).NotTo(BeNil())
-			Expect(latestProvisionJob.Message).To(ContainSubstring("Failed to get job status"))
-		})
-
-		It("should skip provisioning when provider is nil", func() {
-			reconciler.ProvisioningProvider = nil
-
-			result, err := reconciler.handleProvisioning(ctx, instance)
-			Expect(err).NotTo(HaveOccurred())
-			Expect(result.RequeueAfter).To(BeZero())
-			latestProvisionJob := provisioning.FindLatestJobByType(instance.Status.ProvisioningJobs, osacv1alpha1.JobTypeProvision)
-			Expect(latestProvisionJob).To(BeNil())
-		})
-
-		It("should skip provisioning when ManagementStateManual annotation is set", func() {
-			instance.Annotations = map[string]string{
-				osacComputeInstanceManagementStateAnnotation: ManagementStateManual,
-			}
-			provider := &mockProvisioningProvider{}
-			reconciler.ProvisioningProvider = provider
-
-			result, err := reconciler.handleProvisioning(ctx, instance)
-			Expect(err).NotTo(HaveOccurred())
-			Expect(result.RequeueAfter).To(BeZero())
-			latestProvisionJob := provisioning.FindLatestJobByType(instance.Status.ProvisioningJobs, osacv1alpha1.JobTypeProvision)
-			Expect(latestProvisionJob).To(BeNil())
-		})
+		Expect(instance.Status.RunningConfigVersion).To(Equal("v2"))
+		Expect(instance.Status.RunningConfigSince.Time).To(Equal(recorded))
 	})
 
-	Context("handleDeprovisioning", func() {
-		BeforeEach(func() {
-			// Add finalizer for deletion tests
-			instance.Finalizers = []string{osacComputeInstanceFinalizer}
-		})
+	It("does not record before the new configuration is applied", func() {
+		instance := runningInstance(osacv1alpha1.ComputeInstancePhaseRunning, false, false)
 
-		It("should trigger deprovision when no job ID exists", func() {
-			provider := &mockProvisioningProvider{
-				triggerDeprovisionFunc: func(ctx context.Context, resource client.Object, _ []osacv1alpha1.JobStatus) (*provisioning.DeprovisionResult, error) {
-					return &provisioning.DeprovisionResult{
-						Action:                 provisioning.DeprovisionTriggered,
-						JobID:                  "deprovision-job-123",
-						BlockDeletionOnFailure: true,
-					}, nil
-				},
-			}
-			reconciler.ProvisioningProvider = provider
+		recordRunningConfig(instance)
 
-			_, err := reconciler.handleDeprovisioning(ctx, instance)
-			Expect(err).NotTo(HaveOccurred())
-			latestDeprovisionJob := provisioning.FindLatestJobByType(instance.Status.ProvisioningJobs, osacv1alpha1.JobTypeDeprovision)
-			Expect(latestDeprovisionJob).NotTo(BeNil())
-			Expect(latestDeprovisionJob.JobID).To(Equal("deprovision-job-123"))
-			Expect(latestDeprovisionJob.State).To(Equal(osacv1alpha1.JobStatePending))
-			Expect(latestDeprovisionJob.Message).To(Equal("Deprovision job triggered"))
-			Expect(latestDeprovisionJob.BlockDeletionOnFailure).To(BeTrue())
-		})
+		Expect(instance.Status.RunningConfigVersion).To(Equal("v1"))
+	})
 
-		It("should handle rate limit error on deprovision trigger", func() {
-			provider := &mockProvisioningProvider{
-				triggerDeprovisionFunc: func(ctx context.Context, resource client.Object, _ []osacv1alpha1.JobStatus) (*provisioning.DeprovisionResult, error) {
-					return nil, &provisioning.RateLimitError{RetryAfter: 10 * time.Second}
-				},
-			}
-			reconciler.ProvisioningProvider = provider
+	It("clears the recorded observation while a restart is still required", func() {
+		instance := runningInstance(osacv1alpha1.ComputeInstancePhaseRunning, true, true)
 
-			result, err := reconciler.handleDeprovisioning(ctx, instance)
-			Expect(err).NotTo(HaveOccurred())
-			Expect(result.RequeueAfter).To(Equal(10 * time.Second))
-			latestDeprovisionJob := provisioning.FindLatestJobByType(instance.Status.ProvisioningJobs, osacv1alpha1.JobTypeDeprovision)
-			Expect(latestDeprovisionJob).To(BeNil())
-		})
+		recordRunningConfig(instance)
 
-		It("should propagate deprovision trigger error", func() {
-			provider := &mockProvisioningProvider{
-				triggerDeprovisionFunc: func(ctx context.Context, resource client.Object, _ []osacv1alpha1.JobStatus) (*provisioning.DeprovisionResult, error) {
-					return nil, errors.New("deprovision trigger failed")
-				},
-			}
-			reconciler.ProvisioningProvider = provider
+		Expect(instance.Status.RunningConfigVersion).To(Equal(""))
+		Expect(instance.Status.RunningInstanceTypeName).To(Equal(""))
+		Expect(instance.Status.RunningConfigSince).To(BeNil())
+	})
 
-			_, err := reconciler.handleDeprovisioning(ctx, instance)
-			Expect(err).To(HaveOccurred())
-			Expect(err.Error()).To(ContainSubstring("deprovision trigger failed"))
-		})
+	It("invalidates the observation when a restart becomes required after it", func() {
+		instance := runningInstance(osacv1alpha1.ComputeInstancePhaseRunning, true, false)
+		instance.Labels = map[string]string{osacComputeInstanceTypeNameLabel: "standard-8-32"}
+		recordRunningConfig(instance)
+		Expect(instance.Status.RunningConfigVersion).To(Equal("v2"))
+		recorded := instance.Status.RunningConfigSince.Time
 
-		It("should poll for status when deprovision job is running", func() {
-			instance.Status.ProvisioningJobs = []osacv1alpha1.JobStatus{
-				{
-					JobID:     "deprovision-running-456",
-					Type:      osacv1alpha1.JobTypeDeprovision,
-					Timestamp: metav1.NewTime(time.Now().UTC()),
-					State:     osacv1alpha1.JobStatePending,
-				},
-			}
-			provider := &mockProvisioningProvider{
-				getDeprovisionStatusFunc: func(ctx context.Context, resource client.Object, jobID string) (provisioning.ProvisionStatus, error) {
-					Expect(jobID).To(Equal("deprovision-running-456"))
-					return provisioning.ProvisionStatus{
-						JobID:   jobID,
-						State:   osacv1alpha1.JobStateRunning,
-						Message: "Deprovisioning in progress",
-					}, nil
-				},
-			}
-			reconciler.ProvisioningProvider = provider
+		// KubeVirt reports RestartRequired asynchronously, so the requirement can
+		// surface only after the observation was recorded.
+		instance.SetStatusCondition(
+			osacv1alpha1.ComputeInstanceConditionRestartRequired,
+			metav1.ConditionTrue, "", osacv1alpha1.ReasonAsExpected)
 
-			result, err := reconciler.handleDeprovisioning(ctx, instance)
-			Expect(err).NotTo(HaveOccurred())
-			Expect(result.RequeueAfter).To(Equal(30 * time.Second))
-			latestDeprovisionJob := provisioning.FindLatestJobByType(instance.Status.ProvisioningJobs, osacv1alpha1.JobTypeDeprovision)
-			Expect(latestDeprovisionJob).NotTo(BeNil())
-			Expect(latestDeprovisionJob.State).To(Equal(osacv1alpha1.JobStateRunning))
-			Expect(latestDeprovisionJob.Message).To(Equal("Deprovisioning in progress"))
-			// Finalizer should still be present while job is running
-			Expect(instance.Finalizers).To(ContainElement(osacComputeInstanceFinalizer))
-		})
+		recordRunningConfig(instance)
 
-		It("should handle deprovision status check error", func() {
-			instance.Status.ProvisioningJobs = []osacv1alpha1.JobStatus{
-				{
-					JobID:     "deprovision-error-222",
-					Type:      osacv1alpha1.JobTypeDeprovision,
-					Timestamp: metav1.NewTime(time.Now().UTC()),
-					State:     osacv1alpha1.JobStatePending,
-				},
-			}
-			provider := &mockProvisioningProvider{
-				getDeprovisionStatusFunc: func(ctx context.Context, resource client.Object, jobID string) (provisioning.ProvisionStatus, error) {
-					return provisioning.ProvisionStatus{}, errors.New("status check failed")
-				},
-			}
-			reconciler.ProvisioningProvider = provider
+		Expect(instance.Status.RunningConfigVersion).To(Equal(""))
+		Expect(instance.Status.RunningInstanceTypeName).To(Equal(""))
+		Expect(instance.Status.RunningConfigSince).To(BeNil())
 
-			result, err := reconciler.handleDeprovisioning(ctx, instance)
-			Expect(err).NotTo(HaveOccurred())
-			Expect(result.RequeueAfter).To(Equal(30 * time.Second))
-			latestDeprovisionJob := provisioning.FindLatestJobByType(instance.Status.ProvisioningJobs, osacv1alpha1.JobTypeDeprovision)
-			Expect(latestDeprovisionJob).NotTo(BeNil())
-			Expect(latestDeprovisionJob.Message).To(ContainSubstring("Failed to get deprovision status"))
-		})
+		// Once the restart completes, the configuration is observed running again and
+		// re-recorded, so the new configuration bills from after the restart.
+		instance.SetStatusCondition(
+			osacv1alpha1.ComputeInstanceConditionRestartRequired,
+			metav1.ConditionFalse, "", osacv1alpha1.ReasonAsExpected)
 
-		It("should skip deprovisioning when ManagementStateManual annotation is set", func() {
-			instance.Annotations = map[string]string{
-				osacComputeInstanceManagementStateAnnotation: ManagementStateManual,
-			}
-			provider := &mockProvisioningProvider{
-				name: "aap",
-			}
-			reconciler.ProvisioningProvider = provider
+		recordRunningConfig(instance)
 
-			result, err := reconciler.handleDeprovisioning(ctx, instance)
-			Expect(err).NotTo(HaveOccurred())
-			// Should return immediately without triggering deprovision
-			Expect(result.RequeueAfter).To(BeZero())
-			latestDeprovisionJob := provisioning.FindLatestJobByType(instance.Status.ProvisioningJobs, osacv1alpha1.JobTypeDeprovision)
-			Expect(latestDeprovisionJob).To(BeNil())
-		})
+		Expect(instance.Status.RunningConfigVersion).To(Equal("v2"))
+		Expect(instance.Status.RunningInstanceTypeName).To(Equal("standard-8-32"))
+		Expect(instance.Status.RunningConfigSince).ToNot(BeNil())
+		Expect(instance.Status.RunningConfigSince.Time).ToNot(Equal(recorded))
+	})
+
+	It("moves the stamp when the instance type name changes with identical resources", func() {
+		// The config version hashes the resolved resources, so a resize between two
+		// types with identical cores and memory keeps the version; the type name is
+		// part of the running-config identity so the stamp still moves and the new
+		// type bills from the observation.
+		instance := runningInstance(osacv1alpha1.ComputeInstancePhaseRunning, true, false)
+		instance.Labels = map[string]string{osacComputeInstanceTypeNameLabel: "standard-8-32"}
+		recordRunningConfig(instance)
+		recorded := instance.Status.RunningConfigSince.Time
+		Expect(instance.Status.RunningInstanceTypeName).To(Equal("standard-8-32"))
+
+		instance.Labels[osacComputeInstanceTypeNameLabel] = "standard-8-32-flavored"
+
+		recordRunningConfig(instance)
+
+		Expect(instance.Status.RunningConfigVersion).To(Equal("v2"))
+		Expect(instance.Status.RunningInstanceTypeName).To(Equal("standard-8-32-flavored"))
+		Expect(instance.Status.RunningConfigSince.Time).ToNot(Equal(recorded))
+	})
+
+	It("does not record while the instance is not running", func() {
+		instance := runningInstance(osacv1alpha1.ComputeInstancePhaseStarting, true, false)
+
+		recordRunningConfig(instance)
+
+		Expect(instance.Status.RunningConfigVersion).To(Equal("v1"))
+	})
+})
+
+var _ = Describe("ComputeInstance phase transition time", func() {
+	It("stamps the time when the phase changes", func() {
+		instance := &osacv1alpha1.ComputeInstance{Status: osacv1alpha1.ComputeInstanceStatus{
+			Phase: osacv1alpha1.ComputeInstancePhaseStarting,
+		}}
+
+		setComputeInstancePhase(&instance.Status, osacv1alpha1.ComputeInstancePhaseRunning)
+
+		Expect(instance.Status.Phase).To(Equal(osacv1alpha1.ComputeInstancePhaseRunning))
+		Expect(instance.Status.PhaseTransitionTime).NotTo(BeNil())
+	})
+
+	It("stamps the first phase of a new instance", func() {
+		instance := &osacv1alpha1.ComputeInstance{}
+
+		setComputeInstancePhase(&instance.Status, osacv1alpha1.ComputeInstancePhaseStarting)
+
+		Expect(instance.Status.Phase).To(Equal(osacv1alpha1.ComputeInstancePhaseStarting))
+		Expect(instance.Status.PhaseTransitionTime).NotTo(BeNil())
+	})
+
+	It("keeps the time while the phase is unchanged", func() {
+		stamped := metav1.NewTime(time.Now().Add(-time.Hour).UTC())
+		instance := &osacv1alpha1.ComputeInstance{Status: osacv1alpha1.ComputeInstanceStatus{
+			Phase:               osacv1alpha1.ComputeInstancePhaseRunning,
+			PhaseTransitionTime: &stamped,
+		}}
+
+		setComputeInstancePhase(&instance.Status, osacv1alpha1.ComputeInstancePhaseRunning)
+
+		Expect(instance.Status.PhaseTransitionTime.Time).To(Equal(stamped.Time))
 	})
 })

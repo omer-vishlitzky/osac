@@ -15,7 +15,6 @@ package idp
 
 import (
 	"context"
-	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -28,6 +27,8 @@ import (
 
 	"github.com/osac-project/osac/fulfillment-service/internal/apiclient"
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
+	"github.com/osac-project/osac/fulfillment-service/internal/tlsconfig"
+	"github.com/osac-project/osac/fulfillment-service/internal/trust"
 )
 
 // Client is a Keycloak admin client for managing identity provider resources.
@@ -37,8 +38,10 @@ import (
 // - OSAC organizations map to Keycloak Organizations within that realm
 // - Identity providers are realm-level resources assigned to organizations
 type Client struct {
-	logger     *slog.Logger
-	httpClient *apiclient.Client
+	logger                 *slog.Logger
+	httpClient             *apiclient.Client
+	registrationHTTPClient *http.Client
+	baseURL                string
 
 	// realmName is the single Keycloak realm that contains all OSAC organizations
 	realmName               string
@@ -50,7 +53,7 @@ type ClientBuilder struct {
 	logger      *slog.Logger
 	baseURL     string
 	tokenSource auth.TokenSource
-	caPool      *x509.CertPool
+	caPool      *trust.CertPool
 	httpClient  *http.Client
 	realmName   string
 }
@@ -87,7 +90,7 @@ func (b *ClientBuilder) SetRealmName(value string) *ClientBuilder {
 }
 
 // SetCaPool sets the CA certificate pool.
-func (b *ClientBuilder) SetCaPool(value *x509.CertPool) *ClientBuilder {
+func (b *ClientBuilder) SetCaPool(value *trust.CertPool) *ClientBuilder {
 	b.caPool = value
 	return b
 }
@@ -117,17 +120,20 @@ func (b *ClientBuilder) Build() (result *Client, err error) {
 	}
 
 	// Build the underlying HTTP client
+	registrationHTTPClient := b.httpClient
+	if registrationHTTPClient == nil {
+		transport := http.DefaultTransport.(*http.Transport).Clone()
+		transport.TLSClientConfig = tlsconfig.NewClientTLSConfig()
+		if b.caPool != nil {
+			transport.TLSClientConfig.RootCAs = b.caPool.Pool()
+		}
+		registrationHTTPClient = &http.Client{Transport: transport}
+	}
 	httpClientBuilder := apiclient.NewClient().
 		SetLogger(b.logger).
 		SetBaseURL(strings.TrimSuffix(b.baseURL, "/")).
-		SetTokenSource(b.tokenSource)
-
-	if b.caPool != nil {
-		httpClientBuilder = httpClientBuilder.SetCaPool(b.caPool)
-	}
-	if b.httpClient != nil {
-		httpClientBuilder = httpClientBuilder.SetHTTPClient(b.httpClient)
-	}
+		SetTokenSource(b.tokenSource).
+		SetHTTPClient(registrationHTTPClient)
 
 	httpClient, err := httpClientBuilder.Build()
 	if err != nil {
@@ -135,9 +141,11 @@ func (b *ClientBuilder) Build() (result *Client, err error) {
 	}
 
 	result = &Client{
-		logger:     b.logger,
-		httpClient: httpClient,
-		realmName:  b.realmName,
+		logger:                 b.logger,
+		httpClient:             httpClient,
+		registrationHTTPClient: registrationHTTPClient,
+		baseURL:                strings.TrimSuffix(b.baseURL, "/"),
+		realmName:              b.realmName,
 	}
 	return
 }
@@ -182,7 +190,7 @@ func (c *Client) GetTenant(ctx context.Context, name string) (*Tenant, error) {
 		return nil, fmt.Errorf("failed to decode organization response: %w", err)
 	}
 	if len(kcOrgs) == 0 {
-		return nil, fmt.Errorf("organization %q not found", name)
+		return nil, &ErrNotFound{Kind: "organization", Name: name}
 	}
 	kcOrg := kcOrgs[0]
 	return fromKeycloakOrganization(&kcOrg), nil
@@ -218,7 +226,8 @@ func (c *Client) DeleteTenant(ctx context.Context, tenantName string) error {
 
 	org, err := c.GetTenant(ctx, tenantName)
 	if err != nil {
-		if strings.Contains(err.Error(), "not found") {
+		var notFoundErr *ErrNotFound
+		if errors.As(err, &notFoundErr) {
 			return nil
 		}
 		return fmt.Errorf("failed to get organization: %w", err)
@@ -761,6 +770,66 @@ func (c *Client) CreateIdentityProvider(ctx context.Context, tenantName string, 
 			Type:        idpProvider.Type,
 			Enabled:     idpProvider.Enabled,
 			Config:      nil, // Secrets are automatically filtered in GET responses
+		}, nil
+	}
+	return result, nil
+}
+
+// UpdateIdentityProvider updates an existing identity provider at the realm level.
+// In Keycloak, this replaces the full IdP representation using PUT.
+func (c *Client) UpdateIdentityProvider(ctx context.Context, tenantName string, idpProvider *IdentityProvider) (*IdentityProvider, error) {
+	if idpProvider == nil {
+		return nil, fmt.Errorf("identity provider is nil")
+	}
+	c.logger.InfoContext(ctx, "Updating identity provider",
+		slog.String("realm", c.realmName),
+		slog.String("organization", tenantName),
+		slog.String("alias", idpProvider.Alias),
+		slog.String("type", idpProvider.Type),
+	)
+
+	path := fmt.Sprintf("/admin/realms/%s/identity-provider/instances/%s",
+		url.PathEscape(c.realmName),
+		url.PathEscape(idpProvider.Alias),
+	)
+	kcIdp := toKeycloakIdentityProvider(idpProvider)
+
+	response, err := c.httpClient.DoRequest(ctx, http.MethodPut, path, kcIdp)
+	if err != nil {
+		return nil, fmt.Errorf("failed to update identity provider: %w", err)
+	}
+	if closeErr := response.Body.Close(); closeErr != nil {
+		c.logger.WarnContext(ctx, "Failed to close update identity provider response body",
+			slog.String("alias", idpProvider.Alias),
+			slog.Any("error", closeErr),
+		)
+	}
+
+	// Re-link to the organization after realm-level PUT.
+	// Keycloak's PUT on realm-level instances may unlink the IdP from its organization.
+	err = c.linkIdentityProviderToOrganization(ctx, tenantName, idpProvider.Alias)
+	if err != nil {
+		if !isConflictError(err) {
+			return nil, fmt.Errorf("failed to re-link identity provider to organization after update: %w", err)
+		}
+		// 409 = already linked, treat as success
+	}
+
+	// Fetch and return the updated representation
+	result, err := c.GetIdentityProvider(ctx, tenantName, idpProvider.Alias)
+	if err != nil {
+		// IdP was successfully updated - treat read failure as non-fatal
+		c.logger.WarnContext(ctx, "Updated identity provider but failed to fetch it back",
+			slog.String("organization", tenantName),
+			slog.String("alias", idpProvider.Alias),
+			slog.String("error", err.Error()),
+		)
+		return &IdentityProvider{
+			Alias:       idpProvider.Alias,
+			DisplayName: idpProvider.DisplayName,
+			Type:        idpProvider.Type,
+			Enabled:     idpProvider.Enabled,
+			Config:      nil,
 		}, nil
 	}
 	return result, nil

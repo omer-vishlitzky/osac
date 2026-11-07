@@ -88,7 +88,10 @@ func (r *DeleteRequest[O]) do(ctx context.Context) (response *DeleteResponse, er
 		&buffer,
 		`
 		update %s set
-			deletion_timestamp = now()
+			deletion_timestamp = case
+				when deletion_timestamp = 'epoch' then now()
+				else deletion_timestamp
+			end
 		where
 			%s
 		returning
@@ -153,44 +156,30 @@ func (r *DeleteRequest[O]) do(ctx context.Context) (response *DeleteResponse, er
 		err = r.translateError(ctx, tenant, err)
 		return
 	}
-	object := r.newObject()
-	err = r.unmarshalData(data, object)
-	if err != nil {
-		return
-	}
-	labels, err := r.unmarshalMap(labelsData)
-	if err != nil {
-		return
-	}
-	annotations, err := r.unmarshalMap(annotationsData)
-	if err != nil {
-		return
-	}
-	metadata := r.makeMetadata(makeMetadataArgs{
-		creationTs:  creationTs,
-		deletionTs:  deletionTs,
-		finalizers:  finalizers,
-		creator:     creator,
-		tenant:      tenant,
-		project:     project,
-		name:        name,
-		labels:      labels,
-		annotations: annotations,
-		version:     version,
+	_, err = r.objectFromRow(storedObject{
+		id:              r.args.id,
+		name:            name,
+		creationTs:      creationTs,
+		deletionTs:      deletionTs,
+		finalizers:      finalizers,
+		creator:         creator,
+		tenant:          tenant,
+		project:         project,
+		labelsData:      labelsData,
+		annotationsData: annotationsData,
+		version:         version,
+		data:            data,
 	})
-	object.SetId(r.args.id)
-	r.setMetadata(object, metadata)
-
-	// If there are finalizers we need to fire the update event instead of the delete event:
-	if len(finalizers) > 0 {
-		err = r.fireEvent(ctx, Event{
-			Type:   EventTypeUpdated,
-			Object: object,
-		})
+	if err != nil {
 		return
 	}
 
-	// If there are no finalizers we can now archive the object and fire the delete event:
+	// If there are finalizers the object remains in the table with its deletion timestamp set:
+	if len(finalizers) > 0 {
+		return
+	}
+
+	// If there are no finalizers we can now archive the object:
 	err = r.archive(ctx, archiveArgs{
 		id:              r.args.id,
 		creationTs:      creationTs,
@@ -207,14 +196,6 @@ func (r *DeleteRequest[O]) do(ctx context.Context) (response *DeleteResponse, er
 	if err != nil {
 		return
 	}
-	err = r.fireEvent(ctx, Event{
-		Type:   EventTypeDeleted,
-		Object: object,
-	})
-	if err != nil {
-		return
-	}
-
 	// Create and return the response:
 	response = &DeleteResponse{}
 	return

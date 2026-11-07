@@ -5,7 +5,7 @@
   when: netris_session_cookie is not defined
 
 - name: Query existing IPAM subnets
-  ansible.builtin.uri:
+  netris.controller.protected_uri:
     url: "{{ netris_controller_url }}/api/v2/ipam/subnets"
     method: GET
     headers:
@@ -14,27 +14,95 @@
     status_code: [200]
     timeout: "{{ netris_timeout | default(30) }}"
     validate_certs: "{{ netris_validate_certs | default(true) }}"
+    ca_path: "{{ netris_ca_path | default(omit, true) }}"
   register: _ipam_subnets_resp
   no_log: true
 
-- name: Find IPAM subnet by name
+- name: Find IPAM subnets by name
   ansible.builtin.set_fact:
-    _existing_ipam_subnet: >-
+    _existing_ipam_subnets: >-
       {{ (_ipam_subnets_resp.json.data | default([]))
          | selectattr('name', 'equalto', ipam_name)
-         | list | first | default(none) }}
+         | list }}
+
+- name: Filter IPAM subnets by CIDR
+  ansible.builtin.set_fact:
+    _existing_ipam_subnets: >-
+      {{ _existing_ipam_subnets
+         | selectattr('prefix', 'equalto', ipam_cidr)
+         | list }}
+  when: ipam_cidr is defined
+
+- name: Filter IPAM subnets by VPC
+  ansible.builtin.set_fact:
+    _existing_ipam_subnets: >-
+      {{ _existing_ipam_subnets
+         | selectattr('vpc.id', 'equalto', ipam_vpc_id | int)
+         | list }}
+  when: ipam_vpc_id is defined
+
+- name: Filter IPAM subnets by tenant
+  ansible.builtin.set_fact:
+    _existing_ipam_subnets: >-
+      {{ _existing_ipam_subnets
+         | selectattr('tenant.id', 'equalto', ipam_tenant_id | int)
+         | list }}
+  when: ipam_tenant_id is defined
+
+- name: Filter child IPAM subnets by parent
+  ansible.builtin.set_fact:
+    _existing_ipam_subnets: >-
+      {{ _existing_ipam_subnets
+         | selectattr('parentID', 'equalto', ipam_parent_id | int)
+         | list }}
+  when: ipam_parent_id is defined
+
+- name: Fail if the IPAM deletion identity is ambiguous
+  ansible.builtin.assert:
+    that:
+      - _existing_ipam_subnets | length <= 1
+    fail_msg: >-
+      More than one Netris IPAM subnet matches '{{ ipam_name }}' and the supplied
+      parent/VPC/tenant identity. Refusing to delete an ambiguous resource.
+
+- name: Set the matching IPAM subnet
+  ansible.builtin.set_fact:
+    _existing_ipam_subnet: "{{ _existing_ipam_subnets | first | default(none) }}"
+
+- name: Verify IPAM subnet ownership before deletion
+  when:
+    - _existing_ipam_subnet is defined
+    - _existing_ipam_subnet is mapping
+    - ipam_expected_fields is defined
+  block:
+    - name: Compare IPAM subnet with the OSAC resource
+      ansible.builtin.set_fact:
+        _ipam_subnet_delete_mismatches: >-
+          {{ _existing_ipam_subnet | netris.controller.netris_immutable_mismatch(
+               ipam_expected_fields
+             ) }}
+
+    - name: Refuse to delete a mismatched or unverifiable IPAM subnet
+      ansible.builtin.fail:
+        msg: >-
+          {{ 'IPAM subnet' | netris.controller.format_immutable_mismatch_message(
+               ipam_name, _ipam_subnet_delete_mismatches) }}
+      when: _ipam_subnet_delete_mismatches | length > 0
 
 - name: Delete IPAM subnet
   when: _existing_ipam_subnet is defined and _existing_ipam_subnet is mapping
-  ansible.builtin.uri:
+  netris.controller.protected_uri:
     url: "{{ netris_controller_url }}/api/v2/ipam/subnet/{{ _existing_ipam_subnet.id }}"
     method: DELETE
     headers:
       Cookie: "connect.sid={{ netris_session_cookie }}"
     return_content: true
-    status_code: [200, 204, 400]
+    # 404 means the subnet was removed concurrently after the lookup; the
+    # deletion target is already absent, so treat it as deleted.
+    status_code: [200, 204, 400, 404]
     timeout: "{{ netris_timeout | default(30) }}"
     validate_certs: "{{ netris_validate_certs | default(true) }}"
+    ca_path: "{{ netris_ca_path | default(omit, true) }}"
   register: _ipam_subnet_delete_resp
   no_log: true
 
@@ -46,3 +114,10 @@
     msg: >-
       Failed to delete IPAM subnet '{{ ipam_name }}' (ID: {{ _existing_ipam_subnet.id }}).
       Netris responded with: {{ _ipam_subnet_delete_resp.json.message | default(_ipam_subnet_delete_resp.content | default('unknown error')) }}.
+
+- name: Report the concurrently removed IPAM subnet
+  ansible.builtin.debug:
+    msg: >-
+      An IPAM subnet was already absent (HTTP 404) at deletion time; treating
+      it as deleted.
+  when: _ipam_subnet_delete_resp is defined and _ipam_subnet_delete_resp.status | default(0) == 404

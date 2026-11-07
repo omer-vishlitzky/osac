@@ -26,9 +26,11 @@ import (
 	grpccodes "google.golang.org/grpc/codes"
 	grpcstatus "google.golang.org/grpc/status"
 	"google.golang.org/protobuf/reflect/protoreflect"
+	"google.golang.org/protobuf/types/known/fieldmaskpb"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
-	testsv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/tests/v1"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
+	testsv1 "github.com/osac-project/osac/proto/gen/osac/tests/v1"
 )
 
 var _ = Describe("Reference validator", func() {
@@ -49,6 +51,34 @@ var _ = Describe("Reference validator", func() {
 			Expect(err).To(HaveOccurred())
 			Expect(err).To(MatchError("logger is mandatory"))
 			Expect(result).To(BeNil())
+		})
+
+		It("rejects non-canonical update mask paths", func() {
+			for _, test := range []struct {
+				path  string
+				valid bool
+			}{
+				{path: "spec.add_on_operators", valid: true},
+				{path: "spec.node_sets.control-plane.size", valid: true},
+				{path: "metadata.labels.control-plane", valid: true},
+				{path: "spec .add_on_operators", valid: false},
+				{path: "spec.add_on_operators.-1", valid: false},
+				{path: "spec.add_on_operators.id", valid: false},
+				{path: "spec.node_sets.control-plane.invalid-field", valid: false},
+				{path: "spec.node_sets.control-plane.size.host_type", valid: false},
+				{path: "metadata.labels.control-plane.name", valid: false},
+				{path: "spec..add_on_operators", valid: false},
+			} {
+				request := privatev1.ClustersUpdateRequest_builder{
+					UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{test.path}},
+				}.Build()
+				err := validateCanonicalUpdateMask(request)
+				if test.valid {
+					Expect(err).ToNot(HaveOccurred())
+				} else {
+					Expect(err).To(HaveOccurred())
+				}
+			}
 		})
 	})
 
@@ -80,6 +110,233 @@ var _ = Describe("Reference validator", func() {
 				})
 			}).To(PanicWith(ContainSubstring("Register called after interceptor started serving")))
 		})
+	})
+
+	It("skips only configured reference paths for configured methods", func() {
+		updateMethod := "/osac.private.v1.ComputeInstances/Update"
+		v, err := NewReferenceValidator().SetLogger(logger).
+			SetExcludedReferencePaths([]string{updateMethod}, "object.spec.target").
+			Build()
+		Expect(err).ToNot(HaveOccurred())
+		targetLookups := 0
+		v.Register("osac.tests.v1.TestTargetReference", func(ctx context.Context, tenant, project, id, name string) (*ResolvedRef, error) {
+			targetLookups++
+			Expect(tenant).To(Equal("tenant-a"))
+			return nil, &errRefNotFound{identifier: name}
+		})
+		localLookups := 0
+		v.Register("osac.tests.v1.TestTargetLocalReference", func(ctx context.Context, tenant, project, id, name string) (*ResolvedRef, error) {
+			localLookups++
+			return &ResolvedRef{ID: "local-id", Name: name}, nil
+		})
+		request := testsv1.UpdateTestResourceWithRefsRequest_builder{Object: testsv1.TestResourceWithRefs_builder{
+			Metadata: testsv1.Metadata_builder{Tenant: "tenant-a"}.Build(),
+			Spec: testsv1.TestRefSpec_builder{
+				Target:      testsv1.TestTargetReference_builder{Name: "excluded"}.Build(),
+				LocalTarget: testsv1.TestTargetLocalReference_builder{Name: "validated"}.Build(),
+			}.Build(),
+		}.Build()}.Build()
+		called := false
+		handler := func(ctx context.Context, request any) (any, error) { called = true; return nil, nil }
+		_, err = v.UnaryServer(context.Background(), request, &grpc.UnaryServerInfo{FullMethod: updateMethod}, handler)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(called).To(BeTrue())
+		Expect(targetLookups).To(BeZero())
+		Expect(localLookups).To(Equal(1))
+
+		called = false
+		_, err = v.UnaryServer(context.Background(), request,
+			&grpc.UnaryServerInfo{FullMethod: "/osac.private.v1.OtherResources/Update"}, handler)
+		Expect(err).To(HaveOccurred())
+		Expect(called).To(BeFalse())
+		Expect(targetLookups).To(Equal(1))
+		Expect(localLookups).To(Equal(2))
+
+		_, err = v.UnaryServer(context.Background(), request,
+			&grpc.UnaryServerInfo{FullMethod: "/osac.private.v1.ComputeInstances/Create"}, handler)
+		Expect(err).To(HaveOccurred())
+		Expect(called).To(BeFalse())
+		Expect(targetLookups).To(Equal(2))
+		Expect(localLookups).To(Equal(3))
+	})
+
+	Describe("Status-only updates", func() {
+		var request *privatev1.ComputeInstancesUpdateRequest
+		var handler grpc.UnaryHandler
+		var handlerCalled bool
+		var info *grpc.UnaryServerInfo
+		var lookedUpNames []string
+
+		registerLookups := func(v *ReferenceValidator) {
+			GinkgoHelper()
+			for _, referenceType := range []protoreflect.FullName{
+				"osac.private.v1.DiskImageReference",
+				"osac.private.v1.InstanceTypeReference",
+				"osac.private.v1.SecretLocalReference",
+			} {
+				v.Register(referenceType, func(ctx context.Context, tenant, project, id, name string) (*ResolvedRef, error) {
+					lookedUpNames = append(lookedUpNames, name)
+					if name == "running-type" {
+						Expect(tenant).To(Equal("tenant-a"))
+						Expect(project).To(Equal("catalog"))
+						return &ResolvedRef{ID: "running-type-id", Name: name}, nil
+					}
+					return nil, &errRefNotFound{identifier: name}
+				})
+			}
+		}
+
+		BeforeEach(func() {
+			var err error
+			validator, err = NewReferenceValidator().SetLogger(logger).Build()
+			Expect(err).ToNot(HaveOccurred())
+			lookedUpNames = nil
+			registerLookups(validator)
+			request = privatev1.ComputeInstancesUpdateRequest_builder{
+				Object: privatev1.ComputeInstance_builder{
+					Id:       "instance-1",
+					Metadata: privatev1.Metadata_builder{Tenant: "tenant-a", Project: "project-a"}.Build(),
+					Spec: privatev1.ComputeInstanceSpec_builder{
+						DiskImage:    privatev1.DiskImageReference_builder{Name: "removed-image"}.Build(),
+						InstanceType: privatev1.InstanceTypeReference_builder{Name: "removed-type"}.Build(),
+						UserDataSource: privatev1.UserDataSource_builder{
+							Secret: privatev1.SecretLocalReference_builder{Name: "removed-secret"}.Build(),
+						}.Build(),
+					}.Build(),
+					Status: privatev1.ComputeInstanceStatus_builder{
+						State: privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_DELETING,
+						InstanceType: privatev1.InstanceTypeReference_builder{
+							Name: "running-type", Project: "catalog",
+						}.Build(),
+					}.Build(),
+				}.Build(),
+				UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"status"}},
+			}.Build()
+			info = &grpc.UnaryServerInfo{FullMethod: privatev1.ComputeInstances_Update_FullMethodName}
+			handlerCalled = false
+			handler = func(ctx context.Context, received any) (any, error) {
+				handlerCalled = true
+				Expect(received).To(BeIdenticalTo(request))
+				return "accepted", nil
+			}
+		})
+
+		DescribeTable("accepts stale spec references and resolves status references",
+			func(paths []string, deleting bool) {
+				request.SetUpdateMask(&fieldmaskpb.FieldMask{Paths: paths})
+				if deleting {
+					request.GetObject().GetMetadata().SetDeletionTimestamp(timestamppb.Now())
+				}
+				response, err := validator.UnaryServer(context.Background(), request, info, handler)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(response).To(Equal("accepted"))
+				Expect(handlerCalled).To(BeTrue())
+				Expect(lookedUpNames).To(ConsistOf("running-type"))
+				Expect(request.GetObject().GetStatus().GetInstanceType().GetId()).To(Equal("running-type-id"))
+				Expect(request.GetObject().GetSpec().GetDiskImage().GetId()).To(BeEmpty())
+			},
+			Entry("whole status", []string{"status"}, false),
+			Entry("one status field", []string{"status.state"}, false),
+			Entry("multiple status fields during deletion", []string{"status.state", "status.instance_type"}, true),
+		)
+
+		It("rejects missing status references with their full field path", func() {
+			request.GetObject().GetStatus().GetInstanceType().SetName("removed-status-type")
+			_, err := validator.UnaryServer(context.Background(), request, info, handler)
+			Expect(grpcstatus.Code(err)).To(Equal(grpccodes.InvalidArgument))
+			Expect(err).To(MatchError(ContainSubstring("object.status.instance_type")))
+			Expect(err).ToNot(MatchError(ContainSubstring("object.spec")))
+			Expect(handlerCalled).To(BeFalse())
+		})
+
+		It("rejects malformed status masks before looking up references", func() {
+			request.SetUpdateMask(&fieldmaskpb.FieldMask{Paths: []string{"status..state"}})
+			_, err := validator.UnaryServer(context.Background(), request, info, handler)
+			Expect(grpcstatus.Code(err)).To(Equal(grpccodes.InvalidArgument))
+			Expect(lookedUpNames).To(BeEmpty())
+			Expect(handlerCalled).To(BeFalse())
+		})
+
+		DescribeTable("keeps spec validation for other masks, even during deletion",
+			func(mask *fieldmaskpb.FieldMask) {
+				request.SetUpdateMask(mask)
+				request.GetObject().GetMetadata().SetDeletionTimestamp(timestamppb.Now())
+				_, err := validator.UnaryServer(context.Background(), request, info, handler)
+				Expect(grpcstatus.Code(err)).To(Equal(grpccodes.InvalidArgument))
+				Expect(err).To(MatchError(ContainSubstring("object.spec.disk_image")))
+				Expect(err).To(MatchError(ContainSubstring("object.spec.instance_type")))
+				Expect(err).To(MatchError(ContainSubstring("object.spec.user_data_source.secret")))
+				Expect(handlerCalled).To(BeFalse())
+			},
+			Entry("absent mask", (*fieldmaskpb.FieldMask)(nil)),
+			Entry("empty mask", &fieldmaskpb.FieldMask{}),
+			Entry("spec only", &fieldmaskpb.FieldMask{Paths: []string{"spec"}}),
+			Entry("status and spec", &fieldmaskpb.FieldMask{Paths: []string{"status", "spec"}}),
+			Entry("status and metadata", &fieldmaskpb.FieldMask{Paths: []string{"status", "metadata"}}),
+		)
+
+		It("preserves configured exclusions without leaking the status-only exclusion", func() {
+			configured, err := NewReferenceValidator().SetLogger(logger).
+				SetExcludedReferencePaths([]string{info.FullMethod}, "object.status.instance_type").Build()
+			Expect(err).ToNot(HaveOccurred())
+			registerLookups(configured)
+			request.GetObject().GetStatus().GetInstanceType().SetName("removed-status-type")
+			_, err = configured.UnaryServer(context.Background(), request, info, handler)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(handlerCalled).To(BeTrue())
+			Expect(lookedUpNames).To(BeEmpty())
+
+			handlerCalled = false
+			request.SetUpdateMask(&fieldmaskpb.FieldMask{Paths: []string{"spec"}})
+			_, err = configured.UnaryServer(context.Background(), request, info, handler)
+			Expect(grpcstatus.Code(err)).To(Equal(grpccodes.InvalidArgument))
+			Expect(err).To(MatchError(ContainSubstring("object.spec.disk_image")))
+			Expect(err).ToNot(MatchError(ContainSubstring("object.status")))
+			Expect(handlerCalled).To(BeFalse())
+		})
+	})
+
+	It("skips spec references and resolves local status references for cluster status-only updates", func() {
+		var err error
+		validator, err = NewReferenceValidator().SetLogger(logger).Build()
+		Expect(err).ToNot(HaveOccurred())
+		var lookedUpNames []string
+		validator.Register("osac.private.v1.SecretLocalReference", func(ctx context.Context, tenant, project, id, name string) (*ResolvedRef, error) {
+			lookedUpNames = append(lookedUpNames, name)
+			Expect(tenant).To(Equal("tenant-a"))
+			Expect(project).To(Equal("project-a"))
+			if name == "kubeconfig" {
+				return &ResolvedRef{ID: "kubeconfig-id", Name: name}, nil
+			}
+			return nil, &errRefNotFound{identifier: name}
+		})
+		request := privatev1.ClustersUpdateRequest_builder{
+			Object: privatev1.Cluster_builder{
+				Id:       "cluster-1",
+				Metadata: privatev1.Metadata_builder{Tenant: "tenant-a", Project: "project-a"}.Build(),
+				Spec: privatev1.ClusterSpec_builder{
+					PullSecretSecret: privatev1.SecretLocalReference_builder{Name: "removed-pull-secret"}.Build(),
+				}.Build(),
+				Status: privatev1.ClusterStatus_builder{
+					KubeconfigSecret: privatev1.SecretLocalReference_builder{Name: "kubeconfig"}.Build(),
+				}.Build(),
+			}.Build(),
+			UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"status.kubeconfig_secret"}},
+		}.Build()
+		handlerCalled := false
+		handler := func(ctx context.Context, received any) (any, error) {
+			handlerCalled = true
+			Expect(received).To(BeIdenticalTo(request))
+			return "accepted", nil
+		}
+		info := &grpc.UnaryServerInfo{FullMethod: privatev1.Clusters_Update_FullMethodName}
+		response, err := validator.UnaryServer(context.Background(), request, info, handler)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(response).To(Equal("accepted"))
+		Expect(handlerCalled).To(BeTrue())
+		Expect(lookedUpNames).To(ConsistOf("kubeconfig"))
+		Expect(request.GetObject().GetStatus().GetKubeconfigSecret().GetId()).To(Equal("kubeconfig-id"))
+		Expect(request.GetObject().GetSpec().GetPullSecretSecret().GetId()).To(BeEmpty())
 	})
 
 	Describe("Method filtering", func() {
@@ -119,6 +376,37 @@ var _ = Describe("Reference validator", func() {
 			Expect(err).ToNot(HaveOccurred())
 			Expect(handlerCalled).To(BeTrue())
 			Expect(response).To(Equal("response"))
+		})
+
+		It("Does not skip Create reference validation for a deletion timestamp", func() {
+			validator.Register("osac.tests.v1.TestTargetReference", func(
+				ctx context.Context, tenant, project, id, name string,
+			) (*ResolvedRef, error) {
+				return nil, &errRefNotFound{identifier: name}
+			})
+			request := testsv1.CreateTestResourceWithRefsRequest_builder{
+				Object: testsv1.TestResourceWithRefs_builder{
+					Metadata: testsv1.Metadata_builder{
+						Tenant:            "tenant-a",
+						DeletionTimestamp: timestamppb.Now(),
+					}.Build(),
+					Spec: testsv1.TestRefSpec_builder{
+						Target: testsv1.TestTargetReference_builder{Name: "unpublished"}.Build(),
+					}.Build(),
+				}.Build(),
+			}.Build()
+
+			handlerCalled := false
+			_, err := validator.UnaryServer(
+				context.Background(), request,
+				&grpc.UnaryServerInfo{FullMethod: "/osac.tests.v1.TestService/Create"},
+				func(ctx context.Context, req any) (any, error) {
+					handlerCalled = true
+					return nil, nil
+				},
+			)
+			Expect(err).To(HaveOccurred())
+			Expect(handlerCalled).To(BeFalse())
 		})
 
 		It("Validates Update requests", func() {
@@ -457,6 +745,326 @@ var _ = Describe("Reference validator", func() {
 		})
 	})
 
+	Describe("Collection reference validation", func() {
+		var registry *prometheus.Registry
+		var lookups int
+		var invoke func(*testsv1.TestRefSpec, string) (any, error)
+
+		BeforeEach(func() {
+			registry = prometheus.NewRegistry()
+			var err error
+			validator, err = NewReferenceValidator().SetLogger(logger).SetMetricsRegisterer(registry).Build()
+			Expect(err).ToNot(HaveOccurred())
+			lookups = 0
+			lookup := func(ctx context.Context, tenant, project, id, name string) (*ResolvedRef, error) {
+				lookups++
+				if id == "" {
+					id = "id-" + name
+				}
+				if name == "" {
+					name = "name-" + id
+				}
+				return &ResolvedRef{ID: id, Name: name}, nil
+			}
+			validator.Register("osac.tests.v1.TestTargetReference", lookup)
+			validator.Register("osac.tests.v1.TestTargetLocalReference", lookup)
+			validator.Register("osac.tests.v1.TestOtherTargetLocalReference", lookup)
+			invoke = func(spec *testsv1.TestRefSpec, method string) (any, error) {
+				object := testsv1.TestResourceWithRefs_builder{
+					Metadata: testsv1.Metadata_builder{Tenant: "tenant-a", Project: "project-a"}.Build(),
+					Spec:     spec,
+				}.Build()
+				var request any = testsv1.CreateTestResourceWithRefsRequest_builder{Object: object}.Build()
+				if method == "Update" {
+					request = testsv1.UpdateTestResourceWithRefsRequest_builder{Object: object}.Build()
+				}
+				return validator.UnaryServer(context.Background(), request,
+					&grpc.UnaryServerInfo{FullMethod: "/osac.tests.v1.TestService/" + method},
+					func(ctx context.Context, actual any) (any, error) {
+						Expect(actual).To(BeIdenticalTo(request))
+						return spec, nil
+					})
+			}
+		})
+
+		DescribeTable("resolves direct references and mutates their original map values", func(method string) {
+			spec := testsv1.TestRefSpec_builder{Targets: map[string]*testsv1.TestTargetReference{
+				"by-name": testsv1.TestTargetReference_builder{Name: "target"}.Build(),
+				"by-id":   testsv1.TestTargetReference_builder{Id: "target-id"}.Build(),
+			}}.Build()
+			response, err := invoke(spec, method)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(response).To(BeIdenticalTo(spec))
+			Expect(spec.GetTargets()["by-name"].GetId()).To(Equal("id-target"))
+			Expect(spec.GetTargets()["by-id"].GetName()).To(Equal("name-target-id"))
+			Expect(lookups).To(Equal(2))
+			Expect(counterValue(registry, "osac_reference_validation_total", "TestTargetReference", "valid")).To(Equal(2.0))
+			families, err := registry.Gather()
+			Expect(err).ToNot(HaveOccurred())
+			var samples uint64
+			for _, family := range families {
+				if family.GetName() == "osac_reference_validation_duration_seconds" {
+					for _, metric := range family.GetMetric() {
+						samples += metric.GetHistogram().GetSampleCount()
+					}
+				}
+			}
+			Expect(samples).To(Equal(uint64(2)))
+		}, Entry("Create", "Create"), Entry("Update", "Update"))
+
+		It("resolves nested messages, repeated references, and maps within map and list values", func() {
+			attachment := testsv1.TestRefAttachment_builder{
+				Subnet: testsv1.TestTargetLocalReference_builder{Name: "subnet"}.Build(),
+				SecurityGroups: []*testsv1.TestOtherTargetLocalReference{
+					testsv1.TestOtherTargetLocalReference_builder{Name: "group"}.Build(),
+				},
+				Targets: map[string]*testsv1.TestTargetReference{
+					"inner": testsv1.TestTargetReference_builder{Name: "nested"}.Build(),
+				},
+			}.Build()
+			listed := testsv1.TestRefAttachment_builder{Targets: map[string]*testsv1.TestTargetReference{
+				"inner": testsv1.TestTargetReference_builder{Name: "listed"}.Build(),
+			}}.Build()
+			spec := testsv1.TestRefSpec_builder{
+				Attachments:      map[string]*testsv1.TestRefAttachment{"outer": attachment},
+				OtherAttachments: []*testsv1.TestRefAttachment{listed},
+			}.Build()
+			_, err := invoke(spec, "Create")
+			Expect(err).ToNot(HaveOccurred())
+			Expect(attachment.GetSubnet().GetId()).To(Equal("id-subnet"))
+			Expect(attachment.GetSecurityGroups()[0].GetId()).To(Equal("id-group"))
+			Expect(attachment.GetTargets()["inner"].GetId()).To(Equal("id-nested"))
+			Expect(listed.GetTargets()["inner"].GetId()).To(Equal("id-listed"))
+			Expect(lookups).To(Equal(4))
+		})
+
+		It("resolves integer and boolean keyed maps", func() {
+			spec := testsv1.TestRefSpec_builder{
+				NumberedTargets: map[int64]*testsv1.TestTargetLocalReference{
+					-42: testsv1.TestTargetLocalReference_builder{Name: "numbered"}.Build(),
+				},
+				EnabledTargets: map[bool]*testsv1.TestTargetReference{
+					false: testsv1.TestTargetReference_builder{Name: "disabled"}.Build(),
+					true:  testsv1.TestTargetReference_builder{Name: "enabled"}.Build(),
+				},
+			}.Build()
+			_, err := invoke(spec, "Create")
+			Expect(err).ToNot(HaveOccurred())
+			Expect(spec.GetNumberedTargets()[-42].GetId()).To(Equal("id-numbered"))
+			Expect(spec.GetEnabledTargets()[false].GetId()).To(Equal("id-disabled"))
+			Expect(spec.GetEnabledTargets()[true].GetId()).To(Equal("id-enabled"))
+			Expect(lookups).To(Equal(3))
+		})
+
+		It("passes caller and selected scopes to map reference lookups", func() {
+			var scopes []string
+			lookup := func(ctx context.Context, tenant, project, id, name string) (*ResolvedRef, error) {
+				scopes = append(scopes, tenant+"/"+project)
+				return &ResolvedRef{ID: "id-" + name, Name: name}, nil
+			}
+			validator.Register("osac.tests.v1.TestTargetReference", lookup)
+			validator.Register("osac.tests.v1.TestTargetLocalReference", lookup)
+			spec := testsv1.TestRefSpec_builder{
+				Targets: map[string]*testsv1.TestTargetReference{
+					"selected": testsv1.TestTargetReference_builder{Name: "shared", Shared: true, Project: "selected"}.Build(),
+				},
+				NumberedTargets: map[int64]*testsv1.TestTargetLocalReference{
+					1: testsv1.TestTargetLocalReference_builder{Name: "local"}.Build(),
+				},
+			}.Build()
+			_, err := invoke(spec, "Create")
+			Expect(err).ToNot(HaveOccurred())
+			Expect(scopes).To(ConsistOf("shared/selected", "tenant-a/project-a"))
+		})
+
+		It("ignores empty maps, scalar values, and messages without references", func() {
+			spec := testsv1.TestRefSpec_builder{
+				Targets:     map[string]*testsv1.TestTargetReference{},
+				Labels:      map[string]string{"target": "not-a-reference"},
+				Attachments: map[string]*testsv1.TestRefAttachment{"empty": testsv1.TestRefAttachment_builder{}.Build()},
+			}.Build()
+			response, err := invoke(spec, "Create")
+			Expect(err).ToNot(HaveOccurred())
+			Expect(response).To(BeIdenticalTo(spec))
+			Expect(lookups).To(BeZero())
+		})
+
+		It("aggregates sorted violations with escaped, typed, and nested map paths", func() {
+			lookup := func(ctx context.Context, tenant, project, id, name string) (*ResolvedRef, error) {
+				return nil, &notFoundError{name: name}
+			}
+			validator.Register("osac.tests.v1.TestTargetReference", lookup)
+			validator.Register("osac.tests.v1.TestTargetLocalReference", lookup)
+			validator.Register("osac.tests.v1.TestOtherTargetLocalReference", lookup)
+			spec := testsv1.TestRefSpec_builder{
+				Targets: map[string]*testsv1.TestTargetReference{
+					"z":            testsv1.TestTargetReference_builder{Name: "missing"}.Build(),
+					"a":            testsv1.TestTargetReference_builder{}.Build(),
+					"quote\"\\key": testsv1.TestTargetReference_builder{Name: "escaped"}.Build(),
+				},
+				NumberedTargets: map[int64]*testsv1.TestTargetLocalReference{-42: testsv1.TestTargetLocalReference_builder{Name: "numbered"}.Build()},
+				EnabledTargets:  map[bool]*testsv1.TestTargetReference{false: testsv1.TestTargetReference_builder{Name: "boolean"}.Build()},
+				Attachments: map[string]*testsv1.TestRefAttachment{
+					"outer": testsv1.TestRefAttachment_builder{SecurityGroups: []*testsv1.TestOtherTargetLocalReference{
+						testsv1.TestOtherTargetLocalReference_builder{Name: "nested"}.Build(),
+					}}.Build(),
+				},
+			}.Build()
+			response, err := invoke(spec, "Create")
+			Expect(response).To(BeNil())
+			st := grpcstatus.Convert(err)
+			Expect(st.Code()).To(Equal(grpccodes.InvalidArgument))
+			Expect(st.Details()).To(HaveLen(1))
+			violations := st.Details()[0].(*errdetails.BadRequest).GetFieldViolations()
+			var paths []string
+			for _, violation := range violations {
+				paths = append(paths, violation.GetField())
+			}
+			Expect(paths).To(Equal([]string{
+				`object.spec.attachments["outer"].security_groups[0]`,
+				"object.spec.enabled_targets[false]",
+				"object.spec.numbered_targets[-42]",
+				`object.spec.targets["a"]`,
+				`object.spec.targets["quote\"\\key"]`,
+				`object.spec.targets["z"]`,
+			}))
+			Expect(violations[3].GetDescription()).To(ContainSubstring("must specify id or name"))
+			Expect(counterValue(registry, "osac_reference_validation_total", "TestTargetReference", "invalid")).To(Equal(4.0))
+		})
+
+		It("rejects inconsistent id and name in a map reference", func() {
+			validator.Register("osac.tests.v1.TestTargetReference", func(ctx context.Context, tenant, project, id, name string) (*ResolvedRef, error) {
+				return &ResolvedRef{ID: "other-id", Name: name}, nil
+			})
+			spec := testsv1.TestRefSpec_builder{Targets: map[string]*testsv1.TestTargetReference{
+				"target": testsv1.TestTargetReference_builder{Id: "id", Name: "name"}.Build(),
+			}}.Build()
+			response, err := invoke(spec, "Create")
+			Expect(response).To(BeNil())
+			st := grpcstatus.Convert(err)
+			Expect(st.Code()).To(Equal(grpccodes.InvalidArgument))
+			Expect(st.Message()).To(ContainSubstring(`object.spec.targets["target"]`))
+			Expect(st.Message()).To(ContainSubstring("do not refer to the same resource"))
+		})
+
+		It("fails closed for an unregistered map reference type", func() {
+			var err error
+			validator, err = NewReferenceValidator().SetLogger(logger).Build()
+			Expect(err).ToNot(HaveOccurred())
+			spec := testsv1.TestRefSpec_builder{Targets: map[string]*testsv1.TestTargetReference{
+				"target": testsv1.TestTargetReference_builder{Name: "target"}.Build(),
+			}}.Build()
+			response, err := invoke(spec, "Create")
+			Expect(response).To(BeNil())
+			Expect(grpcstatus.Code(err)).To(Equal(grpccodes.Internal))
+			Expect(err.Error()).To(ContainSubstring("no lookup registered"))
+		})
+
+		It("stops map traversal and blocks the handler when a lookup fails internally", func() {
+			validator.Register("osac.tests.v1.TestTargetReference", func(ctx context.Context, tenant, project, id, name string) (*ResolvedRef, error) {
+				lookups++
+				return nil, fmt.Errorf("database unavailable")
+			})
+			spec := testsv1.TestRefSpec_builder{Targets: map[string]*testsv1.TestTargetReference{
+				"a": testsv1.TestTargetReference_builder{Name: "a"}.Build(),
+				"b": testsv1.TestTargetReference_builder{Name: "b"}.Build(),
+			}}.Build()
+			response, err := invoke(spec, "Create")
+			Expect(response).To(BeNil())
+			Expect(grpcstatus.Code(err)).To(Equal(grpccodes.Internal))
+			Expect(err.Error()).To(ContainSubstring("object.spec.targets["))
+			Expect(lookups).To(Equal(1))
+			Expect(counterValue(registry, "osac_reference_validation_total", "TestTargetReference", "error")).To(Equal(1.0))
+		})
+
+		DescribeTable("honors map and nested field exclusions only for their configured method", func(
+			targetPath, attachmentPath string, updateLookups int, keepTargetID string,
+		) {
+			var err error
+			validator, err = NewReferenceValidator().SetLogger(logger).
+				SetExcludedReferencePaths([]string{"/osac.tests.v1.TestService/Update"}, targetPath, attachmentPath).Build()
+			Expect(err).ToNot(HaveOccurred())
+			lookup := func(ctx context.Context, tenant, project, id, name string) (*ResolvedRef, error) {
+				lookups++
+				return &ResolvedRef{ID: "id-" + name, Name: name}, nil
+			}
+			validator.Register("osac.tests.v1.TestTargetReference", lookup)
+			validator.Register("osac.tests.v1.TestTargetLocalReference", lookup)
+			spec := testsv1.TestRefSpec_builder{
+				Targets: map[string]*testsv1.TestTargetReference{
+					"skip": testsv1.TestTargetReference_builder{Name: "target"}.Build(),
+					"keep": testsv1.TestTargetReference_builder{Name: "kept-target"}.Build(),
+				},
+				Attachments: map[string]*testsv1.TestRefAttachment{
+					"skip": testsv1.TestRefAttachment_builder{Subnet: testsv1.TestTargetLocalReference_builder{Name: "excluded"}.Build()}.Build(),
+					"keep": testsv1.TestRefAttachment_builder{Subnet: testsv1.TestTargetLocalReference_builder{Name: "included"}.Build()}.Build(),
+				},
+			}.Build()
+			_, err = invoke(spec, "Update")
+			Expect(err).ToNot(HaveOccurred())
+			Expect(lookups).To(Equal(updateLookups))
+			Expect(spec.GetTargets()["skip"].GetId()).To(BeEmpty())
+			Expect(spec.GetTargets()["keep"].GetId()).To(Equal(keepTargetID))
+			Expect(spec.GetAttachments()["skip"].GetSubnet().GetId()).To(BeEmpty())
+			Expect(spec.GetAttachments()["keep"].GetSubnet().GetId()).To(Equal("id-included"))
+			_, err = invoke(spec, "Create")
+			Expect(err).ToNot(HaveOccurred())
+			Expect(lookups).To(Equal(updateLookups + 4))
+			Expect(spec.GetTargets()["skip"].GetId()).To(Equal("id-target"))
+			Expect(spec.GetTargets()["keep"].GetId()).To(Equal("id-kept-target"))
+			Expect(spec.GetAttachments()["skip"].GetSubnet().GetId()).To(Equal("id-excluded"))
+		},
+			Entry("whole map and nested field", "object.spec.targets", `object.spec.attachments["skip"].subnet`, 1, ""),
+			Entry("individual reference entry and nested field", `object.spec.targets["skip"]`, `object.spec.attachments["skip"].subnet`, 2, "id-kept-target"),
+			Entry("whole map and individual message entry", "object.spec.targets", `object.spec.attachments["skip"]`, 1, ""),
+			Entry("individual reference and message entries", `object.spec.targets["skip"]`, `object.spec.attachments["skip"]`, 2, "id-kept-target"),
+		)
+
+		DescribeTable("honors list exclusions only for their configured method", func(
+			referencePath, attachmentPath string, expectedIDs []string, updateLookups int,
+		) {
+			var err error
+			validator, err = NewReferenceValidator().SetLogger(logger).
+				SetExcludedReferencePaths([]string{"/osac.tests.v1.TestService/Update"}, referencePath, attachmentPath).Build()
+			Expect(err).ToNot(HaveOccurred())
+			lookup := func(ctx context.Context, tenant, project, id, name string) (*ResolvedRef, error) {
+				lookups++
+				return &ResolvedRef{ID: "id-" + name, Name: name}, nil
+			}
+			validator.Register("osac.tests.v1.TestOtherTargetLocalReference", lookup)
+			validator.Register("osac.tests.v1.TestTargetLocalReference", lookup)
+			spec := testsv1.TestRefSpec_builder{
+				OtherTargets: []*testsv1.TestOtherTargetLocalReference{
+					testsv1.TestOtherTargetLocalReference_builder{Name: "target-0"}.Build(),
+					testsv1.TestOtherTargetLocalReference_builder{Name: "target-1"}.Build(),
+				},
+				OtherAttachments: []*testsv1.TestRefAttachment{
+					testsv1.TestRefAttachment_builder{Subnet: testsv1.TestTargetLocalReference_builder{Name: "subnet-0"}.Build()}.Build(),
+					testsv1.TestRefAttachment_builder{Subnet: testsv1.TestTargetLocalReference_builder{Name: "subnet-1"}.Build()}.Build(),
+				},
+			}.Build()
+			_, err = invoke(spec, "Update")
+			Expect(err).ToNot(HaveOccurred())
+			Expect(lookups).To(Equal(updateLookups))
+			Expect([]string{
+				spec.GetOtherTargets()[0].GetId(), spec.GetOtherTargets()[1].GetId(),
+				spec.GetOtherAttachments()[0].GetSubnet().GetId(), spec.GetOtherAttachments()[1].GetSubnet().GetId(),
+			}).To(Equal(expectedIDs))
+			_, err = invoke(spec, "Create")
+			Expect(err).ToNot(HaveOccurred())
+			Expect(lookups).To(Equal(updateLookups + 4))
+			Expect([]string{
+				spec.GetOtherTargets()[0].GetId(), spec.GetOtherTargets()[1].GetId(),
+				spec.GetOtherAttachments()[0].GetSubnet().GetId(), spec.GetOtherAttachments()[1].GetSubnet().GetId(),
+			}).To(Equal([]string{"id-target-0", "id-target-1", "id-subnet-0", "id-subnet-1"}))
+		},
+			Entry("whole lists", "object.spec.other_targets", "object.spec.other_attachments", []string{"", "", "", ""}, 0),
+			Entry("individual reference and whole message list", "object.spec.other_targets[0]", "object.spec.other_attachments", []string{"", "id-target-1", "", ""}, 1),
+			Entry("whole reference list and individual message", "object.spec.other_targets", "object.spec.other_attachments[0]", []string{"", "", "", "id-subnet-1"}, 1),
+			Entry("individual references and messages", "object.spec.other_targets[0]", "object.spec.other_attachments[0]", []string{"", "id-target-1", "", "id-subnet-1"}, 2),
+		)
+	})
+
 	Describe("Stream pass-through", func() {
 		BeforeEach(func() {
 			var err error
@@ -651,7 +1259,9 @@ var _ = Describe("Reference validator", func() {
 			Expect(err).ToNot(HaveOccurred())
 			Expect(handlerCalled).To(BeTrue())
 			Expect(capturedTenant).To(Equal("tenant-a"))
-			Expect(capturedProject).To(Equal("project-b"))
+			// Global reference with empty project selects the
+			// tenant's default/root project, not the owner's.
+			Expect(capturedProject).To(BeEmpty())
 			Expect(capturedID).To(BeEmpty())
 			Expect(capturedName).To(Equal("my-target"))
 		})
@@ -869,6 +1479,254 @@ var _ = Describe("Reference validator", func() {
 
 			Expect(err).ToNot(HaveOccurred())
 			Expect(capturedTenant).To(Equal("shared"))
+		})
+
+		// OSAC-6381 regression: a global reference with an empty
+		// project from an owner in a named project must select
+		// the tenant's default/root project, not inherit the
+		// owner's project.
+		It("Global reference with empty project selects the default project", func() {
+			var capturedTenant, capturedProject string
+			validator.Register("osac.tests.v1.TestTargetReference", func(
+				ctx context.Context, tenant, project, id, name string,
+			) (*ResolvedRef, error) {
+				capturedTenant = tenant
+				capturedProject = project
+				return &ResolvedRef{
+					ID: "id-1", Tenant: tenant,
+					Project: project, Name: name,
+				}, nil
+			})
+
+			request := testsv1.CreateTestResourceWithRefsRequest_builder{
+				Object: testsv1.TestResourceWithRefs_builder{
+					Id: "resource-1",
+					Metadata: testsv1.Metadata_builder{
+						Tenant:  "tenant-a",
+						Project: "named-project",
+					}.Build(),
+					Spec: testsv1.TestRefSpec_builder{
+						Target: testsv1.TestTargetReference_builder{
+							Name: "default-project-target",
+						}.Build(),
+					}.Build(),
+				}.Build(),
+			}.Build()
+
+			mockHandler := func(ctx context.Context, req any) (any, error) {
+				return "response", nil
+			}
+
+			_, err := validator.UnaryServer(
+				context.Background(),
+				request,
+				&grpc.UnaryServerInfo{
+					FullMethod: "/osac.tests.v1.TestService/Create",
+				},
+				mockHandler,
+			)
+
+			Expect(err).ToNot(HaveOccurred())
+			Expect(capturedTenant).To(Equal("tenant-a"))
+			Expect(capturedProject).To(BeEmpty())
+		})
+
+		// Verify that local references still inherit the owner's
+		// project, unlike global references.
+		It("Local reference still uses the owner's project", func() {
+			var capturedProject string
+			validator.Register(
+				"osac.tests.v1.TestTargetLocalReference",
+				func(
+					ctx context.Context,
+					tenant, project, id, name string,
+				) (*ResolvedRef, error) {
+					capturedProject = project
+					return &ResolvedRef{
+						ID: "id-1", Tenant: tenant,
+						Project: project, Name: name,
+					}, nil
+				},
+			)
+
+			request := testsv1.CreateTestResourceWithRefsRequest_builder{
+				Object: testsv1.TestResourceWithRefs_builder{
+					Id: "resource-1",
+					Metadata: testsv1.Metadata_builder{
+						Tenant:  "tenant-a",
+						Project: "named-project",
+					}.Build(),
+					Spec: testsv1.TestRefSpec_builder{
+						LocalTarget: testsv1.TestTargetLocalReference_builder{
+							Name: "local-target",
+						}.Build(),
+					}.Build(),
+				}.Build(),
+			}.Build()
+
+			mockHandler := func(ctx context.Context, req any) (any, error) {
+				return "response", nil
+			}
+
+			_, err := validator.UnaryServer(
+				context.Background(),
+				request,
+				&grpc.UnaryServerInfo{
+					FullMethod: "/osac.tests.v1.TestService/Create",
+				},
+				mockHandler,
+			)
+
+			Expect(err).ToNot(HaveOccurred())
+			Expect(capturedProject).To(
+				Equal("named-project"),
+			)
+		})
+
+		// Shared global reference with empty project targets the
+		// shared tenant's default project.
+		It("Shared global reference with empty project selects shared default", func() {
+			var capturedTenant, capturedProject string
+			validator.Register("osac.tests.v1.TestTargetReference", func(
+				ctx context.Context, tenant, project, id, name string,
+			) (*ResolvedRef, error) {
+				capturedTenant = tenant
+				capturedProject = project
+				return &ResolvedRef{
+					ID: "id-1", Tenant: tenant,
+					Project: project, Name: name,
+				}, nil
+			})
+
+			request := testsv1.CreateTestResourceWithRefsRequest_builder{
+				Object: testsv1.TestResourceWithRefs_builder{
+					Id: "resource-1",
+					Metadata: testsv1.Metadata_builder{
+						Tenant:  "tenant-a",
+						Project: "named-project",
+					}.Build(),
+					Spec: testsv1.TestRefSpec_builder{
+						Target: testsv1.TestTargetReference_builder{
+							Name:   "shared-default-target",
+							Shared: true,
+						}.Build(),
+					}.Build(),
+				}.Build(),
+			}.Build()
+
+			mockHandler := func(ctx context.Context, req any) (any, error) {
+				return "response", nil
+			}
+
+			_, err := validator.UnaryServer(
+				context.Background(),
+				request,
+				&grpc.UnaryServerInfo{
+					FullMethod: "/osac.tests.v1.TestService/Create",
+				},
+				mockHandler,
+			)
+
+			Expect(err).ToNot(HaveOccurred())
+			Expect(capturedTenant).To(Equal("shared"))
+			Expect(capturedProject).To(BeEmpty())
+		})
+
+		// OSAC-6381 regression: a scope-aware lookup must pass
+		// the resolved tenant and project so a same-named resource
+		// in a visible named project cannot shadow the intended
+		// root-project target.
+		It("Scope-aware lookup receives the resolved project for name lookups", func() {
+			var calls []string
+			validator.Register("osac.tests.v1.TestTargetReference", func(
+				ctx context.Context, tenant, project, id, name string,
+			) (*ResolvedRef, error) {
+				calls = append(calls, fmt.Sprintf(
+					"tenant=%s project=%q id=%s name=%s",
+					tenant, project, id, name,
+				))
+				return &ResolvedRef{
+					ID: "root-id", Tenant: tenant,
+					Project: project, Name: name,
+				}, nil
+			})
+
+			request := testsv1.CreateTestResourceWithRefsRequest_builder{
+				Object: testsv1.TestResourceWithRefs_builder{
+					Metadata: testsv1.Metadata_builder{
+						Tenant:  "acme",
+						Project: "apps",
+					}.Build(),
+					Spec: testsv1.TestRefSpec_builder{
+						Target: testsv1.TestTargetReference_builder{
+							Name: "shared-name",
+						}.Build(),
+					}.Build(),
+				}.Build(),
+			}.Build()
+
+			_, err := validator.UnaryServer(
+				context.Background(),
+				request,
+				&grpc.UnaryServerInfo{
+					FullMethod: "/osac.tests.v1.TestService/Create",
+				},
+				func(ctx context.Context, req any) (any, error) {
+					return "ok", nil
+				},
+			)
+
+			Expect(err).ToNot(HaveOccurred())
+			Expect(calls).To(HaveLen(1))
+			Expect(calls[0]).To(Equal(
+				`tenant=acme project="" id= name=shared-name`,
+			))
+		})
+
+		// ID-based lookups must still receive the scope but the
+		// lookup function may use broader visibility for IDs.
+		It("ID-based global lookup receives resolved scope", func() {
+			var capturedProject, capturedID string
+			validator.Register("osac.tests.v1.TestTargetReference", func(
+				ctx context.Context, tenant, project, id, name string,
+			) (*ResolvedRef, error) {
+				capturedProject = project
+				capturedID = id
+				return &ResolvedRef{
+					ID: id, Tenant: tenant,
+					Project: project, Name: "resolved",
+				}, nil
+			})
+
+			request := testsv1.CreateTestResourceWithRefsRequest_builder{
+				Object: testsv1.TestResourceWithRefs_builder{
+					Metadata: testsv1.Metadata_builder{
+						Tenant:  "acme",
+						Project: "apps",
+					}.Build(),
+					Spec: testsv1.TestRefSpec_builder{
+						Target: testsv1.TestTargetReference_builder{
+							Id: "known-id",
+						}.Build(),
+					}.Build(),
+				}.Build(),
+			}.Build()
+
+			_, err := validator.UnaryServer(
+				context.Background(),
+				request,
+				&grpc.UnaryServerInfo{
+					FullMethod: "/osac.tests.v1.TestService/Create",
+				},
+				func(ctx context.Context, req any) (any, error) {
+					return "ok", nil
+				},
+			)
+
+			Expect(err).ToNot(HaveOccurred())
+			Expect(capturedID).To(Equal("known-id"))
+			// Global ref with empty project: scope is root.
+			Expect(capturedProject).To(BeEmpty())
 		})
 	})
 

@@ -45,6 +45,10 @@ const (
 	// Label keys within osac_labels map
 	BareMetalInstanceIDLabel = "bareMetalInstanceId"
 	ManagedByLabel           = "managedBy"
+
+	// OpenStackInterfaceMACsKey stores an administrator-supplied map of OSAC
+	// logical port names to physical MAC addresses in an Ironic node's extra.
+	OpenStackInterfaceMACsKey = OSACPrefix + "interface_macs"
 )
 
 func init() {
@@ -290,15 +294,20 @@ func (c *OpenStackClient) AssignHost(ctx context.Context, inventoryHostID string
 		HostClass:           c.hostClass,
 		ProvisionState:      node.ProvisionState,
 		ManagedBy:           managedBy,
-		Ready:               true, // Ironic nodes are immediately usable after label assignment
+		Available:           true, // Ironic nodes are immediately usable after label assignment
 	}, nil
 }
 
-func (c *OpenStackClient) UnassignHost(ctx context.Context, inventoryHostID string, labels []string) error {
+func (c *OpenStackClient) UnassignHost(ctx context.Context, inventoryHostID, bareMetalInstanceID string, labels []string) error {
 	// Get current node state to check what labels exist
 	node, err := nodes.Get(ctx, c.client, inventoryHostID).Extract()
 	if err != nil {
 		return fmt.Errorf("getting node %s: %w", inventoryHostID, err)
+	}
+
+	currentBareMetalInstanceID, assigned := getNestedLabel(node, BareMetalInstanceIDLabel)
+	if !assigned || currentBareMetalInstanceID != bareMetalInstanceID {
+		return nil
 	}
 
 	existing, _ := node.Extra["osac_labels"].(map[string]any)
@@ -436,4 +445,26 @@ func nodeMatchesLabels(node *nodes.Node, matchExpressions map[string]string) boo
 		}
 	}
 	return true
+}
+
+// GetHostLogicalPortMACs reads the logical port mapping used for DHCP lease matching.
+func (c *OpenStackClient) GetHostLogicalPortMACs(ctx context.Context, inventoryHostID string) (map[string]string, error) {
+	node, err := nodes.Get(ctx, c.client, inventoryHostID).Extract()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get Ironic node %s: %w", inventoryHostID, err)
+	}
+
+	value, ok := node.Extra[OpenStackInterfaceMACsKey]
+	if !ok || value == nil {
+		return map[string]string{}, nil
+	}
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return nil, fmt.Errorf("host %s: failed to marshal %s extra: %w", inventoryHostID, OpenStackInterfaceMACsKey, err)
+	}
+	macs := map[string]string{}
+	if err := json.Unmarshal(raw, &macs); err != nil {
+		return nil, fmt.Errorf("host %s: failed to parse %s extra: %w", inventoryHostID, OpenStackInterfaceMACsKey, err)
+	}
+	return macs, nil
 }

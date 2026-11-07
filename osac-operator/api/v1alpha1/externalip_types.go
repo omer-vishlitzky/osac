@@ -18,11 +18,13 @@ package v1alpha1
 
 import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 )
 
 // ExternalIPSpec defines the desired state of ExternalIP
+// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="spec is immutable after creation"
 type ExternalIPSpec struct {
-	// Pool is the name of the ExternalIPPool this IP is allocated from.
+	// Pool is the API ID of the ExternalIPPool this IP is allocated from.
 	// This field is immutable after creation.
 	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:MinLength=1
@@ -30,70 +32,47 @@ type ExternalIPSpec struct {
 	Pool string `json:"pool"`
 }
 
-// ExternalIPPhaseType is a valid value for .status.phase
-type ExternalIPPhaseType string
-
-const (
-	// ExternalIPPhaseProgressing means an update is in progress
-	ExternalIPPhaseProgressing ExternalIPPhaseType = "Progressing"
-
-	// ExternalIPPhaseFailed means the IP provisioning has failed
-	ExternalIPPhaseFailed ExternalIPPhaseType = "Failed"
-
-	// ExternalIPPhaseReady means the IP and all associated resources are ready
-	ExternalIPPhaseReady ExternalIPPhaseType = "Ready"
-
-	// ExternalIPPhaseDeleting means there has been a request to delete the ExternalIP
-	ExternalIPPhaseDeleting ExternalIPPhaseType = "Deleting"
-)
-
-// ExternalIPStateType is a valid value for .status.state
-type ExternalIPStateType string
-
-const (
-	// ExternalIPStatePending means the IP allocation is pending
-	ExternalIPStatePending ExternalIPStateType = "Pending"
-
-	// ExternalIPStateAllocated means the IP has been allocated from the pool
-	ExternalIPStateAllocated ExternalIPStateType = "Allocated"
-
-	// ExternalIPStateFailed means provisioning failed
-	ExternalIPStateFailed ExternalIPStateType = "Failed"
-)
-
 // ExternalIPStatus defines the observed state of ExternalIP
 type ExternalIPStatus struct {
-	// Phase provides a single-value overview of the state of the ExternalIP
-	// +kubebuilder:validation:Optional
-	// +kubebuilder:validation:Type=string
-	// +kubebuilder:validation:Enum=Progressing;Failed;Ready;Deleting
-	Phase ExternalIPPhaseType `json:"phase,omitempty"`
-
-	// DesiredConfigVersion is a hash of the spec, used to detect spec changes and control retry behavior.
-	// +kubebuilder:validation:Optional
-	DesiredConfigVersion string `json:"desiredConfigVersion,omitempty"`
-
-	// ProvisioningJobs holds an array of JobStatus tracking provisioning and deprovisioning operations
-	// +kubebuilder:validation:Optional
-	ProvisioningJobs []JobStatus `json:"provisioningJobs,omitempty"`
-
-	// Conditions holds an array of metav1.Condition that describe the state of the ExternalIP
+	// Conditions holds the Ready condition of the ExternalIP.
 	// +kubebuilder:validation:Optional
 	Conditions []metav1.Condition `json:"conditions,omitempty" patchStrategy:"merge" patchMergeKey:"type" protobuf:"bytes,1,rep,name=conditions"`
 
-	// Address is the allocated external IP address
+	// NetworkManagers records the Fabric Manager copied from the pool at create.
+	// +kubebuilder:validation:Optional
+	NetworkManagers *NetworkManagers `json:"networkManagers,omitempty"`
+
+	// TaskInput is the task input stored before the first job (contract §4.5).
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:pruning:PreserveUnknownFields
+	TaskInput *runtime.RawExtension `json:"taskInput,omitempty"`
+
+	// Jobs tracks the latest job per task and manager (contract §4.7).
+	// +kubebuilder:validation:Optional
+	// +listType=map
+	// +listMapKey=task
+	// +listMapKey=manager
+	Jobs []NetworkJobStatus `json:"jobs,omitempty"`
+
+	// Address is the allocated external IP address, set only from an accepted
+	// create_external_ip result. The API state is ALLOCATED exactly when it is
+	// set and the ExternalIP is not being deleted.
 	// +kubebuilder:validation:Optional
 	Address string `json:"address,omitempty"`
-
-	// State tracks the attachment lifecycle of the ExternalIP
-	// +kubebuilder:validation:Optional
-	// +kubebuilder:validation:Type=string
-	// +kubebuilder:validation:Enum=Pending;Allocated;Failed
-	State ExternalIPStateType `json:"state,omitempty"`
 
 	// Attached indicates whether a ExternalIPAttachment has successfully attached this IP to a target.
 	// +kubebuilder:validation:Optional
 	Attached bool `json:"attached,omitempty"`
+
+	// StateTransitionTime records when the ExternalIP entered its current state.
+	// It is authoritative for lifecycle consumers and is populated by the operator.
+	// +kubebuilder:validation:Optional
+	StateTransitionTime *metav1.Time `json:"stateTransitionTime,omitempty"`
+
+	// AttachmentTransitionTime records when the settled ExternalIP attachment changed.
+	// It is authoritative for lifecycle consumers and is populated by attachment feedback.
+	// +kubebuilder:validation:Optional
+	AttachmentTransitionTime *metav1.Time `json:"attachmentTransitionTime,omitempty"`
 }
 
 // +kubebuilder:object:root=true
@@ -101,8 +80,7 @@ type ExternalIPStatus struct {
 // +kubebuilder:resource:shortName=externalip
 // +kubebuilder:printcolumn:name="Pool",type=string,JSONPath=`.spec.pool`
 // +kubebuilder:printcolumn:name="Address",type=string,JSONPath=`.status.address`
-// +kubebuilder:printcolumn:name="State",type=string,JSONPath=`.status.state`
-// +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
+// +kubebuilder:printcolumn:name="Ready",type=string,JSONPath=`.status.conditions[?(@.type=="Ready")].reason`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 
 // ExternalIP is the Schema for the externalips API

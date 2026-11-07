@@ -1,0 +1,47 @@
+---
+- name: Apply AgentlessNet NATGateway task
+  block:
+    - name: Validate the NATGateway task input
+      ansible.builtin.include_tasks: _validate_task_input.yaml
+      vars:
+        agentless_net_expected_kind: NATGateway
+        agentless_net_expected_tasks: [create_nat_gateway, delete_nat_gateway]
+
+    - name: Require the controller-supplied dependency snapshots
+      ansible.builtin.assert:
+        that:
+          - osac_job_vars.virtual_network is mapping
+          - osac_job_vars.external_ip is mapping
+          - osac_job_vars.nat_gateway_context is mapping
+          - osac_job_vars.virtual_network.id == osac_job_vars.nat_gateway_context.virtual_network.fulfillment_id
+          - osac_job_vars.external_ip.id == osac_job_vars.nat_gateway_context.external_ip.fulfillment_id
+          - osac_job_vars.external_ip.address == osac_job_vars.nat_gateway_context.external_ip.address
+      no_log: true
+
+    - name: Classify provider failures as retryable
+      ansible.builtin.set_fact:
+        _agentless_net_failure_retryable: true
+
+    - name: Load AgentlessNet network-node inventory
+      ansible.builtin.include_tasks: _load_network_node_inventory.yaml
+      vars:
+        agentless_net_require_switches: false
+
+    - name: Reconcile or remove NATGateway provider state by API ID
+      osac.templates.agentless_net_state:
+        action: "{{ agentless_net_nat_gateway_action }}"
+        state_file: "{{ agentless_net_network_state_file }}"
+        uid: "{{ osac_job_vars.resource.id }}"
+        fulfillment_id: "{{ osac_job_vars.resource.id }}"
+        tenant_id: "{{ osac_job_vars.tenant }}"
+        nat_gateway_context: "{{ osac_job_vars.nat_gateway_context }}"
+        external_interface: "{{ agentless_net_external_interface }}"
+      delegate_to: "{{ groups['agentless_net_vn_network_node'][0] }}"
+      become: true
+      no_log: true
+  rescue:
+    - name: Publish a sanitized NATGateway error
+      ansible.builtin.include_tasks: _report_task_error.yaml
+  always:
+    - name: Remove temporary AgentlessNet SSH credentials
+      ansible.builtin.include_tasks: _cleanup_network_node_inventory.yaml

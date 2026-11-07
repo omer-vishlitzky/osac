@@ -22,9 +22,9 @@ import (
 	"k8s.io/client-go/rest"
 	clnt "sigs.k8s.io/controller-runtime/pkg/client"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
 	"github.com/osac-project/osac/fulfillment-service/internal/database/dao"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
 // stubHubClientProvider is a test double for HubClientProvider that returns a fixed client.
@@ -70,7 +70,23 @@ func createComputeInstanceInState(
 	ctx context.Context,
 	computeInstanceDao *dao.GenericDAO[*privatev1.ComputeInstance],
 	state privatev1.ComputeInstanceState,
+	hubIDs ...string,
 ) *privatev1.ComputeInstance {
+	hubID := "network-hub-a"
+	if len(hubIDs) > 0 {
+		hubID = hubIDs[0]
+	}
+	status := privatev1.ComputeInstanceStatus_builder{State: state, Hub: hubID}
+	if state == privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_RUNNING {
+		status.InternalIpAddress = "10.0.0.10"
+		status.ComputeNetworkAttachmentStatuses = []*privatev1.ComputeNetworkAttachmentStatus{
+			privatev1.ComputeNetworkAttachmentStatus_builder{IpAddress: "10.0.0.10"}.Build(),
+		}
+		status.Conditions = []*privatev1.ComputeInstanceCondition{privatev1.ComputeInstanceCondition_builder{
+			Type:   privatev1.ComputeInstanceConditionType_COMPUTE_INSTANCE_CONDITION_TYPE_READY,
+			Status: privatev1.ConditionStatus_CONDITION_STATUS_TRUE,
+		}.Build()}
+	}
 	resp, err := computeInstanceDao.Create().SetObject(
 		privatev1.ComputeInstance_builder{
 			Metadata: privatev1.Metadata_builder{
@@ -80,9 +96,7 @@ func createComputeInstanceInState(
 			Spec: privatev1.ComputeInstanceSpec_builder{
 				Template: privatev1.ComputeInstanceTemplateReference_builder{Id: "general.small"}.Build(),
 			}.Build(),
-			Status: privatev1.ComputeInstanceStatus_builder{
-				State: state,
-			}.Build(),
+			Status: status.Build(),
 		}.Build(),
 	).Do(ctx)
 	ExpectWithOffset(1, err).ToNot(HaveOccurred())
@@ -113,8 +127,9 @@ func createDiskImageWithLifecycle(
 				Tenant: auth.SharedTenant,
 			}.Build(),
 			Spec: privatev1.DiskImageSpec_builder{
-				Lifecycle:   lifecycle,
-				Deprecation: deprecation,
+				Lifecycle:    lifecycle,
+				Architecture: []privatev1.Architecture{privatev1.Architecture_ARCHITECTURE_AMD64},
+				Deprecation:  deprecation,
 			}.Build(),
 		}.Build(),
 	).Do(ctx)
@@ -144,6 +159,14 @@ func createTenant(id string) {
 	ExpectWithOffset(1, err).ToNot(HaveOccurred())
 }
 
+// seedTenantDefaultNetworking seeds READY default networking for the tenant (see seedReadyDefaultNetworking) and
+// returns the default Subnet, SecurityGroup and VirtualNetwork. Defaults are per tenant; the project and the fabric
+// manager are ignored.
+func seedTenantDefaultNetworking(tenant, _ string, _ *string) (subnetID, securityGroupID, virtualNetworkID string) {
+	fixture := seedReadyDefaultNetworking(tenant, 0)
+	return fixture.subnetID, fixture.securityGroupID, fixture.virtualNetworkID
+}
+
 // createAvailableDiskImageInTenant seeds an AVAILABLE DiskImage with an explicit id, name, and
 // tenant through the universal suite DAO (an unfiltered write). Used by the name-collision
 // precedence tests, where a shared image and one or more same-name tenant images must coexist so
@@ -165,7 +188,8 @@ func createAvailableDiskImageInTenant(id, name, tenant string) {
 				Tenant: tenant,
 			}.Build(),
 			Spec: privatev1.DiskImageSpec_builder{
-				Lifecycle: privatev1.DiskImageLifecycle_DISK_IMAGE_LIFECYCLE_AVAILABLE,
+				Lifecycle:    privatev1.DiskImageLifecycle_DISK_IMAGE_LIFECYCLE_AVAILABLE,
+				Architecture: []privatev1.Architecture{privatev1.Architecture_ARCHITECTURE_AMD64},
 			}.Build(),
 		}.Build(),
 	).Do(ctx)

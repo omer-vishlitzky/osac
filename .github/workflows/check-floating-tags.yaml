@@ -10,6 +10,7 @@ on:
       - 'osac-aap/charts/**/values.yaml'
       - 'osac-metering/charts/**/values.yaml'
       - 'osac-csi-driver/charts/**/values.yaml'
+      - 'osac-ui/charts/**/values.yaml'
       - '.github/scripts/check-floating-tags.sh'
       - '.github/workflows/check-floating-tags.yaml'
 

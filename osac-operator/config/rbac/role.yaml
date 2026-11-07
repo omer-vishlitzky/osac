@@ -4,11 +4,15 @@ kind: ClusterRole
 metadata:
   name: manager-role
 rules:
+- nonResourceURLs:
+  - /metrics
+  verbs:
+  - get
 - apiGroups:
   - ""
   resources:
   - configmaps
-  - secrets
+  - pods
   verbs:
   - get
   - list
@@ -29,27 +33,42 @@ rules:
 - apiGroups:
   - ""
   resources:
-  - services
+  - secrets
   verbs:
+  - create
   - get
+  - list
+  - watch
 - apiGroups:
   - agent-install.openshift.io
   resources:
   - agents
   verbs:
+  - delete
+  - get
+  - list
+  - patch
+  - watch
+- apiGroups:
+  - agent-install.openshift.io
+  resources:
+  - infraenvs
+  verbs:
+  - create
+  - delete
   - get
   - list
   - patch
   - update
   - watch
 - apiGroups:
-  - coordination.k8s.io
+  - cdi.kubevirt.io
   resources:
-  - leases
+  - datavolumes
   verbs:
-  - create
   - get
-  - update
+  - list
+  - watch
 - apiGroups:
   - events.k8s.io
   resources:
@@ -61,7 +80,7 @@ rules:
   - hypershift.openshift.io
   resources:
   - hostedclusters
-  - nodepools
+  - hostedcontrolplanes
   verbs:
   - get
   - list
@@ -69,16 +88,8 @@ rules:
 - apiGroups:
   - hypershift.openshift.io
   resources:
-  - hostedcontrolplanes
+  - nodepools
   verbs:
-  - get
-- apiGroups:
-  - k8s.ovn.org
-  resources:
-  - userdefinednetworks
-  verbs:
-  - create
-  - delete
   - get
   - list
   - patch
@@ -95,22 +106,12 @@ rules:
   - list
   - watch
 - apiGroups:
-  - metallb.io
-  resources:
-  - ipaddresspools
-  verbs:
-  - create
-  - delete
-  - get
-  - update
-- apiGroups:
   - osac.openshift.io
   resources:
   - baremetalinstances
   verbs:
   - get
   - list
-  - patch
   - update
   - watch
 - apiGroups:
@@ -122,7 +123,10 @@ rules:
   - externalipattachments/finalizers
   - externalippools/finalizers
   - externalips/finalizers
+  - fabricdomains/finalizers
   - natgateways/finalizers
+  - networkattachments/finalizers
+  - networkclasses/finalizers
   - securitygroups/finalizers
   - subnets/finalizers
   - tenants/finalizers
@@ -138,7 +142,9 @@ rules:
   - externalipattachments
   - externalippools
   - externalips
+  - fabricdomains
   - natgateways
+  - networkattachments
   - securitygroups
   - subnets
   - tenants
@@ -160,7 +166,10 @@ rules:
   - externalipattachments/status
   - externalippools/status
   - externalips/status
+  - fabricdomains/status
   - natgateways/status
+  - networkattachments/status
+  - networkclasses/status
   - securitygroups/status
   - subnets/status
   - tenants/status
@@ -177,6 +186,8 @@ rules:
   verbs:
   - get
   - list
+  - patch
+  - update
   - watch
 - apiGroups:
   - rbac.authorization.k8s.io
@@ -195,6 +206,16 @@ rules:
   resources:
   - storageclasses
   verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - topolvm.io
+  resources:
+  - logicalvolumes
+  verbs:
+  - create
+  - delete
   - get
   - list
   - watch

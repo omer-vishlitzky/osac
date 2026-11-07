@@ -22,9 +22,9 @@ wait_for_listener_tls() {
 # upgrade. Skip the operator wait when the cluster already exists.
 if oc get kafka/osac-kafka -n "${KAFKA_NS}" &>/dev/null; then
   echo "Kafka cluster already present, skipping operator wait."
-elif oc get subscription amq-streams -n "${KAFKA_NS}" &>/dev/null; then
+elif oc get subscriptions.operators.coreos.com amq-streams -n "${KAFKA_NS}" &>/dev/null; then
   echo "Waiting for AMQ Streams install plan..."
-  until INSTALL_PLAN=$(oc get subscription amq-streams -n "${KAFKA_NS}" -o jsonpath='{.status.installPlanRef.name}' 2>/dev/null) && [[ -n "${INSTALL_PLAN}" ]]; do
+  until INSTALL_PLAN=$(oc get subscriptions.operators.coreos.com amq-streams -n "${KAFKA_NS}" -o jsonpath='{.status.installPlanRef.name}' 2>/dev/null) && [[ -n "${INSTALL_PLAN}" ]]; do
     sleep 10
   done
 
@@ -32,7 +32,7 @@ elif oc get subscription amq-streams -n "${KAFKA_NS}" &>/dev/null; then
   oc patch installplan "${INSTALL_PLAN}" -n "${KAFKA_NS}" --type merge -p '{"spec":{"approved":true}}'
 
   echo "Waiting for AMQ Streams Subscription to report installedCSV..."
-  until AMQ_CSV=$(oc get subscription amq-streams -n "${KAFKA_NS}" -o jsonpath='{.status.installedCSV}' 2>/dev/null) && [[ -n "${AMQ_CSV}" ]]; do
+  until AMQ_CSV=$(oc get subscriptions.operators.coreos.com amq-streams -n "${KAFKA_NS}" -o jsonpath='{.status.installedCSV}' 2>/dev/null) && [[ -n "${AMQ_CSV}" ]]; do
     sleep 10
   done
 
@@ -56,10 +56,10 @@ else
   oc wait --for=condition=Available deploy/strimzi-cluster-operator -n "${KAFKA_NS}" --timeout=300s
 fi
 
-wait_for_listener_tls
-
 echo "Applying Kafka cluster..."
 oc apply -f /config/kafka-cluster.yaml
+
+wait_for_listener_tls
 
 echo "Waiting for Kafka cluster to be ready..."
 until oc wait kafka/osac-kafka -n "${KAFKA_NS}" --for=condition=Ready --timeout=600s 2>/dev/null; do

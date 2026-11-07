@@ -15,8 +15,6 @@ package logout
 
 import (
 	"context"
-	"crypto/tls"
-	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -31,6 +29,8 @@ import (
 	"github.com/osac-project/osac/fulfillment-service/internal/logging"
 	"github.com/osac-project/osac/fulfillment-service/internal/oauth"
 	"github.com/osac-project/osac/fulfillment-service/internal/terminal"
+	"github.com/osac-project/osac/fulfillment-service/internal/tlsconfig"
+	"github.com/osac-project/osac/fulfillment-service/internal/trust"
 )
 
 func Cmd() *cobra.Command {
@@ -215,11 +215,9 @@ func (c *runnerContext) refreshForIdToken(ctx context.Context, client *http.Clie
 // context.Background() with no deadline of its own.
 const httpRequestTimeout = 30 * time.Second
 
-func (c *runnerContext) httpClient(caPool *x509.CertPool, insecure bool) *http.Client {
-	tlsConfig := &tls.Config{
-		RootCAs:    caPool,
-		MinVersion: tls.VersionTLS13,
-	}
+func (c *runnerContext) httpClient(caPool *trust.CertPool, insecure bool) *http.Client {
+	tlsConfig := tlsconfig.NewClientTLSConfig()
+	tlsConfig.RootCAs = caPool.Pool()
 	if insecure {
 		tlsConfig.InsecureSkipVerify = true
 	}

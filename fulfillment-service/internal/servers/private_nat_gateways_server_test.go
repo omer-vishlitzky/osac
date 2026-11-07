@@ -14,19 +14,26 @@ language governing permissions and limitations under the License.
 package servers
 
 import (
+	"context"
+	"errors"
 	"fmt"
 
 	"github.com/google/uuid"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"go.uber.org/mock/gomock"
+	"google.golang.org/grpc"
 	grpccodes "google.golang.org/grpc/codes"
 	grpcstatus "google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
+	"github.com/osac-project/osac/fulfillment-service/internal/database"
 	"github.com/osac-project/osac/fulfillment-service/internal/database/dao"
+	"github.com/osac-project/osac/fulfillment-service/internal/references"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
 var _ = Describe("Private NAT gateways server", func() {
@@ -68,6 +75,7 @@ var _ = Describe("Private NAT gateways server", func() {
 			SetTenancyLogic(tenancy).
 			Build()
 		Expect(err).ToNot(HaveOccurred())
+		_ = networkClassDao
 
 		poolResp, err := externalIPPoolDao.Create().SetObject(
 			privatev1.ExternalIPPool_builder{
@@ -105,13 +113,18 @@ var _ = Describe("Private NAT gateways server", func() {
 		if nc, ok := networkClassCache[key]; ok {
 			return nc
 		}
-		resp, err := networkClassDao.Create().SetObject(
+		resp, err := reuseNetworkClassDAO.Create().SetObject(
 			privatev1.NetworkClass_builder{
-				FabricManager: fabricManager,
+				FabricManager: deref(fabricManager),
 				K8SManager:    k8sManager,
+				Spec:          privatev1.NetworkClassSpec_builder{AddressPlan: fixtureAddressPlan()}.Build(),
 				Metadata: privatev1.Metadata_builder{
 					Tenant: testTenant,
 					Name:   fmt.Sprintf("test-%s", uuid.NewString()[:8]),
+				}.Build(),
+				Status: privatev1.NetworkClassStatus_builder{
+					State: privatev1.NetworkClassState_NETWORK_CLASS_STATE_READY,
+					Hub:   "network-hub-a",
 				}.Build(),
 			}.Build(),
 		).Do(ctx)
@@ -122,34 +135,17 @@ var _ = Describe("Private NAT gateways server", func() {
 	}
 
 	createVirtualNetwork := func() string {
-		nc := createNetworkClass(new("netris"), nil)
+		createNetworkClass(new("netris"), nil)
 		resp, err := vnDao.Create().SetObject(
 			privatev1.VirtualNetwork_builder{
 				Metadata: privatev1.Metadata_builder{
 					Tenant: testTenant,
 					Name:   fmt.Sprintf("test-%s", uuid.NewString()[:8]),
 				}.Build(),
-				Spec: privatev1.VirtualNetworkSpec_builder{
-					NetworkClass: privatev1.NetworkClassReference_builder{Id: nc.GetId()}.Build(),
-				}.Build(),
-			}.Build(),
-		).Do(ctx)
-		Expect(err).ToNot(HaveOccurred())
-		return resp.GetObject().GetId()
-	}
-
-	// createVirtualNetworkWithoutFabricManager creates a VirtualNetwork backed by a k8s-only
-	// NetworkClass (no fabric_manager) for the fabric-manager rejection tests.
-	createVirtualNetworkWithoutFabricManager := func() string {
-		nc := createNetworkClass(nil, new("cudn_localnet"))
-		resp, err := vnDao.Create().SetObject(
-			privatev1.VirtualNetwork_builder{
-				Metadata: privatev1.Metadata_builder{
-					Tenant: testTenant,
-					Name:   fmt.Sprintf("test-%s", uuid.NewString()[:8]),
-				}.Build(),
-				Spec: privatev1.VirtualNetworkSpec_builder{
-					NetworkClass: privatev1.NetworkClassReference_builder{Id: nc.GetId()}.Build(),
+				Spec: privatev1.VirtualNetworkSpec_builder{}.Build(),
+				Status: privatev1.VirtualNetworkStatus_builder{
+					State: privatev1.VirtualNetworkState_VIRTUAL_NETWORK_STATE_READY,
+					Hub:   "network-hub-a",
 				}.Build(),
 			}.Build(),
 		).Do(ctx)
@@ -218,6 +214,340 @@ var _ = Describe("Private NAT gateways server", func() {
 			Expect(err).ToNot(HaveOccurred())
 		})
 
+		DescribeTable("resolves ExternalIP consumers through the reference interceptor", func(sameName, sameID, terminating bool) {
+			tenantsDAO, err := dao.NewGenericDAO[*privatev1.Tenant]().SetLogger(logger).SetTenancyLogic(tenancy).Build()
+			Expect(err).ToNot(HaveOccurred())
+			_, err = tenantsDAO.Create().SetObject(privatev1.Tenant_builder{Id: "second-tenant", Metadata: privatev1.Metadata_builder{Name: "second-tenant", Tenant: "second-tenant"}.Build()}.Build()).Do(ctx)
+			Expect(err).ToNot(HaveOccurred())
+			makeEIP := func(tenant, name string) *privatev1.ExternalIP {
+				response, createErr := externalIPDao.Create().SetObject(privatev1.ExternalIP_builder{
+					Metadata: privatev1.Metadata_builder{Tenant: tenant, Name: name}.Build(),
+					Spec:     privatev1.ExternalIPSpec_builder{Pool: privatev1.ExternalIPPoolReference_builder{Id: sharedPool.GetId()}.Build()}.Build(),
+					Status:   privatev1.ExternalIPStatus_builder{State: privatev1.ExternalIPState_EXTERNAL_IP_STATE_ALLOCATED, Address: "203.0.113.2", Hub: "network-hub-a"}.Build(),
+				}.Build()).Do(ctx)
+				Expect(createErr).ToNot(HaveOccurred())
+				return response.GetObject()
+			}
+			firstEIP := makeEIP(testTenant, "default-nat")
+			secondName := "different-nat"
+			if sameName {
+				secondName = "default-nat"
+			}
+			secondEIP := makeEIP("second-tenant", secondName)
+			validator, err := references.NewReferenceValidator().SetLogger(logger).Build()
+			Expect(err).ToNot(HaveOccurred())
+			references.RegisterDAOLookup(validator, "osac.private.v1.VirtualNetworkLocalReference", vnDao)
+			references.RegisterDAOLookup(validator, "osac.private.v1.ExternalIPLocalReference", externalIPDao)
+			createNAT := func(tenant, networkID, externalID, name string) (*privatev1.NATGatewaysCreateResponse, error) {
+				request := privatev1.NATGatewaysCreateRequest_builder{Object: privatev1.NATGateway_builder{
+					Metadata: privatev1.Metadata_builder{Name: name, Tenant: tenant}.Build(),
+					Spec:     privatev1.NATGatewaySpec_builder{VirtualNetwork: privatev1.VirtualNetworkLocalReference_builder{Id: networkID}.Build(), ExternalIp: privatev1.ExternalIPLocalReference_builder{Id: externalID}.Build()}.Build(),
+				}.Build()}.Build()
+				response, callErr := validator.UnaryServer(ctx, request, &grpc.UnaryServerInfo{FullMethod: privatev1.NATGateways_Create_FullMethodName}, func(callCtx context.Context, message any) (any, error) {
+					return natGatewaysServer.Create(callCtx, message.(*privatev1.NATGatewaysCreateRequest))
+				})
+				if callErr != nil {
+					return nil, callErr
+				}
+				return response.(*privatev1.NATGatewaysCreateResponse), nil
+			}
+			first, err := createNAT(testTenant, vnID, firstEIP.GetId(), "first-nat")
+			Expect(err).ToNot(HaveOccurred())
+			var storedNetworkID, storedNetworkName, storedID, storedName string
+			Expect(suiteTx.QueryRow(ctx, "select data->'spec'->'virtual_network'->>'id',coalesce(data->'spec'->'virtual_network'->>'name',''),data->'spec'->'external_ip'->>'id',coalesce(data->'spec'->'external_ip'->>'name','') from nat_gateways where id=$1", first.GetObject().GetId()).Scan(&storedNetworkID, &storedNetworkName, &storedID, &storedName)).To(Succeed())
+			Expect(storedNetworkID).To(Equal(vnID))
+			Expect(storedNetworkName).ToNot(BeEmpty())
+			Expect(storedID).To(Equal(firstEIP.GetId()))
+			Expect(storedName).To(Equal("default-nat"))
+			if terminating {
+				_, err = suiteTx.Exec(ctx, "update nat_gateways set deletion_timestamp=now() where id=$1", first.GetObject().GetId())
+				Expect(err).ToNot(HaveOccurred())
+			}
+			if sameID {
+				Expect(grpcstatus.Code(natGatewaysServer.lifecycle.ensureExternalIPAvailable(ctx, firstEIP.GetId(), "misleading-name"))).To(Equal(grpccodes.FailedPrecondition))
+				return
+			}
+			network, err := vnDao.Get().SetId(vnID).Do(ctx)
+			Expect(err).ToNot(HaveOccurred())
+			secondVN := proto.Clone(network.GetObject()).(*privatev1.VirtualNetwork)
+			secondVN.SetId("")
+			secondVN.SetMetadata(privatev1.Metadata_builder{Name: "second-network", Tenant: "second-tenant"}.Build())
+			createdVN, err := vnDao.Create().SetObject(secondVN).Do(ctx)
+			Expect(err).ToNot(HaveOccurred())
+			second, err := createNAT("second-tenant", createdVN.GetObject().GetId(), secondEIP.GetId(), "second-nat")
+			fmt.Fprintf(GinkgoWriter, "second actual intercepted Create code=%s\n", grpcstatus.Code(err))
+			Expect(err).ToNot(HaveOccurred())
+			for _, expected := range []struct{ natID, tenant, externalID string }{
+				{first.GetObject().GetId(), testTenant, firstEIP.GetId()},
+				{second.GetObject().GetId(), "second-tenant", secondEIP.GetId()},
+			} {
+				var actualTenant, actualID string
+				Expect(suiteTx.QueryRow(ctx, "select tenant,data->'spec'->'external_ip'->>'id' from nat_gateways where id=$1", expected.natID).Scan(&actualTenant, &actualID)).To(Succeed())
+				Expect(actualTenant).To(Equal(expected.tenant))
+				Expect(actualID).To(Equal(expected.externalID))
+			}
+		}, Entry("distinct canonical IDs with shared names", true, false, false),
+			Entry("noncolliding names", false, false, false),
+			Entry("same canonical ID is occupied", true, true, false),
+			Entry("terminating same canonical ID is occupied", true, true, true))
+
+		DescribeTable("classifies ExternalIP consumer identities with the real DAO", func(mode string, expected bool, code grpccodes.Code) {
+			tenantsDAO, err := dao.NewGenericDAO[*privatev1.Tenant]().SetLogger(logger).SetTenancyLogic(tenancy).Build()
+			Expect(err).ToNot(HaveOccurred())
+			_, err = tenantsDAO.Create().SetObject(privatev1.Tenant_builder{Id: "legacy-tenant", Metadata: privatev1.Metadata_builder{Name: "legacy-tenant", Tenant: "legacy-tenant"}.Build()}.Build()).Do(ctx)
+			Expect(err).ToNot(HaveOccurred())
+			makeEIP := func(tenant, name string) *privatev1.ExternalIP {
+				response, createErr := externalIPDao.Create().SetObject(privatev1.ExternalIP_builder{
+					Metadata: privatev1.Metadata_builder{Tenant: tenant, Name: name}.Build(),
+					Spec:     privatev1.ExternalIPSpec_builder{Pool: privatev1.ExternalIPPoolReference_builder{Id: sharedPool.GetId()}.Build()}.Build(),
+				}.Build()).Do(ctx)
+				Expect(createErr).ToNot(HaveOccurred())
+				return response.GetObject()
+			}
+			name := "default-nat"
+			if mode == "uuid-alias" {
+				name = uuid.NewString()
+			}
+			parent := makeEIP(testTenant, name)
+			other := makeEIP("legacy-tenant", name)
+			owner := privatev1.Metadata_builder{Tenant: testTenant}.Build()
+			reference := privatev1.ExternalIPLocalReference_builder{Id: parent.GetId(), Name: "misleading-name"}.Build()
+			callCtx := ctx
+			lifecycle := *natGatewaysServer.lifecycle
+			switch mode {
+			case "same-id-foreign-owner":
+				owner.SetTenant("legacy-tenant")
+			case "same-id-missing-owner":
+				owner = nil
+			case "other-id", "other-id-only", "ambiguous":
+				reference.SetId(other.GetId())
+				reference.SetName(name)
+				if mode != "other-id" {
+					reference.SetName("")
+				}
+				if mode == "other-id-only" {
+					owner.SetTenant("legacy-tenant")
+				}
+				if mode == "ambiguous" {
+					makeEIP(testTenant, other.GetId())
+				}
+			case "legacy", "uuid-alias", "foreign-legacy", "shared-owner", "missing-owner", "unknown", "escaped", "consistent-legacy", "conflicting-legacy":
+				reference.SetId(name)
+				reference.SetName("")
+				if mode == "foreign-legacy" {
+					owner.SetTenant("legacy-tenant")
+				}
+				if mode == "shared-owner" {
+					owner.SetTenant(auth.SharedTenant)
+					parent = makeEIP(auth.SharedTenant, name)
+				}
+				if mode == "missing-owner" {
+					owner = nil
+				}
+				if mode == "unknown" {
+					reference.SetId("unresolved")
+				}
+				if mode == "escaped" {
+					reference.SetId("path\\name")
+					reference.SetName(name)
+				}
+				if mode == "consistent-legacy" {
+					reference.SetName(name)
+				}
+				if mode == "conflicting-legacy" {
+					reference.SetName("unresolved")
+				}
+			case "name-only", "empty-id", "empty-ref":
+				reference.SetId("")
+				reference.SetName(name)
+				if mode == "empty-ref" {
+					reference.SetName("")
+				}
+			case "nil-ref":
+				reference = nil
+			case "canceled":
+				var cancel context.CancelFunc
+				callCtx, cancel = context.WithCancel(ctx)
+				cancel()
+			case "hidden":
+				hidden := auth.NewMockTenancyLogic(ctrl)
+				hidden.EXPECT().DetermineVisibility(gomock.Any()).Return(auth.ZeroVisibility(), nil).AnyTimes()
+				lifecycle.externalIPDao, err = dao.NewGenericDAO[*privatev1.ExternalIP]().SetLogger(logger).SetTenancyLogic(hidden).Build()
+				Expect(err).ToNot(HaveOccurred())
+				reference.SetId(other.GetId())
+				reference.SetName(name)
+			}
+			matches, resolveErr := lifecycle.externalIPConsumerMatches(callCtx, parent, reference, owner)
+			Expect(grpcstatus.Code(resolveErr)).To(Equal(code))
+			Expect(matches).To(Equal(expected))
+		}, Entry("known same ID ignores misleading name", "same-id", true, grpccodes.OK),
+			Entry("known same ID ignores foreign owner", "same-id-foreign-owner", true, grpccodes.OK),
+			Entry("known same ID ignores missing owner", "same-id-missing-owner", true, grpccodes.OK),
+			Entry("known different ID beats shared display name", "other-id", false, grpccodes.OK),
+			Entry("unambiguous canonical ID-only", "other-id-only", false, grpccodes.OK),
+			Entry("dual-resolving ID-only is indeterminate", "ambiguous", false, grpccodes.FailedPrecondition),
+			Entry("legacy scalar name in ID", "legacy", true, grpccodes.OK),
+			Entry("foreign tenant legacy alias", "foreign-legacy", false, grpccodes.OK),
+			Entry("shared owner and empty project", "shared-owner", true, grpccodes.OK),
+			Entry("UUID-looking unresolved alias", "uuid-alias", true, grpccodes.OK),
+			Entry("name-only reference", "name-only", true, grpccodes.OK),
+			Entry("empty ID uses name and default project", "empty-id", true, grpccodes.OK),
+			Entry("consistent legacy pair", "consistent-legacy", true, grpccodes.OK),
+			Entry("conflicting legacy pair", "conflicting-legacy", false, grpccodes.FailedPrecondition),
+			Entry("missing owner cannot resolve alias", "missing-owner", false, grpccodes.FailedPrecondition),
+			Entry("unknown reference blocks", "unknown", false, grpccodes.FailedPrecondition),
+			Entry("non-roundtripping input blocks", "escaped", false, grpccodes.FailedPrecondition),
+			Entry("empty reference blocks", "empty-ref", false, grpccodes.FailedPrecondition),
+			Entry("nil reference blocks", "nil-ref", false, grpccodes.FailedPrecondition),
+			Entry("cancellation propagates", "canceled", false, grpccodes.Canceled),
+			Entry("hidden identity blocks", "hidden", false, grpccodes.FailedPrecondition))
+
+		It("resolves legacy aliases within nonempty projects without crossing project ownership", func() {
+			projects, err := dao.NewGenericDAO[*privatev1.Project]().SetLogger(logger).SetTenancyLogic(tenancy).Build()
+			Expect(err).ToNot(HaveOccurred())
+			parents := make(map[string]*privatev1.ExternalIP)
+			for _, project := range []string{"source", "destination"} {
+				_, err = projects.Create().SetObject(privatev1.Project_builder{
+					Metadata: privatev1.Metadata_builder{Name: project, Tenant: testTenant}.Build(),
+				}.Build()).Do(ctx)
+				Expect(err).ToNot(HaveOccurred())
+				response, createErr := externalIPDao.Create().SetObject(privatev1.ExternalIP_builder{
+					Metadata: privatev1.Metadata_builder{Tenant: testTenant, Project: project, Name: "default-nat"}.Build(),
+					Spec:     privatev1.ExternalIPSpec_builder{Pool: privatev1.ExternalIPPoolReference_builder{Id: sharedPool.GetId()}.Build()}.Build(),
+				}.Build()).Do(ctx)
+				Expect(createErr).ToNot(HaveOccurred())
+				parents[project] = response.GetObject()
+			}
+			Expect(parents["source"].GetId()).ToNot(Equal(parents["destination"].GetId()))
+			for _, ownerProject := range []string{"source", "destination"} {
+				for _, parentProject := range []string{"source", "destination"} {
+					for _, reference := range []*privatev1.ExternalIPLocalReference{
+						privatev1.ExternalIPLocalReference_builder{Id: "default-nat"}.Build(),
+						privatev1.ExternalIPLocalReference_builder{Name: "default-nat"}.Build(),
+					} {
+						matches, resolveErr := natGatewaysServer.lifecycle.externalIPConsumerMatches(ctx, parents[parentProject], reference,
+							privatev1.Metadata_builder{Tenant: testTenant, Project: ownerProject}.Build())
+						Expect(resolveErr).ToNot(HaveOccurred())
+						Expect(matches).To(Equal(ownerProject == parentProject))
+					}
+				}
+			}
+		})
+
+		DescribeTable("scopes ExternalIP candidate capacity before collecting foreign owners", func(foreignProjects bool) {
+			tenants, err := dao.NewGenericDAO[*privatev1.Tenant]().SetLogger(logger).SetTenancyLogic(tenancy).Build()
+			Expect(err).ToNot(HaveOccurred())
+			projects, err := dao.NewGenericDAO[*privatev1.Project]().SetLogger(logger).SetTenancyLogic(tenancy).Build()
+			Expect(err).ToNot(HaveOccurred())
+			pool, err := externalIPPoolDao.Create().SetObject(privatev1.ExternalIPPool_builder{
+				Metadata: privatev1.Metadata_builder{Tenant: auth.SharedTenant, Name: "capacity-pool"}.Build(),
+				Spec:     privatev1.ExternalIPPoolSpec_builder{Cidrs: []string{"198.18.0.0/15"}}.Build(),
+				Status:   privatev1.ExternalIPPoolStatus_builder{State: privatev1.ExternalIPPoolState_EXTERNAL_IP_POOL_STATE_READY, Total: 2000, Available: 2000}.Build(),
+			}.Build()).Do(ctx)
+			Expect(err).ToNot(HaveOccurred())
+			_ = createNetworkClass(new("netris"), nil)
+			makeIP := func(tenant, project string, ordinal int) *privatev1.ExternalIP {
+				response, createErr := externalIPDao.Create().SetObject(privatev1.ExternalIP_builder{
+					Metadata: privatev1.Metadata_builder{Tenant: tenant, Project: project, Name: "default-nat"}.Build(),
+					Spec:     privatev1.ExternalIPSpec_builder{Pool: privatev1.ExternalIPPoolReference_builder{Id: pool.GetObject().GetId()}.Build()}.Build(),
+					Status:   privatev1.ExternalIPStatus_builder{State: privatev1.ExternalIPState_EXTERNAL_IP_STATE_ALLOCATED, Address: fmt.Sprintf("198.18.%d.%d", ordinal/256, ordinal%256), Hub: "network-hub-a"}.Build(),
+				}.Build()).Do(ctx)
+				Expect(createErr).ToNot(HaveOccurred())
+				return response.GetObject()
+			}
+			parent := makeIP(testTenant, "", 1)
+			for ordinal := 2; ordinal < 1003; ordinal++ {
+				tenant, project := testTenant, ""
+				if foreignProjects {
+					project = fmt.Sprintf("foreign-project-%d", ordinal)
+					_, err = projects.Create().SetObject(privatev1.Project_builder{
+						Metadata: privatev1.Metadata_builder{Tenant: tenant, Name: project}.Build(),
+					}.Build()).Do(ctx)
+				} else {
+					tenant = fmt.Sprintf("foreign-tenant-%d", ordinal)
+					_, err = tenants.Create().SetObject(privatev1.Tenant_builder{
+						Id: tenant, Metadata: privatev1.Metadata_builder{Tenant: tenant, Name: tenant}.Build(),
+					}.Build()).Do(ctx)
+				}
+				Expect(err).ToNot(HaveOccurred())
+				foreign := makeIP(tenant, project, ordinal)
+				network, createErr := vnDao.Create().SetObject(privatev1.VirtualNetwork_builder{
+					Metadata: privatev1.Metadata_builder{Tenant: tenant, Project: project, Name: "default"}.Build(),
+					Spec:     privatev1.VirtualNetworkSpec_builder{}.Build(),
+					Status:   privatev1.VirtualNetworkStatus_builder{State: privatev1.VirtualNetworkState_VIRTUAL_NETWORK_STATE_READY, Hub: "network-hub-a"}.Build(),
+				}.Build()).Do(ctx)
+				Expect(createErr).ToNot(HaveOccurred())
+				_, err = natGatewaysServer.lifecycle.natGatewayDao.Create().SetObject(privatev1.NATGateway_builder{
+					Metadata: privatev1.Metadata_builder{Tenant: tenant, Project: project, Name: "default"}.Build(),
+					Spec: privatev1.NATGatewaySpec_builder{
+						VirtualNetwork: privatev1.VirtualNetworkLocalReference_builder{Id: network.GetObject().GetId()}.Build(),
+						ExternalIp:     privatev1.ExternalIPLocalReference_builder{Id: foreign.GetId(), Name: foreign.GetMetadata().GetName()}.Build(),
+					}.Build(),
+				}.Build()).Do(ctx)
+				Expect(err).ToNot(HaveOccurred())
+			}
+			population, err := natGatewaysServer.lifecycle.natGatewayDao.List().SetLimit(1).Do(ctx)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(population.GetTotal()).To(Equal(int32(1001)))
+			Expect(natGatewaysServer.lifecycle.ensureExternalIPAvailable(ctx, parent.GetId(), "")).To(Succeed())
+			_, err = natGatewaysServer.Create(ctx, privatev1.NATGatewaysCreateRequest_builder{Object: privatev1.NATGateway_builder{
+				Metadata: privatev1.Metadata_builder{Tenant: testTenant, Name: "target-consumer"}.Build(),
+				Spec: privatev1.NATGatewaySpec_builder{
+					VirtualNetwork: privatev1.VirtualNetworkLocalReference_builder{Id: vnID}.Build(),
+					ExternalIp:     privatev1.ExternalIPLocalReference_builder{Id: parent.GetId()}.Build(),
+				}.Build(),
+			}.Build()}.Build())
+			Expect(err).ToNot(HaveOccurred())
+			Expect(grpcstatus.Code(natGatewaysServer.lifecycle.ensureExternalIPAvailable(ctx, parent.GetId(), ""))).To(Equal(grpccodes.FailedPrecondition))
+		}, Entry("foreign tenants with default projects", false), Entry("foreign projects in the same tenant", true))
+
+		It("bounds ExternalIP candidates and retains live and terminating consumer locks", func() {
+			parent := createExternalIPInState(ctx, externalIPDao, sharedPool.GetId(), privatev1.ExternalIPState_EXTERNAL_IP_STATE_ALLOCATED, false)
+			_, err := suiteTx.Exec(ctx, "create temporary table nat_gateways (like public.nat_gateways including defaults) on commit drop")
+			Expect(err).ToNot(HaveOccurred())
+			_, err = suiteTx.Exec(ctx, `insert into nat_gateways(id,name,tenant,data,deletion_timestamp) select id,id,$1,jsonb_build_object('spec',jsonb_build_object('external_ip',jsonb_build_object('id',$2::text,'name',$3::text))),deleted from (values ('consumer-z',now()),('consumer-a','epoch'::timestamptz)) as fixture(id,deleted)`, testTenant, parent.GetId(), parent.GetMetadata().GetName())
+			Expect(err).ToNot(HaveOccurred())
+			Expect(natGatewaysServer.lifecycle.lockExternalIPConsumers(ctx, parent)).To(Succeed())
+			matches, err := natGatewaysServer.lifecycle.externalIPNATGateways(ctx, parent)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(matches).To(HaveLen(2))
+			Expect(matches[0].GetId()).To(Equal("consumer-a"))
+			Expect(matches[1].GetId()).To(Equal("consumer-z"))
+			Expect(grpcstatus.Code(natGatewaysServer.lifecycle.deleteExternalIP(ctx, parent.GetId()))).To(Equal(grpccodes.FailedPrecondition))
+			fresh, err := externalIPDao.Get().SetId(parent.GetId()).Do(ctx)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(fresh.GetObject().GetMetadata().HasDeletionTimestamp()).To(BeFalse())
+			_, err = suiteTx.Exec(ctx, "truncate nat_gateways")
+			Expect(err).ToNot(HaveOccurred())
+			_, err = suiteTx.Exec(ctx, `insert into nat_gateways(id,name,tenant,data) values ('malformed','malformed',$1,'{"spec":{"external_ip":{}}}')`, testTenant)
+			Expect(err).ToNot(HaveOccurred())
+			_, err = natGatewaysServer.lifecycle.externalIPNATGateways(ctx, parent)
+			Expect(grpcstatus.Code(err)).To(Equal(grpccodes.FailedPrecondition))
+			_, err = suiteTx.Exec(ctx, "truncate nat_gateways")
+			Expect(err).ToNot(HaveOccurred())
+			_, err = suiteTx.Exec(ctx, `insert into nat_gateways(id,name,tenant,data) select 'candidate-'||ordinal,'candidate-'||ordinal,$1,jsonb_build_object('spec',jsonb_build_object('external_ip',jsonb_build_object('id',$2::text))) from generate_series(1,1001) ordinal`, testTenant, parent.GetId())
+			Expect(err).ToNot(HaveOccurred())
+			_, err = natGatewaysServer.lifecycle.externalIPNATGateways(ctx, parent)
+			Expect(grpcstatus.Code(err)).To(Equal(grpccodes.FailedPrecondition))
+		})
+
+		It("propagates ExternalIP consumer lookup errors without treating them as absence", func() {
+			failure := errors.New("identity visibility lookup failed")
+			failingTenancy := auth.NewMockTenancyLogic(ctrl)
+			failingTenancy.EXPECT().DetermineVisibility(gomock.Any()).Return(nil, failure)
+			failingDAO, err := dao.NewGenericDAO[*privatev1.ExternalIP]().SetLogger(logger).SetTenancyLogic(failingTenancy).Build()
+			Expect(err).ToNot(HaveOccurred())
+			transaction, err := tm.Begin(ctx)
+			Expect(err).ToNot(HaveOccurred())
+			callCtx := database.TxIntoContext(ctx, transaction)
+			lifecycle := *natGatewaysServer.lifecycle
+			lifecycle.externalIPDao = failingDAO
+			matches, err := lifecycle.externalIPConsumerMatches(callCtx, privatev1.ExternalIP_builder{Id: "target"}.Build(), privatev1.ExternalIPLocalReference_builder{Id: "different"}.Build(), privatev1.Metadata_builder{Tenant: testTenant}.Build())
+			Expect(matches).To(BeFalse())
+			Expect(errors.Is(err, failure)).To(BeTrue())
+			Expect(transaction.End(ctx)).To(Succeed())
+		})
+
 		It("creates NATGateway with PENDING initial state", func() {
 			eip := createAllocatedExternalIP()
 			response, err := natGatewaysServer.Create(ctx, privatev1.NATGatewaysCreateRequest_builder{
@@ -234,9 +564,9 @@ var _ = Describe("Private NAT gateways server", func() {
 				Equal(privatev1.NATGatewayState_NAT_GATEWAY_STATE_PENDING))
 		})
 
-		It("overrides client-provided state to PENDING on Create", func() {
+		It("rejects client-provided output status on Create", func() {
 			eip := createAllocatedExternalIP()
-			response, err := natGatewaysServer.Create(ctx, privatev1.NATGatewaysCreateRequest_builder{
+			_, err := natGatewaysServer.Create(ctx, privatev1.NATGatewaysCreateRequest_builder{
 				Object: privatev1.NATGateway_builder{
 					Metadata: privatev1.Metadata_builder{Name: "test-nat-gateway", Tenant: testTenant}.Build(),
 					Spec: privatev1.NATGatewaySpec_builder{
@@ -248,9 +578,7 @@ var _ = Describe("Private NAT gateways server", func() {
 					}.Build(),
 				}.Build(),
 			}.Build())
-			Expect(err).ToNot(HaveOccurred())
-			Expect(response.GetObject().GetStatus().GetState()).To(
-				Equal(privatev1.NATGatewayState_NAT_GATEWAY_STATE_PENDING))
+			Expect(grpcstatus.Code(err)).To(Equal(grpccodes.InvalidArgument))
 		})
 
 		It("retrieves NATGateway by ID", func() {
@@ -295,7 +623,7 @@ var _ = Describe("Private NAT gateways server", func() {
 			Expect(response.GetItems()).To(HaveLen(count))
 		})
 
-		It("updates NATGateway metadata", func() {
+		It("rejects a NATGateway metadata update", func() {
 			eip := createAllocatedExternalIP()
 			createResponse, err := natGatewaysServer.Create(ctx, privatev1.NATGatewaysCreateRequest_builder{
 				Object: privatev1.NATGateway_builder{
@@ -311,10 +639,126 @@ var _ = Describe("Private NAT gateways server", func() {
 			object := createResponse.GetObject()
 			object.GetMetadata().SetLabels(map[string]string{"env": "test"})
 			updateResponse, err := natGatewaysServer.Update(ctx, privatev1.NATGatewaysUpdateRequest_builder{
-				Object: object,
+				Object:     object,
+				UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"metadata.labels"}},
+			}.Build())
+			Expect(updateResponse).To(BeNil())
+			Expect(grpcstatus.Code(err)).To(Equal(grpccodes.InvalidArgument))
+		})
+
+		It("rejects caller-supplied output status on Create", func() {
+			eip := createAllocatedExternalIP()
+			message := "malicious status"
+			_, err := natGatewaysServer.Create(ctx, privatev1.NATGatewaysCreateRequest_builder{
+				Object: privatev1.NATGateway_builder{
+					Metadata: privatev1.Metadata_builder{Name: "output-on-create", Tenant: testTenant}.Build(),
+					Spec: privatev1.NATGatewaySpec_builder{
+						VirtualNetwork: privatev1.VirtualNetworkLocalReference_builder{Id: vnID}.Build(),
+						ExternalIp:     privatev1.ExternalIPLocalReference_builder{Id: eip.GetId()}.Build(),
+					}.Build(),
+					Status: privatev1.NATGatewayStatus_builder{
+						State:   privatev1.NATGatewayState_NAT_GATEWAY_STATE_READY,
+						Message: &message,
+						Hub:     "hub-1",
+					}.Build(),
+				}.Build(),
+			}.Build())
+			Expect(grpcstatus.Code(err)).To(Equal(grpccodes.InvalidArgument))
+		})
+
+		It("rejects an ExternalIP already claimed by an ExternalIPAttachment", func() {
+			eip := createAllocatedExternalIP()
+			computeDao, err := dao.NewGenericDAO[*privatev1.ComputeInstance]().
+				SetLogger(logger).
+				SetTenancyLogic(tenancy).
+				Build()
+			Expect(err).ToNot(HaveOccurred())
+			computeResponse, err := computeDao.Create().SetObject(privatev1.ComputeInstance_builder{
+				Metadata: privatev1.Metadata_builder{Name: "claimed-compute", Tenant: testTenant}.Build(),
+				Spec: privatev1.ComputeInstanceSpec_builder{
+					Template: privatev1.ComputeInstanceTemplateReference_builder{Id: "general.small"}.Build(),
+				}.Build(),
+				Status: privatev1.ComputeInstanceStatus_builder{
+					State: privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_RUNNING,
+				}.Build(),
+			}.Build()).Do(ctx)
+			Expect(err).ToNot(HaveOccurred())
+			_, err = natGatewaysServer.lifecycle.externalIPAttachmentDao.Create().SetObject(privatev1.ExternalIPAttachment_builder{
+				Metadata: privatev1.Metadata_builder{Name: "claimed-by-attachment", Tenant: testTenant}.Build(),
+				Spec: privatev1.ExternalIPAttachmentSpec_builder{
+					ExternalIp:      privatev1.ExternalIPLocalReference_builder{Id: eip.GetId()}.Build(),
+					ComputeInstance: privatev1.ComputeInstanceLocalReference_builder{Id: computeResponse.GetObject().GetId()}.Build(),
+				}.Build(),
+				Status: privatev1.ExternalIPAttachmentStatus_builder{
+					State: privatev1.ExternalIPAttachmentState_EXTERNAL_IP_ATTACHMENT_STATE_PENDING,
+				}.Build(),
+			}.Build()).Do(ctx)
+			Expect(err).ToNot(HaveOccurred())
+
+			vnID := createVirtualNetwork()
+			_, err = natGatewaysServer.Create(ctx, privatev1.NATGatewaysCreateRequest_builder{
+				Object: privatev1.NATGateway_builder{
+					Metadata: privatev1.Metadata_builder{Name: "nat-after-attachment", Tenant: testTenant}.Build(),
+					Spec: privatev1.NATGatewaySpec_builder{
+						VirtualNetwork: privatev1.VirtualNetworkLocalReference_builder{Id: vnID}.Build(),
+						ExternalIp:     privatev1.ExternalIPLocalReference_builder{Id: eip.GetId()}.Build(),
+					}.Build(),
+				}.Build(),
+			}.Build())
+			Expect(grpcstatus.Code(err)).To(Equal(grpccodes.FailedPrecondition))
+		})
+
+		It("rejects an update without an explicit mask", func() {
+			eip := createAllocatedExternalIP()
+			createResponse, err := natGatewaysServer.Create(ctx, privatev1.NATGatewaysCreateRequest_builder{
+				Object: privatev1.NATGateway_builder{
+					Metadata: privatev1.Metadata_builder{Name: "nil-mask-nat-gateway", Tenant: testTenant}.Build(),
+					Spec: privatev1.NATGatewaySpec_builder{
+						VirtualNetwork: privatev1.VirtualNetworkLocalReference_builder{Id: vnID}.Build(),
+						ExternalIp:     privatev1.ExternalIPLocalReference_builder{Id: eip.GetId()}.Build(),
+					}.Build(),
+				}.Build(),
 			}.Build())
 			Expect(err).ToNot(HaveOccurred())
-			Expect(updateResponse.GetObject().GetMetadata().GetLabels()).To(HaveKeyWithValue("env", "test"))
+			_, err = natGatewaysServer.Update(ctx, privatev1.NATGatewaysUpdateRequest_builder{
+				Object: createResponse.GetObject(),
+			}.Build())
+			Expect(grpcstatus.Code(err)).To(Equal(grpccodes.InvalidArgument))
+		})
+
+		It("allows trusted lifecycle updates to status.state, status.message, and status.hub", func() {
+			eip := createAllocatedExternalIP()
+			createResponse, err := natGatewaysServer.Create(ctx, privatev1.NATGatewaysCreateRequest_builder{
+				Object: privatev1.NATGateway_builder{
+					Metadata: privatev1.Metadata_builder{Name: "trusted-status-update", Tenant: testTenant}.Build(),
+					Spec: privatev1.NATGatewaySpec_builder{
+						VirtualNetwork: privatev1.VirtualNetworkLocalReference_builder{Id: vnID}.Build(),
+						ExternalIp:     privatev1.ExternalIPLocalReference_builder{Id: eip.GetId()}.Build(),
+					}.Build(),
+				}.Build(),
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+
+			message := "trusted message"
+			object := privatev1.NATGateway_builder{
+				Id: createResponse.GetObject().GetId(),
+				Status: privatev1.NATGatewayStatus_builder{
+					State:               privatev1.NATGatewayState_NAT_GATEWAY_STATE_FAILED,
+					StateTransitionTime: timestamppb.Now(),
+					Message:             &message,
+					Hub:                 "hub-1",
+				}.Build(),
+			}.Build()
+			response, err := natGatewaysServer.Update(ctx, privatev1.NATGatewaysUpdateRequest_builder{
+				Object: object,
+				UpdateMask: &fieldmaskpb.FieldMask{
+					Paths: []string{"status.state", "status.state_transition_time", "status.message", "status.hub"},
+				},
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+			Expect(response.GetObject().GetStatus().GetState()).To(Equal(privatev1.NATGatewayState_NAT_GATEWAY_STATE_FAILED))
+			Expect(response.GetObject().GetStatus().GetMessage()).To(Equal("trusted message"))
+			Expect(response.GetObject().GetStatus().GetHub()).To(Equal("hub-1"))
 		})
 
 		It("soft deletes NATGateway", func() {
@@ -475,7 +919,7 @@ var _ = Describe("Private NAT gateways server", func() {
 			Expect(err.Error()).To(ContainSubstring("not in ALLOCATED state"))
 		})
 
-		It("rejects Create when ExternalIP is already attached", func() {
+		It("does not use the parent attached output as an exclusivity guard", func() {
 			vnID := createVirtualNetwork()
 			eip := createExternalIPInState(ctx, externalIPDao, sharedPool.GetId(),
 				privatev1.ExternalIPState_EXTERNAL_IP_STATE_ALLOCATED, true)
@@ -488,9 +932,44 @@ var _ = Describe("Private NAT gateways server", func() {
 					}.Build(),
 				}.Build(),
 			}.Build())
-			Expect(err).To(HaveOccurred())
+			Expect(err).ToNot(HaveOccurred())
+		})
+	})
+
+	Describe("VirtualNetwork readiness", func() {
+		var natGatewaysServer *PrivateNATGatewaysServer
+
+		BeforeEach(func() {
+			var err error
+			natGatewaysServer, err = NewPrivateNATGatewaysServer().
+				SetLogger(logger).
+				SetAttributionLogic(attribution).
+				SetTenancyLogic(tenancy).
+				Build()
+			Expect(err).ToNot(HaveOccurred())
+		})
+
+		It("rejects Create when the VirtualNetwork is not READY", func() {
+			vnID := createVirtualNetwork()
+			vnResponse, err := vnDao.Get().SetId(vnID).Do(ctx)
+			Expect(err).ToNot(HaveOccurred())
+			virtualNetwork := vnResponse.GetObject()
+			virtualNetwork.GetStatus().SetState(privatev1.VirtualNetworkState_VIRTUAL_NETWORK_STATE_PENDING)
+			_, err = vnDao.Update().SetObject(virtualNetwork).Do(ctx)
+			Expect(err).ToNot(HaveOccurred())
+
+			eip := createAllocatedExternalIP()
+			_, err = natGatewaysServer.Create(ctx, privatev1.NATGatewaysCreateRequest_builder{
+				Object: privatev1.NATGateway_builder{
+					Metadata: privatev1.Metadata_builder{Name: "pending-vn-nat", Tenant: testTenant}.Build(),
+					Spec: privatev1.NATGatewaySpec_builder{
+						VirtualNetwork: privatev1.VirtualNetworkLocalReference_builder{Id: vnID}.Build(),
+						ExternalIp:     privatev1.ExternalIPLocalReference_builder{Id: eip.GetId()}.Build(),
+					}.Build(),
+				}.Build(),
+			}.Build())
 			Expect(grpcstatus.Code(err)).To(Equal(grpccodes.FailedPrecondition))
-			Expect(err.Error()).To(ContainSubstring("already attached"))
+			Expect(err.Error()).To(ContainSubstring("not in READY state"))
 		})
 	})
 
@@ -507,36 +986,33 @@ var _ = Describe("Private NAT gateways server", func() {
 			Expect(err).ToNot(HaveOccurred())
 		})
 
-		It("rejects Create when the VirtualNetwork's NetworkClass has no fabric_manager", func() {
-			vnID := createVirtualNetworkWithoutFabricManager()
-			eip := createAllocatedExternalIP()
-			_, err := natGatewaysServer.Create(ctx, privatev1.NATGatewaysCreateRequest_builder{
-				Object: privatev1.NATGateway_builder{
-					Metadata: privatev1.Metadata_builder{Tenant: testTenant}.Build(),
-					Spec: privatev1.NATGatewaySpec_builder{
-						VirtualNetwork: privatev1.VirtualNetworkLocalReference_builder{Id: vnID}.Build(),
-						ExternalIp:     privatev1.ExternalIPLocalReference_builder{Id: eip.GetId()}.Build(),
-					}.Build(),
-				}.Build(),
-			}.Build())
-			Expect(err).To(HaveOccurred())
-			Expect(grpcstatus.Code(err)).To(Equal(grpccodes.FailedPrecondition))
-			Expect(err.Error()).To(ContainSubstring("fabric_manager"))
-		})
-
-		It("allows Create when the VirtualNetwork's NetworkClass has a fabric_manager", func() {
+		It("rejects Create when VirtualNetwork and ExternalIP belong to different Hubs", func() {
 			vnID := createVirtualNetwork()
-			eip := createAllocatedExternalIP()
-			_, err := natGatewaysServer.Create(ctx, privatev1.NATGatewaysCreateRequest_builder{
+			eip := createExternalIPInState(ctx, externalIPDao, sharedPool.GetId(),
+				privatev1.ExternalIPState_EXTERNAL_IP_STATE_ALLOCATED, false, "network-hub-b")
+			name := fmt.Sprintf("test-%s", uuid.NewString()[:8])
+
+			response, err := natGatewaysServer.Create(ctx, privatev1.NATGatewaysCreateRequest_builder{
 				Object: privatev1.NATGateway_builder{
-					Metadata: privatev1.Metadata_builder{Tenant: testTenant}.Build(),
+					Metadata: privatev1.Metadata_builder{Name: name, Tenant: testTenant}.Build(),
 					Spec: privatev1.NATGatewaySpec_builder{
 						VirtualNetwork: privatev1.VirtualNetworkLocalReference_builder{Id: vnID}.Build(),
 						ExternalIp:     privatev1.ExternalIPLocalReference_builder{Id: eip.GetId()}.Build(),
 					}.Build(),
 				}.Build(),
 			}.Build())
+			Expect(response).To(BeNil())
+			Expect(grpcstatus.Code(err)).To(Equal(grpccodes.FailedPrecondition))
+			Expect(err.Error()).To(ContainSubstring("different Hub than the canonical networking Hub"))
+			Expect(err.Error()).ToNot(ContainSubstring("network-hub-a"))
+			Expect(err.Error()).ToNot(ContainSubstring("network-hub-b"))
+
+			natGatewaysDao, err := dao.NewGenericDAO[*privatev1.NATGateway]().
+				SetLogger(logger).SetTenancyLogic(tenancy).Build()
 			Expect(err).ToNot(HaveOccurred())
+			stored, err := natGatewaysDao.List().SetFilter(fmt.Sprintf("this.metadata.name == %q", name)).Do(ctx)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(stored.GetItems()).To(BeEmpty())
 		})
 	})
 
@@ -581,6 +1057,36 @@ var _ = Describe("Private NAT gateways server", func() {
 			Expect(err.Error()).To(ContainSubstring("immutable"))
 		})
 
+		It("rejects moving a stored NATGateway into a reserved tenant and preserves the stored object", func() {
+			vnID := createVirtualNetwork()
+			eip := createAllocatedExternalIP()
+			createResponse, err := natGatewaysServer.Create(ctx, privatev1.NATGatewaysCreateRequest_builder{
+				Object: privatev1.NATGateway_builder{
+					Metadata: privatev1.Metadata_builder{Name: "tenant-immutable-nat", Tenant: testTenant}.Build(),
+					Spec: privatev1.NATGatewaySpec_builder{
+						VirtualNetwork: privatev1.VirtualNetworkLocalReference_builder{Id: vnID}.Build(),
+						ExternalIp:     privatev1.ExternalIPLocalReference_builder{Id: eip.GetId()}.Build(),
+					}.Build(),
+				}.Build(),
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+			id := createResponse.GetObject().GetId()
+
+			_, err = natGatewaysServer.Update(ctx, privatev1.NATGatewaysUpdateRequest_builder{
+				Object: privatev1.NATGateway_builder{
+					Id:       id,
+					Metadata: privatev1.Metadata_builder{Tenant: auth.SharedTenant}.Build(),
+				}.Build(),
+				UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"metadata.tenant"}},
+			}.Build())
+			Expect(grpcstatus.Code(err)).To(Equal(grpccodes.PermissionDenied))
+			Expect(err.Error()).To(ContainSubstring("objects cannot be placed in the 'shared' tenant"))
+
+			stored, getErr := natGatewaysServer.Get(ctx, privatev1.NATGatewaysGetRequest_builder{Id: id}.Build())
+			Expect(getErr).ToNot(HaveOccurred())
+			Expect(stored.GetObject().GetMetadata().GetTenant()).To(Equal(testTenant))
+		})
+
 		It("rejects update of spec.external_ip", func() {
 			vnID := createVirtualNetwork()
 			eip := createAllocatedExternalIP()
@@ -623,7 +1129,7 @@ var _ = Describe("Private NAT gateways server", func() {
 			Expect(err).ToNot(HaveOccurred())
 		})
 
-		It("sets attached flag to true on Create", func() {
+		It("does not populate ExternalIP attachment status on Create", func() {
 			vnID := createVirtualNetwork()
 			eip := createAllocatedExternalIP()
 			_, err := natGatewaysServer.Create(ctx, privatev1.NATGatewaysCreateRequest_builder{
@@ -639,7 +1145,7 @@ var _ = Describe("Private NAT gateways server", func() {
 
 			getResp, err := externalIPDao.Get().SetId(eip.GetId()).Do(ctx)
 			Expect(err).ToNot(HaveOccurred())
-			Expect(getResp.GetObject().GetStatus().GetAttached()).To(BeTrue())
+			Expect(getResp.GetObject().GetStatus().GetAttached()).To(BeFalse())
 		})
 
 		It("clears attached flag on Delete", func() {
@@ -670,10 +1176,240 @@ var _ = Describe("Private NAT gateways server", func() {
 			Expect(getResp.GetObject().GetStatus().GetAttached()).To(BeFalse())
 		})
 
+		It("rejects NATGateway referencing VirtualNetwork from a different tenant", func() {
+			vnID := createVirtualNetwork()
+			eip := createAllocatedExternalIP()
+			_, err := natGatewaysServer.Create(ctx, privatev1.NATGatewaysCreateRequest_builder{
+				Object: privatev1.NATGateway_builder{
+					Metadata: privatev1.Metadata_builder{Name: "cross-tenant-vn-nat", Tenant: "other-tenant"}.Build(),
+					Spec: privatev1.NATGatewaySpec_builder{
+						VirtualNetwork: privatev1.VirtualNetworkLocalReference_builder{Id: vnID}.Build(),
+						ExternalIp:     privatev1.ExternalIPLocalReference_builder{Id: eip.GetId()}.Build(),
+					}.Build(),
+				}.Build(),
+			}.Build())
+			Expect(grpcstatus.Code(err)).To(Equal(grpccodes.InvalidArgument))
+			Expect(err).To(MatchError(ContainSubstring("does not exist")))
+		})
+
+		It("rejects NATGateway referencing ExternalIP from a different tenant", func() {
+			tenantsDao, err := dao.NewGenericDAO[*privatev1.Tenant]().
+				SetLogger(logger).
+				SetTableName("tenants").
+				SetTenancyLogic(tenancy).
+				Build()
+			Expect(err).ToNot(HaveOccurred())
+			_, err = tenantsDao.Create().
+				SetObject(privatev1.Tenant_builder{
+					Id: "tenant-b",
+					Metadata: privatev1.Metadata_builder{
+						Name:   "tenant-b",
+						Tenant: "tenant-b",
+					}.Build(),
+				}.Build()).
+				Do(ctx)
+			Expect(err).ToNot(HaveOccurred())
+
+			vnID := createVirtualNetwork()
+			eipResp, err := externalIPDao.Create().SetObject(
+				privatev1.ExternalIP_builder{
+					Metadata: privatev1.Metadata_builder{
+						Tenant: "tenant-b",
+						Name:   fmt.Sprintf("tenant-b-eip-%s", uuid.NewString()[:8]),
+					}.Build(),
+					Spec: privatev1.ExternalIPSpec_builder{
+						Pool: privatev1.ExternalIPPoolReference_builder{Id: sharedPool.GetId()}.Build(),
+					}.Build(),
+					Status: privatev1.ExternalIPStatus_builder{
+						State:   privatev1.ExternalIPState_EXTERNAL_IP_STATE_ALLOCATED,
+						Address: "203.0.113.50",
+					}.Build(),
+				}.Build(),
+			).Do(ctx)
+			Expect(err).ToNot(HaveOccurred())
+
+			_, err = natGatewaysServer.Create(ctx, privatev1.NATGatewaysCreateRequest_builder{
+				Object: privatev1.NATGateway_builder{
+					Metadata: privatev1.Metadata_builder{Name: "cross-tenant-eip-nat", Tenant: testTenant}.Build(),
+					Spec: privatev1.NATGatewaySpec_builder{
+						VirtualNetwork: privatev1.VirtualNetworkLocalReference_builder{Id: vnID}.Build(),
+						ExternalIp:     privatev1.ExternalIPLocalReference_builder{Id: eipResp.GetObject().GetId()}.Build(),
+					}.Build(),
+				}.Build(),
+			}.Build())
+			Expect(grpcstatus.Code(err)).To(Equal(grpccodes.InvalidArgument))
+			Expect(err).To(MatchError(ContainSubstring("belongs to tenant")))
+		})
+
+		Describe("Create with references by name", func() {
+			const otherTenant = "name-other-tenant"
+			var createByName func(tenant, networkName, externalIPID, externalIPName, name string) (
+				*privatev1.NATGatewaysCreateResponse, error)
+			var makeEIP func(tenant, name string, metadata *privatev1.Metadata) *privatev1.ExternalIP
+			var makeVN func(tenant, name string, labels map[string]string) *privatev1.VirtualNetwork
+
+			BeforeEach(func() {
+				tenantsDAO, err := dao.NewGenericDAO[*privatev1.Tenant]().SetLogger(logger).SetTenancyLogic(tenancy).Build()
+				Expect(err).ToNot(HaveOccurred())
+				_, err = tenantsDAO.Create().SetObject(privatev1.Tenant_builder{
+					Id:       otherTenant,
+					Metadata: privatev1.Metadata_builder{Name: otherTenant, Tenant: otherTenant}.Build(),
+				}.Build()).Do(ctx)
+				Expect(err).ToNot(HaveOccurred())
+				createNetworkClass(new("netris"), nil)
+
+				// The validator has the production exclusion, so the handler resolves the ExternalIP.
+				validator, err := references.NewReferenceValidator().SetLogger(logger).
+					SetExcludedReferencePaths([]string{privatev1.NATGateways_Create_FullMethodName},
+						"object.spec.external_ip").
+					Build()
+				Expect(err).ToNot(HaveOccurred())
+				references.RegisterDAOLookup(validator, "osac.private.v1.VirtualNetworkLocalReference", vnDao)
+				references.RegisterDAOLookup(validator, "osac.private.v1.ExternalIPLocalReference", externalIPDao)
+				createByName = func(tenant, networkName, externalIPID, externalIPName, name string) (
+					*privatev1.NATGatewaysCreateResponse, error) {
+					request := privatev1.NATGatewaysCreateRequest_builder{Object: privatev1.NATGateway_builder{
+						Metadata: privatev1.Metadata_builder{Name: name, Tenant: tenant}.Build(),
+						Spec: privatev1.NATGatewaySpec_builder{
+							VirtualNetwork: privatev1.VirtualNetworkLocalReference_builder{Name: networkName}.Build(),
+							ExternalIp: privatev1.ExternalIPLocalReference_builder{
+								Id: externalIPID, Name: externalIPName,
+							}.Build(),
+						}.Build(),
+					}.Build()}.Build()
+					response, callErr := validator.UnaryServer(ctx, request,
+						&grpc.UnaryServerInfo{FullMethod: privatev1.NATGateways_Create_FullMethodName},
+						func(callCtx context.Context, message any) (any, error) {
+							return natGatewaysServer.Create(callCtx, message.(*privatev1.NATGatewaysCreateRequest))
+						})
+					if callErr != nil {
+						return nil, callErr
+					}
+					return response.(*privatev1.NATGatewaysCreateResponse), nil
+				}
+				makeEIP = func(tenant, name string, metadata *privatev1.Metadata) *privatev1.ExternalIP {
+					if metadata == nil {
+						metadata = privatev1.Metadata_builder{}.Build()
+					}
+					metadata.SetTenant(tenant)
+					metadata.SetName(name)
+					response, createErr := externalIPDao.Create().SetObject(privatev1.ExternalIP_builder{
+						Metadata: metadata,
+						Spec:     privatev1.ExternalIPSpec_builder{Pool: privatev1.ExternalIPPoolReference_builder{Id: sharedPool.GetId()}.Build()}.Build(),
+						Status: privatev1.ExternalIPStatus_builder{
+							State: privatev1.ExternalIPState_EXTERNAL_IP_STATE_ALLOCATED, Address: "203.0.113.2", Hub: "network-hub-a",
+						}.Build(),
+					}.Build()).Do(ctx)
+					Expect(createErr).ToNot(HaveOccurred())
+					return response.GetObject()
+				}
+				makeVN = func(tenant, name string, labels map[string]string) *privatev1.VirtualNetwork {
+					response, createErr := vnDao.Create().SetObject(privatev1.VirtualNetwork_builder{
+						Metadata: privatev1.Metadata_builder{Tenant: tenant, Name: name, Labels: labels}.Build(),
+						Spec:     privatev1.VirtualNetworkSpec_builder{}.Build(),
+						Status: privatev1.VirtualNetworkStatus_builder{
+							State: privatev1.VirtualNetworkState_VIRTUAL_NETWORK_STATE_READY, Hub: "network-hub-a",
+						}.Build(),
+					}.Build()).Do(ctx)
+					Expect(createErr).ToNot(HaveOccurred())
+					return response.GetObject()
+				}
+			})
+
+			It("resolves a name-only ExternalIP and locks it to the gateway", func() {
+				makeVN(testTenant, "vn-by-name", nil)
+				eip := makeEIP(testTenant, "eip-by-name", nil)
+				response, err := createByName(testTenant, "vn-by-name", "", "eip-by-name", "nat-by-name")
+				Expect(err).ToNot(HaveOccurred())
+				reference := response.GetObject().GetSpec().GetExternalIp()
+				Expect(reference.GetId()).To(Equal(eip.GetId()))
+				Expect(reference.GetName()).To(Equal("eip-by-name"))
+				Expect(response.GetObject().GetSpec().GetVirtualNetwork().GetId()).ToNot(BeEmpty())
+				Expect(response.GetObject().GetSpec().GetVirtualNetwork().GetName()).To(Equal("vn-by-name"))
+
+				makeVN(testTenant, "vn-second", nil)
+				_, err = createByName(testTenant, "vn-second", "", "eip-by-name", "nat-second")
+				Expect(grpcstatus.Code(err)).To(Equal(grpccodes.FailedPrecondition))
+			})
+
+			It("resolves the same ExternalIP name within each tenant", func() {
+				makeVN(testTenant, "vn-a", nil)
+				makeVN(otherTenant, "vn-b", nil)
+				first := makeEIP(testTenant, "shared-name", nil)
+				second := makeEIP(otherTenant, "shared-name", nil)
+				a, err := createByName(testTenant, "vn-a", "", "shared-name", "nat-a")
+				Expect(err).ToNot(HaveOccurred())
+				b, err := createByName(otherTenant, "vn-b", "", "shared-name", "nat-b")
+				Expect(err).ToNot(HaveOccurred())
+				Expect(a.GetObject().GetSpec().GetExternalIp().GetId()).To(Equal(first.GetId()))
+				Expect(b.GetObject().GetSpec().GetExternalIp().GetId()).To(Equal(second.GetId()))
+			})
+
+			It("rejects another tenant's ExternalIP name without revealing it", func() {
+				makeVN(testTenant, "vn-a", nil)
+				foreign := makeEIP(otherTenant, "foreign-eip", nil)
+				_, err := createByName(testTenant, "vn-a", "", "foreign-eip", "nat-a")
+				Expect(grpcstatus.Code(err)).To(Equal(grpccodes.InvalidArgument))
+				Expect(grpcstatus.Convert(err).Message()).To(Equal("ExternalIP 'foreign-eip' does not exist"))
+				Expect(err.Error()).ToNot(ContainSubstring(foreign.GetId()))
+				Expect(err.Error()).ToNot(ContainSubstring(otherTenant))
+			})
+
+			It("rejects an unknown ExternalIP name", func() {
+				makeVN(testTenant, "vn-a", nil)
+				_, err := createByName(testTenant, "vn-a", "", "no-such-eip", "nat-a")
+				Expect(grpcstatus.Code(err)).To(Equal(grpccodes.InvalidArgument))
+				Expect(grpcstatus.Convert(err).Message()).To(Equal("ExternalIP 'no-such-eip' does not exist"))
+			})
+
+			It("rejects an ExternalIP ID with a mismatching name", func() {
+				makeVN(testTenant, "vn-a", nil)
+				eip := makeEIP(testTenant, "right-name", nil)
+				_, err := createByName(testTenant, "vn-a", eip.GetId(), "wrong-name", "nat-a")
+				Expect(grpcstatus.Code(err)).To(Equal(grpccodes.InvalidArgument))
+			})
+
+			It("still accepts an ExternalIP ID alone", func() {
+				makeVN(testTenant, "vn-a", nil)
+				eip := makeEIP(testTenant, "right-name", nil)
+				response, err := createByName(testTenant, "vn-a", eip.GetId(), "", "nat-a")
+				Expect(err).ToNot(HaveOccurred())
+				Expect(response.GetObject().GetSpec().GetExternalIp().GetId()).To(Equal(eip.GetId()))
+			})
+
+			DescribeTable("checks the default VirtualNetwork before resolving the ExternalIP",
+				func(externalIPName string) {
+					makeVN(testTenant, "vn-default", map[string]string{"osac.openshift.io/default": "true"})
+					makeEIP(otherTenant, "foreign-eip", nil)
+					// The ExternalIP does not resolve for this tenant, so a resolver that ran first would
+					// return InvalidArgument instead of the default VirtualNetwork error.
+					_, err := createByName(testTenant, "vn-default", "", externalIPName, "nat-a")
+					Expect(grpcstatus.Code(err)).To(Equal(grpccodes.FailedPrecondition))
+					Expect(grpcstatus.Convert(err).Message()).To(ContainSubstring("is a tenant default"))
+				},
+				Entry("unknown ExternalIP name", "no-such-eip"),
+				Entry("another tenant's ExternalIP name", "foreign-eip"))
+
+			It("still rejects an automatic ExternalIP given by name", func() {
+				makeVN(testTenant, "vn-a", nil)
+				makeEIP(testTenant, "auto-eip", privatev1.Metadata_builder{
+					Creator: systemCreator,
+					Labels: map[string]string{
+						autoCreatedLabel:     "true",
+						autoCreatedForLabel:  uuid.NewString(),
+						autoCreatedKindLabel: "compute_instance",
+					},
+				}.Build())
+				_, err := createByName(testTenant, "vn-a", "", "auto-eip", "nat-a")
+				Expect(grpcstatus.Code(err)).To(Equal(grpccodes.FailedPrecondition))
+				Expect(grpcstatus.Convert(err).Message()).To(ContainSubstring("is automatic"))
+			})
+		})
+
 		It("blocks deletion of default-labeled NATGateway", func() {
 			vnID := createVirtualNetwork()
 			eip := createAllocatedExternalIP()
-			createResponse, err := natGatewaysServer.Create(ctx, privatev1.NATGatewaysCreateRequest_builder{
+			createResponse, err := natGatewaysServer.Create(controllerContext(), privatev1.NATGatewaysCreateRequest_builder{
 				Object: privatev1.NATGateway_builder{
 					Metadata: privatev1.Metadata_builder{
 						Name:       "test-nat-gateway",
@@ -690,6 +1426,7 @@ var _ = Describe("Private NAT gateways server", func() {
 				}.Build(),
 			}.Build())
 			Expect(err).ToNot(HaveOccurred())
+			stateBeforeDelete := createResponse.GetObject().GetStatus().GetState()
 
 			_, err = natGatewaysServer.Delete(ctx, privatev1.NATGatewaysDeleteRequest_builder{
 				Id: createResponse.GetObject().GetId(),
@@ -700,6 +1437,52 @@ var _ = Describe("Private NAT gateways server", func() {
 			Expect(status.Code()).To(Equal(grpccodes.FailedPrecondition))
 			Expect(err.Error()).To(ContainSubstring("default"))
 			Expect(err.Error()).To(ContainSubstring("system-managed"))
+			getResponse, err := natGatewaysServer.Get(ctx, privatev1.NATGatewaysGetRequest_builder{
+				Id: createResponse.GetObject().GetId(),
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+			Expect(getResponse.GetObject().GetMetadata().GetDeletionTimestamp()).To(BeNil())
+			Expect(getResponse.GetObject().GetStatus().GetState()).To(Equal(stateBeforeDelete))
+		})
+
+		It("blocks deletion after an update omits the default label", func() {
+			vnID := createVirtualNetwork()
+			eip := createAllocatedExternalIP()
+			createResp, err := natGatewaysServer.Create(controllerContext(), privatev1.NATGatewaysCreateRequest_builder{
+				Object: privatev1.NATGateway_builder{
+					Metadata: privatev1.Metadata_builder{
+						Name:   "default-nat-gateway-update",
+						Tenant: testTenant,
+						Labels: map[string]string{"osac.openshift.io/default": "true"},
+					}.Build(),
+					Spec: privatev1.NATGatewaySpec_builder{
+						VirtualNetwork: privatev1.VirtualNetworkLocalReference_builder{Id: vnID}.Build(),
+						ExternalIp:     privatev1.ExternalIPLocalReference_builder{Id: eip.GetId()}.Build(),
+					}.Build(),
+				}.Build(),
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+
+			object := createResp.GetObject()
+			object.GetMetadata().SetLabels(map[string]string{"env": "test"})
+			_, err = natGatewaysServer.Update(ctx, privatev1.NATGatewaysUpdateRequest_builder{
+				Object:     object,
+				UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"metadata.labels"}},
+			}.Build())
+			Expect(err).To(HaveOccurred())
+			status, ok := grpcstatus.FromError(err)
+			Expect(ok).To(BeTrue())
+			Expect(status.Code()).To(Equal(grpccodes.InvalidArgument))
+
+			_, err = natGatewaysServer.Delete(ctx, privatev1.NATGatewaysDeleteRequest_builder{Id: object.GetId()}.Build())
+			Expect(err).To(HaveOccurred())
+			status, ok = grpcstatus.FromError(err)
+			Expect(ok).To(BeTrue())
+			Expect(status.Code()).To(Equal(grpccodes.FailedPrecondition))
+
+			getResp, err := natGatewaysServer.Get(ctx, privatev1.NATGatewaysGetRequest_builder{Id: object.GetId()}.Build())
+			Expect(err).ToNot(HaveOccurred())
+			Expect(getResp.GetObject().GetMetadata().GetLabels()).To(HaveKeyWithValue("osac.openshift.io/default", "true"))
 		})
 	})
 })

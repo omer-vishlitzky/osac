@@ -31,8 +31,8 @@ spec:
     - jsonPath: .status.phase
       name: Phase
       type: string
-    - jsonPath: .status.backend
-      name: Backend
+    - jsonPath: .status.provider
+      name: Provider
       priority: 1
       type: string
     - jsonPath: .status.vendorVolumeID
@@ -93,12 +93,34 @@ spec:
                   rule: self == oldSelf
               storageTier:
                 description: |-
-                  StorageTier is the name of the StorageTier that determines which backend
+                  StorageTier is the name of the StorageTier that determines which provider
                   and protocol serve this volume.
                 minLength: 1
                 type: string
                 x-kubernetes-validations:
                 - message: storageTier is immutable
+                  rule: self == oldSelf
+              topology:
+                description: |-
+                  Topology carries CSI-style placement constraints for this volume.
+                  For node-local backends (e.g. LVMS), the "osac.io/node" segment
+                  pins the volume to the scheduler-selected node; the ComputeInstance
+                  using this volume is then node-pinned. For network backends,
+                  topology may carry zone/region segments or be empty.
+                  The target CSI driver must support WaitForFirstConsumer and
+                  advertise VOLUME_ACCESSIBILITY_CONSTRAINTS for topology to take
+                  effect. Immutable after creation.
+                properties:
+                  segments:
+                    additionalProperties:
+                      type: string
+                    description: |-
+                      Segments is a CSI-style topology map (e.g. {"osac.io/node": "worker-1"}).
+                      Keys mirror CSI topology keys; values are scheduler-resolved.
+                    type: object
+                type: object
+                x-kubernetes-validations:
+                - message: topology is immutable
                   rule: self == oldSelf
             required:
             - accessMode
@@ -108,11 +130,6 @@ spec:
           status:
             description: VolumeStatus defines the observed state of Volume.
             properties:
-              backend:
-                description: |-
-                  Backend is the name of the StorageBackend that serves this volume.
-                  Resolved during tier resolution at creation time.
-                type: string
               conditions:
                 description: Conditions holds an array of metav1.Condition that describe
                   the state of the Volume.
@@ -182,6 +199,7 @@ spec:
                 - Ready
                 - Failed
                 - Deleting
+                - Deleted
                 type: string
               protocol:
                 allOf:
@@ -194,6 +212,22 @@ spec:
                 description: |-
                   Protocol is the storage protocol used for this volume.
                   Resolved during tier resolution at creation time.
+                type: string
+              provider:
+                description: |-
+                  Provider identifies the registered VendorProvisioner implementation selected for this volume.
+                  Resolved during tier resolution at creation time.
+                type: string
+              provisionedSizeGiB:
+                description: ProvisionedSizeGiB is the capacity last committed on
+                  the vendor array.
+                format: int64
+                type: integer
+              stateTransitionTime:
+                description: |-
+                  StateTransitionTime is the authoritative time at which the lifecycle
+                  phase last changed.
+                format: date-time
                 type: string
               vendorContext:
                 additionalProperties:

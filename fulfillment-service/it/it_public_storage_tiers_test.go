@@ -21,10 +21,11 @@ import (
 	. "github.com/onsi/gomega"
 	grpccodes "google.golang.org/grpc/codes"
 	grpcstatus "google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/fieldmaskpb"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
-	publicv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/public/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/uuid"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
 
 // testBackendPassword is a dummy credential for a StorageBackend that only ever exists for the
@@ -125,9 +126,6 @@ var _ = Describe("Public storage tiers", func() {
 		Expect(object.GetId()).To(Equal(id))
 		Expect(object.GetSpec().GetDescription()).To(Equal("Public IT test storage tier."))
 		Expect(object.GetSpec().GetProtocol()).To(Equal(publicv1.StorageProtocol_STORAGE_PROTOCOL_NFS))
-		Expect(object.GetSpec().GetMaxReadBandwidthMbs()).To(Equal(int32(1000)))
-		Expect(object.GetSpec().GetMaxWriteBandwidthMbs()).To(Equal(int32(500)))
-		Expect(object.GetSpec().GetEncryptionEnabled()).To(BeTrue())
 		Expect(object.GetStatus().GetState()).To(Equal(publicv1.StorageTierState_STORAGE_TIER_STATE_ACTIVE))
 	})
 
@@ -151,6 +149,42 @@ var _ = Describe("Public storage tiers", func() {
 		Expect(response.GetItems()).To(HaveLen(2))
 		ids := []string{response.GetItems()[0].GetId(), response.GetItems()[1].GetId()}
 		Expect(ids).To(ContainElements(id1, id2))
+	})
+
+	It("rejects reserved-key filters and still supports ordinary label filters", func() {
+		id := createViaPrivate("reserved-filter", privatev1.StorageProtocol_STORAGE_PROTOCOL_NFS)
+		markerKey := "it.osac.io/filter-case"
+		markerValue := uuid.New()
+		_, err := privateClient.Update(ctx, privatev1.StorageTiersUpdateRequest_builder{
+			Object: privatev1.StorageTier_builder{
+				Id: id,
+				Metadata: privatev1.Metadata_builder{
+					Labels: map[string]string{
+						markerKey: markerValue,
+						"admin.osac.openshift.io/private-filter-test": "secret",
+					},
+				}.Build(),
+			}.Build(),
+			UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"metadata.labels"}},
+		}.Build())
+		Expect(err).ToNot(HaveOccurred())
+
+		reservedFilter := "this.metadata.labels['admin.osac.openshift.io/private-filter-test'] == 'secret'"
+		_, err = publicClient.List(ctx, publicv1.StorageTiersListRequest_builder{
+			Filter: &reservedFilter,
+		}.Build())
+		Expect(err).To(HaveOccurred())
+		status, ok := grpcstatus.FromError(err)
+		Expect(ok).To(BeTrue())
+		Expect(status.Code()).To(Equal(grpccodes.InvalidArgument))
+
+		publicMapFilter := fmt.Sprintf("this.metadata.labels[%q] == %q", markerKey, markerValue)
+		response, err := publicClient.List(ctx, publicv1.StorageTiersListRequest_builder{
+			Filter: &publicMapFilter,
+		}.Build())
+		Expect(err).ToNot(HaveOccurred())
+		Expect(response.GetItems()).To(HaveLen(1))
+		Expect(response.GetItems()[0].GetId()).To(Equal(id))
 	})
 
 	It("Supports pagination", func() {
@@ -202,8 +236,8 @@ var _ = Describe("Public storage tiers", func() {
 		Expect(status.Code()).To(Equal(grpccodes.InvalidArgument))
 	})
 
-	It("Rejects a filter referencing a field at a private-mismatched path", func() {
-		createViaPrivate("mismatch", privatev1.StorageProtocol_STORAGE_PROTOCOL_NFS)
+	It("Rejects a filter referencing a removed field", func() {
+		createViaPrivate("removed", privatev1.StorageProtocol_STORAGE_PROTOCOL_NFS)
 
 		filter := "this.spec.max_read_bandwidth_mbs == 1000"
 		_, err := publicClient.List(ctx, publicv1.StorageTiersListRequest_builder{

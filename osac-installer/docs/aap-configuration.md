@@ -5,9 +5,21 @@ Kubernetes ConfigMaps and Secrets that are mounted into AAP instance group
 execution pods via `envFrom`. This makes every key available as an environment
 variable during playbook execution.
 
-Currently only the **cluster-fulfillment-ig** instance group mounts these
-variables, as it is the only instance group that consumes them (for cluster provisioning workflows).
-This will be expanded to additional instance groups in the future as more automation workflows are added.
+Two instance groups carry networking and CaaS settings:
+
+- `cluster-fulfillment-ig` (`aap.instanceGroups.clusterFulfillment`): CaaS
+  settings such as the hosted-cluster and external-access DNS settings below.
+- `network-fulfillment-ig` (`aap.instanceGroups.networkFulfillment`): the
+  network managers' settings (`config`, a ConfigMap) and credentials
+  (`secret`, a Secret), written verbatim. Each key starts with the manager's
+  registration name in upper case, for example `NETRIS_CONTROLLER_URL`,
+  `NETRIS_PASSWORD` or `NETRIS_SITE_ID`. See
+  [Networking configuration](network-backend.md).
+
+The CaaS Netris steps (`NETWORK_CLASS=netris`) take the Netris controller URL,
+certificate validation and CA ConfigMap from the Netris settings in
+`aap.instanceGroups.networkFulfillment.config`; see
+[CaaS on Netris](network-backend.md#caas-on-netris).
 
 ## How It Works
 
@@ -19,12 +31,10 @@ file and they are applied during `make install-osac`.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `NETWORK_CLASS` | `esi` | Network backend (`netris` or `esi`) |
-| `NETWORK_STEPS_COLLECTION` | `osac.steps` | Ansible collection for network steps |
 | `EXTERNAL_ACCESS_BASE_DOMAIN` | `box.massopen.cloud` | Base domain for cluster DNS records |
 | `EXTERNAL_ACCESS_SUPPORTED_BASE_DOMAINS` | `box.massopen.cloud` | Comma-separated list of allowed domains |
 | `EXTERNAL_ACCESS_API_INTERNAL_NETWORK` | `hypershift` | Internal network for API access |
-| `HOSTED_CLUSTER_BASE_DOMAIN` | `box.massopen.cloud` | Base domain for hosted clusters |
+| `HOSTED_CLUSTER_BASE_DOMAIN` | `hosted.` plus the hub's apps domain without `apps.` | Base domain for hosted clusters. The chart sets this default from the hub `Ingress`; `box.massopen.cloud` is only the playbook fallback when the variable is absent |
 | `HOSTED_CLUSTER_CONTROLLER_AVAILABILITY_POLICY` | `HighlyAvailable` | Control plane HA policy |
 | `HOSTED_CLUSTER_INFRASTRUCTURE_AVAILABILITY_POLICY` | `HighlyAvailable` | Infrastructure HA policy |
 | `DNS_CLASS` | `dns.route53.dns` | DNS backend driver role (see [DNS Backend](dns-backend.md)) |
@@ -40,8 +50,8 @@ Kubernetes Secret. Do not pre-encode them.
 | `AWS_ACCESS_KEY_ID` | AWS credentials for Route53 DNS |
 | `AWS_SECRET_ACCESS_KEY` | AWS credentials for Route53 DNS |
 
-Additional variables are added by specific network backends — see
-[Network Backend Configuration](network-backend.md).
+Network manager credentials go in `aap.instanceGroups.networkFulfillment.secret`
+(Secret `network-fulfillment-ig`).
 
 > **Note on SSH keys:** SSH private keys are not set via environment variables.
 > They must be added directly to the `cluster-fulfillment-ig` Kubernetes Secret.

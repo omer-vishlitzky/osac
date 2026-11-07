@@ -17,7 +17,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
-	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -35,11 +34,6 @@ import (
 
 	"github.com/cenkalti/backoff/v4"
 	"github.com/onsi/gomega/ghttp"
-	"github.com/osac-project/osac/fulfillment-service/internal/auth"
-	"github.com/osac-project/osac/fulfillment-service/internal/jq"
-	"github.com/osac-project/osac/fulfillment-service/internal/network"
-	"github.com/osac-project/osac/fulfillment-service/internal/oauth"
-	"github.com/osac-project/osac/fulfillment-service/internal/uuid"
 	"google.golang.org/grpc"
 	grpccodes "google.golang.org/grpc/codes"
 	grpcstatus "google.golang.org/grpc/status"
@@ -54,11 +48,19 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 	crclient "sigs.k8s.io/controller-runtime/pkg/client"
 
+	"github.com/osac-project/osac/fulfillment-service/internal/auth"
+	"github.com/osac-project/osac/fulfillment-service/internal/jq"
+	"github.com/osac-project/osac/fulfillment-service/internal/network"
+	"github.com/osac-project/osac/fulfillment-service/internal/oauth"
+	"github.com/osac-project/osac/fulfillment-service/internal/tlsconfig"
+	"github.com/osac-project/osac/fulfillment-service/internal/trust"
+	"github.com/osac-project/osac/fulfillment-service/internal/uuid"
+
 	bmfov1alpha1 "github.com/osac-project/osac/bare-metal-fulfillment-operator/api/v1alpha1"
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
-	publicv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/public/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/version"
 	osacv1alpha1 "github.com/osac-project/osac/osac-operator/api/v1alpha1"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
 
 var ServiceAccountTenants = map[string]string{
@@ -72,6 +74,8 @@ var OIDCTenants = map[string][]string{
 	"adam":    {"engineering"},
 	"ben":     {"development"},
 	"charles": {"sales"},
+	// Keep a separate single-tenant user for project access-isolation tests.
+	sshKeyProjectOwnerUsername: {usersGroup},
 }
 
 // ToolBuilder contains the data and logic needed to create an instance of the integration test tool. Don't create
@@ -85,19 +89,20 @@ type ToolBuilder struct {
 // Tool is an instance of the integration test tool that sets up the test environment. Don't create instances of this
 // directly, use the NewTool function instead.
 type Tool struct {
-	logger        *slog.Logger
-	projectDir    string
-	tmpDir        string
-	clusterName   string
-	kubeClient    crclient.Client
-	kubeClientSet *kubernetes.Clientset
-	caPool        *x509.CertPool
-	kcFile        string
-	internalView  *ToolView
-	externalView  *ToolView
-	secret        string
-	jqTool        *jq.Tool
-	cliBinaryPath string
+	logger          *slog.Logger
+	projectDir      string
+	tmpDir          string
+	clusterName     string
+	kubeClient      crclient.Client
+	kubeClientSet   *kubernetes.Clientset
+	caPool          *trust.CertPool
+	kcFile          string
+	internalView    *ToolView
+	externalView    *ToolView
+	secret          string
+	jqTool          *jq.Tool
+	cliBinaryPath   string
+	userTokenSource auth.TokenSource
 }
 
 // ToolView contains the gRPC connections and HTTP clients that can be used to connect to the cluster. This is a
@@ -106,6 +111,7 @@ type ToolView struct {
 	anonymousConn   *grpc.ClientConn
 	emergencyConn   *grpc.ClientConn
 	adminConn       *grpc.ClientConn
+	controllerConn  *grpc.ClientConn
 	userConn        *grpc.ClientConn
 	anonymousClient *http.Client
 	emergencyClient *http.Client
@@ -278,6 +284,19 @@ func (t *Tool) Setup(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	if endpoint := os.Getenv("IT_MCP_DEPLOYED_URL"); endpoint != "" {
+		if err := t.waitForMCPReady(ctx, endpoint); err != nil {
+			return err
+		}
+	}
+
+	// Ensure Keycloak trusts the cluster CA so that the OIDC broker can complete
+	// back-channel token exchanges with intra-cluster realm endpoints over TLS.
+	// The function is idempotent and is a no-op if KC is already patched.
+	err = t.EnsureKCTrustsClusterCA(ctx)
+	if err != nil {
+		return err
+	}
 
 	// Create test users in Keycloak and set up admin org membership before
 	// creating clients — the admin token source needs admin to be in an org
@@ -357,6 +376,69 @@ func (t *Tool) checkAddress(ctx context.Context, addr string) error {
 				"'/etc/hosts' file: %[2]w",
 			host, err,
 		)
+	}
+	return nil
+}
+
+// waitForMCPReady checks the deployed TLS route before the suite creates test
+// users and resource fixtures. A missing TLSRoute can otherwise go unnoticed
+// until the MCP spec runs after the expensive BeforeSuite setup.
+func (t *Tool) waitForMCPReady(ctx context.Context, rawURL string) error {
+	endpoint := strings.TrimSuffix(rawURL, "/")
+	parsed, err := url.Parse(endpoint)
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil ||
+		parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return errors.New("IT_MCP_DEPLOYED_URL must be an HTTPS root URL")
+	}
+	t.logger.DebugContext(ctx, "Checking MCP endpoint", "url", endpoint)
+	transport := &http.Transport{TLSClientConfig: &tls.Config{
+		RootCAs: t.caPool.Pool(), MinVersion: tls.VersionTLS12,
+	}}
+	defer transport.CloseIdleConnections()
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   5 * time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	var lastErr error
+	for {
+		lastErr = probeMCPMetadata(probeCtx, client, endpoint)
+		if lastErr == nil {
+			return nil
+		}
+		select {
+		case <-probeCtx.Done():
+			return fmt.Errorf("MCP endpoint %s is not ready: %w; check its deployment, route, and TLS certificate in the selected cluster", endpoint, lastErr)
+		case <-time.After(2 * time.Second):
+		}
+	}
+}
+
+func probeMCPMetadata(ctx context.Context, client *http.Client, endpoint string) error {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint+"/.well-known/oauth-protected-resource", nil)
+	if err != nil {
+		return err
+	}
+	response, err := client.Do(request)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return fmt.Errorf("OAuth metadata returned HTTP %d", response.StatusCode)
+	}
+	var metadata struct {
+		Resource string `json:"resource"`
+	}
+	if err := json.NewDecoder(io.LimitReader(response.Body, 64<<10)).Decode(&metadata); err != nil {
+		return fmt.Errorf("invalid OAuth metadata: %w", err)
+	}
+	if metadata.Resource != endpoint+"/" {
+		return fmt.Errorf("OAuth metadata resource %q does not match %q", metadata.Resource, endpoint+"/")
 	}
 	return nil
 }
@@ -491,7 +573,7 @@ func (t *Tool) loadCaBundle(ctx context.Context) error {
 	}
 
 	// Create the CA pool:
-	t.caPool, err = network.NewCertPool().
+	t.caPool, err = trust.NewCertPool().
 		SetLogger(t.logger).
 		AddFiles(caFiles...).
 		Build()
@@ -511,10 +593,15 @@ func (t *Tool) createClients(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	controllerTokenSource, err := t.makeControllerTokenSource()
+	if err != nil {
+		return err
+	}
 	userTokenSource, err := t.makeKeycloakTokenSource(ctx, userUsername, usersPassword)
 	if err != nil {
 		return err
 	}
+	t.userTokenSource = userTokenSource
 
 	// Create gRPC clients:
 	t.internalView = &ToolView{}
@@ -527,6 +614,10 @@ func (t *Tool) createClients(ctx context.Context) error {
 		return err
 	}
 	t.internalView.adminConn, err = t.makeGrpcConn(internalServiceAddr, adminTokenSource)
+	if err != nil {
+		return err
+	}
+	t.internalView.controllerConn, err = t.makeGrpcConn(internalServiceAddr, controllerTokenSource)
 	if err != nil {
 		return err
 	}
@@ -590,6 +681,28 @@ func (t *Tool) createTenants(ctx context.Context) error {
 		}.Build())
 		status, ok := grpcstatus.FromError(err)
 		if ok && status.Code() == grpccodes.AlreadyExists {
+			existing, getErr := tenantsClient.Get(ctx, privatev1.TenantsGetRequest_builder{
+				Id: tenant,
+			}.Build())
+			if getErr != nil {
+				return fmt.Errorf("failed to get existing tenant %q: %w", tenant, getErr)
+			}
+			tenantStatus := existing.GetObject().GetStatus()
+			switch tenantStatus.GetState() {
+			case privatev1.TenantState_TENANT_STATE_SYNCED:
+			case privatev1.TenantState_TENANT_STATE_FAILED:
+				return fmt.Errorf("existing tenant %q is FAILED: %s", tenant, tenantStatus.GetMessage())
+			case privatev1.TenantState_TENANT_STATE_PENDING, privatev1.TenantState_TENANT_STATE_UNSPECIFIED:
+				_, signalErr := tenantsClient.Signal(ctx, privatev1.TenantsSignalRequest_builder{
+					Id: tenant,
+				}.Build())
+				if signalErr != nil {
+					return fmt.Errorf("failed to signal existing tenant %q: %w", tenant, signalErr)
+				}
+			default:
+				return fmt.Errorf("existing tenant %q has unexpected state %v: %s",
+					tenant, tenantStatus.GetState(), tenantStatus.GetMessage())
+			}
 			continue
 		}
 		if err != nil {
@@ -624,13 +737,22 @@ func (t *Tool) waitForTenantsSynced(ctx context.Context) error {
 			if getErr != nil {
 				return fmt.Errorf("failed to get tenant %q: %w", tenantName, getErr)
 			}
-			if resp.GetObject().GetStatus().GetState() != privatev1.TenantState_TENANT_STATE_SYNCED {
-				return fmt.Errorf("tenant %q not yet synced", tenantName)
+			tenantStatus := resp.GetObject().GetStatus()
+			state := tenantStatus.GetState()
+			switch state {
+			case privatev1.TenantState_TENANT_STATE_SYNCED:
+				return nil
+			case privatev1.TenantState_TENANT_STATE_FAILED:
+				return backoff.Permanent(fmt.Errorf("tenant %q is FAILED: %s", tenantName, tenantStatus.GetMessage()))
+			case privatev1.TenantState_TENANT_STATE_PENDING, privatev1.TenantState_TENANT_STATE_UNSPECIFIED:
+				return fmt.Errorf("tenant %q is %v: %s", tenantName, state, tenantStatus.GetMessage())
+			default:
+				return backoff.Permanent(fmt.Errorf("tenant %q has unexpected state %v: %s",
+					tenantName, state, tenantStatus.GetMessage()))
 			}
-			return nil
 		}, backoff.WithContext(bo, ctx))
 		if err != nil {
-			return fmt.Errorf("timed out waiting for tenant %q to reach SYNCED: %w", tenant, err)
+			return fmt.Errorf("failed waiting for tenant %q to reach SYNCED: %w", tenant, err)
 		}
 		t.logger.DebugContext(ctx, "Tenant synced", slog.String("tenant", tenant))
 	}
@@ -1128,6 +1250,23 @@ func (t *Tool) makeKeycloakTokenSource(ctx context.Context, username, password s
 	return
 }
 
+func (t *Tool) makeControllerTokenSource() (result auth.TokenSource, err error) {
+	store, err := auth.NewMemoryTokenStore().SetLogger(t.logger).Build()
+	if err != nil {
+		return nil, err
+	}
+	return oauth.NewTokenSource().
+		SetLogger(t.logger).
+		SetStore(store).
+		SetCaPool(t.caPool).
+		SetIssuer(fmt.Sprintf("https://%s/realms/osac", keycloakAddr)).
+		SetFlow(oauth.CredentialsFlow).
+		SetClientId(controllerClientId).
+		SetClientSecret(t.Secret()).
+		SetScopes("openid", "organization").
+		Build()
+}
+
 // KeycloakAdminRequest makes an authenticated request to the Keycloak admin API for the 'osac' realm.
 // The path is relative to /admin/realms/osac (e.g., "/organizations", "/users/{id}").
 func (t *Tool) KeycloakAdminRequest(ctx context.Context, method, path string, input any) (
@@ -1155,12 +1294,11 @@ func (t *Tool) KeycloakAdminRequest(ctx context.Context, method, path string, in
 		err = fmt.Errorf("failed to create Keycloak admin token source: %w", err)
 		return
 	}
+	tlsConfig := tlsconfig.NewClientTLSConfig()
+	tlsConfig.RootCAs = t.caPool.Pool()
 	httpClient := &http.Client{
 		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{
-				RootCAs:    t.caPool,
-				MinVersion: tls.VersionTLS12,
-			},
+			TLSClientConfig: tlsConfig,
 		},
 	}
 	var body io.Reader
@@ -1203,6 +1341,96 @@ func (t *Tool) KeycloakAdminRequest(ctx context.Context, method, path string, in
 	return
 }
 
+// KeycloakAdminRequestForRealm is the generalized form of KeycloakAdminRequest.
+// Pass an empty realm to target the root admin endpoint (e.g. for realm creation/deletion).
+func (t *Tool) KeycloakAdminRequestForRealm(ctx context.Context, realm, method, path string, input any) (
+	code int, output []byte, err error,
+) {
+	var fullURL string
+	if realm == "" {
+		fullURL = fmt.Sprintf("https://%s/admin%s", keycloakAddr, path)
+	} else {
+		fullURL = fmt.Sprintf("https://%s/admin/realms/%s%s", keycloakAddr, realm, path)
+	}
+
+	store, err := auth.NewMemoryTokenStore().
+		SetLogger(t.logger).
+		Build()
+	if err != nil {
+		err = fmt.Errorf("failed to create Keycloak admin token store: %w", err)
+		return
+	}
+	tokenSource, err := oauth.NewTokenSource().
+		SetLogger(t.logger).
+		SetStore(store).
+		SetCaPool(t.caPool).
+		SetIssuer(fmt.Sprintf("https://%s/realms/master", keycloakAddr)).
+		SetFlow(oauth.PasswordFlow).
+		SetClientId("admin-cli").
+		SetUsername("admin").
+		SetPassword("admin").
+		SetScopes("openid").
+		Build()
+	if err != nil {
+		err = fmt.Errorf("failed to create Keycloak admin token source: %w", err)
+		return
+	}
+	tlsConfig := tlsconfig.NewClientTLSConfig()
+	tlsConfig.RootCAs = t.caPool.Pool()
+	httpClient := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: tlsConfig,
+		},
+	}
+	var body io.Reader
+	if input != nil {
+		var data []byte
+		data, err = json.Marshal(input)
+		if err != nil {
+			err = fmt.Errorf("failed to marshal request body: %w", err)
+			return
+		}
+		body = bytes.NewReader(data)
+	}
+	request, err := http.NewRequestWithContext(ctx, method, fullURL, body)
+	if err != nil {
+		err = fmt.Errorf("failed to create request: %w", err)
+		return
+	}
+	if input != nil {
+		request.Header.Set("Content-Type", "application/json")
+	}
+	token, err := tokenSource.Token(ctx)
+	if err != nil {
+		err = fmt.Errorf("failed to get token: %w", err)
+		return
+	}
+	request.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token.Access))
+	response, err := httpClient.Do(request)
+	if err != nil {
+		err = fmt.Errorf("failed to send request: %w", err)
+		return
+	}
+	defer response.Body.Close()
+	output, err = io.ReadAll(response.Body)
+	if err != nil {
+		err = fmt.Errorf("failed to read response body: %w", err)
+		return
+	}
+	code = response.StatusCode
+	return
+}
+
+// MakeUserConnection creates a gRPC connection authenticated as the specified user.
+// This is useful for creating connections for test users created during test execution.
+func (t *Tool) MakeUserConnection(ctx context.Context, username, password string) (*grpc.ClientConn, error) {
+	tokenSource, err := t.makeKeycloakTokenSource(ctx, username, password)
+	if err != nil {
+		return nil, err
+	}
+	return t.makeGrpcConn(externalServiceAddr, tokenSource)
+}
+
 // makeGrpcConn creates a gRPC connection that automatically adds the token to the request.
 func (t *Tool) makeGrpcConn(addr string, tokenSource auth.TokenSource) (result *grpc.ClientConn, err error) {
 	userAgent := fmt.Sprintf("%s/%s", userAgent, version.Get())
@@ -1219,10 +1447,10 @@ func (t *Tool) makeGrpcConn(addr string, tokenSource auth.TokenSource) (result *
 // makeHttpClient creates an HTTP client that automatically adds the scheme, host and token to the request. Users of the
 // client only need to provide the URL path, and other headers as needed.
 func (t *Tool) makeHttpClient(addr string, tokenSource auth.TokenSource) *http.Client {
+	tlsConfig := tlsconfig.NewClientTLSConfig()
+	tlsConfig.RootCAs = t.caPool.Pool()
 	transport := &http.Transport{
-		TLSClientConfig: &tls.Config{
-			RootCAs: t.caPool,
-		},
+		TLSClientConfig: tlsConfig,
 	}
 	tripper := ghttp.RoundTripperFunc(
 		func(request *http.Request) (response *http.Response, err error) {
@@ -1358,8 +1586,9 @@ func (t *Tool) registerHub(ctx context.Context) error {
 	hubsClient := privatev1.NewHubsClient(t.internalView.adminConn)
 
 	// Wait for the API to be ready:
+	var hubsResponse *privatev1.HubsListResponse
 	for range 30 {
-		_, err = hubsClient.List(ctx, privatev1.HubsListRequest_builder{}.Build())
+		hubsResponse, err = hubsClient.List(ctx, privatev1.HubsListRequest_builder{}.Build())
 		if err == nil {
 			break
 		}
@@ -1367,6 +1596,31 @@ func (t *Tool) registerHub(ctx context.Context) error {
 	}
 	if err != nil {
 		return fmt.Errorf("API not ready after waiting: %w", err)
+	}
+
+	// The installer registers the in-cluster hub as "hub" before the
+	// integration suite starts. Reuse that hub instead of creating a second
+	// active hub: NetworkClass reconciliation requires exactly one active hub
+	// to resolve the canonical hub reference.
+	activeHubs := make([]*privatev1.Hub, 0, len(hubsResponse.GetItems()))
+	for _, hub := range hubsResponse.GetItems() {
+		if hub.GetMetadata().GetDeletionTimestamp() == nil {
+			activeHubs = append(activeHubs, hub)
+		}
+	}
+	switch len(activeHubs) {
+	case 1:
+		hubId = activeHubs[0].GetId()
+		if namespace := activeHubs[0].GetSpec().GetNamespace(); namespace != "" {
+			hubNamespace = namespace
+		}
+		t.logger.InfoContext(ctx, "Reusing existing hub", "hub_id", hubId, "namespace", hubNamespace)
+		return nil
+	case 0:
+		// Continue below and create the local hub for standalone integration
+		// environments that do not provision one through the installer.
+	default:
+		return fmt.Errorf("cannot register integration hub: found %d active hubs", len(activeHubs))
 	}
 
 	// Create the hub:
@@ -1587,6 +1841,11 @@ func (v *ToolView) AdminConn() *grpc.ClientConn {
 	return v.adminConn
 }
 
+// ControllerConn returns the gRPC connection authenticated as the controller service account.
+func (v *ToolView) ControllerConn() *grpc.ClientConn {
+	return v.controllerConn
+}
+
 // UserConn returns the gRPC connection for the regular user.
 func (v *ToolView) UserConn() *grpc.ClientConn {
 	return v.userConn
@@ -1627,6 +1886,7 @@ func (v *ToolView) Close() error {
 		closeConn(v.anonymousConn),
 		closeConn(v.emergencyConn),
 		closeConn(v.adminConn),
+		closeConn(v.controllerConn),
 		closeConn(v.userConn),
 		closeClient(v.anonymousClient),
 		closeClient(v.emergencyClient),
@@ -1640,22 +1900,45 @@ func (t *Tool) ProjectDir() string {
 	return t.projectDir
 }
 
+// UserTokenSource returns the regular user's token source for another HTTP listener.
+func (t *Tool) UserTokenSource() auth.TokenSource {
+	return t.userTokenSource
+}
+
+// CaPool returns the CA pool used by the integration clients.
+func (t *Tool) CaPool() *trust.CertPool {
+	return t.caPool
+}
+
 // Names of the command line tools:
 const kubectlCmd = "kubectl"
 
 // Name and namespace of the hub:
-const hubId = "local"
-const hubNamespace = "osac"
+var hubId = "local"
+var hubNamespace = "osac"
 
 // userAgent is the user agent string for the integration test tool.
 const userAgent = "fulfillment-it-tool"
 
-// Service host name and address (host-side, via Kind port mapping):
-const (
-	keycloakAddr        = "keycloak.keycloak.svc.cluster.local:8443"
-	externalServiceAddr = "fulfillment-api.osac.svc.cluster.local:8443"
-	internalServiceAddr = "fulfillment-internal-api.osac.svc.cluster.local:8443"
+// Service addresses route through the host-side Kind ingress port. A dedicated
+// port lets concurrent integration runs use separate clusters on the same host.
+// Keycloak's in-cluster broker calls must use the Service port even when the
+// test runner uses a different host-side ingress port.
+const keycloakInternalAddr = "keycloak.keycloak.svc.cluster.local:8443"
+
+var (
+	keycloakAddr        = integrationServiceAddress("keycloak.keycloak.svc.cluster.local")
+	externalServiceAddr = integrationServiceAddress("fulfillment-api.osac.svc.cluster.local")
+	internalServiceAddr = integrationServiceAddress("fulfillment-internal-api.osac.svc.cluster.local")
 )
+
+func integrationServiceAddress(host string) string {
+	port := os.Getenv("IT_HTTPS_PORT")
+	if port == "" {
+		port = "8443"
+	}
+	return net.JoinHostPort(host, port)
+}
 
 // Namespace, name and key of the Kubernetes secret that contains the random secret used for passwords and credentials.
 const (
@@ -1678,9 +1961,10 @@ const (
 
 // Details of the Keycloak regular user:
 const (
-	userUsername  = "user"
-	usersPassword = "password"
-	usersGroup    = "users"
+	userUsername               = "user"
+	usersPassword              = "password"
+	usersGroup                 = "users"
+	sshKeyProjectOwnerUsername = "ssh-key-project-owner"
 )
 
 // ExtractOrganizationNames extracts organization names from a JWT organization claim.

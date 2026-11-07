@@ -6,6 +6,56 @@
 # is ever sourced by a script that forgot to.
 set -euo pipefail
 
+ensure_podman_pid_limits() {
+    local cluster="$1" kind_command="$2" podman_command="$3" nodes node limit
+    if ! nodes=$("${kind_command}" get nodes --name "${cluster}") || [[ -z "${nodes}" ]]; then
+        echo "ERROR: Could not list Podman Kind nodes for '${cluster}'; check the selected connection." >&2
+        return 1
+    fi
+    while IFS= read -r node; do
+        [[ -n "${node}" ]] || continue
+        if ! limit=$("${podman_command}" inspect --format '{{.HostConfig.PidsLimit}}' "${node}") ||
+           [[ ! "${limit}" =~ ^(-1|0|[1-9][0-9]*)$ ]]; then
+            echo "ERROR: Could not inspect configured Podman PID limit for '${node}'; check the selected connection." >&2
+            return 1
+        fi
+        if [[ "${limit}" != -1 && "${limit}" != 0 ]] && (( limit < 65536 )); then
+            if ! "${podman_command}" update --pids-limit 65536 "${node}"; then
+                echo "ERROR: Could not raise Podman PID limit for '${node}' from ${limit} to 65536; check runtime permissions." >&2
+                return 1
+            fi
+            if ! limit=$("${podman_command}" inspect --format '{{.HostConfig.PidsLimit}}' "${node}") ||
+               [[ ! "${limit}" =~ ^(-1|0|[1-9][0-9]*)$ ]] ||
+               { [[ "${limit}" != -1 && "${limit}" != 0 ]] && (( limit < 65536 )); }; then
+                echo "ERROR: Podman PID limit verification failed for '${node}' (reported '${limit}'); expected at least 65536 or unlimited." >&2
+                return 1
+            fi
+        fi
+    done <<< "${nodes}"
+}
+
+# Validate the Kubernetes Secret metadata.name and data key used for the
+# remote-cluster kubeconfig before either value reaches a command or manifest.
+validate_remote_kubeconfig_secret() {
+    local secret_name="$1"
+    local secret_key="$2"
+    local LC_ALL=C
+
+    if (( ${#secret_name} > 253 )) || \
+        [[ ! "${secret_name}" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$ ]]; then
+        echo "ERROR: REMOTE_KUBECONFIG_SECRET_NAME must be a DNS subdomain of at most 253 characters" >&2
+        return 2
+    fi
+
+    if (( ${#secret_key} == 0 || ${#secret_key} > 253 )) || \
+        [[ ! "${secret_key}" =~ ^[-._a-zA-Z0-9]+$ || "${secret_key}" == "." || "${secret_key}" == ..* ]]; then
+        echo "ERROR: REMOTE_KUBECONFIG_SECRET_KEY must be a valid Secret data key of at most 253 characters" >&2
+        return 2
+    fi
+
+    return 0
+}
+
 # Retry a condition until it succeeds or times out, optionally running a command each iteration
 # Usage: retry_until <timeout_seconds> <interval_seconds> <condition_command> [loop_command]
 # Returns: 0 on success, 1 on timeout
@@ -34,8 +84,25 @@ wait_for_namespace_cleanup() {
     if oc get namespace "${namespace}" &>/dev/null && \
        [[ "$(oc get namespace "${namespace}" -o jsonpath='{.status.phase}')" == "Terminating" ]]; then
         echo "Waiting for namespace ${namespace} to finish terminating..."
-        oc wait --for=delete "namespace/${namespace}" --timeout="${timeout}s" || {
-            echo "ERROR: namespace ${namespace} stuck in Terminating state. You may need to manually remove finalizers."
+        local wait_output wait_status
+        if wait_output=$(oc wait --for=delete "namespace/${namespace}" --timeout="${timeout}s" 2>&1); then
+            return 0
+        else
+            wait_status=$?
+        fi
+
+        # Finalizers can run resource cleanup, so do not remove them for API or auth errors.
+        if [[ "${wait_output}" != *"timed out waiting for the condition"* ]]; then
+            echo "ERROR: failed while waiting for namespace ${namespace}: ${wait_output}" >&2
+            return "${wait_status}"
+        fi
+
+        echo "WARNING: namespace ${namespace} stuck in Terminating state, removing finalizers..."
+        oc get namespace "${namespace}" -o json \
+            | python3 -c "import json,sys; ns=json.load(sys.stdin); ns['spec']['finalizers']=[]; json.dump(ns,sys.stdout)" \
+            | oc replace --raw "/api/v1/namespaces/${namespace}/finalize" -f - >/dev/null 2>&1 || true
+        oc wait --for=delete "namespace/${namespace}" --timeout=60s 2>/dev/null || {
+            echo "ERROR: namespace ${namespace} still exists after finalizer removal."
             exit 1
         }
     fi
@@ -65,6 +132,52 @@ wait_for_resource() {
     }
 
     oc wait --for="${condition}" "${resource}" ${ns_args[@]+"${ns_args[@]}"} --timeout="${timeout}s"
+}
+
+# Wait for what the osac-infra release leaves starting when its
+# `helm upgrade --install --wait-for-jobs` returns. That flag waits for hook
+# Jobs, not for Deployments, so the bundled PostgreSQL pod (it needs its server
+# certificate first) and the default CA issuer can still be coming up when the
+# next step starts. Each resource is waited for only if the profile created it.
+# Usage: wait_for_infra_ready <cli> [timeout_seconds]
+wait_for_infra_ready() {
+    local cli="$1"
+    local timeout="${2:-300}"
+    local entry resource namespace condition found rc message lookup_err
+    local -a ns_args
+    local -a targets=(
+        "clusterissuer/default-ca||condition=Ready"
+        "deployment/postgres|osac-infra|condition=Available"
+        "kafka/osac-kafka|osac-kafka|condition=Ready"
+    )
+
+    for entry in "${targets[@]}"; do
+        IFS='|' read -r resource namespace condition <<<"${entry}"
+        ns_args=()
+        [[ -n "${namespace}" ]] && ns_args=(-n "${namespace}")
+
+        # A resource the profile did not create is skipped: the object is absent
+        # (empty output) or its CRD is not installed. Any other failure (API
+        # unreachable, forbidden, timed out) is an error and not "absent".
+        lookup_err="$(mktemp)"
+        rc=0
+        found="$("${cli}" get "${resource}" "${ns_args[@]+"${ns_args[@]}"}" --ignore-not-found -o name --request-timeout=15s 2>"${lookup_err}")" || rc=$?
+        message="$(<"${lookup_err}")"
+        rm -f "${lookup_err}"
+        if (( rc != 0 )); then
+            if [[ "${message}" == *"the server doesn't have a resource type"* ]]; then
+                continue
+            fi
+            echo "ERROR: could not look up ${resource}: ${message}" >&2
+            return 1
+        fi
+        [[ -n "${found}" ]] || continue
+        echo "Waiting for ${resource} (${condition}, up to ${timeout}s)..."
+        "${cli}" wait --for="${condition}" "${resource}" "${ns_args[@]+"${ns_args[@]}"}" --timeout="${timeout}s" || {
+            echo "ERROR: ${resource} did not reach ${condition} within ${timeout}s" >&2
+            return 1
+        }
+    done
 }
 
 # Retry a command until it succeeds or times out.
@@ -133,19 +246,181 @@ http_json() {
     return 1
 }
 
-# Resolve the nearest real (non-nightly) component release tag reachable from a
-# repo path's HEAD. --match narrows git describe's glob search to tags shaped
-# like "<prefix>/vX.Y.Z" -- scoped by the component prefix, not just a bare
-# "vX.Y.Z", because git tags aren't path-scoped and a bare vX.Y.Z pattern can
-# match an unrelated component's old tag (e.g. fulfillment-service tagged bare
-# vX.Y.Z releases before OSAC-3529 moved it to a component-scoped prefix; that
-# history is still reachable from HEAD). --match is still a glob, not a real
-# anchor (its trailing '*' is needed to allow multi-digit version segments,
-# but that same '*' would also accept a stray "-rc1"/".4" suffix), so the
-# result is re-validated with a real regex before being trusted. Fails loudly
-# rather than silently guessing a version: publishing a chart under a made-up
-# placeholder tag would be worse than failing the build outright, since it
-# could get pushed to the registry unnoticed.
+# Usage: get_fulfillment_access_token <issuer_url> <client_id> <client_secret> [curl_args...]
+get_fulfillment_access_token() {
+    if (($# < 3)); then
+        echo "ERROR: Fulfillment client credentials are not configured." >&2
+        return 1
+    fi
+
+    local issuer_url="$1" client_id="$2" client_secret="$3"
+    shift 3
+    local -a curl_args=("$@")
+
+    if [[ -z "${issuer_url}" || -z "${client_id}" || -z "${client_secret}" ]]; then
+        echo "ERROR: Fulfillment client credentials are not configured." >&2
+        return 1
+    fi
+    if [[ "${issuer_url}" != https://* ]]; then
+        echo "ERROR: Fulfillment token issuer URL must use HTTPS." >&2
+        return 1
+    fi
+
+    local secret_file
+    if ! secret_file=$(mktemp); then
+        echo "ERROR: unable to prepare the Fulfillment token request." >&2
+        return 1
+    fi
+    if ! chmod 600 "${secret_file}" || ! printf '%s' "${client_secret}" > "${secret_file}"; then
+        rm -f "${secret_file}"
+        echo "ERROR: unable to prepare the Fulfillment token request." >&2
+        return 1
+    fi
+
+    local token_url="${issuer_url%/}/protocol/openid-connect/token"
+    local response
+    if ! response=$(curl --silent --show-error --fail \
+        --connect-timeout 5 --max-time 30 \
+        "${curl_args[@]}" \
+        --request POST \
+        --data-urlencode 'grant_type=client_credentials' \
+        --data-urlencode "client_id=${client_id}" \
+        --data-urlencode "client_secret@${secret_file}" \
+        "${token_url}"); then
+        rm -f "${secret_file}"
+        echo "ERROR: Fulfillment token request failed." >&2
+        return 1
+    fi
+    rm -f "${secret_file}"
+
+    local access_token
+    if ! access_token=$(printf '%s' "${response}" | python3 -c '
+import json
+import sys
+
+try:
+    token = json.load(sys.stdin).get("access_token")
+except (json.JSONDecodeError, AttributeError):
+    sys.exit(1)
+
+if not isinstance(token, str) or not token:
+    sys.exit(1)
+
+sys.stdout.write(token)
+'); then
+        echo "ERROR: Fulfillment token response was invalid." >&2
+        return 1
+    fi
+
+    printf '%s\n' "${access_token}"
+}
+
+# Usage: get_fulfillment_service_account_token <namespace> [curl-args...]
+# Resolve the public issuer URL and service-account credentials from the
+# installer's existing ConfigMap and Secret, then exchange them for a token.
+get_fulfillment_service_account_token() {
+    if (($# < 1)) || [[ -z "$1" ]]; then
+        echo "ERROR: Fulfillment client credentials are not configured." >&2
+        return 1
+    fi
+
+    local namespace="$1"
+    shift
+    local auth_config issuer_url client_id_secret_name client_id_secret_key
+    local client_secret_secret_name client_secret_secret_key
+    local encoded_client_id encoded_client_secret client_id client_secret
+    local auth_config_map_output auth_config_map auth_config_map_name auth_config_map_count
+
+    if ! auth_config_map_output=$(kubectl -n "${namespace}" get configmap \
+        -l 'osac.openshift.io/fulfillment-auth-config=true' \
+        -o name \
+        2>/dev/null); then
+        echo "ERROR: Fulfillment issuer configuration is unavailable." >&2
+        return 1
+    fi
+    auth_config_map_name=""
+    auth_config_map_count=0
+    if [[ -n "${auth_config_map_output}" ]]; then
+        while IFS= read -r auth_config_map; do
+            [[ -n "${auth_config_map}" ]] || continue
+            auth_config_map_name="${auth_config_map}"
+            auth_config_map_count=$((auth_config_map_count + 1))
+        done <<< "${auth_config_map_output}"
+    fi
+    if ((auth_config_map_count != 1)); then
+        echo "ERROR: expected exactly one Fulfillment auth ConfigMap, found ${auth_config_map_count}." >&2
+        return 1
+    fi
+    if ! auth_config=$(kubectl -n "${namespace}" get "${auth_config_map_name}" \
+        -o 'jsonpath={.data.OSAC_FULFILLMENT_ISSUER_URL}{"\t"}{.data.OSAC_FULFILLMENT_CLIENT_ID_SECRET_NAME}{"\t"}{.data.OSAC_FULFILLMENT_CLIENT_ID_SECRET_KEY}{"\t"}{.data.OSAC_FULFILLMENT_CLIENT_SECRET_SECRET_NAME}{"\t"}{.data.OSAC_FULFILLMENT_CLIENT_SECRET_SECRET_KEY}' \
+        2>/dev/null); then
+        echo "ERROR: Fulfillment issuer configuration is unavailable." >&2
+        return 1
+    fi
+    IFS=$'\t' read -r issuer_url client_id_secret_name client_id_secret_key \
+        client_secret_secret_name client_secret_secret_key <<< "${auth_config}"
+    if [[ -z "${issuer_url}" || -z "${client_id_secret_name}" || -z "${client_id_secret_key}" \
+        || -z "${client_secret_secret_name}" || -z "${client_secret_secret_key}" ]]; then
+        echo "ERROR: Fulfillment client credentials are unavailable." >&2
+        return 1
+    fi
+    if ! encoded_client_id=$(kubectl -n "${namespace}" get secret "${client_id_secret_name}" \
+        -o "jsonpath={.data['${client_id_secret_key}']}" 2>/dev/null); then
+        echo "ERROR: Fulfillment client credentials are unavailable." >&2
+        return 1
+    fi
+    if ! encoded_client_secret=$(kubectl -n "${namespace}" get secret "${client_secret_secret_name}" \
+        -o "jsonpath={.data['${client_secret_secret_key}']}" 2>/dev/null); then
+        echo "ERROR: Fulfillment client credentials are unavailable." >&2
+        return 1
+    fi
+
+    if ! client_id=$(printf '%s' "${encoded_client_id}" | python3 -c '
+import base64
+import sys
+
+try:
+    value = base64.b64decode(sys.stdin.buffer.read(), validate=True)
+    sys.stdout.buffer.write(value)
+except (ValueError, base64.binascii.Error):
+    sys.exit(1)
+'); then
+        echo "ERROR: Fulfillment client credentials are invalid." >&2
+        return 1
+    fi
+    unset encoded_client_id
+    if ! client_secret=$(printf '%s' "${encoded_client_secret}" | python3 -c '
+import base64
+import sys
+
+try:
+    value = base64.b64decode(sys.stdin.buffer.read(), validate=True)
+    sys.stdout.buffer.write(value)
+except (ValueError, base64.binascii.Error):
+    sys.exit(1)
+'); then
+        echo "ERROR: Fulfillment client credentials are invalid." >&2
+        return 1
+    fi
+    unset encoded_client_secret
+
+    get_fulfillment_access_token "${issuer_url}" "${client_id}" "${client_secret}" "$@"
+}
+
+# Resolve the highest real (non-nightly) component release tag matching
+# "<prefix>/vX.Y.Z" -- scoped by prefix since tags aren't path-scoped.
+#
+# Name-based (git tag -l), not ancestry-based (git describe --tags):
+# release tags get created on a throwaway temp-branch commit that's never
+# merged back into the default branch, so an ancestry walk from a fresh
+# checkout can never see them -- confirmed live, it left nightly stuck
+# resolving a week-old base version while real releases kept shipping.
+# `git tag -l` lists every tag in the local object database regardless of
+# branch, which is what "latest real release" actually means here.
+#
+# The glob is still not a real anchor, so candidates are re-validated with
+# a regex before being trusted -- fails loudly rather than guessing a
+# version and packaging a chart under a made-up tag.
 # Usage: resolve_release_tag <repo_path> [tag_prefix]
 # tag_prefix defaults to "osac" (umbrella chart tags: osac/vX.Y.Z).
 resolve_release_tag() {
@@ -163,15 +438,41 @@ resolve_release_tag() {
     match_pattern="${prefix}/v[0-9]*.[0-9]*.[0-9]*"
     validate_regex="^${prefix}/v[0-9]+\\.[0-9]+\\.[0-9]+$"
 
-    if ! tag=$(git -C "${path}" describe --tags --abbrev=0 --match "${match_pattern}" --exclude '*-nightly*' 2>/dev/null); then
-        echo "ERROR: no real (non-nightly) ${prefix}/vX.Y.Z release tag reachable from ${path} — refusing to guess a version" >&2
-        return 1
-    fi
-    if [[ ! "${tag}" =~ ${validate_regex} ]]; then
-        echo "ERROR: nearest release tag '${tag}' reachable from ${path} is not a plain ${prefix}/vX.Y.Z tag — refusing to guess a version" >&2
+    tag=$(git -C "${path}" tag -l "${match_pattern}" | { grep -E "${validate_regex}" || true; } | sort -V | tail -1)
+    if [[ -z "${tag}" ]]; then
+        echo "ERROR: no real (non-nightly) ${prefix}/vX.Y.Z release tag found in ${path} — refusing to guess a version" >&2
         return 1
     fi
     echo "${tag}"
+}
+
+# Validate a plain semver.org version string (no leading 'v'). Full
+# semver.org grammar adapted to POSIX ERE for bash's =~: rejects
+# leading-zero numeric identifiers (e.g. "01.2.3", "1.2.3-01") and
+# malformed dot-separated prerelease/build identifiers that a more
+# permissive [a-zA-Z0-9.]+ charset would let through. Shared here so
+# osac-build-and-publish.yaml's release_version/component_versions inputs
+# (see OSAC-5337) don't grow a second hand-copied regex to drift out of
+# sync with, the exact class of bug OSAC-5178 fixed.
+# Usage: validate_semver <version>
+validate_semver() {
+    local version="$1"
+    local semver_re='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9a-zA-Z-]*)(\.(0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9a-zA-Z-]*))*)?(\+[0-9a-zA-Z-]+(\.[0-9a-zA-Z-]+)*)?$'
+    # Reject pathologically long input before it ever reaches the regex engine --
+    # cheap defense-in-depth against the prerelease clause's repeated alternation
+    # groups, independent of how expensive a match against them actually is.
+    # No real semver string needs anywhere near this length.
+    [[ "${#version}" -le 128 ]] && [[ "${version}" =~ ${semver_re} ]]
+}
+
+# True if <prefix>/v<version> already exists as a tag reachable from this
+# checkout. Used by release mode to decide whether an explicitly-requested
+# component_versions entry needs a real build (doesn't exist yet) or can
+# just be pinned like any other already-released version (OSAC-5337).
+# Usage: real_tag_exists <prefix> <version>
+real_tag_exists() {
+    local prefix="$1" version="$2"
+    git rev-parse -q --verify "refs/tags/${prefix}/v${version}^{commit}" >/dev/null 2>&1
 }
 
 # Resolve the nearest real (non-nightly) bare vX.Y.Z release tag reachable from an
@@ -194,26 +495,6 @@ resolve_bare_release_tag() {
 
     echo "ERROR: no real (non-nightly) vX.Y.Z release tag reachable from ${path} — refusing to guess a version" >&2
     return 1
-}
-
-# Resolve the nearest real (non-nightly) bare vX.Y.Z tag that is an ancestor of ref
-# (e.g. a pinned osac-ui commit). Matches archived submodule git describe behavior.
-# Usage: resolve_bare_release_tag_at <repo_path> <ref>
-resolve_bare_release_tag_at() {
-    local path="$1" ref="$2"
-    local tag
-    local validate_regex='^v[0-9]+\.[0-9]+\.[0-9]+$'
-
-    if ! tag=$(git -C "${path}" describe --tags --match 'v[0-9]*.[0-9]*.[0-9]*' --abbrev=0 \
-        --exclude '*-nightly*' --exclude '*-*' "${ref}" 2>/dev/null); then
-        echo "ERROR: no vX.Y.Z release tag reachable from ${ref} in ${path}" >&2
-        return 1
-    fi
-    if [[ "${tag}" == *-nightly* ]] || [[ ! "${tag}" =~ ${validate_regex} ]]; then
-        echo "ERROR: nearest tag '${tag}' at ${ref} in ${path} is not a plain vX.Y.Z tag" >&2
-        return 1
-    fi
-    echo "${tag}"
 }
 
 readonly POSTGRES_INSTALL_DOC="../fulfillment-service/docs/INSTALL.md"

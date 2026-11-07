@@ -23,9 +23,9 @@ import (
 	. "github.com/onsi/gomega"
 	"go.uber.org/mock/gomock"
 
-	testsv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/tests/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
 	"github.com/osac-project/osac/fulfillment-service/internal/database"
+	testsv1 "github.com/osac-project/osac/proto/gen/osac/tests/v1"
 )
 
 var _ = Describe("Lock", func() {
@@ -175,6 +175,24 @@ var _ = Describe("Lock", func() {
 				_, err := generic.Lock().AddIds(objects...).Do(ctx)
 				Expect(err).ToNot(HaveOccurred())
 				checkLocked(ctx, objects...)
+			},
+		)
+		Expect(err).ToNot(HaveOccurred())
+	})
+
+	It("returns locked objects in identifier order when requested", func() {
+		err := tm.Run(
+			ctx,
+			func(ctx context.Context) {
+				createObject(ctx, "obj3", "my-tenant")
+				createObject(ctx, "obj1", "my-tenant")
+				response, err := generic.Lock().AddIds("obj3", "obj1", "obj1").SetReturnObjects(true).Do(ctx)
+				Expect(err).ToNot(HaveOccurred())
+				objects := response.GetObjects()
+				Expect(objects).To(HaveLen(2))
+				Expect(objects[0].GetId()).To(Equal("obj1"))
+				Expect(objects[1].GetId()).To(Equal("obj3"))
+				Expect(objects[0].GetMetadata().GetTenant()).To(Equal("my-tenant"))
 			},
 		)
 		Expect(err).ToNot(HaveOccurred())

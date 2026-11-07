@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/kubernetes-csi/csi-test/v5/pkg/sanity"
+
 	"github.com/osac-project/osac/osac-csi-driver/pkg/driver"
 	"github.com/osac-project/osac/osac-csi-driver/pkg/fulfillment"
 )
@@ -39,6 +40,7 @@ func TestSanity(t *testing.T) {
 	driverSocket := filepath.Join(tmpDir, "driver.sock")
 	nodeID := "test-node-1"
 	backendName := "fake"
+	t.Setenv("NODE_NAME", nodeID)
 
 	vendorSrv, _, err := startFakeVendor(vendorSocket, nodeID)
 	if err != nil {
@@ -92,8 +94,8 @@ func TestSanity(t *testing.T) {
 	config.Address = driverSocket
 	config.SecretsFile = secretsFile
 	config.TestVolumeParameters = map[string]string{
-		"tier":   "default",
-		"tenant": "test-tenant",
+		"osac.tier": "default",
+		"tenant":    "test-tenant",
 	}
 	config.TargetPath = filepath.Join(tmpDir, "target")
 	config.StagingPath = filepath.Join(tmpDir, "staging")

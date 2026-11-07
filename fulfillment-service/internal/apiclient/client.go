@@ -16,8 +16,6 @@ package apiclient
 import (
 	"bytes"
 	"context"
-	"crypto/tls"
-	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -26,12 +24,27 @@ import (
 	"net/http"
 
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
+	"github.com/osac-project/osac/fulfillment-service/internal/tlsconfig"
+	"github.com/osac-project/osac/fulfillment-service/internal/trust"
 )
 
 // APIError represents an HTTP API error with status code and response body.
 type APIError struct {
 	StatusCode int
 	Body       string
+}
+
+// RequestError indicates that the HTTP client could not determine the request outcome.
+type RequestError struct {
+	Cause error
+}
+
+func (e *RequestError) Error() string {
+	return fmt.Sprintf("failed to send HTTP request: %v", e.Cause)
+}
+
+func (e *RequestError) Unwrap() error {
+	return e.Cause
 }
 
 // Error implements the error interface.
@@ -52,7 +65,7 @@ type Client struct {
 type ClientBuilder struct {
 	baseURL     string
 	tokenSource auth.TokenSource
-	caPool      *x509.CertPool
+	caPool      *trust.CertPool
 	httpClient  *http.Client
 	logger      *slog.Logger
 }
@@ -81,7 +94,7 @@ func (b *ClientBuilder) SetTokenSource(value auth.TokenSource) *ClientBuilder {
 }
 
 // SetCaPool sets a custom CA pool for TLS verification.
-func (b *ClientBuilder) SetCaPool(value *x509.CertPool) *ClientBuilder {
+func (b *ClientBuilder) SetCaPool(value *trust.CertPool) *ClientBuilder {
 	b.caPool = value
 	return b
 }
@@ -110,10 +123,9 @@ func (b *ClientBuilder) Build() (result *Client, err error) {
 	httpClient := b.httpClient
 	if httpClient == nil {
 		transport := http.DefaultTransport.(*http.Transport).Clone()
+		transport.TLSClientConfig = tlsconfig.NewClientTLSConfig()
 		if b.caPool != nil {
-			transport.TLSClientConfig = &tls.Config{
-				RootCAs: b.caPool,
-			}
+			transport.TLSClientConfig.RootCAs = b.caPool.Pool()
 		}
 		httpClient = &http.Client{
 			Transport: transport,
@@ -180,7 +192,7 @@ func (c *Client) DoRequest(ctx context.Context, method, path string, body any) (
 
 	response, err = c.httpClient.Do(request)
 	if err != nil {
-		err = fmt.Errorf("failed to send HTTP request: %w", err)
+		err = &RequestError{Cause: err}
 		return
 	}
 

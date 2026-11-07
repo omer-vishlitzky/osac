@@ -20,9 +20,9 @@ import (
 	. "github.com/onsi/ginkgo/v2/dsl/core"
 	. "github.com/onsi/gomega"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
-	publicv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/public/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/uuid"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
 
 var _ = Describe("Public bare metal instance types", func() {
@@ -51,12 +51,20 @@ var _ = Describe("Public bare metal instance types", func() {
 					Hardware: privatev1.BareMetalHardwareSpec_builder{
 						Cpu: privatev1.BareMetalCPUSpec_builder{
 							Cores:          cores,
-							Architecture:   "x86_64",
+							Architecture:   "amd64",
 							ThreadsPerCore: 2,
 						}.Build(),
 						Memory: privatev1.BareMetalMemorySpec_builder{
 							TotalGb: memoryGb,
 						}.Build(),
+						NetworkPorts: []*privatev1.BareMetalNetworkPortSpec{
+							privatev1.BareMetalNetworkPortSpec_builder{
+								Name:  "data-0",
+								Role:  "fabric",
+								Type:  "Ethernet",
+								Speed: "25Gbps",
+							}.Build(),
+						},
 					}.Build(),
 					HostLabelSelector: privatev1.BareMetalLabelSelector_builder{
 						MatchLabels: map[string]string{
@@ -99,7 +107,7 @@ var _ = Describe("Public bare metal instance types", func() {
 		Expect(object.GetId()).To(Equal(id))
 		Expect(object.GetSpec().GetHardware().GetCpu().GetCores()).To(Equal(int32(16)))
 		Expect(object.GetSpec().GetHardware().GetMemory().GetTotalGb()).To(Equal(int64(64)))
-		Expect(object.GetSpec().GetHardware().GetCpu().GetArchitecture()).To(Equal("x86_64"))
+		Expect(object.GetSpec().GetHardware().GetCpu().GetArchitecture()).To(Equal("amd64"))
 	})
 
 	It("Can filter bare metal instance types by metadata", func() {

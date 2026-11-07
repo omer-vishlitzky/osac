@@ -28,7 +28,6 @@ import (
 	"google.golang.org/protobuf/types/known/anypb"
 	"gopkg.in/yaml.v3"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/cmd/cli/create/baremetalinstance"
 	"github.com/osac-project/osac/fulfillment-service/internal/cmd/cli/create/baremetalinstancecatalogitem"
 	"github.com/osac-project/osac/fulfillment-service/internal/cmd/cli/create/baremetalinstancetype"
@@ -40,6 +39,7 @@ import (
 	"github.com/osac-project/osac/fulfillment-service/internal/cmd/cli/create/diskimage"
 	"github.com/osac-project/osac/fulfillment-service/internal/cmd/cli/create/externalip"
 	"github.com/osac-project/osac/fulfillment-service/internal/cmd/cli/create/externalipattachment"
+	"github.com/osac-project/osac/fulfillment-service/internal/cmd/cli/create/fabricdomain"
 	"github.com/osac-project/osac/fulfillment-service/internal/cmd/cli/create/hub"
 	"github.com/osac-project/osac/fulfillment-service/internal/cmd/cli/create/instancetype"
 	"github.com/osac-project/osac/fulfillment-service/internal/cmd/cli/create/natgateway"
@@ -54,6 +54,7 @@ import (
 	"github.com/osac-project/osac/fulfillment-service/internal/logging"
 	"github.com/osac-project/osac/fulfillment-service/internal/reflection"
 	"github.com/osac-project/osac/fulfillment-service/internal/terminal"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
 func Cmd() *cobra.Command {
@@ -76,6 +77,7 @@ func Cmd() *cobra.Command {
 	result.AddCommand(diskimage.Cmd())
 	result.AddCommand(externalip.Cmd())
 	result.AddCommand(externalipattachment.Cmd())
+	result.AddCommand(fabricdomain.Cmd())
 	result.AddCommand(help.MarkPrivateAPI(hub.Cmd()))
 	result.AddCommand(help.MarkPrivateAPI(instancetype.Cmd()))
 	result.AddCommand(natgateway.Cmd())
@@ -134,6 +136,7 @@ func (c *runnerContext) run(cmd *cobra.Command, args []string) error {
 		SetConnection(c.conn).
 		AddPackages(c.settings.Packages()).
 		SetTenantFunc(config.TenantFromContext).
+		SetProjectFunc(config.ProjectFromContext).
 		Build()
 	if err != nil {
 		return fmt.Errorf("failed to create reflection tool: %w", err)
@@ -173,6 +176,31 @@ func (c *runnerContext) run(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	tenant := config.TenantFromContext(ctx)
+	project := config.ProjectFromContext(ctx)
+
+	// Pre-validate all objects for project conflicts before creating any object.
+	// This prevents partial application when a conflict is detected at index > 0.
+	if project != "" {
+		for i, object := range objects {
+			objectDesc := object.ProtoReflect().Descriptor()
+			objectType := string(objectDesc.FullName())
+			objectHelper := helper.Lookup(objectType)
+			if objectHelper == nil {
+				return fmt.Errorf("input object at index %d is of an unknown type '%s'", i, objectType)
+			}
+			if objectHelper.IsProjectScoped() {
+				fileProject := objectHelper.GetProject(object)
+				if fileProject != "" && fileProject != project {
+					return fmt.Errorf(
+						"input object at index %d has metadata.project '%s' which "+
+							"conflicts with the --project flag value '%s'",
+						i, fileProject, project,
+					)
+				}
+			}
+		}
+	}
+
 	for i, object := range objects {
 		objectDesc := object.ProtoReflect().Descriptor()
 		objectType := string(objectDesc.FullName())
@@ -182,6 +210,9 @@ func (c *runnerContext) run(cmd *cobra.Command, args []string) error {
 		}
 		if tenant != "" && objectHelper.IsTenantScoped() {
 			objectHelper.SetTenant(object, tenant)
+		}
+		if project != "" && objectHelper.IsProjectScoped() {
+			objectHelper.SetProject(object, project)
 		}
 		object, err = objectHelper.Create(ctx, object)
 		if err != nil {

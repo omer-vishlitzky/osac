@@ -1,0 +1,21 @@
+---
+# The OSAC operator passes the VM's network as osac_job_vars.vm_network
+# (VMaaS networking design): the namespace of the Subnet's hub network, or the
+# Tenant namespace with the default pod network when provider networking is
+# disabled.
+- name: Require the VM network input
+  ansible.builtin.assert:
+    that:
+      - osac_job_vars.vm_network is defined
+      - osac_job_vars.vm_network.namespace | default('') | length > 0
+      - osac_job_vars.vm_network.networks | default([]) | length > 0
+      - osac_job_vars.vm_network.interfaces | default([]) | length > 0
+    fail_msg: "The job input has no vm_network with a namespace, networks, and interfaces."
+    quiet: true
+
+- name: Use the VM network namespace
+  ansible.builtin.set_fact:
+    compute_instance_target_namespace: "{{ osac_job_vars.vm_network.namespace }}"
+    vm_network_networks: "{{ osac_job_vars.vm_network.networks }}"
+    vm_network_interfaces: "{{ osac_job_vars.vm_network.interfaces }}"
+    vm_network_labels: "{{ osac_job_vars.vm_network.labels | default({}) }}"

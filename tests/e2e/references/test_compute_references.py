@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import base64
 import logging
+import re
 import subprocess
 from collections.abc import Generator
 from typing import Any
@@ -9,15 +11,10 @@ from uuid import uuid4
 import pytest
 
 from tests.e2e.core.grpc_client import PRIVATE_API, PUBLIC_API, GRPCClient
-from tests.e2e.core.helpers import (
-    assert_grpc_field_violation,
-    wait_for_cr,
-    wait_for_deletion,
-    wait_for_provision,
-    wait_for_running,
-)
+from tests.e2e.core.helpers import assert_grpc_field_violation, wait_for_cr, wait_for_provision, wait_for_running
 from tests.e2e.core.k8s_client import K8sClient
-from tests.e2e.core.runner import env
+from tests.e2e.core.runner import env, poll_until
+from tests.e2e.core.wait_kinds import WaitResourceKind
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +28,7 @@ def compute_template() -> str:
 def ref_instance_type(private_grpc: GRPCClient) -> Generator[str, None, None]:
     tag = uuid4().hex[:8]
     name = f"ref-it-{tag}"
-    private_grpc.create_instance_type(name=name, cores=2, memory_gib=4)
+    private_grpc.create_instance_type(name=name, vcpus=2, memory_gib=4)
     yield name
     try:
         private_grpc.delete_instance_type(name=name)
@@ -43,18 +40,18 @@ def ref_instance_type(private_grpc: GRPCClient) -> Generator[str, None, None]:
 def ref_ci_catalog_item(private_grpc: GRPCClient, compute_template: str) -> Generator[str, None, None]:
     tag = uuid4().hex[:8]
     name = f"ref-ci-cat-{tag}"
-    cat_id = private_grpc.create_compute_instance_catalog_item(name=name, template=compute_template)
+    cat_id = private_grpc.create_compute_instance_catalog_item(name=name, template=compute_template, api=PRIVATE_API)
     yield cat_id
     try:
-        private_grpc.delete_compute_instance_catalog_item(catalog_item_id=cat_id)
+        private_grpc.delete_compute_instance_catalog_item(catalog_item_id=cat_id, api=PRIVATE_API)
     except subprocess.CalledProcessError:
         logger.warning("Failed to cleanup catalog item %s", cat_id)
 
 
 @pytest.fixture(scope="module")
 def ref_disk_image(grpc: GRPCClient) -> Generator[str, None, None]:
-    # Provider-admin (grpc) DiskImages are globally visible, so this single fixture also
-    # satisfies tenant-scoped creates (e.g. the cross-tenant test's jwt_grpc_tenant1).
+    # Both grpc and jwt_grpc_tenant1 use tenant1, so this tenant-owned image is visible
+    # to the reference tests that create compute instances with either client.
     tag = uuid4().hex[:8]
     name = f"ref-di-{tag}"
     di_id = grpc.create_disk_image(name=name, source_ref="quay.io/containerdisks/fedora:41")
@@ -78,18 +75,69 @@ def _ci_create_data(
         "object": {
             "metadata": {"name": name},
             "spec": {
-                "catalog_item": {"name": cat_item_name},
-                "instance_type": {"name": instance_type},
+                "catalog_item": {"name": cat_item_name, "shared": True},
+                "instance_type": {"name": instance_type, "shared": True},
                 "disk_image": {"name": disk_image},
                 "boot_disk": {"storage_tier": {"name": storage_tier}},
-                "network_attachments": [
-                    {"subnet": {"name": subnet_name}, "security_groups": [{"name": sg_name}]}
-                ],
+                "network_attachments": [{"subnet": {"name": subnet_name}, "security_groups": [{"name": sg_name}]}],
             },
         }
     }
 
 
+def _delete_compute_instance_and_wait(grpc: GRPCClient, k8s: K8sClient, ci_id: str, cr_name: str | None = None) -> None:
+    """Keep references alive until both Kubernetes and Fulfillment finish deletion."""
+
+    def is_not_found(exc: subprocess.CalledProcessError) -> bool:
+        return re.search(r"(?m)^\s*Code:\s*NotFound\s*$", (exc.stderr or "") + "\n" + (exc.stdout or "")) is not None
+
+    def api_is_absent() -> bool:
+        try:
+            grpc.get_compute_instance(ci_id=ci_id)
+        except subprocess.CalledProcessError as exc:
+            if is_not_found(exc):
+                return True
+            raise
+        return False
+
+    try:
+        try:
+            # Resolve before Delete so a fast deletion cannot hide the CR name.
+            if cr_name is None:
+                cr_name = wait_for_cr(k8s=k8s, uuid=ci_id)
+        finally:
+            try:
+                grpc.delete_compute_instance(ci_id=ci_id)
+            except subprocess.CalledProcessError as exc:
+                if not is_not_found(exc):
+                    raise
+        poll_until(
+            fn=lambda: k8s.is_absent(resource="computeinstances.osac.openshift.io", name=cr_name),
+            until=lambda gone: gone is True,
+            retries=120,
+            delay=5,
+            description=f"ComputeInstance {ci_id} CR deletion",
+            resource_kind=WaitResourceKind.COMPUTE_INSTANCE,
+            resource_id=cr_name,
+        )
+        poll_until(
+            fn=api_is_absent,
+            until=lambda gone: gone is True,
+            retries=30,
+            delay=2,
+            description=f"ComputeInstance {ci_id} API deletion",
+            resource_kind=WaitResourceKind.COMPUTE_INSTANCE,
+            resource_id=ci_id,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        # grpcurl exceptions contain the bearer token in their command arguments.
+        pending = exc.__context__
+        if isinstance(pending, subprocess.SubprocessError):
+            pending = None
+        raise RuntimeError(f"ComputeInstance {ci_id} cleanup request failed") from pending
+
+
+@pytest.mark.requires_vmaas
 class TestComputeReferences:
     """OSAC-3100: Compute resource reference tests."""
 
@@ -137,12 +185,7 @@ class TestComputeReferences:
             assert sg_ref.get("name") == ref_security_group["name"]
             assert sg_ref.get("id") == ref_security_group["id"]
         finally:
-            grpc.delete_compute_instance(ci_id=ci_id)
-            try:
-                cr_name = wait_for_cr(k8s=k8s_hub_client, uuid=ci_id)
-                wait_for_deletion(k8s=k8s_hub_client, name=cr_name)
-            except (subprocess.CalledProcessError, AssertionError, TimeoutError):
-                logger.warning("Cleanup wait failed for compute instance %s", ci_id)
+            _delete_compute_instance_and_wait(grpc, k8s_hub_client, ci_id)
 
     def test_compute_instance_reaches_running_with_name_refs(
         self,
@@ -182,12 +225,7 @@ class TestComputeReferences:
             phase = k8s_hub_client.get_compute_instance_phase(name=cr_name)
             assert phase == "Running"
         finally:
-            grpc.delete_compute_instance(ci_id=ci_id)
-            if cr_name:
-                try:
-                    wait_for_deletion(k8s=k8s_hub_client, name=cr_name)
-                except (subprocess.CalledProcessError, AssertionError, TimeoutError):
-                    logger.warning("Cleanup wait failed for compute instance %s", ci_id)
+            _delete_compute_instance_and_wait(grpc, k8s_hub_client, ci_id, cr_name)
 
     def test_invalid_subnet_name_returns_array_indexed_field_path(
         self,
@@ -209,8 +247,8 @@ class TestComputeReferences:
                     "object": {
                         "metadata": {"name": f"ref-ci-bad-sg-{tag}"},
                         "spec": {
-                            "catalog_item": {"name": cat_item_name},
-                            "instance_type": {"name": ref_instance_type},
+                            "catalog_item": {"name": cat_item_name, "shared": True},
+                            "instance_type": {"name": ref_instance_type, "shared": True},
                             "disk_image": {"name": ref_disk_image},
                             "boot_disk": {"storage_tier": {"name": default_storage_tier}},
                             "network_attachments": [
@@ -229,6 +267,7 @@ class TestComputeReferences:
         self,
         jwt_grpc_tenant1: GRPCClient,
         private_grpc: GRPCClient,
+        k8s_hub_client: K8sClient,
         compute_template: str,
         ref_subnet: dict[str, str],
         ref_security_group: dict[str, str],
@@ -238,7 +277,9 @@ class TestComputeReferences:
     ):
         tag = uuid4().hex[:8]
         cat_name = f"ref-xt-cat-{tag}"
-        cat_id = private_grpc.create_compute_instance_catalog_item(name=cat_name, template=compute_template)
+        cat_id = private_grpc.create_compute_instance_catalog_item(
+            name=cat_name, template=compute_template, api=PRIVATE_API
+        )
         ci_id = None
         try:
             response: dict[str, Any] = jwt_grpc_tenant1.call(
@@ -260,12 +301,9 @@ class TestComputeReferences:
             assert cat_ref.get("id") == cat_id
         finally:
             if ci_id:
-                try:
-                    jwt_grpc_tenant1.delete_compute_instance(ci_id=ci_id)
-                except subprocess.CalledProcessError:
-                    logger.warning("Failed to cleanup compute instance %s", ci_id)
+                _delete_compute_instance_and_wait(jwt_grpc_tenant1, k8s_hub_client, ci_id)
             try:
-                private_grpc.delete_compute_instance_catalog_item(catalog_item_id=cat_id)
+                private_grpc.delete_compute_instance_catalog_item(catalog_item_id=cat_id, api=PRIVATE_API)
             except subprocess.CalledProcessError:
                 logger.warning("Failed to cleanup cross-tenant catalog item %s", cat_id)
 
@@ -274,8 +312,8 @@ class TestComputeReferences:
         active_name = f"ref-it-active-{tag}"
         deprecated_name = f"ref-it-depr-{tag}"
 
-        active_id = private_grpc.create_instance_type(name=active_name, cores=2, memory_gib=4)
-        private_grpc.create_instance_type(name=deprecated_name, cores=2, memory_gib=4)
+        active_id = private_grpc.create_instance_type(name=active_name, vcpus=2, memory_gib=4)
+        private_grpc.create_instance_type(name=deprecated_name, vcpus=2, memory_gib=4)
         try:
             private_grpc.call(
                 service=f"{PRIVATE_API}.InstanceTypes/Update",
@@ -305,3 +343,58 @@ class TestComputeReferences:
                 private_grpc.delete_instance_type(name=active_name)
             except subprocess.CalledProcessError:
                 logger.warning("Failed to cleanup active instance type %s", active_name)
+
+    def test_compute_instance_user_data_secret_by_name(
+        self,
+        grpc: GRPCClient,
+        k8s_hub_client: K8sClient,
+        ref_subnet: dict[str, str],
+        ref_security_group: dict[str, str],
+        ref_ci_catalog_item: str,
+        ref_instance_type: str,
+        ref_disk_image: str,
+        default_storage_tier: str,
+    ):
+        tag = uuid4().hex[:8]
+        secret_name = f"ref-user-data-{tag}"
+        secret_response: dict[str, Any] = grpc.call(
+            service=f"{PUBLIC_API}.Secrets/Create",
+            data={
+                "object": {
+                    "metadata": {"name": secret_name},
+                    "type": "SECRET_TYPE_USER_DATA",
+                    "data": {"userdata": base64.b64encode(b"#cloud-config\n").decode()},
+                }
+            },
+        )
+        secret_id = secret_response["object"]["id"]
+        ci_id: str | None = None
+
+        try:
+            cat_item = grpc.get_compute_instance_catalog_item(catalog_item_id=ref_ci_catalog_item)
+            data = _ci_create_data(
+                f"ref-ci-secret-{tag}",
+                cat_item["object"]["metadata"]["name"],
+                ref_subnet["name"],
+                ref_security_group["name"],
+                ref_instance_type,
+                ref_disk_image,
+                default_storage_tier,
+            )
+            data["object"]["spec"]["user_data_source"] = {"secret": {"name": secret_name}}
+
+            response: dict[str, Any] = grpc.call(service=f"{PUBLIC_API}.ComputeInstances/Create", data=data)
+            ci_id = response["object"]["id"]
+            source = response["object"]["spec"].get(
+                "user_data_source", response["object"]["spec"].get("userDataSource", {})
+            )
+            secret_ref = source["secret"]
+            assert secret_ref.get("name") == secret_name
+            assert secret_ref.get("id") == secret_id
+        finally:
+            if ci_id:
+                _delete_compute_instance_and_wait(grpc, k8s_hub_client, ci_id)
+            try:
+                grpc.call(service=f"{PUBLIC_API}.Secrets/Delete", data={"id": secret_id})
+            except subprocess.CalledProcessError:
+                logger.warning("Failed to cleanup secret %s", secret_id)

@@ -14,67 +14,71 @@ language governing permissions and limitations under the License.
 package computeinstance
 
 import (
+	"context"
+
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"github.com/spf13/pflag"
 	"google.golang.org/protobuf/proto"
 
-	publicv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/public/v1"
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
 
-var _ = Describe("parseNetworkAttachmentFlag", func() {
-	DescribeTable("when input is valid it should parse",
-		func(input, wantSubnet string, wantSGs []string) {
-			got, err := parseNetworkAttachmentFlag(input)
-			Expect(err).NotTo(HaveOccurred())
-			Expect(got.GetSubnet().GetId()).To(Equal(wantSubnet))
-			var gotSGs []string
-			for _, sg := range got.GetSecurityGroups() {
-				gotSGs = append(gotSGs, sg.GetId())
-			}
-			if wantSGs == nil {
-				Expect(gotSGs).To(BeNil())
-			} else {
-				Expect(gotSGs).To(Equal(wantSGs))
-			}
-		},
-		Entry("when value is bare subnet id it should use it as subnet",
-			"  sub-1  ", "sub-1", nil),
-		Entry("when value is subnet=key form it should parse subnet",
-			"subnet=sub-2", "sub-2", nil),
-		Entry("when value includes security_groups alias it should parse groups",
-			"subnet=a,security_groups=g1,g2", "a", []string{"g1", "g2"}),
-		Entry("when value lists security-groups after subnet it should parse groups",
-			"subnet=b,security-groups=x", "b", []string{"x"}),
-	)
-
-	DescribeTable("when input is invalid it should error",
-		func(input string) {
-			_, err := parseNetworkAttachmentFlag(input)
-			Expect(err).To(HaveOccurred())
-		},
-		Entry("when value is empty it should error", "   "),
-		Entry("when key is unknown it should error", "subnet=a,foo=bar"),
-		Entry("when subnet= form omits subnet it should error", "security-groups=g1"),
-		Entry("when fragment has no equals it should error", "subnet=sub,noglue"),
-		Entry("when value after equals is empty it should error", "subnet="),
-		Entry("when subnet is duplicated it should error", "subnet=a,subnet=b"),
-	)
-})
-
-// Legacy subnet and security-groups tests removed - these fields are no longer supported
-
 var _ = Describe("buildSpec", func() {
-	It("should populate attachments when network-attachment flags are set", func() {
+	It("should populate a registered SSH key reference from the flag", func() {
 		c := &runnerContext{}
-		c.args.networkAttachments = []string{"n1", "subnet=n2,security-groups=g1"}
+		c.args.sshKey = "login-key"
+
+		spec, err := c.buildSpec("tmpl", nil)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(spec.GetSshKey().GetName()).To(Equal("login-key"))
+		Expect(spec.GetSshKey().GetId()).To(BeEmpty())
+		Expect(spec.GetSshKey().GetProject()).To(BeEmpty())
+		Expect(spec.GetSshKey().GetShared()).To(BeFalse())
+	})
+
+	It("should parse name-only SSH key syntax for template creation", func() {
+		c := &runnerContext{}
+		c.args.sshKey = "name=login-key"
+
+		spec, err := c.buildSpec("tmpl", nil)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(spec.GetSshKey().GetName()).To(Equal("login-key"))
+		Expect(spec.GetSshKey().GetProject()).To(BeEmpty())
+	})
+
+	It("should preserve the SSH key project from key/value syntax", func() {
+		c := &runnerContext{}
+		c.args.sshKey = "name=login-key,project=apps"
+
+		spec, err := c.buildSpec("tmpl", nil)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(spec.GetSshKey().GetName()).To(Equal("login-key"))
+		Expect(spec.GetSshKey().GetProject()).To(Equal("apps"))
+		Expect(spec.GetSshKey().GetShared()).To(BeFalse())
+	})
+
+	It("should send the resolved instance type ID", func() {
+		c := &runnerContext{}
+		c.args.instanceType = "instance-type-id"
+		spec, err := c.buildSpec("tmpl", nil)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(spec.GetInstanceType().GetId()).To(Equal("instance-type-id"))
+	})
+
+	It("should populate attachments when network-attachment flags are set", func() {
+		c := &runnerContext{
+			networkAttachment: publicv1.ComputeNetworkAttachment_builder{
+				Subnet:         publicv1.SubnetLocalReference_builder{Id: "n2"}.Build(),
+				SecurityGroups: []*publicv1.SecurityGroupLocalReference{publicv1.SecurityGroupLocalReference_builder{Id: "g1"}.Build()},
+			}.Build(),
+		}
 		spec, err := c.buildSpec("tmpl", nil)
 		Expect(err).NotTo(HaveOccurred())
 
 		want := publicv1.ComputeInstanceSpec_builder{
 			Template: publicv1.ComputeInstanceTemplateReference_builder{Id: "tmpl"}.Build(),
 			NetworkAttachments: []*publicv1.ComputeNetworkAttachment{
-				publicv1.ComputeNetworkAttachment_builder{Subnet: publicv1.SubnetLocalReference_builder{Id: "n1"}.Build()}.Build(),
 				publicv1.ComputeNetworkAttachment_builder{
 					Subnet:         publicv1.SubnetLocalReference_builder{Id: "n2"}.Build(),
 					SecurityGroups: []*publicv1.SecurityGroupLocalReference{publicv1.SecurityGroupLocalReference_builder{Id: "g1"}.Build()},
@@ -102,19 +106,64 @@ var _ = Describe("buildSpec", func() {
 
 		Expect(spec.HasDiskImage()).To(BeFalse())
 	})
+
+	It("should set user_data_source.secret when user-data-secret is provided", func() {
+		c := &runnerContext{}
+		c.args.userDataSecret = "cloud-init"
+		spec, err := c.buildSpec("tmpl", nil)
+		Expect(err).NotTo(HaveOccurred())
+
+		Expect(spec.GetUserDataSource().GetSecret().GetName()).To(Equal("cloud-init"))
+	})
 })
 
 var _ = Describe("buildSpecFromCatalogItem", func() {
-	It("should populate attachments when network-attachment flags are set", func() {
+	DescribeTable("should preserve bare and name-only SSH key values",
+		func(value string) {
+			c := &runnerContext{}
+			c.args.sshKey = value
+
+			spec, err := c.buildSpecFromCatalogItem("cat-001")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(spec.GetSshKey().GetName()).To(Equal("login-key"))
+			Expect(spec.GetSshKey().GetProject()).To(BeEmpty())
+		},
+		Entry("bare name", "login-key"),
+		Entry("name key", "name=login-key"),
+	)
+
+	It("should preserve the SSH key project from key/value syntax", func() {
 		c := &runnerContext{}
-		c.args.networkAttachments = []string{"n1", "subnet=n2,security-groups=g1"}
+		c.args.sshKey = "name=login-key,project=apps"
+
+		spec, err := c.buildSpecFromCatalogItem("cat-001")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(spec.GetSshKey().GetName()).To(Equal("login-key"))
+		Expect(spec.GetSshKey().GetProject()).To(Equal("apps"))
+		Expect(spec.GetSshKey().GetShared()).To(BeFalse())
+	})
+
+	It("should send the resolved instance type ID", func() {
+		c := &runnerContext{}
+		c.args.instanceType = "instance-type-id"
+		spec, err := c.buildSpecFromCatalogItem("cat-001")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(spec.GetInstanceType().GetId()).To(Equal("instance-type-id"))
+	})
+
+	It("should populate attachments when network-attachment flags are set", func() {
+		c := &runnerContext{
+			networkAttachment: publicv1.ComputeNetworkAttachment_builder{
+				Subnet:         publicv1.SubnetLocalReference_builder{Id: "n2"}.Build(),
+				SecurityGroups: []*publicv1.SecurityGroupLocalReference{publicv1.SecurityGroupLocalReference_builder{Id: "g1"}.Build()},
+			}.Build(),
+		}
 		spec, err := c.buildSpecFromCatalogItem("cat-001")
 		Expect(err).NotTo(HaveOccurred())
 
 		want := publicv1.ComputeInstanceSpec_builder{
 			CatalogItem: publicv1.ComputeInstanceCatalogItemReference_builder{Id: "cat-001"}.Build(),
 			NetworkAttachments: []*publicv1.ComputeNetworkAttachment{
-				publicv1.ComputeNetworkAttachment_builder{Subnet: publicv1.SubnetLocalReference_builder{Id: "n1"}.Build()}.Build(),
 				publicv1.ComputeNetworkAttachment_builder{
 					Subnet:         publicv1.SubnetLocalReference_builder{Id: "n2"}.Build(),
 					SecurityGroups: []*publicv1.SecurityGroupLocalReference{publicv1.SecurityGroupLocalReference_builder{Id: "g1"}.Build()},
@@ -135,10 +184,17 @@ var _ = Describe("buildSpecFromCatalogItem", func() {
 		Expect(proto.Equal(spec, want)).To(BeTrue(), "spec should equal expected spec")
 	})
 
-	It("should return error when network-attachment value is invalid", func() {
+	It("should reject more than one network-attachment flag", func() {
+		c := &runnerContext{}
+		c.args.networkAttachments = []string{"n1", "n2"}
+		err := c.resolveNetworkAttachment(context.Background(), nil)
+		Expect(err).To(MatchError(ContainSubstring("at most one --network-attachment")))
+	})
+
+	It("should reject an invalid network-attachment value before resolving names", func() {
 		c := &runnerContext{}
 		c.args.networkAttachments = []string{"subnet=a,foo=bar"}
-		_, err := c.buildSpecFromCatalogItem("cat-003")
+		err := c.resolveNetworkAttachment(context.Background(), nil)
 		Expect(err).To(HaveOccurred())
 	})
 
@@ -159,6 +215,15 @@ var _ = Describe("buildSpecFromCatalogItem", func() {
 		Expect(err).NotTo(HaveOccurred())
 
 		Expect(spec.HasDiskImage()).To(BeFalse())
+	})
+
+	It("should set user_data_source.secret when user-data-secret is provided", func() {
+		c := &runnerContext{}
+		c.args.userDataSecret = "cloud-init"
+		spec, err := c.buildSpecFromCatalogItem("cat-006")
+		Expect(err).NotTo(HaveOccurred())
+
+		Expect(spec.GetUserDataSource().GetSecret().GetName()).To(Equal("cloud-init"))
 	})
 })
 
@@ -205,9 +270,26 @@ var _ = Describe("Create computeinstance flag registration", func() {
 		flag := cmd.Flags().Lookup("disk-image")
 		Expect(flag).NotTo(BeNil())
 	})
+
+	It("should register --ssh-key and not the removed inline key flag", func() {
+		cmd := Cmd()
+		Expect(cmd.Flags().Lookup("ssh-key")).NotTo(BeNil())
+		Expect(cmd.Flags().Lookup("ssh-public-key")).To(BeNil())
+	})
 })
 
 var _ = Describe("Create computeinstance flag validation", func() {
+	It("should reject user data and a user data secret together", func() {
+		cmd := Cmd()
+		cmd.SetOut(GinkgoWriter)
+		cmd.SetErr(GinkgoWriter)
+		cmd.SetArgs([]string{"--template", "tpl-001", "--user-data", "data", "--user-data-secret", "cloud-init"})
+		err := cmd.Execute()
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("user-data"))
+		Expect(err.Error()).To(ContainSubstring("user-data-secret"))
+	})
+
 	It("should return error when both --catalog-item and --template are set", func() {
 		cmd := Cmd()
 		cmd.SetOut(GinkgoWriter)
@@ -241,12 +323,14 @@ var _ = Describe("buildBootDisk", func() {
 		Expect(disk).To(BeNil())
 	})
 
-	It("should return error when storage tier is set without size", func() {
+	It("should return disk with only storage tier when size is not set", func() {
 		c := &runnerContext{}
 		c.args.bootDiskStorageTier = "premium"
-		_, err := c.buildBootDisk()
-		Expect(err).To(HaveOccurred())
-		Expect(err.Error()).To(ContainSubstring("--boot-disk-size is required"))
+		disk, err := c.buildBootDisk()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(disk).NotTo(BeNil())
+		Expect(disk.GetStorageTier().GetName()).To(Equal("premium"))
+		Expect(disk.HasSizeGib()).To(BeFalse())
 	})
 
 	It("should return disk with both fields when both are set", func() {
@@ -287,15 +371,25 @@ var _ = Describe("--additional-disk flag parsing", func() {
 		return val.GetSlice()
 	}
 
+	It("should preserve an explicitly empty value to opt out of catalog defaults", func() {
+		raw := rawDisks("--additional-disk", "")
+		Expect(raw).To(Equal([]string{""}))
+
+		disks, err := parseAdditionalDisks(raw)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(disks).NotTo(BeNil())
+		Expect(disks.GetItems()).To(BeEmpty())
+	})
+
 	It("should keep a single comma-joined key=value spec as one element", func() {
 		raw := rawDisks("--additional-disk", "size=50,storage-tier=e2e-x")
 		Expect(raw).To(Equal([]string{"size=50,storage-tier=e2e-x"}))
 
 		disks, err := parseAdditionalDisks(raw)
 		Expect(err).ToNot(HaveOccurred())
-		Expect(disks).To(HaveLen(1))
-		Expect(disks[0].GetSizeGib()).To(Equal(int32(50)))
-		Expect(disks[0].GetStorageTier().GetName()).To(Equal("e2e-x"))
+		Expect(disks.GetItems()).To(HaveLen(1))
+		Expect(disks.GetItems()[0].GetSizeGib()).To(Equal(int32(50)))
+		Expect(disks.GetItems()[0].GetStorageTier().GetName()).To(Equal("e2e-x"))
 	})
 
 	It("should parse multiple disks with different storage tiers", func() {
@@ -310,11 +404,11 @@ var _ = Describe("--additional-disk flag parsing", func() {
 
 		disks, err := parseAdditionalDisks(raw)
 		Expect(err).ToNot(HaveOccurred())
-		Expect(disks).To(HaveLen(2))
-		Expect(disks[0].GetSizeGib()).To(Equal(int32(50)))
-		Expect(disks[0].GetStorageTier().GetName()).To(Equal("fast"))
-		Expect(disks[1].GetSizeGib()).To(Equal(int32(100)))
-		Expect(disks[1].GetStorageTier().GetName()).To(Equal("archive"))
+		Expect(disks.GetItems()).To(HaveLen(2))
+		Expect(disks.GetItems()[0].GetSizeGib()).To(Equal(int32(50)))
+		Expect(disks.GetItems()[0].GetStorageTier().GetName()).To(Equal("fast"))
+		Expect(disks.GetItems()[1].GetSizeGib()).To(Equal(int32(100)))
+		Expect(disks.GetItems()[1].GetStorageTier().GetName()).To(Equal("archive"))
 	})
 
 	It("should reject a bare integer additional disk", func() {

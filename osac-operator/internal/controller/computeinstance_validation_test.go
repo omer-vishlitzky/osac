@@ -69,7 +69,7 @@ var _ = Describe("ComputeInstance CEL Validation", func() {
 					SourceType: osacv1alpha1.ImageSourceTypeRegistry,
 					SourceRef:  "quay.io/test/test-image:latest",
 				},
-				Cores:       2,
+				VCPUs:       2,
 				MemoryGiB:   4,
 				BootDisk:    osacv1alpha1.DiskSpec{SizeGiB: 20, StorageTier: "standard"},
 				RunStrategy: osacv1alpha1.RunStrategyAlways,
@@ -112,18 +112,21 @@ var _ = Describe("ComputeInstance CEL Validation", func() {
 		Expect(k8sClient.Create(ctx, instance)).To(Succeed())
 	})
 
+	It("should reject multiple networkAttachments", func() {
+		instance := createValidInstance("test-multiple-network-attachments")
+		instance.Spec.NetworkAttachments = []osacv1alpha1.ComputeNetworkAttachment{
+			{SubnetRef: "subnet-a"},
+			{SubnetRef: "subnet-b"},
+		}
+
+		err := k8sClient.Create(ctx, instance)
+		Expect(err).To(HaveOccurred())
+		Expect(apierrors.IsInvalid(err)).To(BeTrue())
+		Expect(err.Error()).To(ContainSubstring("at most one network attachment is supported"))
+	})
+
 	Describe("NetworkAttachment immutability", func() {
-		It("documents limitation: changing subnetRef via full replacement bypasses validation", func() {
-			// LIMITATION: With listType=map, changing the map key (subnetRef) is treated as
-			// removing the old item and adding a new item. Since the array size stays the same,
-			// the size check passes. The self==oldSelf validation on subnetRef doesn't trigger
-			// because Kubernetes sees these as different items (different keys = uncorrelated).
-			//
-			// Preventing this edge case would require a validating webhook that checks if
-			// the set of subnetRef values has changed.
-			//
-			// In practice, this is unlikely to occur accidentally since changing a VM's subnet
-			// typically requires explicit user action, and the VM would need to be recreated anyway.
+		It("should reject replacing a subnetRef", func() {
 			instance := createValidInstance("test-subnet-replacement")
 			instance.Spec.NetworkAttachments = []osacv1alpha1.ComputeNetworkAttachment{
 				{SubnetRef: "subnet-a", SecurityGroupRefs: []string{"sg-1"}},
@@ -134,17 +137,17 @@ var _ = Describe("ComputeInstance CEL Validation", func() {
 			// Fetch latest version
 			Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(instance), instance)).To(Succeed())
 
-			// Replace with different subnetRef (same size, different key)
-			// This currently is NOT prevented by CEL validations
+			// Replace with a different subnetRef while keeping the list size unchanged.
 			instance.Spec.NetworkAttachments = []osacv1alpha1.ComputeNetworkAttachment{
 				{SubnetRef: "subnet-b", SecurityGroupRefs: []string{"sg-1"}},
 			}
 			err := k8sClient.Update(ctx, instance)
-			// Currently this succeeds - documenting known limitation
-			_ = err // May or may not fail depending on future webhook implementation
+			Expect(err).To(HaveOccurred())
+			Expect(apierrors.IsInvalid(err)).To(BeTrue())
+			Expect(err.Error()).To(ContainSubstring("networkAttachments are immutable after creation"))
 		})
 
-		It("should allow changing securityGroupRefs without changing subnetRef", func() {
+		It("should reject changing securityGroupRefs without changing subnetRef", func() {
 			instance := createValidInstance("test-sg-mutable")
 			instance.Spec.NetworkAttachments = []osacv1alpha1.ComputeNetworkAttachment{
 				{SubnetRef: "subnet-a", SecurityGroupRefs: []string{"sg-1"}},
@@ -157,35 +160,30 @@ var _ = Describe("ComputeInstance CEL Validation", func() {
 
 			// Change only securityGroupRefs
 			instance.Spec.NetworkAttachments[0].SecurityGroupRefs = []string{"sg-2", "sg-3"}
-			Expect(k8sClient.Update(ctx, instance)).To(Succeed())
+			err := k8sClient.Update(ctx, instance)
+			Expect(err).To(HaveOccurred())
+			Expect(apierrors.IsInvalid(err)).To(BeTrue())
+			Expect(err.Error()).To(ContainSubstring("networkAttachments are immutable after creation"))
 		})
 
-		It("should reject adding networkAttachment entries", func() {
+		It("should reject adding the first networkAttachment after creation", func() {
 			instance := createValidInstance("test-add-attachment")
-			instance.Spec.NetworkAttachments = []osacv1alpha1.ComputeNetworkAttachment{
-				{SubnetRef: "subnet-a"},
-			}
-
 			Expect(k8sClient.Create(ctx, instance)).To(Succeed())
 
 			// Fetch latest version
 			Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(instance), instance)).To(Succeed())
 
-			// Try to add another networkAttachment
-			instance.Spec.NetworkAttachments = append(instance.Spec.NetworkAttachments,
-				osacv1alpha1.ComputeNetworkAttachment{SubnetRef: "subnet-b"},
-			)
+			// Try to add the optional field after creation.
+			instance.Spec.NetworkAttachments = []osacv1alpha1.ComputeNetworkAttachment{{SubnetRef: "subnet-a"}}
 			err := k8sClient.Update(ctx, instance)
 			Expect(err).To(HaveOccurred())
 			Expect(apierrors.IsInvalid(err)).To(BeTrue())
+			Expect(err.Error()).To(ContainSubstring("networkAttachments are immutable after creation"))
 		})
 
-		It("should reject removing networkAttachment entries", func() {
+		It("should reject removing the networkAttachment after creation", func() {
 			instance := createValidInstance("test-remove-attachment")
-			instance.Spec.NetworkAttachments = []osacv1alpha1.ComputeNetworkAttachment{
-				{SubnetRef: "subnet-a"},
-				{SubnetRef: "subnet-b"},
-			}
+			instance.Spec.NetworkAttachments = []osacv1alpha1.ComputeNetworkAttachment{{SubnetRef: "subnet-a"}}
 
 			Expect(k8sClient.Create(ctx, instance)).To(Succeed())
 
@@ -193,14 +191,12 @@ var _ = Describe("ComputeInstance CEL Validation", func() {
 			Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(instance), instance)).To(Succeed())
 
 			// Try to remove a networkAttachment
-			instance.Spec.NetworkAttachments = instance.Spec.NetworkAttachments[:1]
+			instance.Spec.NetworkAttachments = nil
 			err := k8sClient.Update(ctx, instance)
 			Expect(err).To(HaveOccurred())
 			Expect(apierrors.IsInvalid(err)).To(BeTrue())
+			Expect(err.Error()).To(ContainSubstring("networkAttachments are immutable after creation"))
 		})
-
-		// Removed: duplicate of "documents limitation: changing subnetRef via full replacement bypasses validation"
-		// This test was testing the same edge case - see that test for explanation.
 	})
 
 	Describe("Image immutability", func() {
@@ -233,38 +229,6 @@ var _ = Describe("ComputeInstance CEL Validation", func() {
 			Expect(err).To(HaveOccurred())
 			Expect(apierrors.IsInvalid(err)).To(BeTrue())
 			Expect(err.Error()).To(ContainSubstring("image is immutable"))
-		})
-	})
-
-	Describe("Compute resource immutability", func() {
-		It("should reject changing cores", func() {
-			instance := createValidInstance("test-cores-immutable")
-			Expect(k8sClient.Create(ctx, instance)).To(Succeed())
-
-			// Fetch latest version
-			Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(instance), instance)).To(Succeed())
-
-			// Try to change cores
-			instance.Spec.Cores = 4
-			err := k8sClient.Update(ctx, instance)
-			Expect(err).To(HaveOccurred())
-			Expect(apierrors.IsInvalid(err)).To(BeTrue())
-			Expect(err.Error()).To(ContainSubstring("cores is immutable"))
-		})
-
-		It("should reject changing memoryGiB", func() {
-			instance := createValidInstance("test-memory-immutable")
-			Expect(k8sClient.Create(ctx, instance)).To(Succeed())
-
-			// Fetch latest version
-			Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(instance), instance)).To(Succeed())
-
-			// Try to change memory
-			instance.Spec.MemoryGiB = 8
-			err := k8sClient.Update(ctx, instance)
-			Expect(err).To(HaveOccurred())
-			Expect(apierrors.IsInvalid(err)).To(BeTrue())
-			Expect(err.Error()).To(ContainSubstring("memoryGiB is immutable"))
 		})
 	})
 
@@ -350,7 +314,7 @@ var _ = Describe("ComputeInstance CEL Validation", func() {
 			//
 			// To prevent nil-to-value transitions would require parent-level validation using has() checks,
 			// or a validating webhook. For the current use case, this limitation is acceptable since:
-			// 1. Most immutable fields are required (cores, memory, etc.)
+			// 1. Most immutable fields are required (vCPUs, memory, etc.)
 			// 2. Optional immutable fields (userDataSecretRef, sshKey) are typically set at creation
 			// 3. Changing a set value IS prevented by the validation
 			instance := createValidInstance("test-add-userdata")
@@ -386,8 +350,68 @@ var _ = Describe("ComputeInstance CEL Validation", func() {
 	})
 
 	Describe("Mutable fields", func() {
+		It("should allow changing vCPUs", func() {
+			instance := createValidInstance("test-vcpus-mutable")
+			Expect(k8sClient.Create(ctx, instance)).To(Succeed())
+
+			// Fetch latest version
+			Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(instance), instance)).To(Succeed())
+
+			// Change vCPUs - should succeed
+			instance.Spec.VCPUs = 4
+			Expect(k8sClient.Update(ctx, instance)).To(Succeed())
+
+			// Verify the change persisted
+			Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(instance), instance)).To(Succeed())
+			Expect(instance.Spec.VCPUs).To(Equal(int32(4)))
+		})
+
+		It("should reject updating vCPUs outside the allowed range", func() {
+			instance := createValidInstance("test-vcpus-bounds")
+			Expect(k8sClient.Create(ctx, instance)).To(Succeed())
+
+			Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(instance), instance)).To(Succeed())
+			instance.Spec.VCPUs = 0
+			err := k8sClient.Update(ctx, instance)
+			Expect(err).To(HaveOccurred())
+			Expect(apierrors.IsInvalid(err)).To(BeTrue())
+
+			instance.Spec.VCPUs = 129
+			err = k8sClient.Update(ctx, instance)
+			Expect(err).To(HaveOccurred())
+			Expect(apierrors.IsInvalid(err)).To(BeTrue())
+		})
+
+		It("should allow changing memoryGiB", func() {
+			instance := createValidInstance("test-memory-mutable")
+			Expect(k8sClient.Create(ctx, instance)).To(Succeed())
+
+			// Fetch latest version
+			Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(instance), instance)).To(Succeed())
+
+			// Change memory - should succeed
+			instance.Spec.MemoryGiB = 8
+			Expect(k8sClient.Update(ctx, instance)).To(Succeed())
+
+			// Verify the change persisted
+			Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(instance), instance)).To(Succeed())
+			Expect(instance.Spec.MemoryGiB).To(Equal(int32(8)))
+		})
+
+		It("should reject updating memoryGiB below the minimum", func() {
+			instance := createValidInstance("test-memory-below-minimum")
+			Expect(k8sClient.Create(ctx, instance)).To(Succeed())
+
+			Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(instance), instance)).To(Succeed())
+			instance.Spec.MemoryGiB = 0
+			err := k8sClient.Update(ctx, instance)
+			Expect(err).To(HaveOccurred())
+			Expect(apierrors.IsInvalid(err)).To(BeTrue())
+		})
+
 		It("should allow changing runStrategy", func() {
 			instance := createValidInstance("test-runstrategy-mutable")
+			instance.Spec.NetworkAttachments = []osacv1alpha1.ComputeNetworkAttachment{{SubnetRef: "subnet-a"}}
 			instance.Spec.RunStrategy = osacv1alpha1.RunStrategyAlways
 			Expect(k8sClient.Create(ctx, instance)).To(Succeed())
 
@@ -405,6 +429,7 @@ var _ = Describe("ComputeInstance CEL Validation", func() {
 
 		It("should allow setting restartRequestedAt", func() {
 			instance := createValidInstance("test-restart-mutable")
+			instance.Spec.NetworkAttachments = []osacv1alpha1.ComputeNetworkAttachment{{SubnetRef: "subnet-a"}}
 			Expect(k8sClient.Create(ctx, instance)).To(Succeed())
 
 			// Fetch latest version
@@ -645,21 +670,6 @@ var _ = Describe("ComputeInstance CEL Validation", func() {
 			Expect(err.Error()).To(ContainSubstring("Too many"))
 		})
 
-		It("should allow creating ComputeInstance with exactly 8 networkAttachments", func() {
-			instance := createValidInstance("test-exactly-8-attachments")
-			instance.Spec.NetworkAttachments = []osacv1alpha1.ComputeNetworkAttachment{
-				{SubnetRef: "subnet-1"},
-				{SubnetRef: "subnet-2"},
-				{SubnetRef: "subnet-3"},
-				{SubnetRef: "subnet-4"},
-				{SubnetRef: "subnet-5"},
-				{SubnetRef: "subnet-6"},
-				{SubnetRef: "subnet-7"},
-				{SubnetRef: "subnet-8"},
-			}
-
-			Expect(k8sClient.Create(ctx, instance)).To(Succeed())
-		})
 	})
 
 	Describe("StorageTier validation", func() {

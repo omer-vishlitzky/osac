@@ -17,18 +17,17 @@ import (
 	"bytes"
 	"embed"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
 
-	"charm.land/glamour/v2"
-	"charm.land/glamour/v2/ansi"
-	"charm.land/glamour/v2/styles"
 	"charm.land/lipgloss/v2"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
-	"golang.org/x/term"
 
+	"github.com/osac-project/osac/fulfillment-service/internal/cmd/cli/color"
+	"github.com/osac-project/osac/fulfillment-service/internal/cmd/cli/markdown"
 	"github.com/osac-project/osac/fulfillment-service/internal/templating"
 )
 
@@ -56,71 +55,18 @@ func Setup(cmd *cobra.Command) {
 	// help is displayed, so that it can adapt to the current terminal width and color capabilities.
 	cmd.SetHelpFunc(func(c *cobra.Command, args []string) {
 		out := c.OutOrStdout()
-
-		// Determine if the output is a terminal and get its size:
-		var width int
-		isTTY := false
-		file, ok := out.(*os.File)
-		if ok {
-			fd := int(file.Fd())
-			if term.IsTerminal(fd) {
-				isTTY = true
-				width, _, err = term.GetSize(fd)
-				if err != nil {
-					c.PrintErrln("Error getting terminal size:", err)
-					return
-				}
-			}
-		}
-		width = min(width, maxReadableWidth)
-
-		// Select the style based on terminal capabilities. Use colored styles only when the output is
-		// a terminal and the NO_COLOR environment variable is not set (https://no-color.org/).
-		_, noColor := os.LookupEnv("NO_COLOR")
-		var style ansi.StyleConfig
-		if isTTY && !noColor {
-			if lipgloss.HasDarkBackground(os.Stdin, os.Stdout) {
-				style = styles.DarkStyleConfig
-			} else {
-				style = styles.LightStyleConfig
-			}
-		} else {
-			style = styles.NoTTYStyleConfig
-		}
-
-		// Regardless of the style, we want to remove the default document margin and leading newline,
-		// so the output is flush with the left edge of the terminal.
-		zero := new(uint)
-		style.Document.Margin = zero
-		style.Document.BlockPrefix = ""
-
-		// We don't want to display the heading prefixes:
-		style.H2.Prefix = ""
-		style.H3.Prefix = ""
-		style.H4.Prefix = ""
-		style.H5.Prefix = ""
-		style.H6.Prefix = ""
-
-		// For code inside paragraphs, we don't want to change the background color or add prefixes
-		// and suffixes:
-		style.Code.BackgroundColor = nil
-		style.Code.Prefix = ""
-		style.Code.Suffix = ""
+		useColor := color.Enabled(c, out)
 
 		// Hide private-API subcommands when the user is not in private mode:
 		hidePrivateSubcommands(c)
 
 		// Render the help output:
 		var buffer bytes.Buffer
-		err = engine.Execute(&buffer, "command_help.md", c)
-		if err != nil {
+		if err := engine.Execute(&buffer, "command_help.md", c); err != nil {
 			c.PrintErrln("Error executing help template:", err)
 			return
 		}
-		renderer, err := glamour.NewTermRenderer(
-			glamour.WithStyles(style),
-			glamour.WithWordWrap(width),
-		)
+		renderer, _, err := markdown.NewRenderer(out, useColor)
 		if err != nil {
 			c.PrintErrln("Error creating renderer:", err)
 			return
@@ -130,7 +76,11 @@ func Setup(cmd *cobra.Command) {
 			c.Print(buffer.String())
 			return
 		}
-		_, err = lipgloss.Fprint(out, text)
+		if useColor {
+			_, err = fmt.Fprint(out, text)
+		} else {
+			_, err = lipgloss.Fprint(out, text)
+		}
 		if err != nil {
 			c.PrintErrln("Error writing help output:", err)
 			return
@@ -196,7 +146,7 @@ func hidePrivateSubcommands(c *cobra.Command) {
 	}
 	if configDir != "" {
 		if absDir, err := filepath.Abs(configDir); err == nil {
-			data, err := os.ReadFile(filepath.Clean(filepath.Join(absDir, "config.json")))
+			data, err := os.ReadFile(filepath.Clean(filepath.Join(absDir, "config.json"))) // #nosec G703 -- the CLI user's own config file
 			if err == nil {
 				var cfg struct {
 					Private bool `json:"private,omitempty"`
@@ -214,6 +164,3 @@ func hidePrivateSubcommands(c *cobra.Command) {
 		}
 	}
 }
-
-// maxReadableWidth is the maximum width for help output that we consider readable.
-const maxReadableWidth = 100

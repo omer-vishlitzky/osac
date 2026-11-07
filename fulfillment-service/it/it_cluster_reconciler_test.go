@@ -24,6 +24,8 @@ import (
 	grpcstatus "google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
+	"google.golang.org/protobuf/types/known/fieldmaskpb"
+	"google.golang.org/protobuf/types/known/timestamppb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 	corev1 "k8s.io/api/core/v1"
 	kubeerrors "k8s.io/apimachinery/pkg/api/errors"
@@ -31,12 +33,12 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	crclient "sigs.k8s.io/controller-runtime/pkg/client"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
-	publicv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/public/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/kubernetes/gvks"
 	"github.com/osac-project/osac/fulfillment-service/internal/kubernetes/labels"
 	"github.com/osac-project/osac/fulfillment-service/internal/uuid"
 	osacv1alpha1 "github.com/osac-project/osac/osac-operator/api/v1alpha1"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
 
 func verifyNotFound(g Gomega, err error) {
@@ -48,12 +50,12 @@ func verifyNotFound(g Gomega, err error) {
 
 var _ = Describe("Cluster reconciler", func() {
 	var (
-		ctx             context.Context
-		clustersClient  publicv1.ClustersClient
-		hostTypesClient privatev1.HostTypesClient
-		hostTypeId      string
-		templatesClient privatev1.ClusterTemplatesClient
-		templateId      string
+		ctx                 context.Context
+		clustersClient      publicv1.ClustersClient
+		instanceTypesClient privatev1.BareMetalInstanceTypesClient
+		bmitName            string
+		templatesClient     privatev1.ClusterTemplatesClient
+		templateId          string
 	)
 
 	makeAny := func(value proto.Message) *anypb.Any {
@@ -65,26 +67,43 @@ var _ = Describe("Cluster reconciler", func() {
 	BeforeEach(func() {
 		// Create a context:
 		ctx = context.Background()
+		ensureTenantDefaultNetworkingFixture(ctx, usersGroup, "")
 
 		// Create the clients:
 		clustersClient = publicv1.NewClustersClient(tool.ExternalView().UserConn())
-		hostTypesClient = privatev1.NewHostTypesClient(tool.InternalView().AdminConn())
+		instanceTypesClient = privatev1.NewBareMetalInstanceTypesClient(tool.InternalView().AdminConn())
 		templatesClient = privatev1.NewClusterTemplatesClient(tool.InternalView().AdminConn())
 
-		// Create a host type for testing:
-		hostTypeId = fmt.Sprintf("my_host_type_%s", uuid.New())
-		_, err := hostTypesClient.Create(ctx, privatev1.HostTypesCreateRequest_builder{
-			Object: privatev1.HostType_builder{
-				Id: hostTypeId,
+		// Create a bare metal instance type for testing:
+		bmitName = fmt.Sprintf("test-bmit-%s", uuid.New()[24:32])
+		_, err := instanceTypesClient.Create(ctx, privatev1.BareMetalInstanceTypesCreateRequest_builder{
+			Object: privatev1.BareMetalInstanceType_builder{
 				Metadata: privatev1.Metadata_builder{
-					Name: fmt.Sprintf("test-ht-%s", uuid.New()[24:32]),
+					Name: bmitName,
+				}.Build(),
+				Spec: privatev1.BareMetalInstanceTypeSpec_builder{
+					Hardware: privatev1.BareMetalHardwareSpec_builder{
+						Cpu:    privatev1.BareMetalCPUSpec_builder{Cores: 32, Architecture: "amd64", ThreadsPerCore: 2}.Build(),
+						Memory: privatev1.BareMetalMemorySpec_builder{TotalGb: 128}.Build(),
+						NetworkPorts: []*privatev1.BareMetalNetworkPortSpec{
+							privatev1.BareMetalNetworkPortSpec_builder{
+								Name:  "eth0",
+								Role:  "fabric",
+								Type:  "Ethernet",
+								Speed: "10Gbps",
+							}.Build(),
+						},
+					}.Build(),
+					HostLabelSelector: privatev1.BareMetalLabelSelector_builder{
+						MatchLabels: map[string]string{"hardware.profile": "compute"},
+					}.Build(),
 				}.Build(),
 			}.Build(),
 		}.Build())
 		Expect(err).ToNot(HaveOccurred())
 
 		// Create a template for testing:
-		templateId = fmt.Sprintf("my_template_%s", uuid.New())
+		templateId = newTemplateID("my_template")
 		_, err = templatesClient.Create(ctx, privatev1.ClusterTemplatesCreateRequest_builder{
 			Object: privatev1.ClusterTemplate_builder{
 				Id:          templateId,
@@ -110,12 +129,6 @@ var _ = Describe("Cluster reconciler", func() {
 						Default:     makeAny(wrapperspb.String("your_default")),
 					}.Build(),
 				},
-				NodeSets: map[string]*privatev1.ClusterTemplateNodeSet{
-					"my_node_set": privatev1.ClusterTemplateNodeSet_builder{
-						HostType: privatev1.HostTypeReference_builder{Id: hostTypeId}.Build(),
-						Size:     3,
-					}.Build(),
-				},
 			}.Build(),
 		}.Build())
 		Expect(err).ToNot(HaveOccurred())
@@ -128,6 +141,28 @@ var _ = Describe("Cluster reconciler", func() {
 	})
 
 	It("Creates the Kubernetes object when a cluster is created", func() {
+		operatorsClient := privatev1.NewAddOnOperatorsClient(tool.InternalView().AdminConn())
+		operatorID := fmt.Sprintf("test-operator-%s", uuid.New())
+		operatorName := fmt.Sprintf("test-operator-%s", uuid.New()[24:32])
+		_, err := operatorsClient.Create(ctx, privatev1.AddOnOperatorsCreateRequest_builder{
+			Object: privatev1.AddOnOperator_builder{
+				Id: operatorID,
+				Metadata: privatev1.Metadata_builder{
+					Name: operatorName,
+				}.Build(),
+				Title:       "Test operator",
+				Description: "Test operator.",
+				Published:   proto.Bool(true),
+			}.Build(),
+		}.Build())
+		Expect(err).ToNot(HaveOccurred())
+		DeferCleanup(func() {
+			_, err := operatorsClient.Delete(ctx, privatev1.AddOnOperatorsDeleteRequest_builder{
+				Id: operatorID,
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+		})
+
 		// Create the cluster
 		response, err := clustersClient.Create(ctx, publicv1.ClustersCreateRequest_builder{
 			Object: publicv1.Cluster_builder{
@@ -136,6 +171,10 @@ var _ = Describe("Cluster reconciler", func() {
 				}.Build(),
 				Spec: publicv1.ClusterSpec_builder{
 					Template: publicv1.ClusterTemplateReference_builder{Id: templateId}.Build(),
+					NodeSets: testClusterNodeSets(bmitName, 3),
+					AddOnOperators: []*publicv1.AddOnOperatorReference{
+						publicv1.AddOnOperatorReference_builder{Id: operatorID}.Build(),
+					},
 					TemplateParameters: map[string]*anypb.Any{
 						"my": makeAny(wrapperspb.String("my_value")),
 					},
@@ -171,16 +210,62 @@ var _ = Describe("Cluster reconciler", func() {
 		// Check that namespace is correct:
 		Expect(kubeObject.GetNamespace()).To(Equal(hubNamespace))
 
-		// Verify that the node sets from the template are reflected in the Kubernetes object:
+		// Verify that the request NodeSets are reflected in the Kubernetes object:
 		Expect(kubeObject.Spec.NodeRequests).To(HaveLen(1))
-		Expect(kubeObject.Spec.NodeRequests[0].ResourceClass).To(Equal(hostTypeId))
+		Expect(kubeObject.Spec.NodeRequests[0].BareMetal).ToNot(BeNil())
+		Expect(kubeObject.Spec.NodeRequests[0].BareMetal.InstanceType).To(Equal(bmitName))
 		Expect(kubeObject.Spec.NodeRequests[0].NumberOfNodes).To(BeNumerically("==", 3))
+		Expect(kubeObject.Spec.AddOnOperators).To(Equal([]string{operatorName}))
 
 		// Verify that the template parameters are reflected in the Kubernetes object:
 		Expect(kubeObject.Spec.TemplateParameters).To(MatchJSON(`{
 			"my": "my_value",
 			"your": "your_default"
 		}`))
+	})
+
+	It("Rejects unpublished add-on operators through the public cluster API", func() {
+		operatorsClient := privatev1.NewAddOnOperatorsClient(tool.InternalView().AdminConn())
+		operatorID := fmt.Sprintf("test-unpublished-operator-%s", uuid.New())
+		_, err := operatorsClient.Create(ctx, privatev1.AddOnOperatorsCreateRequest_builder{
+			Object: privatev1.AddOnOperator_builder{
+				Id: operatorID,
+				Metadata: privatev1.Metadata_builder{
+					Name: fmt.Sprintf("test-unpublished-operator-%s", uuid.New()[24:32]),
+				}.Build(),
+				Title:       "Test unpublished operator",
+				Description: "Test unpublished operator.",
+				Published:   proto.Bool(false),
+			}.Build(),
+		}.Build())
+		Expect(err).ToNot(HaveOccurred())
+		DeferCleanup(func() {
+			_, err := operatorsClient.Delete(ctx, privatev1.AddOnOperatorsDeleteRequest_builder{
+				Id: operatorID,
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+		})
+
+		_, err = clustersClient.Create(ctx, publicv1.ClustersCreateRequest_builder{
+			Object: publicv1.Cluster_builder{
+				Metadata: publicv1.Metadata_builder{
+					Name: fmt.Sprintf("test-unpublished-cluster-%s", uuid.New()[24:32]),
+				}.Build(),
+				Spec: publicv1.ClusterSpec_builder{
+					Template: publicv1.ClusterTemplateReference_builder{Id: templateId}.Build(),
+					AddOnOperators: []*publicv1.AddOnOperatorReference{
+						publicv1.AddOnOperatorReference_builder{Id: operatorID}.Build(),
+					},
+					TemplateParameters: map[string]*anypb.Any{
+						"my": makeAny(wrapperspb.String("my_value")),
+					},
+				}.Build(),
+			}.Build(),
+		}.Build())
+		Expect(err).To(HaveOccurred())
+		status, ok := grpcstatus.FromError(err)
+		Expect(ok).To(BeTrue())
+		Expect(status.Code()).To(Equal(grpccodes.InvalidArgument))
 	})
 
 	It("Deletes the Kubernetes object when a cluster is deleted", func() {
@@ -192,6 +277,7 @@ var _ = Describe("Cluster reconciler", func() {
 				}.Build(),
 				Spec: publicv1.ClusterSpec_builder{
 					Template: publicv1.ClusterTemplateReference_builder{Id: templateId}.Build(),
+					NodeSets: testClusterNodeSets(bmitName, 3),
 					TemplateParameters: map[string]*anypb.Any{
 						"my": makeAny(wrapperspb.String("my_value")),
 					},
@@ -256,9 +342,9 @@ var _ = Describe("Cluster reconciler", func() {
 						"my": makeAny(wrapperspb.String("my_value")),
 					},
 					NodeSets: map[string]*publicv1.ClusterNodeSet{
-						"my_node_set": publicv1.ClusterNodeSet_builder{
-							HostType: publicv1.HostTypeReference_builder{Id: hostTypeId}.Build(),
-							Size:     proto.Int32(3),
+						"my-node-set": publicv1.ClusterNodeSet_builder{
+							BaremetalInstanceType: publicv1.BareMetalInstanceTypeReference_builder{Id: bmitName, Shared: true}.Build(),
+							Size:                  proto.Int32(3),
 						}.Build(),
 					},
 				}.Build(),
@@ -292,7 +378,7 @@ var _ = Describe("Cluster reconciler", func() {
 
 		// Verify the initial node set size in the Kubernetes object:
 		Expect(clusterOrderObj.Spec.NodeRequests).To(HaveLen(1))
-		Expect(clusterOrderObj.Spec.NodeRequests[0].ResourceClass).To(Equal(hostTypeId))
+		Expect(clusterOrderObj.Spec.NodeRequests[0].BareMetal.InstanceType).To(Equal(bmitName))
 		Expect(clusterOrderObj.Spec.NodeRequests[0].NumberOfNodes).To(BeNumerically("==", 3))
 
 		// Update the cluster to change the node set size
@@ -308,13 +394,16 @@ var _ = Describe("Cluster reconciler", func() {
 						"my": makeAny(wrapperspb.String("my_value")),
 					},
 					NodeSets: map[string]*publicv1.ClusterNodeSet{
-						"my_node_set": publicv1.ClusterNodeSet_builder{
-							HostType: publicv1.HostTypeReference_builder{Id: hostTypeId}.Build(),
-							Size:     proto.Int32(5),
+						"my-node-set": publicv1.ClusterNodeSet_builder{
+							BaremetalInstanceType: publicv1.BareMetalInstanceTypeReference_builder{Id: bmitName, Shared: true}.Build(),
+							Size:                  proto.Int32(5),
 						}.Build(),
 					},
 				}.Build(),
 			}.Build(),
+			UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{
+				"spec.node_sets",
+			}},
 		}.Build())
 		Expect(err).ToNot(HaveOccurred())
 
@@ -328,7 +417,7 @@ var _ = Describe("Cluster reconciler", func() {
 				err := kubeClient.Get(ctx, clusterOrderKey, clusterOrderObj)
 				g.Expect(err).ToNot(HaveOccurred())
 				g.Expect(clusterOrderObj.Spec.NodeRequests).To(HaveLen(1))
-				g.Expect(clusterOrderObj.Spec.NodeRequests[0].ResourceClass).To(Equal(hostTypeId))
+				g.Expect(clusterOrderObj.Spec.NodeRequests[0].BareMetal.InstanceType).To(Equal(bmitName))
 				g.Expect(clusterOrderObj.Spec.NodeRequests[0].NumberOfNodes).To(BeNumerically("==", 5))
 			},
 			time.Minute,
@@ -352,6 +441,7 @@ var _ = Describe("Cluster reconciler", func() {
 					}.Build(),
 					Spec: publicv1.ClusterSpec_builder{
 						Template: publicv1.ClusterTemplateReference_builder{Id: templateId}.Build(),
+						NodeSets: testClusterNodeSets(bmitName, 3),
 						TemplateParameters: map[string]*anypb.Any{
 							"my": makeAny(wrapperspb.String("my_value")),
 						}}.Build(),
@@ -438,6 +528,7 @@ var _ = Describe("Cluster reconciler", func() {
 			Expect(err).ToNot(HaveOccurred())
 			privateCluster := privateClusterResponse.GetObject()
 			privateCluster.GetStatus().SetState(privatev1.ClusterState_CLUSTER_STATE_READY)
+			privateCluster.GetStatus().SetStateTransitionTime(timestamppb.New(time.Now()))
 			_, err = privateClustersClient.Update(ctx, privatev1.ClustersUpdateRequest_builder{
 				Object: privateCluster,
 			}.Build())

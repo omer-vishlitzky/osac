@@ -1,0 +1,39 @@
+---
+- name: Create AgentlessNet VirtualNetwork
+  block:
+    - name: Validate the VirtualNetwork task input
+      ansible.builtin.include_tasks: _validate_task_input.yaml
+      vars:
+        agentless_net_expected_kind: VirtualNetwork
+        agentless_net_expected_tasks: [create_virtual_network]
+
+    - name: Require a VirtualNetwork IPv4 CIDR
+      ansible.builtin.assert:
+        that:
+          - osac_job_vars.resource.spec.ipv4Cidr is string
+          - osac_job_vars.resource.spec.ipv4Cidr | length > 0
+      no_log: true
+
+    - name: Classify provider failures as retryable
+      ansible.builtin.set_fact:
+        _agentless_net_failure_retryable: true
+
+    - name: Load the AgentlessNet network-node inventory
+      ansible.builtin.include_tasks: _load_network_node_inventory.yaml
+
+    - name: Reconcile VirtualNetwork state by API ID
+      osac.templates.agentless_net_state:
+        action: ensure_virtual_network
+        state_file: "{{ agentless_net_network_state_file }}"
+        uid: "{{ osac_job_vars.resource.id }}"
+        tenant_id: "{{ osac_job_vars.tenant }}"
+        virtual_network_cidr: "{{ osac_job_vars.resource.spec.ipv4Cidr }}"
+      delegate_to: "{{ groups['agentless_net_vn_network_node'][0] }}"
+      become: true
+      no_log: true
+  rescue:
+    - name: Publish a sanitized VirtualNetwork error
+      ansible.builtin.include_tasks: _report_task_error.yaml
+  always:
+    - name: Remove temporary AgentlessNet SSH credentials
+      ansible.builtin.include_tasks: _cleanup_network_node_inventory.yaml

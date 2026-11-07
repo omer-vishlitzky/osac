@@ -38,3 +38,66 @@ Return the hostname for the fulfillment internal API. Fails if 'internalHostname
 {{- define "fulfillment-internal-api.hostname" -}}
 {{- required "internalHostname is required" .Values.internalHostname -}}
 {{- end -}}
+
+{{- define "fulfillment-mcp-server.hostname" -}}
+{{- $hostname := required "mcp.externalHostname is required when mcp.enabled=true" .Values.mcp.externalHostname -}}
+{{- if eq .Values.variant "kind" -}}
+{{- $expected := printf "mcp.%s.localhost" .Release.Namespace -}}
+{{- if ne $hostname $expected -}}
+{{- fail (printf "mcp.externalHostname must be %s for the kind variant" $expected) -}}
+{{- end -}}
+{{- end -}}
+{{- $hostname -}}
+{{- end -}}
+
+{{- define "fulfillment-mcp-server.externalPort" -}}
+{{- $port := int .Values.mcp.externalPort -}}
+{{- if and (eq .Values.variant "openshift") (ne $port 443) -}}
+{{- fail "mcp.externalPort must be 443 for the openshift variant" -}}
+{{- end -}}
+{{- $port -}}
+{{- end -}}
+
+{{/*
+Check if a service tier is enabled via global.services.<key>.enabled.
+Args: list of [context, serviceKey]
+Falls back to true when global.services is not set.
+Returns non-empty string for enabled, empty for disabled (for use in {{- if include ... }}).
+*/}}
+{{- define "fulfillment-service.serviceEnabled" -}}
+{{- $ctx := index . 0 -}}
+{{- $svcKey := index . 1 -}}
+{{- $enabled := true -}}
+{{- if $ctx.Values.global -}}
+{{- if $ctx.Values.global.services -}}
+{{- $svc := index $ctx.Values.global.services $svcKey -}}
+{{- if $svc -}}
+{{- if hasKey $svc "enabled" -}}
+{{- $enabled = $svc.enabled -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- $enabled -}}
+{{- end }}
+
+{{/*
+Networking installation settings, from global.networking:
+- provisioningEnabled (default true): whether OSAC runs provider networking jobs. It can't change after installation.
+- excludedIpv4Cidrs (default empty): canonical IPv4 CIDRs that the provider's infrastructure uses.
+Renders the command line arguments shared by the gRPC server and the controllers.
+*/}}
+{{- define "fulfillment-service.networkingArgs" -}}
+{{- $networking := dict -}}
+{{- if .Values.global -}}
+{{- $networking = .Values.global.networking | default dict -}}
+{{- end -}}
+{{- $enabled := true -}}
+{{- if hasKey $networking "provisioningEnabled" -}}
+{{- $enabled = $networking.provisioningEnabled -}}
+{{- end }}
+- --networking-provisioning-enabled={{ $enabled }}
+{{- with $networking.excludedIpv4Cidrs }}
+- --networking-excluded-ipv4-cidrs={{ join "," . }}
+{{- end }}
+{{- end }}

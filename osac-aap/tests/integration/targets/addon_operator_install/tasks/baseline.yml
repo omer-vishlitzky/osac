@@ -1,0 +1,62 @@
+---
+# Kind does not run OLM. The positive installation/readiness path is covered
+# by the deployed E2E suite; this target covers the playbook input contract.
+- name: Add-on operator install - contract validation
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    failure_cases:
+      - name: unknown_operator_role
+        extra_vars:
+          addon_operator_name: missing_addon_operator
+          admin_kubeconfig: |
+            apiVersion: v1
+            kind: Config
+          osac_job_vars:
+            resource: "{{ lookup('file', '../../../fixtures/clusterorder-test.yaml') | from_yaml }}"
+        expected_error: "the role 'osac.templates.missing_addon_operator' was not found"
+      - name: missing_operator_inputs
+        extra_vars:
+          osac_job_vars:
+            resource: "{{ lookup('file', '../../../fixtures/clusterorder-test.yaml') | from_yaml }}"
+        expected_error: "addon_operator_name, osac_job_vars.resource, and admin_kubeconfig are required"
+      - name: invalid_operator_role_name
+        extra_vars:
+          addon_operator_name: "../invalid-role"
+          admin_kubeconfig: |
+            apiVersion: v1
+            kind: Config
+          osac_job_vars:
+            resource: "{{ lookup('file', '../../../fixtures/clusterorder-test.yaml') | from_yaml }}"
+        expected_error: "addon_operator_name must be a valid role name"
+
+  tasks:
+    - name: Run the playbook for each expected failure case
+      ansible.builtin.command:
+        argv:
+          - uv
+          - run
+          - ansible-playbook
+          - "{{ playbook_dir }}/../../../../../playbook_osac_install_addon_operator.yml"
+          - --extra-vars
+          - "{{ item.extra_vars | to_json }}"
+      loop: "{{ failure_cases }}"
+      loop_control:
+        label: "{{ item.name }}"
+      register: addon_operator_failures
+      changed_when: false
+      failed_when: false
+      no_log: true
+
+    - name: Verify each expected failure case
+      ansible.builtin.assert:
+        that:
+          - item.rc != 0
+          - item.item.expected_error in (item.stdout + item.stderr)
+        fail_msg: >-
+          {{ item.item.name }} did not fail with the expected error:
+          {{ item.stdout + item.stderr }}
+      loop: "{{ addon_operator_failures.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"

@@ -6,9 +6,19 @@ checkout: install, importing your Claude Code setup, permissions, trusting the
 repo's hooks, reconnecting authenticated services, and the workflow
 differences worth knowing.
 
-Codex reads `AGENTS.md` natively, so the project's conventions, component map,
-and graphify rules load without extra configuration. Start there — this guide
-only covers Codex-specific setup.
+Codex reads `AGENTS.md` natively, so the project's conventions and component
+map load without extra configuration. Start there — this guide only covers
+Codex-specific setup. Graphify is optional; when `graphify-out/graph.json`
+exists, follow the root `AGENTS.md` guidance for code-structure discovery.
+
+When launched at the repository root, Codex does not preload every nested
+component instruction file or the documents linked from it. Follow the root
+instruction to read all applicable component `AGENTS.md` files and their
+required references before changing files. Shared project knowledge lives in
+[`docs/agent-context/`](agent-context/README.md), available in a fresh clone
+without bootstrap or a skill invocation. The bootstrap-managed
+`.design/context/*.md` paths forward workflows to these canonical documents;
+follow those references instead of treating the forwarding file as the full context.
 
 ## Prerequisites
 
@@ -18,9 +28,9 @@ only covers Codex-specific setup.
 - The Codex CLI installed and authenticated with your OpenAI account.
 - The same local toolchain the other tools expect (Go, Node.js, buf, kubectl,
   kind, `jira` CLI, `gh` CLI, `jq`).
-- Optional but recommended: `graphify` installed (`uv tool install graphifyy`
-  or `pipx install graphifyy`) so the knowledge-graph hooks do something. See
-  AGENTS.md's "Knowledge Graph (graphify brain)" section.
+- Optional: `graphify` installed (`uv tool install graphifyy` or
+  `pipx install graphifyy`) for code-structure discovery when
+  `graphify-out/graph.json` exists.
 
 ## Skill discovery (`.agents/skills`)
 
@@ -48,10 +58,9 @@ install personal skills under `$CODEX_HOME/skills` (normally
 
 The repo ships `.codex/config.toml` at the root. After you trust the project,
 Codex walks from the `.git` root down to your CWD and honors project-level
-config. The one setting that matters here is a raised `project_doc_max_bytes`
-— the root `AGENTS.md` plus a component `AGENTS.md` can exceed Codex's 32 KiB
-default, which would otherwise truncate the conventions Codex loads. Leave it
-in place; don't lower it.
+config. The one setting that matters here is `project_doc_max_bytes`, which is kept at
+32 KiB. The current compact root plus component instruction files fit within
+that default; keep the setting aligned with the compact instruction design.
 
 ## Importing your Claude Code setup (`/import`)
 
@@ -80,25 +89,37 @@ Approve commands as they arise and only persist the ones you run constantly.
 
 ## Trusting the repo's hooks (`.codex/hooks.json`)
 
-The repo ships `.codex/hooks.json`, which mirrors the Claude Code hooks:
+The repo ships native Codex hooks in `.codex/hooks.json`:
 
 - **SessionStart** refreshes the vendored `ai-workflows` context and fetches
   the latest published graphify bundle into `graphify-out/`.
 - **PreToolUse (Bash)** nudges you to consult the knowledge graph before broad
-  shell exploration (best-effort; it no-ops when `graphify` isn't installed).
+  shell exploration (best-effort; it no-ops when `graphify` isn't installed)
+  and runs component checks before commits and PR creation.
+- **PostToolUse (`apply_patch`)** routes proto, module, and operator API edits
+  to the component checks shared with Claude Code.
 
 Codex requires you to trust repo hooks before they run — use `/hooks` in the
-Codex CLI to review and trust them. Until you do, sessions start without the
-context refresh and graph fetch (Codex falls back to normal cold exploration).
+Codex CLI to review and trust them. Until you do, none of the repo hooks run:
+the session context refresh, graph fetch, and component checks are skipped.
+Codex ties trust to the current hook definition, so changes to the config or
+hook scripts may require review again.
 For non-interactive runs where you can't trust interactively, Codex offers a
 bypass flag (`--dangerously-bypass-hook-trust`). Use it only in protected,
 reviewed CI or other pre-vetted automation—never for untrusted pull-request
 code unless the workflow separately verifies the hook definition and every
 referenced script.
 
-The hook scripts are agent-neutral: they resolve the project directory from the
-git worktree root when Codex doesn't set `CLAUDE_PROJECT_DIR`, so the same
-scripts serve both tools.
+Codex reports `apply_patch` edits as patch text in `tool_input.command` rather
+than a separate file-path field. The Codex adapter extracts paths from the
+supported `Update File`, `Add File`, `Delete File`, and `Move to` patch headers,
+then passes them to the shared path router. An unrecognized patch format or
+tool with no usable path is a no-op; it doesn't route against unrelated dirty
+files in the worktree. PostToolUse runs after the edit, so it can't undo an
+edit if a follow-up generator fails.
+
+The shared hook scripts resolve the project root from the event's `cwd`, so
+they work from Codex and Claude Code without `CLAUDE_PROJECT_DIR`.
 
 ## Reconnecting authenticated services (MCP)
 
@@ -106,6 +127,10 @@ MCP server definitions may carry over via `/import`, but custom authentication
 may require you to sign in again. Verify the servers you rely on are connected
 at the start of a session rather than discovering missing authorization
 mid-task.
+
+For the opt-in OSAC MCP development endpoint, follow the
+[local MCP client guide](guides/developer/mcp-local-clients.md) for
+OAuth client registration, private CA trust, and write approvals.
 
 ## Per-worktree Jira context (`.ai-context/jira.md`)
 

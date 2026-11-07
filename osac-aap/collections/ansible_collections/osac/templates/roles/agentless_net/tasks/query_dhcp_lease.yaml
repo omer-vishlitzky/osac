@@ -1,0 +1,62 @@
+---
+- name: Query AgentlessNet DHCP lease for a NetworkAttachment
+  block:
+    - name: Validate the DHCP query input
+      ansible.builtin.include_tasks: _validate_task_input.yaml
+      vars:
+        agentless_net_expected_kind: NetworkAttachment
+        agentless_net_expected_tasks: [query_dhcp_lease]
+
+    - name: Require a physical attachment and parent snapshots
+      ansible.builtin.assert:
+        that:
+          - osac_job_vars.target.kind == 'BareMetalInstance'
+          - osac_job_vars.target.id == osac_job_vars.resource.id
+          - osac_job_vars.network_attachment.interface.type == 'physical'
+          - osac_job_vars.network_attachment.interface.mac_address is match('^[0-9a-f]{2}(:[0-9a-f]{2}){5}$')
+          - osac_job_vars.subnet.id == osac_job_vars.network_attachment.subnet
+      no_log: true
+
+    - name: Classify missing DHCP lease as retryable
+      ansible.builtin.set_fact:
+        _agentless_net_failure_retryable: true
+
+    - name: Load the AgentlessNet network-node inventory
+      ansible.builtin.include_tasks: _load_network_node_inventory.yaml
+      vars:
+        agentless_net_require_switches: false
+
+    - name: Read the active lease for the saved API-ID reservation
+      osac.templates.agentless_net_state:
+        action: query_dhcp_lease
+        state_file: "{{ agentless_net_network_state_file }}"
+        uid: "{{ osac_job_vars.resource.id }}"
+        tenant_id: "{{ osac_job_vars.tenant }}"
+      delegate_to: "{{ groups['agentless_net_vn_network_node'][0] }}"
+      become: true
+      register: _agentless_net_lease
+      no_log: true
+
+    - name: Require an active matching DHCP lease
+      ansible.builtin.assert:
+        that:
+          - _agentless_net_lease.found | bool
+          - _agentless_net_lease.lease.mac_address == osac_job_vars.network_attachment.interface.mac_address | lower
+        fail_msg: AgentlessNet has no active lease for the reserved attachment MAC and address.
+      no_log: true
+
+    - name: Return the typed DHCP lease result
+      ansible.builtin.set_stats:
+        aggregate: false
+        per_host: false
+        data:
+          osac_result:
+            dhcp_lease:
+              ip_address: "{{ _agentless_net_lease.lease.ip_address }}"
+              mac_address: "{{ _agentless_net_lease.lease.mac_address }}"
+  rescue:
+    - name: Publish a sanitized DHCP query error
+      ansible.builtin.include_tasks: _report_task_error.yaml
+  always:
+    - name: Remove temporary AgentlessNet SSH credentials
+      ansible.builtin.include_tasks: _cleanup_network_node_inventory.yaml

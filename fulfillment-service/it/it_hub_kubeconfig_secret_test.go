@@ -23,8 +23,8 @@ import (
 	grpcstatus "google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/uuid"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
 // sampleHubKubeconfig is a syntactically-plausible kubeconfig payload. The Hubs server validation
@@ -92,6 +92,7 @@ var _ = Describe("Hub kubeconfig_secret", Label("secrets", "hub"), func() {
 		name = fmt.Sprintf("hub-kubeconfig-%s", uuid.New()[24:32])
 		response, err := secretsClient.Create(ctx, privatev1.SecretsCreateRequest_builder{
 			Object: privatev1.Secret_builder{
+				Type: privatev1.SecretType_SECRET_TYPE_KUBECONFIG,
 				Metadata: privatev1.Metadata_builder{
 					Name:   name,
 					Tenant: tenantName,

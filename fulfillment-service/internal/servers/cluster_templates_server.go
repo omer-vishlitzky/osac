@@ -22,18 +22,18 @@ import (
 	grpccodes "google.golang.org/grpc/codes"
 	grpcstatus "google.golang.org/grpc/status"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
-	publicv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/public/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
-	"github.com/osac-project/osac/fulfillment-service/internal/events"
+	"github.com/osac-project/osac/fulfillment-service/internal/vault"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
 
 type ClusterTemplatesServerBuilder struct {
 	logger            *slog.Logger
-	notifier          events.Notifier
 	attributionLogic  auth.AttributionLogic
 	tenancyLogic      auth.TenancyLogic
 	metricsRegisterer prometheus.Registerer
+	secretStore       vault.SecretStore
 }
 
 var _ publicv1.ClusterTemplatesServer = (*ClusterTemplatesServer)(nil)
@@ -57,12 +57,6 @@ func (b *ClusterTemplatesServerBuilder) SetLogger(value *slog.Logger) *ClusterTe
 	return b
 }
 
-// SetNotifier sets the notifier to use. This is optional.
-func (b *ClusterTemplatesServerBuilder) SetNotifier(value events.Notifier) *ClusterTemplatesServerBuilder {
-	b.notifier = value
-	return b
-}
-
 // SetAttributionLogic sets the attribution logic to use. This is optional.
 func (b *ClusterTemplatesServerBuilder) SetAttributionLogic(value auth.AttributionLogic) *ClusterTemplatesServerBuilder {
 	b.attributionLogic = value
@@ -72,6 +66,12 @@ func (b *ClusterTemplatesServerBuilder) SetAttributionLogic(value auth.Attributi
 // SetTenancyLogic sets the tenancy logic to use. This is mandatory.
 func (b *ClusterTemplatesServerBuilder) SetTenancyLogic(value auth.TenancyLogic) *ClusterTemplatesServerBuilder {
 	b.tenancyLogic = value
+	return b
+}
+
+// SetSecretStore sets the store used to validate Vault-backed SSH-key Secret defaults.
+func (b *ClusterTemplatesServerBuilder) SetSecretStore(value vault.SecretStore) *ClusterTemplatesServerBuilder {
+	b.secretStore = value
 	return b
 }
 
@@ -112,11 +112,11 @@ func (b *ClusterTemplatesServerBuilder) Build() (result *ClusterTemplatesServer,
 	// Create the private server to delegate to:
 	delegate, err := NewPrivateClusterTemplatesServer().
 		SetLogger(b.logger).
-		SetNotifier(b.notifier).
 		SetAttributionLogic(b.attributionLogic).
 		SetTenancyLogic(b.tenancyLogic).
 		SetMetricsRegisterer(b.metricsRegisterer).
 		SetFilterDesc((*publicv1.ClusterTemplate)(nil).ProtoReflect().Descriptor()).
+		SetSecretStore(b.secretStore).
 		Build()
 	if err != nil {
 		return
@@ -220,7 +220,7 @@ func (s *ClusterTemplatesServer) Create(ctx context.Context,
 			"Failed to map public cluster template to private",
 			slog.Any("error", err),
 		)
-		err = grpcstatus.Errorf(grpccodes.Internal, "failed to process cluster template")
+		err = publicInputMappingError(err, "failed to process cluster template")
 		return
 	}
 
@@ -254,6 +254,11 @@ func (s *ClusterTemplatesServer) Create(ctx context.Context,
 
 func (s *ClusterTemplatesServer) Update(ctx context.Context,
 	request *publicv1.ClusterTemplatesUpdateRequest) (response *publicv1.ClusterTemplatesUpdateResponse, err error) {
+	ctx = withPublicAPIView(ctx)
+	if err := validatePublicObjectMetadata(request.GetObject()); err != nil {
+		return nil, err
+	}
+
 	// Validate the request:
 	publicClusterTemplate := request.GetObject()
 	if publicClusterTemplate == nil {
@@ -283,7 +288,7 @@ func (s *ClusterTemplatesServer) Update(ctx context.Context,
 			"Failed to map public cluster template to private",
 			slog.Any("error", err),
 		)
-		err = grpcstatus.Errorf(grpccodes.Internal, "failed to process cluster template")
+		err = publicInputMappingError(err, "failed to process cluster template")
 		return
 	}
 

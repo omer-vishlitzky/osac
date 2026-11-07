@@ -21,10 +21,15 @@ import (
 	grpccodes "google.golang.org/grpc/codes"
 	grpcstatus "google.golang.org/grpc/status"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
 func validatePoolCIDRFormat(cidrStr string, ipFamily privatev1.IPFamily, idx int) (string, error) {
+	if ipFamily != privatev1.IPFamily_IP_FAMILY_IPV4 {
+		return "", grpcstatus.Errorf(grpccodes.InvalidArgument,
+			"field 'spec.ip_family' must be IP_FAMILY_IPV4; IPv6 and unspecified-family pools are not supported")
+	}
+
 	prefix, err := netip.ParsePrefix(cidrStr)
 	if err != nil {
 		return "", grpcstatus.Errorf(grpccodes.InvalidArgument,
@@ -32,48 +37,37 @@ func validatePoolCIDRFormat(cidrStr string, ipFamily privatev1.IPFamily, idx int
 	}
 
 	isIPv4 := prefix.Addr().Is4()
-	switch ipFamily {
-	case privatev1.IPFamily_IP_FAMILY_IPV4:
-		if !isIPv4 {
-			return "", grpcstatus.Errorf(grpccodes.InvalidArgument,
-				"field 'spec.cidrs[%d]' contains IPv6 address but pool ip_family is IPv4: %s", idx, cidrStr)
-		}
-	case privatev1.IPFamily_IP_FAMILY_IPV6:
-		if isIPv4 {
-			return "", grpcstatus.Errorf(grpccodes.InvalidArgument,
-				"field 'spec.cidrs[%d]' contains IPv4 address but pool ip_family is IPv6: %s", idx, cidrStr)
-		}
+	if !isIPv4 {
+		return "", grpcstatus.Errorf(grpccodes.InvalidArgument,
+			"field 'spec.cidrs[%d]' must be a canonical IPv4 CIDR; IPv6 address is not supported: %s", idx, cidrStr)
+	}
+	canonical := prefix.Masked().String()
+	if canonical != cidrStr {
+		return "", grpcstatus.Errorf(grpccodes.InvalidArgument,
+			"field 'spec.cidrs[%d]' CIDR '%s' is not canonical; use '%s'", idx, cidrStr, canonical)
 	}
 
-	return prefix.Masked().String(), nil
+	return canonical, nil
 }
 
-func validateNoCIDRSelfOverlap(cidrs []string) error {
-	prefixes := make([]netip.Prefix, len(cidrs))
-	for i, cidr := range cidrs {
-		p, err := netip.ParsePrefix(cidr)
-		if err != nil {
-			return grpcstatus.Errorf(grpccodes.Internal, "failed to parse CIDR '%s'", cidr)
-		}
-		prefixes[i] = p
+func validateSingleIPv4PoolCIDR(cidrs []string) ([]string, error) {
+	if len(cidrs) != 1 {
+		return nil, grpcstatus.Errorf(grpccodes.InvalidArgument,
+			"field 'spec.cidrs' must contain exactly one canonical IPv4 CIDR")
 	}
 
-	for i := 0; i < len(prefixes); i++ {
-		for j := i + 1; j < len(prefixes); j++ {
-			if prefixes[i].Overlaps(prefixes[j]) {
-				return grpcstatus.Errorf(grpccodes.InvalidArgument,
-					"field 'spec.cidrs[%d]' (%s) overlaps with 'spec.cidrs[%d]' (%s) within the same pool",
-					i, cidrs[i], j, cidrs[j])
-			}
-		}
+	canonical, err := validatePoolCIDRFormat(cidrs[0], privatev1.IPFamily_IP_FAMILY_IPV4, 0)
+	if err != nil {
+		return nil, err
 	}
-	return nil
+	return []string{canonical}, nil
 }
 
-func calculatePoolCapacity(cidrs []string, ipFamily privatev1.IPFamily) int64 {
+// calculatePoolCapacity returns the usable addresses of the IPv4 CIDRs of a pool.
+func calculatePoolCapacity(cidrs []string) int64 {
 	var total int64
 	for _, cidr := range cidrs {
-		cap := calculateCIDRCapacity(cidr, ipFamily)
+		cap := calculateCIDRCapacity(cidr)
 		if total > math.MaxInt64-cap {
 			return math.MaxInt64
 		}
@@ -82,31 +76,19 @@ func calculatePoolCapacity(cidrs []string, ipFamily privatev1.IPFamily) int64 {
 	return total
 }
 
-func calculateCIDRCapacity(cidrStr string, ipFamily privatev1.IPFamily) int64 {
+// calculateCIDRCapacity returns the usable addresses of an IPv4 CIDR: all but the network and broadcast addresses,
+// except /31 and /32. Pools are IPv4 only, so anything else counts 0.
+func calculateCIDRCapacity(cidrStr string) int64 {
 	prefix, err := netip.ParsePrefix(cidrStr)
-	if err != nil {
+	if err != nil || !prefix.Addr().Is4() {
 		return 0
 	}
-	bits := prefix.Addr().BitLen()
-	ones := prefix.Bits()
-	if ones < 0 {
-		return 0
+	hostBits := 32 - prefix.Bits()
+	total := int64(1) << hostBits
+	if hostBits >= 2 {
+		return total - 2 // subtract network and broadcast
 	}
-	hostBits := bits - ones
-
-	if ipFamily == privatev1.IPFamily_IP_FAMILY_IPV4 {
-		total := int64(1) << hostBits
-		if hostBits >= 2 {
-			return total - 2 // subtract network and broadcast
-		}
-		return total // /31 = 2 (point-to-point), /32 = 1 (host route)
-	}
-
-	// IPv6: all addresses usable; cap at math.MaxInt64 for large prefix lengths.
-	if hostBits >= 63 {
-		return math.MaxInt64
-	}
-	return int64(1) << hostBits
+	return total // /31 = 2 (point-to-point), /32 = 1 (host route)
 }
 
 func cidrSlicesEqual(a, b []string) bool {

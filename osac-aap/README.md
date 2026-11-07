@@ -25,9 +25,14 @@ User ─► fulfillment-service (API) ─► osac-operator (watches K8s CRs) ─
    SecurityGroup, ComputeInstance, ClusterOrder, etc.) and triggers AAP job
    templates to provision them.
 3. **osac-aap (this repo)** — The Ansible automation that actually creates
-   infrastructure. Each playbook receives the full K8s CR as its payload,
-   reads an `implementation_strategy` annotation, and dynamically includes the
-   matching template role to do the provisioning.
+   infrastructure. Networking jobs run the generic playbook
+   `playbook_osac_network_task.yml`, which includes the task file of the
+   manager role the operator names in `osac_job_vars` (network manager
+   contract); other playbooks receive their CR in `osac_job_vars.resource`.
+   No job template runs the per-resource networking playbooks
+   (`playbook_osac_create_subnet.yml` and the like) any more; they stay only
+   as entry points of the AgentlessNet tests until that manager adopts the
+   contract.
 
 ## What it provisions
 
@@ -39,8 +44,219 @@ pluggable backends:
 | Implementation | Role | Backend |
 |----------------|------|---------|
 | `cudn_net` | ClusterUserDefinedNetwork (CUDN) on OpenShift | OVN-Kubernetes |
+| `cudn_evpn` | OSAC Kubernetes Manager for network type `evpn`: VirtualNetwork namespace, EVPN CUDN and SecurityGroup NetworkPolicies ([README](collections/ansible_collections/osac/templates/roles/cudn_evpn/README.md)) | OVN-Kubernetes EVPN |
 | `netris` | Netris Controller API | Netris |
+| `agentless_net` | UID-keyed VirtualNetwork namespace plus Subnet VLAN, gateway, and per-VirtualNetwork DHCP | AgentlessNet |
 | `openstack` | OpenStack Neutron | Neutron |
+
+The `agentless_net` unified-resource path provisions and removes the
+VirtualNetwork namespace, transit uplink, forwarding baseline, and child
+Subnet VLAN/gateway/DHCP state. Subnet VLANs are added to configured Cumulus
+trunks; the role never moves a host access port. AgentlessNet registers and
+removes ExternalIPPools in SQLite. Registration stores the pool's Kubernetes
+UID, Fulfillment UUID, tenant, IPv4 family, and single canonical IPv4 CIDR.
+ExternalIP allocation reserves a UID-owned address in the same state file. The
+operator validates the AAP allocation artifact and writes
+`ExternalIP.status.address`; release removes the provider reservation.
+
+For contract v1, ExternalIPAttachment AAP jobs consume the controller-supplied
+ExternalIP, BareMetalInstance, Subnet, and VirtualNetwork identity/address
+snapshot. AAP does not query or patch Kubernetes. It stores attachment state
+by attachment UID, installs all-protocol whole-address DNAT and narrowly scoped
+host forwarding, then adds the ExternalIP `/32` through local FRR using the
+saved VirtualNetwork transit next hop. Detach withdraws that route before
+removing forwarding, DNAT, and matching conntrack entries. The operator accepts
+the `osac_result` artifact before marking the attachment Ready or releasing its
+finalizers. BMaaS is the first supported consumer; VMaaS and CaaS target wiring
+remain follow-up work. Provider BGP peers are configured outside these jobs.
+For NATGateway tasks, AAP reads the controller-supplied ExternalIP and
+VirtualNetwork snapshot and keeps the ExternalIP reservation until cleanup.
+It translates the complete immutable VirtualNetwork CIDR, excluding the saved
+transit `/31`, with a constant two-rule namespace pair. It installs explicit
+SNAT, scoped host forwarding and a NAT bypass rule, and announces the ExternalIP
+`/32` through local FRR. Subnet creation and deletion do not inspect or reconcile
+NATGateway state. NATGateway delete withdraws the route before removing SNAT,
+the transit exemption, and matching conntrack state.
+SecurityGroups remain unsupported.
+
+All AgentlessNet provider state uses schema version 1 in a SQLite database at
+`AGENTLESS_NET_STATE_FILE` (default `/etc/osac/agentless_network_state.sqlite3`).
+The current schema is created directly at v1 with `virtual_networks`,
+`subnets`, `external_ip_pools`, `external_ips`, `attachments`, and
+`nat_gateways`. Earlier schema-v1 layouts are recognized and upgraded only by
+adding the missing consumer tables in one transaction; unknown layouts fail
+closed. These tables
+store VirtualNetwork, Subnet, immutable ExternalIPPool and ExternalIP state,
+attachment-owned cleanup snapshots, and NATGateway route cleanup identity.
+`external_ips` reserves one provider
+IPv4 address per ExternalIP Kubernetes UID and pool. `attachments` retains the
+ExternalIP, target, Subnet, VirtualNetwork and exact route/rule inputs until
+provider cleanup succeeds. `nat_gateways` retains the NATGateway, ExternalIP,
+VirtualNetwork, provider interfaces, route next hop, and cleanup identity until
+provider cleanup succeeds. The
+`virtual_networks` table stores each VirtualNetwork's immutable CR CIDR and one UID-keyed `/31` transit
+link carved from that CIDR. The `subnets` table stores each Kubernetes Subnet
+UID, its parent Kubernetes UID and tenant, the global VLAN ID, and saved
+gateway/DHCP state.
+
+There is no SQLite migration or in-application downgrade path. An existing
+database with an unexpected v1 layout or a different `user_version` fails
+closed without being changed; an operator must handle disposable development
+state out of band before using this v1 layout. The OSAC-6306/OSAC-6307 schema-v1 rule
+intentionally supersedes the schema-v2/additive-migration provision in the
+[OSAC-3664 Agentless VLAN Fabric Manager design](https://github.com/osac-project/enhancement-proposals/blob/main/enhancements/OSAC-3664-agentless-vlan-fabric-manager/design.md).
+
+### Disposable lab state reset
+
+Legacy lab state is not migrated or adopted. Before switching layouts, stop
+provisioning and concurrent AAP jobs and coordinate a maintenance window with
+the lab owner. Preserve the old state and inventory for ownership review. When
+possible, use the old version's normal delete workflow before upgrading;
+otherwise manually identify and remove only the old deployment's resources.
+Coordinate switch access-port restoration and trunk VLAN membership cleanup
+with network-node cleanup: Subnet VLAN/gateway interfaces, per-VirtualNetwork
+dnsmasq service and configuration/lease files, namespaces and transit uplinks,
+and owned forwarding/NAT rules and advertised ExternalIP routes. Shared switch
+VLANs and host rules require checking other users before removal.
+
+The current cleanup path is in `agentless_net_state.py`
+(`prepare_delete_subnet`, `release_subnet`, `delete_and_remove_virtual_network`)
+and the `agentless_net_subnet.py` / `agentless_net_network.py` provider helpers.
+It relies on saved ownership and dependency ordering; it cannot infer or adopt
+legacy resources. Only after verifying provider cleanup should the lab owner
+reset the persisted state and recreate resources with the new version. Deleting
+the database alone loses ownership/allocation records and can orphan VLANs,
+namespaces and dnsmasq processes; a fresh allocator may then reuse live IDs.
+This is a manual, lab-only reset procedure, not an in-place upgrade path.
+
+Existing labs must also plan a coordinated registration/NetworkClass replacement
+or reinstall to pick up `security_group_icmp`: the AgentlessNet registration
+ConfigMap is immutable, and the operator derives capabilities only until the
+NetworkClass first becomes READY. A Helm upgrade alone cannot refresh this
+capability on an existing READY class; respect dependency guards and the manual
+cleanup above rather than deleting live resources indiscriminately.
+
+AgentlessNet ExternalIPPool and ExternalIP jobs use the same inventory and
+state-file settings as VirtualNetwork jobs. Inventory describes exactly one
+network node; pool registration and address reservation do not require switch
+inventory. ExternalIP allocation reserves an address by Kubernetes UID and
+returns it in `osac_result.data.address`; the operator validates the result and
+publishes the address in status. Release removes that UID-owned reservation;
+API pool capacity remains held until Fulfillment archives the ExternalIP.
+For Subnet provisioning, osac-operator resolves the parent VirtualNetwork by its
+Fulfillment UUID label in the Subnet namespace and sends its Fulfillment UUID,
+Kubernetes UID, tenant, and phase in `osac_job_vars.parent_virtual_network`.
+AgentlessNet validates that context against the Subnet before changing provider
+state, so its AAP job does not need separate Kubernetes API credentials for the
+parent UID lookup.
+Both addresses are endpoints: the host uses the base address and acts as the
+namespace default gateway; the namespace uses the next address. The `/31` link
+reserves no network or broadcast address and is not an OSAC Subnet. This
+implementation retains the merged VirtualNetwork `/31` and SQLite store. This
+differs from the [accepted AgentlessNet design](https://github.com/osac-project/enhancement-proposals/blob/main/enhancements/OSAC-3664-agentless-vlan-fabric-manager/design.md),
+which specifies a separate `/30` transit pool and JSON state. The transit route
+is intended to take precedence over the host's default route; existing
+more-specific host routes that overlap the transit block are rejected.
+
+Host uplink names use the reserved `osacvn` prefix. Two shared host `FORWARD`
+rules isolate all such interfaces, keeping firewall rule count independent of
+the number of VirtualNetworks.
+
+The state-file flock protects short SQLite transactions. A bounded 256-file
+lock pool serializes operations for each resource UID while provider commands
+run; Subnet operations use the parent VirtualNetwork UID lock so siblings
+cannot overwrite shared DHCP configuration. Hash collisions can serialize
+unrelated UIDs. A short firewall lock protects the shared host `FORWARD` rules.
+Failed creates retain their allocation for retry. Deletes retain Subnet rows
+until DHCP, namespace-interface, trunk-membership, and VLAN cleanup is verified.
+The module rejects unsupported database versions, corrupt state, and unsafe
+owner or file modes; do not delete the state database to clear an error. The
+unified allocator uses its SQLite VLAN pool and does not call the legacy JSON
+VLAN allocator. Deployments sharing switches with legacy CaaS workflows must
+configure disjoint VLAN pools.
+
+Each AgentlessNet VirtualNetwork and Subnet job reads serialized YAML or JSON from
+`AGENTLESS_NET_VN_INVENTORY` in the existing `network-fulfillment-ig` ConfigMap,
+which the networking worker imports through `envFrom`. It must describe
+exactly one authoritative host under `all.children.net_nodes.hosts`, with
+`ansible_host` and `ansible_user`, plus an optional port (default `22`). Do not
+put password fields anywhere in the ConfigMap. For example:
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: network-fulfillment-ig
+  namespace: <aap-worker-namespace>
+data:
+  AGENTLESS_NET_VN_INVENTORY: |
+    all:
+      children:
+        net_nodes:
+          hosts:
+            network-node:
+              ansible_host: <ssh-host>
+              ansible_user: <ssh-user>
+              ansible_port: 22
+        switches:
+          hosts:
+            leaf-1:
+              ansible_host: <cumulus-host>
+              ansible_user: cumulus
+              # Optional; omitted values default to cumulus.
+              ansible_network_os: cumulus
+              trunk_ports: [swp1, swp3]
+```
+
+VirtualNetwork-only jobs may omit the `switches` group. Subnet jobs require at
+least one Cumulus host with a nonempty list of safe `trunk_ports`. The saved
+Subnet VLAN is converged on each declared trunk; the role does not assign host
+access ports. Before reserving a new Subnet, the role reads every switch's
+`bridge -j vlan show` memberships and NVUE internal and L3-VNI reserved ranges.
+The SQLite allocator chooses the lowest available VLAN from 1–4094 after
+excluding those observed IDs and every saved allocation. Existing Subnet UIDs
+reuse their saved VLAN, including allocations from the former 100–199 range.
+The managed-node trunk defaults to `eth1`; SSH host, username, credentials,
+physical switch trunks, and the optional SSH port remain infrastructure
+configuration.
+
+Configure SSH with an AAP machine credential, a mounted private-key path, or
+`AGENTLESS_NET_SSH_PRIVATE_KEY` from the existing `network-fulfillment-ig`
+Secret. When the Secret key is used, the role writes it to a mode-0600
+temporary file on the worker and removes it after the operation, including
+failures. Missing or invalid inventory fails before provider mutation.
+Configure nonsecret values through the existing
+[AAP instance-group configuration](../osac-installer/docs/network-backend.md#caas-on-netris).
+Tenant VirtualNetwork and Subnet create commands and API inputs remain
+unchanged; VLAN bounds and DHCP-manager selection are internal provider details.
+
+The managed node must be reachable by SSH and provide Python 3, `iproute2`,
+`iptables` with conntrack support, `dnsmasq`, `ss`, and privilege escalation.
+The role derives its DHCP manager on that node: it reuses the manager identified
+by an existing VN-owned service file, otherwise selects running systemd when
+available or the dedicated Supervisor daemon when reachable. Missing or
+conflicting service-manager state fails before switch changes. No DHCP manager
+selector is required in the ConfigMap. The role enables IPv4 forwarding and a
+permit-all `FORWARD` policy inside the namespace. It does not change the host
+forwarding sysctl; interface-scoped host drops keep traffic isolated between
+VirtualNetworks. NAT, SecurityGroups, and VMaaS/CaaS workload attachment remain
+unsupported. The backend adds a local `/32` route but does not configure
+upstream BGP peers. A VirtualNetwork without a Ready
+Subnet cannot make `DefaultNetworkingReady` true. Replacing a networking
+manager requires draining and replacing its resources; changing an existing
+VN's backend is unsupported.
+
+The unified SQLite allocator assumes one authoritative allocator per fabric.
+Switch discovery avoids VLANs already present on configured switches, but it
+does not coordinate atomically with an independently running legacy CaaS JSON
+allocator. The legacy CaaS pool and transit-address settings remain in their
+existing workflows and do not set unified Subnet VLAN bounds. The SQLite state
+path remains available as an advanced `AGENTLESS_NET_STATE_FILE` override.
+
+`AGENTLESS_NET_IPAM_STATE_FILE` remains the separate legacy CaaS IPAM state
+override. `AGENTLESS_NET_EXTERNAL_INTERFACE` selects the uplink for AgentlessNet
+ExternalIPAttachment and embedded CaaS step workflows; it does not configure
+VirtualNetwork transit links.
 
 Plus MetalLB-based ExternalIPPool / ExternalIP management (`metallb_l2`).
 
@@ -55,16 +271,31 @@ Plus MetalLB-based ExternalIPPool / ExternalIP management (`metallb_l2`).
   bare-metal host lifecycle.
 - **`bm_private_network` / `bm_host_private_network`** — Private network
   attachment for bare-metal hosts.
-- Host lease management and the
-  [ESI (Elastic Secure Infrastructure)](https://esi.readthedocs.org) collection
-  (`massopencloud.esi`) for bare-metal provisioning via OpenStack Ironic.
+- Host lease management and bare-metal provisioning integrations.
 
 ### Clusters
 
 - **`ocp_small`**, **`ocp_4_20_ai_maas`**, **`ocp_ci_small`** — OpenShift cluster
   templates with different sizes, authentication methods, and infrastructure
-  backends (ESI, NICo).
+  backends (Netris, agentless_net).
 - Multi-step workflow playbooks for hosted cluster create / delete / post-install.
+
+### Local LVMS CSI StorageClasses
+
+Single-node VMaaS development/CI deployments can opt in with
+`csi_driver_install_lvms_storage_class_enabled: true`. Tenant Stage 2 creates
+`osac-<tenant>-<tier>` using the OSAC CSI provisioner. The default remains
+`false`, preserving direct TopoLVM classes; ClusterOrder/CaaS stays on its
+legacy storage path.
+
+The selector does not migrate existing classes or volumes. If a same-name
+class already exists with incompatible provisioner, parameters, reclaim policy
+or binding mode, the role fails before modifying any local classes and explains
+the prerequisite. Kubernetes makes these fields immutable. For an existing
+development installation, check its PVC/PV dependencies and explicitly remove
+and recreate the class before opting in, or keep the legacy selector setting.
+The role never deletes a class automatically; existing compatible CSI classes
+remain idempotent.
 
 ## Architecture
 
@@ -77,7 +308,7 @@ osac-aap/
 │   │   ├── templates/                      # Pluggable infrastructure roles with meta/osac.yaml
 │   │   ├── workflows/                      # Multi-step orchestration (cluster, compute_instance)
 │   │   └── config_as_code/                 # AAP configuration (job templates, inventories, credentials)
-│   ├── massopencloud/                      # ESI bare-metal + MOC workflow steps
+│   ├── massopencloud/                      # Bare-metal + MOC workflow steps
 │   ├── netris/                             # Netris network backend steps
 │   ├── nico/                               # NVIDIA NICo bare-metal backend steps
 │   ├── dns/                                # DNS management
@@ -90,22 +321,24 @@ osac-aap/
 
 ### Key design pattern
 
-Every template role declares its capabilities in `meta/osac.yaml`. Network
-roles identify themselves via `fabric_manager`/`k8s_manager` (the dispatcher's
-routing keys); other template types still use `implementation_strategy`:
+Every template role declares its capabilities in `meta/osac.yaml`. For network
+roles the file is informational; a registration ConfigMap (`ansible_role`)
+selects the role:
 
 ```yaml
 template_type: network
-fabric_manager: cudn_net
+fabric_manager: <registration-name>
 capabilities:
   supports_ipv4: true
-  supports_ipv6: true
-  supports_dual_stack: true
+  supports_ipv6: false
+  supports_dual_stack: false
 ```
 
-Running `playbook_osac_config_as_code.yml` publishes these as NetworkClasses /
-ComputeClasses that the fulfillment-service auto-discovers, making the system
-pluggable — new backends can be added without changing the operator or API.
+Network roles declare their dispatcher identity for the operator. The installer
+owns NetworkClass creation; `agentless_net` is selected through the installer
+[overlay instructions](../osac-installer/docs/network-backend.md)
+and is not published as a ComputeClass. The generic
+resource playbooks then include the selected role without changing the API.
 
 ## Pre-requisites
 

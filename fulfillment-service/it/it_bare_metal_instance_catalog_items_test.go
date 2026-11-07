@@ -1,0 +1,986 @@
+/*
+Copyright (c) 2026 Red Hat Inc.
+
+Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the
+License. You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on an
+"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific
+language governing permissions and limitations under the License.
+*/
+
+package it
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+	bmfv1 "github.com/osac-project/osac/bare-metal-fulfillment-operator/api/v1alpha1"
+	"github.com/osac-project/osac/fulfillment-service/internal/kubernetes/labels"
+	"github.com/osac-project/osac/fulfillment-service/internal/uuid"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/anypb"
+	"google.golang.org/protobuf/types/known/wrapperspb"
+	crclient "sigs.k8s.io/controller-runtime/pkg/client"
+)
+
+var _ = Describe("Bare Metal Instance Catalog Items", Label("catalog-items"), func() {
+	It("rejects a cross-tenant DiskImage name without persisting a catalog item", func(ctx context.Context) {
+		_, conn := createCatalogItemTenantAdminFixture(ctx)
+		images := publicv1.NewDiskImagesClient(tool.ExternalView().UserConn())
+		image := createPublicDiskImageFixture(ctx, images, "")
+		template := createCatalogItemBareMetalInstanceTemplateFixture(ctx, nil, nil)
+		catalogs := publicv1.NewBareMetalInstanceCatalogItemsClient(conn)
+		name := catalogItemFixtureName()
+		response, err := catalogs.Create(ctx, publicv1.BareMetalInstanceCatalogItemsCreateRequest_builder{
+			Object: publicv1.BareMetalInstanceCatalogItem_builder{
+				Metadata:  publicv1.Metadata_builder{Name: name}.Build(),
+				Title:     "Cross-tenant DiskImage rejection",
+				Template:  publicv1.BareMetalInstanceTemplateReference_builder{Id: template, Shared: true}.Build(),
+				Published: true,
+				Fields: publicv1.BareMetalInstanceCatalogItemFields_builder{
+					DiskImage: publicv1.DiskImageReferenceFieldPolicy_builder{
+						Editable: publicv1.EditableDiskImageReferenceField_builder{
+							DefaultValue: publicv1.DiskImageReference_builder{Name: image.GetMetadata().GetName()}.Build(),
+						}.Build(),
+					}.Build(),
+				}.Build(),
+			}.Build(),
+		}.Build())
+		if response.GetObject().GetId() != "" {
+			DeferCleanup(func(ctx context.Context) {
+				_, err := catalogs.Delete(ctx, publicv1.BareMetalInstanceCatalogItemsDeleteRequest_builder{Id: response.GetObject().GetId()}.Build())
+				Expect(err).NotTo(HaveOccurred())
+			})
+		}
+		expectCatalogItemStatusCode(err, codes.NotFound)
+		listed, err := catalogs.List(ctx, publicv1.BareMetalInstanceCatalogItemsListRequest_builder{
+			Filter: new("this.metadata.name == '" + name + "'"),
+		}.Build())
+		Expect(err).NotTo(HaveOccurred())
+		Expect(listed.GetItems()).To(BeEmpty())
+	})
+
+	Context("Provisioning and field governance", func() {
+		It("materializes bare metal instance typed policies and replaces editable attachments", func(ctx context.Context) {
+			By("creating a tenant catalog item with hardware, image, and network policies")
+			network := createCatalogItemNetworkFixture(ctx, usersGroup, "")
+			otherNetwork := createCatalogItemNetworkInClassFixture(ctx, usersGroup, "", network.networkClassID)
+			instanceType := createCatalogItemBareMetalInstanceTypeFixture(ctx, usersGroup)
+			image := createCatalogItemDiskImageFixture(ctx, "shared", catalogItemFixtureName())
+			sshKeySecret := createCatalogItemSSHKeySecretFixture(ctx, usersGroup)
+			template := createCatalogItemBareMetalInstanceTemplateFixture(ctx, nil, bareMetalInstanceCatalogItemParameterDefinitions())
+			fields := publicv1.BareMetalInstanceCatalogItemFields_builder{
+				InstanceType: publicv1.BareMetalInstanceTypeReferenceFieldPolicy_builder{
+					Locked: publicv1.BareMetalInstanceTypeReference_builder{Id: instanceType, Shared: true}.Build(),
+				}.Build(),
+				DiskImage: publicv1.DiskImageReferenceFieldPolicy_builder{
+					Locked: publicv1.DiskImageReference_builder{Id: image.GetId()}.Build(),
+				}.Build(),
+				SshKey: publicv1.FullSecretReferenceFieldPolicy_builder{
+					Editable: publicv1.EditableFullSecretReferenceField_builder{
+						DefaultValue: publicv1.SecretReference_builder{Id: sshKeySecret}.Build(),
+					}.Build(),
+				}.Build(),
+				UserDataSource: publicv1.UserDataSourceFieldPolicy_builder{Locked: publicv1.UserDataSource_builder{Inline: new("")}.Build()}.Build(),
+				RunStrategy: publicv1.BareMetalInstanceRunStrategyFieldPolicy_builder{
+					Editable: publicv1.EditableBareMetalInstanceRunStrategyField_builder{DefaultValue: new(publicv1.BareMetalInstanceRunStrategy_BARE_METAL_INSTANCE_RUN_STRATEGY_HALTED)}.Build(),
+				}.Build(),
+
+				NetworkAttachments: publicv1.BareMetalNetworkAttachmentListFieldPolicy_builder{
+					Editable: publicv1.EditableBareMetalNetworkAttachmentList_builder{
+						DefaultValue: publicv1.BareMetalNetworkAttachmentList_builder{Items: []*publicv1.BareMetalNetworkAttachment{network.bareMetalInstanceAttachment()}}.Build(),
+					}.Build(),
+				}.Build(),
+				AutoExternalIpAttachment: publicv1.BoolFieldPolicy_builder{Locked: new(false)}.Build(),
+			}.Build()
+
+			item := createBareMetalInstanceCatalogItemFixture(ctx, tool.ExternalView().AdminConn(), publicv1.BareMetalInstanceCatalogItem_builder{
+				Metadata:           publicv1.Metadata_builder{Name: catalogItemFixtureName(), Tenant: usersGroup}.Build(),
+				Template:           publicv1.BareMetalInstanceTemplateReference_builder{Id: template}.Build(),
+				Published:          true,
+				Fields:             fields,
+				TemplateParameters: catalogItemParameterPolicies(),
+			}.Build())
+
+			By("creating an instance with a caller-selected network attachment")
+			request := publicv1.BareMetalInstanceSpec_builder{
+				CatalogItem:        publicv1.BareMetalInstanceCatalogItemReference_builder{Id: item.GetId()}.Build(),
+				NetworkAttachments: []*publicv1.BareMetalNetworkAttachment{otherNetwork.bareMetalInstanceAttachment()},
+				TemplateParameters: map[string]*anypb.Any{"size": catalogItemParameterValue(wrapperspb.Int32(0))},
+			}.Build()
+			created, e := createBareMetalInstanceFixture(ctx, tool.ExternalView().UserConn(), request)
+			Expect(e).NotTo(HaveOccurred())
+
+			By("checking stored hardware, image, attachment, and Template inputs")
+			client := publicv1.NewBareMetalInstancesClient(tool.ExternalView().UserConn())
+			persisted, e := client.Get(ctx, publicv1.BareMetalInstancesGetRequest_builder{Id: created.GetId()}.Build())
+			Expect(e).NotTo(HaveOccurred())
+			spec := persisted.GetObject().GetSpec()
+			Expect(spec.GetInstanceType().GetId()).To(Equal(instanceType))
+
+			Expect(spec.GetDiskImage().GetId()).To(Equal(image.GetId()))
+			Expect(spec.GetDiskImage().GetShared()).To(BeTrue())
+			Expect(spec.GetSshKey().GetId()).To(Equal(sshKeySecret))
+			Expect(spec.GetUserDataSource().HasInline()).To(BeTrue())
+			Expect(spec.GetUserDataSource().GetInline()).To(BeEmpty())
+			Expect(spec.GetRunStrategy()).To(Equal(publicv1.BareMetalInstanceRunStrategy_BARE_METAL_INSTANCE_RUN_STRATEGY_HALTED))
+			Expect(spec.HasAutoExternalIpAttachment()).To(BeTrue())
+			Expect(spec.GetAutoExternalIpAttachment()).To(BeFalse())
+			Expect(spec.GetNetworkAttachments()).To(HaveLen(1))
+			Expect(spec.GetNetworkAttachments()[0].GetSubnet().GetId()).To(Equal(otherNetwork.subnetID))
+			Expect(spec.GetNetworkAttachments()[0].GetSecurityGroups()[0].GetId()).To(Equal(otherNetwork.securityGroupID))
+			Expect(spec.GetTemplate().GetId()).To(Equal(template))
+			Expect(proto.Equal(spec.GetTemplateParameters()["enabled"], catalogItemParameterValue(wrapperspb.Bool(false)))).To(BeTrue())
+			Expect(proto.Equal(spec.GetTemplateParameters()["size"], catalogItemParameterValue(wrapperspb.Int32(0)))).To(BeTrue())
+			Expect(proto.Equal(spec.GetTemplateParameters()["ordinary"], catalogItemParameterValue(wrapperspb.String("template")))).To(BeTrue())
+
+			By("rejecting explicit values for locked policies")
+			type invalidInput struct {
+				name string
+				set  func(*publicv1.BareMetalInstanceSpec)
+			}
+			inputs := []invalidInput{
+				{
+					name: "identical locked type",
+					set: func(s *publicv1.BareMetalInstanceSpec) {
+						s.SetInstanceType(publicv1.BareMetalInstanceTypeReference_builder{Id: instanceType, Shared: true}.Build())
+					},
+				},
+				{
+					name: "identical locked image reference",
+					set: func(s *publicv1.BareMetalInstanceSpec) {
+						s.SetDiskImage(publicv1.DiskImageReference_builder{Id: image.GetId()}.Build())
+					},
+				},
+				{
+					name: "empty user data",
+					set: func(s *publicv1.BareMetalInstanceSpec) {
+						s.SetUserDataSource(publicv1.UserDataSource_builder{Inline: new("")}.Build())
+					},
+				},
+				{
+					name: "explicit false",
+					set: func(s *publicv1.BareMetalInstanceSpec) {
+						s.SetAutoExternalIpAttachment(false)
+					},
+				},
+				{
+					name: "locked parameter",
+					set: func(s *publicv1.BareMetalInstanceSpec) {
+						s.GetTemplateParameters()["enabled"] = catalogItemParameterValue(wrapperspb.Bool(false))
+					},
+				},
+			}
+			for _, input := range inputs {
+				By(input.name)
+				s := proto.Clone(request).(*publicv1.BareMetalInstanceSpec)
+				input.set(s)
+				_, e = createBareMetalInstanceFixture(ctx, tool.ExternalView().UserConn(), s)
+				expectCatalogItemStatusCode(e, codes.InvalidArgument)
+			}
+
+			By("using the default image and network when the caller omits them")
+			defaulted, e := createBareMetalInstanceFixture(ctx, tool.ExternalView().UserConn(), publicv1.BareMetalInstanceSpec_builder{
+				CatalogItem:        publicv1.BareMetalInstanceCatalogItemReference_builder{Id: item.GetId()}.Build(),
+				NetworkAttachments: []*publicv1.BareMetalNetworkAttachment{},
+			}.Build())
+			Expect(e).NotTo(HaveOccurred())
+			persistedDefaults, e := client.Get(ctx, publicv1.BareMetalInstancesGetRequest_builder{Id: defaulted.GetId()}.Build())
+			Expect(e).NotTo(HaveOccurred())
+			defaulted = persistedDefaults.GetObject()
+			Expect(proto.Equal(defaulted.GetSpec().GetTemplateParameters()["size"], catalogItemParameterValue(wrapperspb.Int32(20)))).To(BeTrue())
+			Expect(defaulted.GetSpec().GetDiskImage().GetId()).To(Equal(image.GetId()))
+			Expect(defaulted.GetSpec().GetNetworkAttachments()[0].GetSubnet().GetId()).To(Equal(network.subnetID))
+		})
+
+		It("rejects Create with more than one network attachment", func(ctx context.Context) {
+			network := createCatalogItemNetworkFixture(ctx, usersGroup, "")
+			otherNetwork := createCatalogItemNetworkInClassFixture(ctx, usersGroup, "", network.networkClassID)
+			instanceType := createCatalogItemBareMetalInstanceTypeFixture(ctx, usersGroup)
+			image := createCatalogItemDiskImageFixture(ctx, "shared", catalogItemFixtureName())
+			sshKeySecret := createCatalogItemSSHKeySecretFixture(ctx, usersGroup)
+			template := createCatalogItemBareMetalInstanceTemplateFixture(ctx, nil, bareMetalInstanceCatalogItemParameterDefinitions())
+			item := createBareMetalInstanceCatalogItemFixture(ctx, tool.ExternalView().AdminConn(), publicv1.BareMetalInstanceCatalogItem_builder{
+				Metadata:  publicv1.Metadata_builder{Name: catalogItemFixtureName(), Tenant: usersGroup}.Build(),
+				Template:  publicv1.BareMetalInstanceTemplateReference_builder{Id: template}.Build(),
+				Published: true,
+				Fields: publicv1.BareMetalInstanceCatalogItemFields_builder{
+					InstanceType: publicv1.BareMetalInstanceTypeReferenceFieldPolicy_builder{
+						Locked: publicv1.BareMetalInstanceTypeReference_builder{Id: instanceType, Shared: true}.Build(),
+					}.Build(),
+					DiskImage: publicv1.DiskImageReferenceFieldPolicy_builder{
+						Locked: publicv1.DiskImageReference_builder{Id: image.GetId()}.Build(),
+					}.Build(),
+					SshKey: publicv1.FullSecretReferenceFieldPolicy_builder{
+						Editable: publicv1.EditableFullSecretReferenceField_builder{
+							DefaultValue: publicv1.SecretReference_builder{Id: sshKeySecret}.Build(),
+						}.Build(),
+					}.Build(),
+					NetworkAttachments: publicv1.BareMetalNetworkAttachmentListFieldPolicy_builder{
+						Editable: publicv1.EditableBareMetalNetworkAttachmentList_builder{
+							DefaultValue: publicv1.BareMetalNetworkAttachmentList_builder{
+								Items: []*publicv1.BareMetalNetworkAttachment{network.bareMetalInstanceAttachment()},
+							}.Build(),
+						}.Build(),
+					}.Build(),
+				}.Build(),
+				TemplateParameters: catalogItemParameterPolicies(),
+			}.Build())
+
+			_, err := createBareMetalInstanceFixture(ctx, tool.ExternalView().UserConn(), publicv1.BareMetalInstanceSpec_builder{
+				CatalogItem: publicv1.BareMetalInstanceCatalogItemReference_builder{Id: item.GetId()}.Build(),
+				NetworkAttachments: []*publicv1.BareMetalNetworkAttachment{
+					network.bareMetalInstanceAttachment(),
+					otherNetwork.bareMetalInstanceAttachment(),
+				},
+			}.Build())
+			expectCatalogItemStatusCode(err, codes.InvalidArgument)
+			Expect(err.Error()).To(ContainSubstring("at most one network attachment"))
+		})
+
+		It("applies editable DiskImage and Template defaults and validates dry-run authentication", func(ctx context.Context) {
+			By("creating a shared catalog item with image and external-IP defaults")
+			// Shared catalog items cannot default tenant-local network attachments; Create
+			// without attachments requires tenant-default Subnet/SG on the caller's tenant.
+			ensureTenantDefaultNetworkingFixture(ctx, usersGroup, "")
+			instanceType := createCatalogItemBareMetalInstanceTypeFixture(ctx, usersGroup)
+			defaultImage := createCatalogItemDiskImageFixture(ctx, "shared", catalogItemFixtureName())
+			overrideImage := createCatalogItemDiskImageFixture(ctx, "shared", catalogItemFixtureName())
+			template := createCatalogItemBareMetalInstanceTemplateFixture(ctx, nil, []*privatev1.BareMetalInstanceTemplateParameterDefinition{
+				privatev1.BareMetalInstanceTemplateParameterDefinition_builder{
+					Name: "ordinary", Type: "type.googleapis.com/google.protobuf.StringValue",
+					Default: catalogItemParameterValue(wrapperspb.String("template")),
+				}.Build(),
+			})
+			item := createBareMetalInstanceCatalogItemFixture(ctx, tool.ExternalView().AdminConn(), publicv1.BareMetalInstanceCatalogItem_builder{
+				Metadata:  publicv1.Metadata_builder{Name: catalogItemFixtureName()}.Build(),
+				Template:  publicv1.BareMetalInstanceTemplateReference_builder{Id: template}.Build(),
+				Published: true,
+				Fields: publicv1.BareMetalInstanceCatalogItemFields_builder{
+					DiskImage: publicv1.DiskImageReferenceFieldPolicy_builder{
+						Editable: publicv1.EditableDiskImageReferenceField_builder{
+							DefaultValue: publicv1.DiskImageReference_builder{Id: defaultImage.GetId()}.Build(),
+						}.Build(),
+					}.Build(),
+					AutoExternalIpAttachment: publicv1.BoolFieldPolicy_builder{
+						Editable: publicv1.EditableBoolField_builder{DefaultValue: new(true)}.Build(),
+					}.Build(),
+				}.Build(),
+			}.Build())
+			client := publicv1.NewBareMetalInstancesClient(tool.ExternalView().UserConn())
+			externalIPs := privatev1.NewExternalIPsClient(tool.InternalView().AdminConn())
+			beforeExternalIPs, err := externalIPs.List(ctx, privatev1.ExternalIPsListRequest_builder{}.Build())
+			Expect(err).NotTo(HaveOccurred())
+			dry := metadata.AppendToOutgoingContext(ctx, "x-dry-run", "true")
+			sshKeySecret := createCatalogItemSSHKeySecretFixture(ctx, usersGroup)
+			spec := publicv1.BareMetalInstanceSpec_builder{
+				CatalogItem:  publicv1.BareMetalInstanceCatalogItemReference_builder{Id: item.GetId()}.Build(),
+				InstanceType: publicv1.BareMetalInstanceTypeReference_builder{Id: instanceType, Shared: true}.Build(),
+				SshKey:       publicv1.SecretReference_builder{Id: sshKeySecret}.Build(),
+			}.Build()
+			name := catalogItemFixtureName()
+			By("validating a dry-run instance without storing it or allocating an external IP")
+			result, e := client.Create(dry, publicv1.BareMetalInstancesCreateRequest_builder{
+				Object: publicv1.BareMetalInstance_builder{
+					Metadata: publicv1.Metadata_builder{Name: name}.Build(),
+					Spec:     spec,
+				}.Build(),
+			}.Build())
+			Expect(e).NotTo(HaveOccurred())
+			Expect(result.GetObject().GetSpec().GetDiskImage().GetId()).To(Equal(defaultImage.GetId()))
+			Expect(proto.Equal(result.GetObject().GetSpec().GetTemplateParameters()["ordinary"], catalogItemParameterValue(wrapperspb.String("template")))).To(BeTrue())
+			listed, e := client.List(ctx, publicv1.BareMetalInstancesListRequest_builder{Filter: new("this.metadata.name == '" + name + "'")}.Build())
+			Expect(e).NotTo(HaveOccurred())
+			Expect(listed.GetItems()).To(BeEmpty())
+			afterExternalIPs, err := externalIPs.List(ctx, privatev1.ExternalIPsListRequest_builder{}.Build())
+			Expect(err).NotTo(HaveOccurred())
+			Expect(afterExternalIPs.GetTotal()).To(Equal(beforeExternalIPs.GetTotal()))
+			By("creating an instance with caller-selected image and external-IP values")
+			overrideSpec := proto.Clone(spec).(*publicv1.BareMetalInstanceSpec)
+			overrideSpec.SetDiskImage(publicv1.DiskImageReference_builder{Id: overrideImage.GetId()}.Build())
+			overrideSpec.SetAutoExternalIpAttachment(false)
+			override, e := createBareMetalInstanceFixture(ctx, tool.ExternalView().UserConn(), overrideSpec)
+			Expect(e).NotTo(HaveOccurred())
+			persisted, e := client.Get(ctx, publicv1.BareMetalInstancesGetRequest_builder{Id: override.GetId()}.Build())
+			Expect(e).NotTo(HaveOccurred())
+			Expect(persisted.GetObject().GetSpec().GetDiskImage().GetId()).To(Equal(overrideImage.GetId()))
+			By("rejecting a request that names both the catalog item and its Template")
+			spec.SetTemplate(publicv1.BareMetalInstanceTemplateReference_builder{Id: template}.Build())
+			_, e = client.Create(dry, publicv1.BareMetalInstancesCreateRequest_builder{
+				Object: publicv1.BareMetalInstance_builder{
+					Metadata: publicv1.Metadata_builder{Name: catalogItemFixtureName()}.Build(),
+					Spec:     spec,
+				}.Build(),
+			}.Build())
+			expectCatalogItemStatusCode(e, codes.InvalidArgument)
+			By("rejecting a request without an SSH key")
+			spec.ClearTemplate()
+			spec.ClearSshKey()
+			_, e = client.Create(dry, publicv1.BareMetalInstancesCreateRequest_builder{
+				Object: publicv1.BareMetalInstance_builder{
+					Metadata: publicv1.Metadata_builder{Name: catalogItemFixtureName()}.Build(),
+					Spec:     spec,
+				}.Build(),
+			}.Build())
+			expectCatalogItemStatusCode(e, codes.InvalidArgument)
+			By("creating directly from the Template without catalog provenance")
+			spec.ClearCatalogItem()
+			spec.SetTemplate(publicv1.BareMetalInstanceTemplateReference_builder{Id: template}.Build())
+			spec.SetSshKey(publicv1.SecretReference_builder{Id: sshKeySecret}.Build())
+			spec.SetAutoExternalIpAttachment(false)
+			spec.SetDiskImage(publicv1.DiskImageReference_builder{Id: overrideImage.GetId()}.Build())
+			direct, e := createBareMetalInstanceFixture(ctx, tool.ExternalView().UserConn(), spec)
+			Expect(e).NotTo(HaveOccurred())
+			Expect(direct.GetSpec().HasCatalogItem()).To(BeFalse())
+			Expect(direct.GetSpec().GetDiskImage().GetId()).To(Equal(overrideImage.GetId()))
+			Expect(proto.Equal(direct.GetSpec().GetTemplateParameters()["ordinary"], catalogItemParameterValue(wrapperspb.String("template")))).To(BeTrue())
+			By("rejecting creation without a Catalog Item or Template")
+			spec.ClearTemplate()
+			_, e = client.Create(dry, publicv1.BareMetalInstancesCreateRequest_builder{
+				Object: publicv1.BareMetalInstance_builder{
+					Metadata: publicv1.Metadata_builder{Name: catalogItemFixtureName()}.Build(),
+					Spec:     spec,
+				}.Build(),
+			}.Build())
+			expectCatalogItemStatusCode(e, codes.InvalidArgument)
+		})
+
+		DescribeTable("rejects unusable networking after catalog item policy resolution", func(ctx context.Context, callerOverride bool, expectedCode codes.Code) {
+
+			template := createCatalogItemBareMetalInstanceTemplateFixture(ctx, nil, nil)
+			image := createCatalogItemDiskImageFixture(ctx, "shared", catalogItemFixtureName())
+			network := createCatalogItemNetworkFixture(ctx, usersGroup, "")
+			item := createBareMetalInstanceCatalogItemFixture(ctx, tool.ExternalView().AdminConn(), publicv1.BareMetalInstanceCatalogItem_builder{
+				Metadata:  publicv1.Metadata_builder{Name: catalogItemFixtureName(), Tenant: usersGroup}.Build(),
+				Template:  publicv1.BareMetalInstanceTemplateReference_builder{Id: template}.Build(),
+				Published: true,
+				Fields: publicv1.BareMetalInstanceCatalogItemFields_builder{
+					NetworkAttachments: publicv1.BareMetalNetworkAttachmentListFieldPolicy_builder{
+						Editable: publicv1.EditableBareMetalNetworkAttachmentList_builder{
+							DefaultValue: publicv1.BareMetalNetworkAttachmentList_builder{Items: []*publicv1.BareMetalNetworkAttachment{network.bareMetalInstanceAttachment()}}.Build(),
+						}.Build(),
+					}.Build(),
+				}.Build(),
+			}.Build())
+			spec := publicv1.BareMetalInstanceSpec_builder{
+				CatalogItem:  publicv1.BareMetalInstanceCatalogItemReference_builder{Id: item.GetId()}.Build(),
+				DiskImage:    publicv1.DiskImageReference_builder{Id: image.GetId()}.Build(),
+				InstanceType: publicv1.BareMetalInstanceTypeReference_builder{Id: createCatalogItemBareMetalInstanceTypeFixture(ctx, usersGroup), Shared: true}.Build(),
+				SshKey:       publicv1.SecretReference_builder{Id: createCatalogItemSSHKeySecretFixture(ctx, usersGroup)}.Build(),
+			}.Build()
+			client := publicv1.NewBareMetalInstancesClient(tool.ExternalView().UserConn())
+			dry := metadata.AppendToOutgoingContext(ctx, "x-dry-run", "true")
+			request := publicv1.BareMetalInstancesCreateRequest_builder{
+				Object: publicv1.BareMetalInstance_builder{
+					Metadata: publicv1.Metadata_builder{Name: catalogItemFixtureName()}.Build(),
+					Spec:     spec,
+				}.Build(),
+			}.Build()
+			_, err := client.Create(dry, request)
+			Expect(err).NotTo(HaveOccurred())
+
+			if callerOverride {
+				By("replacing the editable attachment with a security group from another virtual network")
+				other := createCatalogItemNetworkInClassFixture(ctx, usersGroup, "", network.networkClassID)
+				attachment := network.bareMetalInstanceAttachment()
+				attachment.SetSecurityGroups([]*publicv1.SecurityGroupLocalReference{
+					publicv1.SecurityGroupLocalReference_builder{Id: other.securityGroupID}.Build(),
+				})
+				spec.SetNetworkAttachments([]*publicv1.BareMetalNetworkAttachment{attachment})
+			} else {
+				By("making the default subnet pending after the catalog item was published")
+				setCatalogItemSubnetFixtureState(ctx, network.subnetID, privatev1.SubnetState_SUBNET_STATE_PENDING)
+			}
+			_, err = client.Create(dry, request)
+			expectCatalogItemStatusCode(err, expectedCode)
+			Expect(err.Error()).To(ContainSubstring("spec.network_attachments[0]"))
+
+		},
+			Entry("caller override: security group belongs to a different virtual network", true, codes.InvalidArgument),
+			Entry("catalog item default: subnet is no longer ready", false, codes.FailedPrecondition),
+		)
+		It("allows a Secret source to replace an inline catalog default", func(ctx context.Context) {
+			ensureTenantDefaultNetworkingFixture(ctx, usersGroup, "")
+			secret := createCatalogItemUserDataSecretFixture(ctx, usersGroup)
+			image := createCatalogItemDiskImageFixture(ctx, "shared", catalogItemFixtureName())
+			template := createCatalogItemBareMetalInstanceTemplateFixture(ctx, nil, nil)
+			item := createBareMetalInstanceCatalogItemFixture(ctx, tool.ExternalView().AdminConn(), publicv1.BareMetalInstanceCatalogItem_builder{
+				Metadata:  publicv1.Metadata_builder{Name: catalogItemFixtureName()}.Build(),
+				Template:  publicv1.BareMetalInstanceTemplateReference_builder{Id: template}.Build(),
+				Published: true,
+				Fields: publicv1.BareMetalInstanceCatalogItemFields_builder{
+					UserDataSource: publicv1.UserDataSourceFieldPolicy_builder{
+						Editable: publicv1.EditableUserDataSourceField_builder{DefaultValue: publicv1.UserDataSource_builder{Inline: new("#cloud-config\n")}.Build()}.Build(),
+					}.Build(),
+				}.Build(),
+			}.Build())
+			client := publicv1.NewBareMetalInstancesClient(tool.ExternalView().UserConn())
+			request := publicv1.BareMetalInstancesCreateRequest_builder{
+				Object: publicv1.BareMetalInstance_builder{
+					Metadata: publicv1.Metadata_builder{Name: catalogItemFixtureName()}.Build(),
+					Spec: publicv1.BareMetalInstanceSpec_builder{
+						CatalogItem:    publicv1.BareMetalInstanceCatalogItemReference_builder{Id: item.GetId()}.Build(),
+						DiskImage:      publicv1.DiskImageReference_builder{Id: image.GetId()}.Build(),
+						UserDataSource: publicv1.UserDataSource_builder{Secret: publicv1.SecretLocalReference_builder{Id: secret}.Build()}.Build(),
+						InstanceType:   publicv1.BareMetalInstanceTypeReference_builder{Id: createCatalogItemBareMetalInstanceTypeFixture(ctx, usersGroup), Shared: true}.Build(),
+					}.Build(),
+				}.Build(),
+			}.Build()
+			dry := metadata.AppendToOutgoingContext(ctx, "x-dry-run", "true")
+			response, err := client.Create(dry, request)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(response.GetObject().GetSpec().GetUserDataSource().GetSecret().GetId()).To(Equal(secret))
+			Expect(response.GetObject().GetSpec().GetUserDataSource().HasInline()).To(BeFalse())
+		})
+
+		It("canonicalizes a registered ssh_key policy and locks it into created instances", func(ctx context.Context) {
+			ensureTenantDefaultNetworkingFixture(ctx, usersGroup, "")
+			instanceType := createCatalogItemBareMetalInstanceTypeFixture(ctx, usersGroup)
+			image := createCatalogItemDiskImageFixture(ctx, "shared", catalogItemFixtureName())
+			template := createCatalogItemBareMetalInstanceTemplateFixture(ctx, nil, nil)
+
+			secretName := fmt.Sprintf("it-bmi-cat-ssh-key-%s", uuid.New()[24:32])
+			secrets := privatev1.NewSecretsClient(tool.InternalView().AdminConn())
+			secretResp, err := secrets.Create(ctx, privatev1.SecretsCreateRequest_builder{
+				Object: privatev1.Secret_builder{
+					Metadata: privatev1.Metadata_builder{Name: secretName, Tenant: usersGroup}.Build(),
+					Type:     privatev1.SecretType_SECRET_TYPE_SSH_PUBLIC_KEY,
+					Data:     map[string][]byte{"public_key": []byte(catalogItemFixtureSSHPublicKey)},
+				}.Build(),
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+			secret := secretResp.GetObject()
+			DeferCleanup(func(ctx context.Context) {
+				_, err := secrets.Delete(ctx, privatev1.SecretsDeleteRequest_builder{Id: secret.GetId()}.Build())
+				Expect(err).ToNot(HaveOccurred())
+			})
+
+			item := createBareMetalInstanceCatalogItemFixture(ctx, tool.ExternalView().AdminConn(), publicv1.BareMetalInstanceCatalogItem_builder{
+				Metadata:  publicv1.Metadata_builder{Name: catalogItemFixtureName(), Tenant: usersGroup}.Build(),
+				Template:  publicv1.BareMetalInstanceTemplateReference_builder{Id: template}.Build(),
+				Published: true,
+				Fields: publicv1.BareMetalInstanceCatalogItemFields_builder{
+					DiskImage: publicv1.DiskImageReferenceFieldPolicy_builder{
+						Locked: publicv1.DiskImageReference_builder{Id: image.GetId()}.Build(),
+					}.Build(),
+					SshKey: publicv1.FullSecretReferenceFieldPolicy_builder{
+						Locked: publicv1.SecretReference_builder{Name: secretName}.Build(),
+					}.Build(),
+				}.Build(),
+			}.Build())
+			locked := item.GetFields().GetSshKey().GetLocked()
+			Expect(locked).ToNot(BeNil())
+			Expect(locked.GetId()).To(Equal(secret.GetId()), "the locked policy must store the canonical Secret ID")
+			Expect(locked.GetName()).To(Equal(secretName))
+
+			created, err := createBareMetalInstanceFixture(ctx, tool.ExternalView().UserConn(), publicv1.BareMetalInstanceSpec_builder{
+				CatalogItem:  publicv1.BareMetalInstanceCatalogItemReference_builder{Id: item.GetId()}.Build(),
+				InstanceType: publicv1.BareMetalInstanceTypeReference_builder{Id: instanceType, Shared: true}.Build(),
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+			Expect(created.GetSpec().GetSshKey().GetId()).To(Equal(secret.GetId()),
+				"the locked registered key must be applied without caller input")
+		})
+	})
+	Context("Template parameters", func() {
+		It("distinguishes editable required input from Template defaults and invalid values", func(ctx context.Context) {
+			By("publishing a bare metal instance catalog item that requires the enabled parameter in each request")
+			image := createCatalogItemDiskImageFixture(ctx, "shared", catalogItemFixtureName())
+			instanceType := createCatalogItemBareMetalInstanceTypeFixture(ctx, "shared")
+			template := createCatalogItemBareMetalInstanceTemplateFixture(ctx, nil, bareMetalInstanceCatalogItemParameterDefinitions(), instanceType)
+			network := createCatalogItemNetworkFixture(ctx, usersGroup, "")
+			item := createBareMetalInstanceCatalogItemFixture(ctx, tool.ExternalView().AdminConn(), publicv1.BareMetalInstanceCatalogItem_builder{
+				Metadata:  publicv1.Metadata_builder{Name: catalogItemFixtureName()}.Build(),
+				Template:  publicv1.BareMetalInstanceTemplateReference_builder{Id: template}.Build(),
+				Published: true,
+				TemplateParameters: map[string]*publicv1.TemplateParameterPolicy{
+					"enabled": publicv1.TemplateParameterPolicy_builder{
+						Editable: publicv1.EditableTemplateParameter_builder{}.Build(),
+					}.Build(),
+					"size": publicv1.TemplateParameterPolicy_builder{
+						Editable: publicv1.EditableTemplateParameter_builder{}.Build(),
+					}.Build(),
+				},
+			}.Build())
+			client := publicv1.NewBareMetalInstancesClient(tool.ExternalView().UserConn())
+			request := publicv1.BareMetalInstancesCreateRequest_builder{
+				Object: publicv1.BareMetalInstance_builder{
+					Metadata: publicv1.Metadata_builder{Name: catalogItemFixtureName()}.Build(),
+					Spec: publicv1.BareMetalInstanceSpec_builder{
+						CatalogItem:        publicv1.BareMetalInstanceCatalogItemReference_builder{Id: item.GetId()}.Build(),
+						DiskImage:          publicv1.DiskImageReference_builder{Id: image.GetId()}.Build(),
+						NetworkAttachments: []*publicv1.BareMetalNetworkAttachment{network.bareMetalInstanceAttachment()},
+						SshKey:             publicv1.SecretReference_builder{Id: createCatalogItemSSHKeySecretFixture(ctx, usersGroup)}.Build(),
+					}.Build(),
+				}.Build(),
+			}.Build()
+			dry := metadata.AppendToOutgoingContext(ctx, "x-dry-run", "true")
+
+			By("rejecting a bare metal instance request that omits the required parameter")
+			_, err := client.Create(dry, request)
+			expectCatalogItemStatusCode(err, codes.InvalidArgument)
+
+			By("accepting caller input and applying the Template size default")
+			request.GetObject().GetSpec().SetTemplateParameters(map[string]*anypb.Any{
+				"enabled":  catalogItemParameterValue(wrapperspb.Bool(false)),
+				"ordinary": catalogItemParameterValue(wrapperspb.String("user")),
+			})
+			response, err := client.Create(dry, request)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(proto.Equal(response.GetObject().GetSpec().GetTemplateParameters()["size"], catalogItemParameterValue(wrapperspb.Int32(10)))).To(BeTrue())
+			Expect(proto.Equal(response.GetObject().GetSpec().GetTemplateParameters()["ordinary"], catalogItemParameterValue(wrapperspb.String("user")))).To(BeTrue())
+
+			By("rejecting malformed and unknown Template parameters")
+			for _, tc := range []struct {
+				name       string
+				parameters map[string]*anypb.Any
+			}{
+				{
+					name: "wrong parameter type",
+					parameters: map[string]*anypb.Any{
+						"enabled": catalogItemParameterValue(wrapperspb.String("false")),
+					},
+				},
+				{
+					name: "unknown parameter",
+					parameters: map[string]*anypb.Any{
+						"enabled": catalogItemParameterValue(wrapperspb.Bool(false)),
+						"unknown": catalogItemParameterValue(wrapperspb.Bool(true)),
+					},
+				},
+			} {
+				By(tc.name)
+				request.GetObject().GetSpec().SetTemplateParameters(tc.parameters)
+				_, err = client.Create(dry, request)
+				expectCatalogItemStatusCode(err, codes.InvalidArgument)
+			}
+		})
+	})
+
+	Context("Authoring and publication", func() {
+		It("lets a Tenant Admin publish governed items for members of that tenant", func(ctx context.Context) {
+			By("creating an unpublished catalog item as a tenant admin")
+			image := createCatalogItemDiskImageFixture(ctx, "shared", catalogItemFixtureName())
+			template := createCatalogItemBareMetalInstanceTemplateFixture(ctx, nil, nil)
+			tenant, conn := createCatalogItemTenantAdminFixture(ctx)
+			items := publicv1.NewBareMetalInstanceCatalogItemsClient(conn)
+			owned := createBareMetalInstanceCatalogItemFixture(ctx, conn, publicv1.BareMetalInstanceCatalogItem_builder{
+				Metadata: publicv1.Metadata_builder{Name: catalogItemFixtureName()}.Build(),
+				Template: publicv1.BareMetalInstanceTemplateReference_builder{Id: template}.Build(),
+			}.Build())
+			Expect(owned.GetMetadata().GetTenant()).To(Equal(tenant), "catalog item should belong to the tenant admin's tenant")
+			memberConn := createCatalogItemMemberFixture(ctx, tenant)
+			memberItems := publicv1.NewBareMetalInstanceCatalogItemsClient(memberConn)
+
+			By("publishing governed defaults for tenant members")
+			_, err := items.Update(ctx, publicv1.BareMetalInstanceCatalogItemsUpdateRequest_builder{
+				Object: publicv1.BareMetalInstanceCatalogItem_builder{Id: owned.GetId(), Published: true,
+					Fields: publicv1.BareMetalInstanceCatalogItemFields_builder{
+						UserDataSource:           publicv1.UserDataSourceFieldPolicy_builder{Editable: publicv1.EditableUserDataSourceField_builder{DefaultValue: publicv1.UserDataSource_builder{Inline: new("#cloud-config\n# tenant")}.Build()}.Build()}.Build(),
+						AutoExternalIpAttachment: publicv1.BoolFieldPolicy_builder{Locked: new(false)}.Build(),
+					}.Build(),
+				}.Build(), UpdateMask: catalogItemUpdateMask("published", "fields"),
+			}.Build())
+			Expect(err).NotTo(HaveOccurred())
+			visible, err := memberItems.Get(ctx, publicv1.BareMetalInstanceCatalogItemsGetRequest_builder{Id: owned.GetId()}.Build())
+			Expect(err).NotTo(HaveOccurred())
+			Expect(visible.GetObject().GetFields().GetUserDataSource().GetEditable().GetDefaultValue().GetInline()).To(Equal("#cloud-config\n# tenant"))
+			Expect(visible.GetObject().GetFields().GetAutoExternalIpAttachment().HasLocked()).To(BeTrue())
+			Expect(visible.GetObject().GetFields().GetAutoExternalIpAttachment().GetLocked()).To(BeFalse())
+
+			By("provisioning a bare metal instance as a member with an editable override")
+			network := createCatalogItemNetworkFixture(ctx, tenant, "")
+			spec := publicv1.BareMetalInstanceSpec_builder{
+				CatalogItem:        publicv1.BareMetalInstanceCatalogItemReference_builder{Id: owned.GetId()}.Build(),
+				DiskImage:          publicv1.DiskImageReference_builder{Id: image.GetId()}.Build(),
+				UserDataSource:     publicv1.UserDataSource_builder{Inline: new("#cloud-config\n# member")}.Build(),
+				NetworkAttachments: []*publicv1.BareMetalNetworkAttachment{network.bareMetalInstanceAttachment()},
+				InstanceType:       publicv1.BareMetalInstanceTypeReference_builder{Id: createCatalogItemBareMetalInstanceTypeFixture(ctx, tenant), Shared: true}.Build(),
+			}.Build()
+			created, err := createBareMetalInstanceFixture(ctx, memberConn, spec)
+			Expect(err).NotTo(HaveOccurred())
+			objects := publicv1.NewBareMetalInstancesClient(memberConn)
+			stored, err := objects.Get(ctx, publicv1.BareMetalInstancesGetRequest_builder{Id: created.GetId()}.Build())
+			Expect(err).NotTo(HaveOccurred())
+			Expect(stored.GetObject().GetMetadata().GetTenant()).To(Equal(tenant))
+			Expect(stored.GetObject().GetSpec().GetUserDataSource().GetInline()).To(Equal("#cloud-config\n# member"))
+			Expect(stored.GetObject().GetSpec().HasAutoExternalIpAttachment()).To(BeTrue())
+			Expect(stored.GetObject().GetSpec().GetAutoExternalIpAttachment()).To(BeFalse())
+
+			By("hiding the tenant catalog item from another tenant")
+			outsider := publicv1.NewBareMetalInstanceCatalogItemsClient(tool.ExternalView().UserConn())
+			_, err = outsider.Get(ctx, publicv1.BareMetalInstanceCatalogItemsGetRequest_builder{Id: owned.GetId()}.Build())
+			expectCatalogItemStatusCode(err, codes.NotFound)
+			hidden, err := outsider.List(ctx, publicv1.BareMetalInstanceCatalogItemsListRequest_builder{Filter: new("this.id == '" + owned.GetId() + "'")}.Build())
+			Expect(err).NotTo(HaveOccurred())
+			Expect(hidden.GetItems()).To(BeEmpty())
+			_, err = createBareMetalInstanceFixture(ctx, tool.ExternalView().UserConn(), publicv1.BareMetalInstanceSpec_builder{
+				CatalogItem: publicv1.BareMetalInstanceCatalogItemReference_builder{Id: owned.GetId()}.Build(),
+			}.Build())
+			expectCatalogItemStatusCode(err, codes.NotFound)
+
+			By("preventing a member from deleting the tenant catalog item")
+			_, err = memberItems.Delete(ctx, publicv1.BareMetalInstanceCatalogItemsDeleteRequest_builder{Id: owned.GetId()}.Build())
+			expectCatalogItemStatusCode(err, codes.PermissionDenied)
+
+			By("unpublishing the catalog item so members cannot create new bare metal instances from it")
+			_, err = items.Update(ctx, publicv1.BareMetalInstanceCatalogItemsUpdateRequest_builder{
+				Object:     publicv1.BareMetalInstanceCatalogItem_builder{Id: owned.GetId(), Published: false}.Build(),
+				UpdateMask: catalogItemUpdateMask("published"),
+			}.Build())
+			Expect(err).NotTo(HaveOccurred())
+			_, err = createBareMetalInstanceFixture(ctx, memberConn, spec)
+			expectCatalogItemStatusCode(err, codes.NotFound)
+		})
+
+		It("shows published shared catalog items to tenants without letting them edit the items", func(ctx context.Context) {
+			template := createCatalogItemBareMetalInstanceTemplateFixture(ctx, nil, nil)
+			_, conn := createCatalogItemTenantAdminFixture(ctx)
+			items := publicv1.NewBareMetalInstanceCatalogItemsClient(conn)
+			user := publicv1.NewBareMetalInstanceCatalogItemsClient(tool.ExternalView().UserConn())
+			shared := createBareMetalInstanceCatalogItemFixture(ctx, tool.ExternalView().AdminConn(), publicv1.BareMetalInstanceCatalogItem_builder{
+				Metadata: publicv1.Metadata_builder{Name: catalogItemFixtureName()}.Build(),
+				Template: publicv1.BareMetalInstanceTemplateReference_builder{Id: template}.Build(),
+			}.Build())
+			Expect(shared.GetMetadata().GetTenant()).To(Equal("shared"))
+			_, err := user.Get(ctx, publicv1.BareMetalInstanceCatalogItemsGetRequest_builder{Id: shared.GetId()}.Build())
+			Expect(err).NotTo(HaveOccurred())
+			_, err = items.Update(ctx, publicv1.BareMetalInstanceCatalogItemsUpdateRequest_builder{
+				Object:     publicv1.BareMetalInstanceCatalogItem_builder{Id: shared.GetId(), Title: "Foreign edit"}.Build(),
+				UpdateMask: catalogItemUpdateMask("title"),
+			}.Build())
+			expectCatalogItemStatusCode(err, codes.PermissionDenied)
+			listed, err := user.List(ctx, publicv1.BareMetalInstanceCatalogItemsListRequest_builder{Filter: new("this.id == '" + shared.GetId() + "' && this.published")}.Build())
+			Expect(err).NotTo(HaveOccurred())
+			Expect(listed.GetItems()).To(BeEmpty())
+			provider := publicv1.NewBareMetalInstanceCatalogItemsClient(tool.ExternalView().AdminConn())
+			_, err = provider.Update(ctx, publicv1.BareMetalInstanceCatalogItemsUpdateRequest_builder{
+				Object:     publicv1.BareMetalInstanceCatalogItem_builder{Id: shared.GetId(), Published: true}.Build(),
+				UpdateMask: catalogItemUpdateMask("published"),
+			}.Build())
+			Expect(err).NotTo(HaveOccurred())
+			listed, err = user.List(ctx, publicv1.BareMetalInstanceCatalogItemsListRequest_builder{Filter: new("this.id == '" + shared.GetId() + "' && this.published")}.Build())
+			Expect(err).NotTo(HaveOccurred())
+			Expect(listed.GetItems()).To(HaveLen(1))
+		})
+		It("keeps unchanged policies and rejects invalid updates without saving partial changes", func(ctx context.Context) {
+			By("creating a catalog item with two field policies")
+			template := createCatalogItemBareMetalInstanceTemplateFixture(ctx, nil, nil)
+			item := createBareMetalInstanceCatalogItemFixture(ctx, tool.ExternalView().AdminConn(), publicv1.BareMetalInstanceCatalogItem_builder{
+				Metadata:  publicv1.Metadata_builder{Name: catalogItemFixtureName()}.Build(),
+				Template:  publicv1.BareMetalInstanceTemplateReference_builder{Id: template}.Build(),
+				Published: true,
+				Fields: publicv1.BareMetalInstanceCatalogItemFields_builder{
+					UserDataSource:           publicv1.UserDataSourceFieldPolicy_builder{Locked: publicv1.UserDataSource_builder{Inline: new("initial")}.Build()}.Build(),
+					AutoExternalIpAttachment: publicv1.BoolFieldPolicy_builder{Locked: new(false)}.Build(),
+				}.Build(),
+			}.Build())
+			client := publicv1.NewBareMetalInstanceCatalogItemsClient(tool.ExternalView().AdminConn())
+
+			By("editing one policy while retaining the other")
+			_, err := client.Update(ctx, publicv1.BareMetalInstanceCatalogItemsUpdateRequest_builder{
+				Object: publicv1.BareMetalInstanceCatalogItem_builder{
+					Id: item.GetId(),
+					Fields: publicv1.BareMetalInstanceCatalogItemFields_builder{
+						UserDataSource: publicv1.UserDataSourceFieldPolicy_builder{
+							Editable: publicv1.EditableUserDataSourceField_builder{DefaultValue: publicv1.UserDataSource_builder{Inline: new("edited")}.Build()}.Build(),
+						}.Build(),
+					}.Build(),
+				}.Build(),
+				UpdateMask: catalogItemUpdateMask("fields.user_data_source"),
+			}.Build())
+			Expect(err).NotTo(HaveOccurred())
+			before, err := client.Get(ctx, publicv1.BareMetalInstanceCatalogItemsGetRequest_builder{Id: item.GetId()}.Build())
+			Expect(err).NotTo(HaveOccurred())
+			Expect(before.GetObject().GetFields().GetAutoExternalIpAttachment().HasLocked()).To(BeTrue())
+			Expect(before.GetObject().GetFields().GetAutoExternalIpAttachment().GetLocked()).To(BeFalse())
+			Expect(before.GetObject().GetFields().GetUserDataSource().HasLocked()).To(BeFalse())
+			Expect(before.GetObject().GetFields().GetUserDataSource().GetEditable().GetDefaultValue().GetInline()).To(Equal("edited"))
+
+			By("rejecting an invalid policy without changing the catalog item title")
+			_, err = client.Update(ctx, publicv1.BareMetalInstanceCatalogItemsUpdateRequest_builder{
+				Object: publicv1.BareMetalInstanceCatalogItem_builder{
+					Id:    item.GetId(),
+					Title: "must not persist",
+					Fields: publicv1.BareMetalInstanceCatalogItemFields_builder{
+						UserDataSource: publicv1.UserDataSourceFieldPolicy_builder{}.Build(),
+					}.Build(),
+				}.Build(),
+				UpdateMask: catalogItemUpdateMask("title", "fields.user_data_source"),
+			}.Build())
+			expectCatalogItemStatusCode(err, codes.InvalidArgument)
+			after, err := client.Get(ctx, publicv1.BareMetalInstanceCatalogItemsGetRequest_builder{Id: item.GetId()}.Build())
+			Expect(err).NotTo(HaveOccurred())
+			Expect(proto.Equal(before.GetObject(), after.GetObject())).To(BeTrue())
+
+			By("clearing all field policies explicitly")
+			_, err = client.Update(ctx, publicv1.BareMetalInstanceCatalogItemsUpdateRequest_builder{
+				Object: publicv1.BareMetalInstanceCatalogItem_builder{
+					Id:     item.GetId(),
+					Fields: publicv1.BareMetalInstanceCatalogItemFields_builder{}.Build(),
+				}.Build(),
+				UpdateMask: catalogItemUpdateMask("fields"),
+			}.Build())
+			Expect(err).NotTo(HaveOccurred())
+			after, err = client.Get(ctx, publicv1.BareMetalInstanceCatalogItemsGetRequest_builder{Id: item.GetId()}.Build())
+			Expect(err).NotTo(HaveOccurred())
+			Expect(after.GetObject().GetFields().GetUserDataSource()).To(BeNil())
+			Expect(after.GetObject().GetFields().GetAutoExternalIpAttachment()).To(BeNil())
+		})
+		DescribeTable("rejects catalog items that specify an empty network list", func(ctx context.Context, policy func() *publicv1.BareMetalNetworkAttachmentListFieldPolicy) {
+			template := createCatalogItemBareMetalInstanceTemplateFixture(ctx, nil, nil)
+			client := publicv1.NewBareMetalInstanceCatalogItemsClient(tool.ExternalView().AdminConn())
+			name := catalogItemFixtureName()
+			_, err := client.Create(ctx, publicv1.BareMetalInstanceCatalogItemsCreateRequest_builder{
+				Object: publicv1.BareMetalInstanceCatalogItem_builder{
+					Metadata: publicv1.Metadata_builder{Name: name, Tenant: usersGroup}.Build(),
+					Template: publicv1.BareMetalInstanceTemplateReference_builder{Id: template}.Build(),
+					Fields:   publicv1.BareMetalInstanceCatalogItemFields_builder{NetworkAttachments: policy()}.Build(),
+				}.Build(),
+			}.Build())
+			expectCatalogItemStatusCode(err, codes.InvalidArgument)
+			list, err := client.List(ctx, publicv1.BareMetalInstanceCatalogItemsListRequest_builder{Filter: new("this.metadata.name == '" + name + "'")}.Build())
+			Expect(err).NotTo(HaveOccurred())
+			Expect(list.GetItems()).To(BeEmpty())
+		},
+			Entry("locked list", func() *publicv1.BareMetalNetworkAttachmentListFieldPolicy {
+				return publicv1.BareMetalNetworkAttachmentListFieldPolicy_builder{
+					Locked: publicv1.BareMetalNetworkAttachmentList_builder{}.Build(),
+				}.Build()
+			}),
+			Entry("editable default list", func() *publicv1.BareMetalNetworkAttachmentListFieldPolicy {
+				return publicv1.BareMetalNetworkAttachmentListFieldPolicy_builder{
+					Editable: publicv1.EditableBareMetalNetworkAttachmentList_builder{
+						DefaultValue: publicv1.BareMetalNetworkAttachmentList_builder{}.Build(),
+					}.Build(),
+				}.Build()
+			}),
+		)
+	})
+	Context("Referenced objects", func() {
+		It("prevents deleting a Template until its unpublished catalog item is deleted", func(ctx context.Context) {
+			template := createCatalogItemBareMetalInstanceTemplateFixture(ctx, nil, nil)
+			item := createBareMetalInstanceCatalogItemFixture(ctx, tool.ExternalView().AdminConn(), publicv1.BareMetalInstanceCatalogItem_builder{
+				Metadata: publicv1.Metadata_builder{Name: catalogItemFixtureName()}.Build(),
+				Template: publicv1.BareMetalInstanceTemplateReference_builder{Id: template}.Build(),
+			}.Build())
+			templates := privatev1.NewBareMetalInstanceTemplatesClient(tool.InternalView().AdminConn())
+			_, err := templates.Delete(ctx, privatev1.BareMetalInstanceTemplatesDeleteRequest_builder{Id: template}.Build())
+			expectCatalogItemStatusCode(err, codes.FailedPrecondition)
+			_, err = publicv1.NewBareMetalInstanceCatalogItemsClient(tool.ExternalView().AdminConn()).Delete(ctx, publicv1.BareMetalInstanceCatalogItemsDeleteRequest_builder{Id: item.GetId()}.Build())
+			Expect(err).NotTo(HaveOccurred())
+			_, err = templates.Delete(ctx, privatev1.BareMetalInstanceTemplatesDeleteRequest_builder{Id: template}.Build())
+			Expect(err).NotTo(HaveOccurred())
+		})
+		It("prevents deleting an instance type until the catalog item stops using it", func(ctx context.Context) {
+			By("creating a published bare metal catalog item that uses an instance type")
+			template := createCatalogItemBareMetalInstanceTemplateFixture(ctx, nil, nil)
+			id := createCatalogItemBareMetalInstanceTypeFixture(ctx, usersGroup)
+			items := publicv1.NewBareMetalInstanceCatalogItemsClient(tool.ExternalView().AdminConn())
+			dependencies := privatev1.NewBareMetalInstanceTypesClient(tool.InternalView().AdminConn())
+			item := createBareMetalInstanceCatalogItemFixture(ctx, tool.ExternalView().AdminConn(), publicv1.BareMetalInstanceCatalogItem_builder{
+				Metadata:  publicv1.Metadata_builder{Name: catalogItemFixtureName(), Tenant: usersGroup}.Build(),
+				Template:  publicv1.BareMetalInstanceTemplateReference_builder{Id: template}.Build(),
+				Published: true,
+				Fields: publicv1.BareMetalInstanceCatalogItemFields_builder{
+					InstanceType: publicv1.BareMetalInstanceTypeReferenceFieldPolicy_builder{
+						Locked: publicv1.BareMetalInstanceTypeReference_builder{Id: id, Shared: true}.Build(),
+					}.Build(),
+				}.Build(),
+			}.Build())
+
+			By("blocking deletion while the dependency is locked")
+			_, err := dependencies.Delete(ctx, privatev1.BareMetalInstanceTypesDeleteRequest_builder{Id: id}.Build())
+			expectCatalogItemStatusCode(err, codes.FailedPrecondition)
+
+			By("retaining protection after unpublishing and switching to an editable default")
+			_, err = items.Update(ctx, publicv1.BareMetalInstanceCatalogItemsUpdateRequest_builder{
+				Object: publicv1.BareMetalInstanceCatalogItem_builder{
+					Id:        item.GetId(),
+					Published: false,
+					Fields: publicv1.BareMetalInstanceCatalogItemFields_builder{
+						InstanceType: publicv1.BareMetalInstanceTypeReferenceFieldPolicy_builder{
+							Editable: publicv1.EditableBareMetalInstanceTypeReferenceField_builder{
+								DefaultValue: publicv1.BareMetalInstanceTypeReference_builder{Id: id, Shared: true}.Build(),
+							}.Build(),
+						}.Build(),
+					}.Build(),
+				}.Build(),
+				UpdateMask: catalogItemUpdateMask("published", "fields.instance_type"),
+			}.Build())
+			Expect(err).NotTo(HaveOccurred())
+			_, err = dependencies.Delete(ctx, privatev1.BareMetalInstanceTypesDeleteRequest_builder{Id: id}.Build())
+			expectCatalogItemStatusCode(err, codes.FailedPrecondition)
+
+			By("clearing the dependency policy")
+			_, err = items.Update(ctx, publicv1.BareMetalInstanceCatalogItemsUpdateRequest_builder{
+				Object: publicv1.BareMetalInstanceCatalogItem_builder{Id: item.GetId()}.Build(), UpdateMask: catalogItemUpdateMask("fields.instance_type"),
+			}.Build())
+			Expect(err).NotTo(HaveOccurred())
+
+			By("releasing the dependency after the last policy reference is cleared")
+			_, err = dependencies.Delete(ctx, privatev1.BareMetalInstanceTypesDeleteRequest_builder{Id: id}.Build())
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+	})
+	Context("Lifecycle independence", func() {
+		It("keeps resolved inputs independent of policy edits and reconciles a restart after catalog item deletion", func(ctx context.Context) {
+			By("creating an instance from the original catalog policy")
+			ensureTenantDefaultNetworkingFixture(ctx, usersGroup, "")
+			image := createCatalogItemDiskImageFixture(ctx, "shared", catalogItemFixtureName())
+			instanceType := createCatalogItemBareMetalInstanceTypeFixture(ctx, usersGroup)
+			template := createCatalogItemBareMetalInstanceTemplateFixture(ctx, nil, nil)
+			items := publicv1.NewBareMetalInstanceCatalogItemsClient(tool.ExternalView().AdminConn())
+			item := createBareMetalInstanceCatalogItemFixture(ctx, tool.ExternalView().AdminConn(), publicv1.BareMetalInstanceCatalogItem_builder{
+				Metadata:  publicv1.Metadata_builder{Name: catalogItemFixtureName()}.Build(),
+				Template:  publicv1.BareMetalInstanceTemplateReference_builder{Id: template}.Build(),
+				Published: true,
+				Fields: publicv1.BareMetalInstanceCatalogItemFields_builder{
+					UserDataSource: publicv1.UserDataSourceFieldPolicy_builder{
+						Editable: publicv1.EditableUserDataSourceField_builder{DefaultValue: publicv1.UserDataSource_builder{Inline: new("#cloud-config\n# first")}.Build()}.Build(),
+					}.Build(),
+					RunStrategy: publicv1.BareMetalInstanceRunStrategyFieldPolicy_builder{Locked: new(publicv1.BareMetalInstanceRunStrategy_BARE_METAL_INSTANCE_RUN_STRATEGY_HALTED)}.Build(),
+				}.Build(),
+			}.Build())
+			request := publicv1.BareMetalInstanceSpec_builder{
+				CatalogItem:  publicv1.BareMetalInstanceCatalogItemReference_builder{Id: item.GetId()}.Build(),
+				DiskImage:    publicv1.DiskImageReference_builder{Id: image.GetId()}.Build(),
+				InstanceType: publicv1.BareMetalInstanceTypeReference_builder{Id: instanceType, Shared: true}.Build(),
+			}.Build()
+			first, e := createBareMetalInstanceFixture(ctx, tool.ExternalView().UserConn(), request)
+			Expect(e).NotTo(HaveOccurred())
+			By("changing the policy and checking that only new instances receive it")
+			_, e = items.Update(ctx, publicv1.BareMetalInstanceCatalogItemsUpdateRequest_builder{
+				Object: publicv1.BareMetalInstanceCatalogItem_builder{
+					Id: item.GetId(),
+					Fields: publicv1.BareMetalInstanceCatalogItemFields_builder{
+						UserDataSource: publicv1.UserDataSourceFieldPolicy_builder{Locked: publicv1.UserDataSource_builder{Inline: new("#cloud-config\n# second")}.Build()}.Build(),
+					}.Build(),
+				}.Build(),
+				UpdateMask: catalogItemUpdateMask("fields.user_data_source"),
+			}.Build())
+			Expect(e).NotTo(HaveOccurred())
+			second, e := createBareMetalInstanceFixture(ctx, tool.ExternalView().UserConn(), request)
+			Expect(e).NotTo(HaveOccurred())
+			client := publicv1.NewBareMetalInstancesClient(tool.ExternalView().UserConn())
+			persistedSecond, e := client.Get(ctx, publicv1.BareMetalInstancesGetRequest_builder{Id: second.GetId()}.Build())
+			Expect(e).NotTo(HaveOccurred())
+			second = persistedSecond.GetObject()
+			Expect(second.GetSpec().GetUserDataSource().GetInline()).To(Equal("#cloud-config\n# second"))
+			stored, e := client.Get(ctx, publicv1.BareMetalInstancesGetRequest_builder{Id: first.GetId()}.Build())
+			Expect(e).NotTo(HaveOccurred())
+			Expect(stored.GetObject().GetSpec().GetUserDataSource().GetInline()).To(Equal("#cloud-config\n# first"))
+			By("updating the original instance without reapplying the catalog policy")
+			_, e = client.Update(ctx, publicv1.BareMetalInstancesUpdateRequest_builder{
+				Object:     publicv1.BareMetalInstance_builder{Id: first.GetId(), Spec: publicv1.BareMetalInstanceSpec_builder{RunStrategy: new(publicv1.BareMetalInstanceRunStrategy_BARE_METAL_INSTANCE_RUN_STRATEGY_ALWAYS)}.Build()}.Build(),
+				UpdateMask: catalogItemUpdateMask("spec.run_strategy"),
+			}.Build())
+			Expect(e).NotTo(HaveOccurred())
+			live, e := client.Get(ctx, publicv1.BareMetalInstancesGetRequest_builder{Id: first.GetId()}.Build())
+			Expect(e).NotTo(HaveOccurred())
+			Expect(live.GetObject().GetSpec().GetRunStrategy()).To(Equal(publicv1.BareMetalInstanceRunStrategy_BARE_METAL_INSTANCE_RUN_STRATEGY_ALWAYS))
+
+			By("restarting through the public API after catalog deletion")
+			// The instance retains provenance, but reconciliation uses its materialized Template.
+			_, e = items.Delete(ctx, publicv1.BareMetalInstanceCatalogItemsDeleteRequest_builder{Id: item.GetId()}.Build())
+			Expect(e).NotTo(HaveOccurred())
+			_, e = client.Update(ctx, publicv1.BareMetalInstancesUpdateRequest_builder{
+				Object: publicv1.BareMetalInstance_builder{
+					Id: first.GetId(),
+					Spec: publicv1.BareMetalInstanceSpec_builder{
+						CatalogItem:    publicv1.BareMetalInstanceCatalogItemReference_builder{Id: item.GetId()}.Build(),
+						RunStrategy:    new(publicv1.BareMetalInstanceRunStrategy_BARE_METAL_INSTANCE_RUN_STRATEGY_ALWAYS),
+						RestartTrigger: 1,
+					}.Build(),
+				}.Build(),
+				UpdateMask: catalogItemUpdateMask("spec.catalog_item",
+					"spec.run_strategy",
+					"spec.restart_trigger"),
+			}.Build())
+			Expect(e).NotTo(HaveOccurred())
+			Eventually(func(g Gomega) {
+				objects := &bmfv1.BareMetalInstanceList{}
+				g.Expect(tool.KubeClient().List(ctx, objects, crclient.MatchingLabels{labels.BareMetalInstanceUuid: first.GetId()})).To(Succeed())
+				g.Expect(objects.Items).To(HaveLen(1))
+				g.Expect(objects.Items[0].Spec.TemplateID).To(Equal(template))
+				g.Expect(objects.Items[0].Spec.RestartTrigger).To(Equal(int64(1)))
+			}, time.Minute, time.Second).Should(Succeed())
+			internal := privatev1.NewBareMetalInstancesClient(tool.InternalView().AdminConn())
+			By("restarting through the private API after catalog deletion")
+			_, e = internal.Update(ctx, privatev1.BareMetalInstancesUpdateRequest_builder{
+				Object: privatev1.BareMetalInstance_builder{
+					Id: first.GetId(),
+					Spec: privatev1.BareMetalInstanceSpec_builder{
+						CatalogItem:    privatev1.BareMetalInstanceCatalogItemReference_builder{Id: item.GetId()}.Build(),
+						RestartTrigger: 2,
+					}.Build(),
+				}.Build(),
+				UpdateMask: catalogItemUpdateMask("spec.catalog_item",
+					"spec.restart_trigger"),
+			}.Build())
+			Expect(e).NotTo(HaveOccurred())
+			Eventually(func(g Gomega) {
+				objects := &bmfv1.BareMetalInstanceList{}
+				g.Expect(tool.KubeClient().List(ctx, objects, crclient.MatchingLabels{labels.BareMetalInstanceUuid: first.GetId()})).To(Succeed())
+				g.Expect(objects.Items).To(HaveLen(1))
+				g.Expect(objects.Items[0].Spec.RestartTrigger).To(Equal(int64(2)))
+			}, time.Minute, time.Second).Should(Succeed())
+
+			By("rejecting provenance clearing through the public API")
+			_, e = client.Update(ctx, publicv1.BareMetalInstancesUpdateRequest_builder{
+				Object: publicv1.BareMetalInstance_builder{
+					Id:   first.GetId(),
+					Spec: publicv1.BareMetalInstanceSpec_builder{}.Build(),
+				}.Build(),
+				UpdateMask: catalogItemUpdateMask("spec.catalog_item"),
+			}.Build())
+			expectCatalogItemStatusCode(e, codes.InvalidArgument)
+			By("rejecting provenance mutation through the public API")
+			_, e = client.Update(ctx, publicv1.BareMetalInstancesUpdateRequest_builder{
+				Object: publicv1.BareMetalInstance_builder{
+					Id: first.GetId(),
+					Spec: publicv1.BareMetalInstanceSpec_builder{
+						CatalogItem: publicv1.BareMetalInstanceCatalogItemReference_builder{Id: "different"}.Build(),
+					}.Build(),
+				}.Build(),
+				UpdateMask: catalogItemUpdateMask("spec.catalog_item"),
+			}.Build())
+			expectCatalogItemStatusCode(e, codes.InvalidArgument)
+
+			By("rejecting provenance mutation and clearing through the private API")
+			for _, tc := range []struct {
+				name      string
+				reference *privatev1.BareMetalInstanceCatalogItemReference
+			}{
+				{"different catalog item", privatev1.BareMetalInstanceCatalogItemReference_builder{Id: "different"}.Build()},
+				{"cleared catalog item", nil},
+			} {
+				By(tc.name)
+				_, e = internal.Update(ctx, privatev1.BareMetalInstancesUpdateRequest_builder{
+					Object: privatev1.BareMetalInstance_builder{
+						Id:   first.GetId(),
+						Spec: privatev1.BareMetalInstanceSpec_builder{CatalogItem: tc.reference}.Build(),
+					}.Build(),
+					UpdateMask: catalogItemUpdateMask("spec.catalog_item"),
+				}.Build())
+				expectCatalogItemStatusCode(e, codes.InvalidArgument)
+			}
+			persisted, e := client.Get(ctx, publicv1.BareMetalInstancesGetRequest_builder{Id: first.GetId()}.Build())
+			Expect(e).NotTo(HaveOccurred())
+			Expect(proto.Equal(persisted.GetObject().GetSpec().GetCatalogItem(), first.GetSpec().GetCatalogItem())).To(BeTrue())
+			Expect(persisted.GetObject().GetSpec().GetTemplate().GetId()).To(Equal(template))
+
+		})
+	})
+})

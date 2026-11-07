@@ -28,10 +28,10 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	crclient "sigs.k8s.io/controller-runtime/pkg/client"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/kubernetes/labels"
 	"github.com/osac-project/osac/fulfillment-service/internal/uuid"
 	osacv1alpha1 "github.com/osac-project/osac/osac-operator/api/v1alpha1"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
 var _ = Describe("Tenant onboarding to hub", func() {
@@ -60,7 +60,7 @@ var _ = Describe("Tenant onboarding to hub", func() {
 		Eventually(
 			func(g Gomega) {
 				err := kubeClient.List(ctx, tenantList, crclient.MatchingLabels{
-					labels.TenantUuid: name,
+					labels.TenantID: id,
 				}, crclient.InNamespace(hubNamespace))
 				g.Expect(err).ToNot(HaveOccurred())
 				g.Expect(tenantList.Items).To(HaveLen(1))
@@ -72,6 +72,7 @@ var _ = Describe("Tenant onboarding to hub", func() {
 		Expect(tenantCR.GetName()).To(Equal(name))
 		Expect(tenantCR.GetNamespace()).To(Equal(hubNamespace))
 		Expect(tenantCR.Labels[labels.TenantUuid]).To(Equal(name))
+		Expect(tenantCR.Labels[labels.TenantID]).To(Equal(id))
 
 		By("Verifying namespace exists on the hub cluster")
 		ns := &corev1.Namespace{}
@@ -102,7 +103,7 @@ var _ = Describe("Tenant onboarding to hub", func() {
 		Eventually(
 			func(g Gomega) {
 				err := kubeClient.List(ctx, tenantList, crclient.MatchingLabels{
-					labels.TenantUuid: name,
+					labels.TenantID: id,
 				}, crclient.InNamespace(hubNamespace))
 				g.Expect(err).ToNot(HaveOccurred())
 				g.Expect(tenantList.Items).To(HaveLen(1))
@@ -118,7 +119,7 @@ var _ = Describe("Tenant onboarding to hub", func() {
 		Eventually(
 			func(g Gomega) {
 				err := kubeClient.List(ctx, tenantList, crclient.MatchingLabels{
-					labels.TenantUuid: name,
+					labels.TenantID: id,
 				}, crclient.InNamespace(hubNamespace))
 				g.Expect(err).ToNot(HaveOccurred())
 				g.Expect(tenantList.Items).To(BeEmpty())
@@ -154,7 +155,7 @@ var _ = Describe("Tenant onboarding to hub", func() {
 		Eventually(
 			func(g Gomega) {
 				err := kubeClient.List(ctx, tenantList, crclient.MatchingLabels{
-					labels.TenantUuid: name,
+					labels.TenantID: id,
 				}, crclient.InNamespace(hubNamespace))
 				g.Expect(err).ToNot(HaveOccurred())
 				g.Expect(tenantList.Items).To(HaveLen(1))
@@ -164,8 +165,9 @@ var _ = Describe("Tenant onboarding to hub", func() {
 		).Should(Succeed())
 		tenantCR := &tenantList.Items[0]
 
-		By("Removing the TenantUuid label from the Tenant CR")
+		By("Removing the tenant identity labels from the Tenant CR")
 		delete(tenantCR.Labels, labels.TenantUuid)
+		delete(tenantCR.Labels, labels.TenantID)
 		err := kubeClient.Update(ctx, tenantCR)
 		Expect(err).ToNot(HaveOccurred())
 
@@ -184,14 +186,16 @@ var _ = Describe("Tenant onboarding to hub", func() {
 		}.Build())
 		Expect(err).ToNot(HaveOccurred())
 
-		By("Verifying TenantUuid label is restored on the Tenant CR")
+		By("Verifying tenant identity labels are restored on the Tenant CR")
 		Eventually(
 			func(g Gomega) {
 				err := kubeClient.List(ctx, tenantList, crclient.MatchingLabels{
-					labels.TenantUuid: name,
+					labels.TenantID: id,
 				}, crclient.InNamespace(hubNamespace))
 				g.Expect(err).ToNot(HaveOccurred())
 				g.Expect(tenantList.Items).To(HaveLen(1))
+				g.Expect(tenantList.Items[0].Labels).To(HaveKeyWithValue(labels.TenantUuid, name))
+				g.Expect(tenantList.Items[0].Labels).To(HaveKeyWithValue(labels.TenantID, id))
 			},
 			time.Minute,
 			time.Second,
@@ -211,18 +215,77 @@ var _ = Describe("Tenant onboarding to hub", func() {
 	})
 })
 
-var _ = Describe("Tenant deletion with projects", func() {
+var _ = Describe("Tenant deletion", func() {
 	var (
 		tenantsClient  privatev1.TenantsClient
 		projectsClient privatev1.ProjectsClient
+		usersClient    privatev1.UsersClient
 	)
 
 	BeforeEach(func() {
 		tenantsClient = privatev1.NewTenantsClient(tool.InternalView().AdminConn())
 		projectsClient = privatev1.NewProjectsClient(tool.InternalView().AdminConn())
+		usersClient = privatev1.NewUsersClient(tool.InternalView().AdminConn())
 	})
 
-	It("Blocks tenant deletion until all projects are removed", func(ctx context.Context) {
+	It("Deletes a tenant with a user in its root project", func(ctx context.Context) {
+		name := fmt.Sprintf("test-%s", uuid.New())
+
+		By(fmt.Sprintf("Creating tenant %q", name))
+		id := createTenant(ctx, tenantsClient, name)
+		By("Waiting for tenant to reach SYNCED state")
+		waitForTenantSynced(ctx, tenantsClient, id)
+
+		By("Creating a user in the tenant root project")
+		userName := fmt.Sprintf("user-%s", uuid.New())
+		createdUser, err := usersClient.Create(ctx, privatev1.UsersCreateRequest_builder{
+			Object: privatev1.User_builder{
+				Metadata: privatev1.Metadata_builder{
+					Name:   userName,
+					Tenant: name,
+				}.Build(),
+				Spec: privatev1.UserSpec_builder{
+					Username: userName,
+					Email:    userName + "@example.com",
+					Enabled:  true,
+				}.Build(),
+			}.Build(),
+		}.Build())
+		Expect(err).ToNot(HaveOccurred())
+		Expect(createdUser.GetObject().GetMetadata().GetProject()).To(BeEmpty())
+
+		By("Deleting the tenant without first deleting its user")
+		_, err = tenantsClient.Delete(ctx, privatev1.TenantsDeleteRequest_builder{
+			Id: id,
+		}.Build())
+		Expect(err).ToNot(HaveOccurred())
+
+		listFilter := fmt.Sprintf("this.metadata.tenant == %q", name)
+		Eventually(
+			func(g Gomega) {
+				usersResp, err := usersClient.List(ctx, privatev1.UsersListRequest_builder{
+					Filter: &listFilter,
+				}.Build())
+				g.Expect(err).ToNot(HaveOccurred())
+				g.Expect(usersResp.GetTotal()).To(BeZero())
+
+				projectsResp, err := projectsClient.List(ctx, privatev1.ProjectsListRequest_builder{
+					Filter: &listFilter,
+				}.Build())
+				g.Expect(err).ToNot(HaveOccurred())
+				g.Expect(projectsResp.GetTotal()).To(BeZero())
+
+				_, err = tenantsClient.Get(ctx, privatev1.TenantsGetRequest_builder{
+					Id: id,
+				}.Build())
+				g.Expect(isGRPCCode(err, grpccodes.NotFound)).To(BeTrue())
+			},
+			3*time.Minute,
+			time.Second,
+		).Should(Succeed())
+	})
+
+	It("Deletes all projects before removing the tenant", func(ctx context.Context) {
 		name := fmt.Sprintf("test-%s", uuid.New())
 
 		By(fmt.Sprintf("Creating tenant %q", name))
@@ -233,7 +296,7 @@ var _ = Describe("Tenant deletion with projects", func() {
 
 		By("Creating a project under the tenant")
 		projectName := fmt.Sprintf("proj-%s", uuid.New())
-		projectResp, err := projectsClient.Create(ctx, privatev1.ProjectsCreateRequest_builder{
+		_, err := projectsClient.Create(ctx, privatev1.ProjectsCreateRequest_builder{
 			Object: privatev1.Project_builder{
 				Metadata: privatev1.Metadata_builder{
 					Name:   projectName,
@@ -242,52 +305,58 @@ var _ = Describe("Tenant deletion with projects", func() {
 			}.Build(),
 		}.Build())
 		Expect(err).ToNot(HaveOccurred())
-		projectId := projectResp.GetObject().GetId()
-
 		By("Requesting tenant deletion (without deleting the project first)")
 		_, err = tenantsClient.Delete(ctx, privatev1.TenantsDeleteRequest_builder{
 			Id: id,
 		}.Build())
 		Expect(err).ToNot(HaveOccurred())
 
-		By("Verifying the tenant is not immediately removed (blocked by project FK)")
-		Consistently(
+		kubeClient := tool.KubeClient()
+		listFilter := fmt.Sprintf("this.metadata.tenant == %q", name)
+		By("Verifying tenant and hub resources remain while tenant projects are pending deletion")
+		Eventually(
 			func(g Gomega) {
+				listResp, err := projectsClient.List(ctx, privatev1.ProjectsListRequest_builder{
+					Filter: &listFilter,
+				}.Build())
+				g.Expect(err).ToNot(HaveOccurred())
+				g.Expect(listResp.GetTotal()).To(BeNumerically(">", 0))
+
 				getResp, err := tenantsClient.Get(ctx, privatev1.TenantsGetRequest_builder{
 					Id: id,
 				}.Build())
 				g.Expect(err).ToNot(HaveOccurred())
 				g.Expect(getResp.GetObject().GetMetadata().HasDeletionTimestamp()).To(BeTrue())
+
+				tenantList := &osacv1alpha1.TenantList{}
+				err = kubeClient.List(ctx, tenantList, crclient.MatchingLabels{
+					labels.TenantID: id,
+				}, crclient.InNamespace(hubNamespace))
+				g.Expect(err).ToNot(HaveOccurred())
+				g.Expect(tenantList.Items).To(HaveLen(1))
+				g.Expect(tenantList.Items[0].GetDeletionTimestamp().IsZero()).To(BeTrue())
+
+				ns := &corev1.Namespace{}
+				err = kubeClient.Get(ctx, crclient.ObjectKey{Name: name}, ns)
+				g.Expect(err).ToNot(HaveOccurred())
+				g.Expect(ns.GetDeletionTimestamp().IsZero()).To(BeTrue())
 			},
-			10*time.Second,
+			30*time.Second,
 			time.Second,
 		).Should(Succeed())
 
-		By("Deleting the explicitly created project")
-		deleteProject(ctx, projectsClient, projectId)
-
-		By("Deleting all remaining projects for the tenant (including auto-created root)")
-		listFilter := fmt.Sprintf(
-			"this.metadata.tenant == %q && !has(this.metadata.deletion_timestamp)", name,
-		)
-		for {
-			listResp, listErr := projectsClient.List(ctx, privatev1.ProjectsListRequest_builder{
-				Filter: &listFilter,
-			}.Build())
-			Expect(listErr).ToNot(HaveOccurred())
-			if listResp.GetTotal() == 0 {
-				break
-			}
-			for _, item := range listResp.GetItems() {
-				deleteProject(ctx, projectsClient, item.GetId())
-			}
-		}
-
-		By("Signaling the tenant to wake reconcilers from backoff")
-		_, err = tenantsClient.Signal(ctx, privatev1.TenantsSignalRequest_builder{
-			Id: id,
-		}.Build())
-		Expect(err).ToNot(HaveOccurred())
+		By("Waiting for tenant deletion to remove every project, including the root")
+		Eventually(
+			func(g Gomega) {
+				listResp, err := projectsClient.List(ctx, privatev1.ProjectsListRequest_builder{
+					Filter: &listFilter,
+				}.Build())
+				g.Expect(err).ToNot(HaveOccurred())
+				g.Expect(listResp.GetTotal()).To(BeZero())
+			},
+			2*time.Minute,
+			time.Second,
+		).Should(Succeed())
 
 		By("Verifying the tenant is eventually fully deleted")
 		Eventually(

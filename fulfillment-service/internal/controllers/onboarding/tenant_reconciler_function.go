@@ -14,8 +14,8 @@ language governing permissions and limitations under the License.
 // Package onboarding reconciles Tenant objects into Tenant CRDs on all hub clusters.
 package onboarding
 
-//go:generate mockgen -source=../../api/osac/private/v1/tenants_service_grpc.pb.go -destination=tenants_client_mock.go -package=onboarding TenantsClient
-//go:generate mockgen -source=../../api/osac/private/v1/projects_service_grpc.pb.go -destination=projects_client_mock.go -package=onboarding ProjectsClient
+//go:generate mockgen -destination=tenants_client_mock.go -package=onboarding github.com/osac-project/osac/proto/gen/osac/private/v1 TenantsClient
+//go:generate mockgen -destination=projects_client_mock.go -package=onboarding github.com/osac-project/osac/proto/gen/osac/private/v1 ProjectsClient
 
 import (
 	"context"
@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"log/slog"
 	"slices"
+	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/proto"
@@ -34,12 +35,14 @@ import (
 
 	osacv1alpha1 "github.com/osac-project/osac/osac-operator/api/v1alpha1"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/controllers"
 	"github.com/osac-project/osac/fulfillment-service/internal/controllers/finalizers"
 	"github.com/osac-project/osac/fulfillment-service/internal/kubernetes/labels"
 	"github.com/osac-project/osac/fulfillment-service/internal/masks"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
+
+const tenantDeletionRetryInterval = time.Second
 
 type FunctionBuilder struct {
 	logger     *slog.Logger
@@ -113,7 +116,9 @@ func (r *function) run(ctx context.Context, tenant *privatev1.Tenant) error {
 		tenant: tenant,
 	}
 	var err error
-	if tenant.HasMetadata() && tenant.GetMetadata().HasDeletionTimestamp() {
+	if t.addFinalizer() {
+		// Persist both barriers before doing any external work.
+	} else if tenant.HasMetadata() && tenant.GetMetadata().HasDeletionTimestamp() {
 		err = t.delete(ctx)
 	} else {
 		err = t.update(ctx)
@@ -123,6 +128,7 @@ func (r *function) run(ctx context.Context, tenant *privatev1.Tenant) error {
 		_, updateErr := r.tenantsClient.Update(ctx, privatev1.TenantsUpdateRequest_builder{
 			Object:     tenant,
 			UpdateMask: updateMask,
+			Lock:       true,
 		}.Build())
 		if err == nil {
 			err = updateErr
@@ -132,10 +138,6 @@ func (r *function) run(ctx context.Context, tenant *privatev1.Tenant) error {
 }
 
 func (t *task) update(ctx context.Context) error {
-	if t.addFinalizer() {
-		return nil
-	}
-
 	hubs, err := t.listAllHubs(ctx)
 	if err != nil {
 		return err
@@ -197,6 +199,7 @@ func (t *task) createOrUpdateOnHub(ctx context.Context, hubId string, hubEntry *
 			object.Labels = make(map[string]string)
 		}
 		object.Labels[labels.TenantUuid] = tenantName
+		object.Labels[labels.TenantID] = t.tenant.GetId()
 		return nil
 	})
 	if err != nil {
@@ -241,6 +244,35 @@ func (t *task) ensureNamespaceOnHub(ctx context.Context, hubId string, hubEntry 
 }
 
 func (t *task) delete(ctx context.Context) error {
+	if !slices.Contains(t.tenant.GetMetadata().GetFinalizers(), finalizers.TenantOnboarding) {
+		return nil
+	}
+
+	// Wait for all projects (including projects whose deletion is still in
+	// progress) to be archived before deleting the Tenant CR or Namespace on
+	// any hub, so project workloads and volumes finish deprovisioning before
+	// hub storage teardown begins.
+	listFilter := fmt.Sprintf(
+		"this.metadata.tenant == %q",
+		t.tenant.GetMetadata().GetName(),
+	)
+	listResp, err := t.r.projectsClient.List(ctx, privatev1.ProjectsListRequest_builder{
+		Filter: new(listFilter),
+		Limit:  new(int32(0)),
+	}.Build())
+	if err != nil {
+		return controllers.RequeueAfter(
+			fmt.Errorf("failed to query for remaining projects: %w", err),
+			tenantDeletionRetryInterval,
+		)
+	}
+	if listResp.GetTotal() > 0 {
+		return controllers.RequeueAfter(
+			fmt.Errorf("tenant still has %d project(s) pending deletion", listResp.GetTotal()),
+			tenantDeletionRetryInterval,
+		)
+	}
+
 	hubs, err := t.listAllHubs(ctx)
 	if err != nil {
 		return err
@@ -292,24 +324,10 @@ func (t *task) delete(ctx context.Context) error {
 		crStillPresent = true
 	}
 	if crStillPresent {
-		return fmt.Errorf("tenant CR still present on one or more hubs")
-	}
-
-	// Wait for all projects to be archived before removing the finalizer —
-	// otherwise the DAO archive hits FK violations from the projects table.
-	listFilter := fmt.Sprintf(
-		"this.metadata.tenant == %q && !has(this.metadata.deletion_timestamp)",
-		t.tenant.GetMetadata().GetName(),
-	)
-	listResp, err := t.r.projectsClient.List(ctx, privatev1.ProjectsListRequest_builder{
-		Filter: new(listFilter),
-		Limit:  new(int32(0)),
-	}.Build())
-	if err != nil {
-		return fmt.Errorf("failed to query for remaining projects: %w", err)
-	}
-	if listResp.GetTotal() > 0 {
-		return fmt.Errorf("tenant still has %d project(s) pending deletion", listResp.GetTotal())
+		return controllers.RequeueAtInterval(
+			fmt.Errorf("tenant CR still present on one or more hubs"),
+			tenantDeletionRetryInterval,
+		)
 	}
 
 	t.removeFinalizer()
@@ -363,36 +381,15 @@ func (t *task) getKubeObject(ctx context.Context, hubEntry *controllers.HubEntry
 }
 
 func (t *task) listAllHubs(ctx context.Context) ([]*privatev1.Hub, error) {
-	var allHubs []*privatev1.Hub
-	var offset int32
-	for {
-		response, err := t.r.hubsClient.List(ctx, privatev1.HubsListRequest_builder{
-			Offset: &offset,
-		}.Build())
-		if err != nil {
-			return nil, fmt.Errorf("failed to list hubs: %w", err)
-		}
-		allHubs = append(allHubs, response.GetItems()...)
-		total := response.GetTotal()
-		if total <= 0 || offset+response.GetSize() >= total {
-			break
-		}
-		offset += response.GetSize()
+	hubs, err := controllers.ListAllHubs(ctx, t.r.hubsClient)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list hubs: %w", err)
 	}
-	return allHubs, nil
+	return hubs, nil
 }
 
 func (t *task) addFinalizer() bool {
-	if !t.tenant.HasMetadata() {
-		t.tenant.SetMetadata(&privatev1.Metadata{})
-	}
-	list := t.tenant.GetMetadata().GetFinalizers()
-	if !slices.Contains(list, finalizers.Controller) {
-		list = append(list, finalizers.Controller)
-		t.tenant.GetMetadata().SetFinalizers(list)
-		return true
-	}
-	return false
+	return finalizers.PrepareTenant(t.tenant)
 }
 
 func (t *task) removeFinalizer() {
@@ -400,9 +397,9 @@ func (t *task) removeFinalizer() {
 		return
 	}
 	list := t.tenant.GetMetadata().GetFinalizers()
-	if slices.Contains(list, finalizers.Controller) {
+	if slices.Contains(list, finalizers.TenantOnboarding) {
 		list = slices.DeleteFunc(list, func(item string) bool {
-			return item == finalizers.Controller
+			return item == finalizers.TenantOnboarding
 		})
 		t.tenant.GetMetadata().SetFinalizers(list)
 	}

@@ -1,0 +1,187 @@
+import {
+  Alert,
+  Bullseye,
+  DescriptionList,
+  DescriptionListDescription,
+  DescriptionListGroup,
+  DescriptionListTerm,
+  Spinner,
+  Stack,
+  StackItem,
+  Title,
+} from '@patternfly/react-core';
+import { useFormikContext } from 'formik';
+
+import { Projects } from '@osac/types';
+import { useListResource } from '@osac/ui-components/api/use-resource';
+import {
+  CLUSTER_VERSION_ACTIVE_LIST_FILTER,
+  useClusterVersions,
+} from '@osac/ui-components/api/v1/cluster-versions';
+import {
+  fullProjectPathToQueryFilter,
+  getProjectName,
+} from '@osac/ui-components/components/Project/utils';
+import { getErrorMessage } from '@osac/ui-components/utils/error';
+
+import { formatClusterNodeSetReview } from './clusterNodeSetReview';
+import { ClusterWizardValues } from './fields';
+import { findVersionByName, versionDisplayName } from './versionUtils';
+import { useTranslation } from '../../../hooks/useTranslation';
+import { displayValue } from '../../../utils/detailFormatters';
+import { NetworkAttachmentReviewFields } from '../../ProvisioningWizard/NetworkAttachmentReviewFields';
+
+const formatNodeSetsForReview = (
+  nodeSetRows: ClusterWizardValues['spec']['nodeSetRows'],
+): string => {
+  if (nodeSetRows.value.length === 0) {
+    return '—';
+  }
+  return nodeSetRows.value
+    .map((row) => formatClusterNodeSetReview(row.hostType.name, row.size))
+    .join(', ');
+};
+
+export const ClusterReviewStep = () => {
+  const { t } = useTranslation();
+  const { values } = useFormikContext<ClusterWizardValues>();
+
+  const { data: versions = [] } = useClusterVersions({
+    filter: CLUSTER_VERSION_ACTIVE_LIST_FILTER,
+  });
+
+  const {
+    data: projects,
+    isLoading: projectsLoading,
+    error: projectsError,
+  } = useListResource(Projects, { filter: fullProjectPathToQueryFilter(values.metadata.project) });
+
+  const isCustomNetwork = !values.spec.networkAttachment.value.useDefaultNetwork;
+
+  const versionDisplay = versionDisplayName(
+    findVersionByName(versions, values.spec.versionName.value),
+    values.spec.versionName.value,
+  );
+
+  if (projectsLoading) {
+    return (
+      <Bullseye>
+        <Spinner />
+      </Bullseye>
+    );
+  }
+
+  return (
+    <Stack hasGutter>
+      {!!projectsError && (
+        <StackItem>
+          <Alert variant="warning" isInline title={t('Failed to fetch project')}>
+            {getErrorMessage(projectsError)}
+          </Alert>
+        </StackItem>
+      )}
+      <StackItem>
+        <DescriptionList
+          isHorizontal
+          isCompact
+          aria-label={t('catalogProvision.steps.review.title')}
+        >
+          <DescriptionListGroup>
+            <DescriptionListTerm>{t('Catalog item')}</DescriptionListTerm>
+            <DescriptionListDescription>
+              {values.catalogItemReference.name || '—'}
+            </DescriptionListDescription>
+          </DescriptionListGroup>
+
+          <DescriptionListGroup>
+            <DescriptionListTerm>{t('Project')}</DescriptionListTerm>
+            <DescriptionListDescription>
+              {projects?.size === 1
+                ? getProjectName(projects.items[0], t)
+                : values.metadata.project}
+            </DescriptionListDescription>
+          </DescriptionListGroup>
+          <DescriptionListGroup>
+            <DescriptionListTerm>{t('Name')}</DescriptionListTerm>
+            <DescriptionListDescription>
+              {displayValue(values.metadata.name)}
+            </DescriptionListDescription>
+          </DescriptionListGroup>
+          <DescriptionListGroup>
+            <DescriptionListTerm>{t('SSH public key')}</DescriptionListTerm>
+            <DescriptionListDescription>
+              {displayValue(values.spec.sshPublicKey.value)}
+            </DescriptionListDescription>
+          </DescriptionListGroup>
+          <DescriptionListGroup>
+            <DescriptionListTerm>{t('Pull secret')}</DescriptionListTerm>
+            <DescriptionListDescription>
+              {displayValue(values.spec.pullSecretSecret.value)}
+            </DescriptionListDescription>
+          </DescriptionListGroup>
+
+          <DescriptionListGroup>
+            <DescriptionListTerm>{t('Version')}</DescriptionListTerm>
+            <DescriptionListDescription>{displayValue(versionDisplay)}</DescriptionListDescription>
+          </DescriptionListGroup>
+          <DescriptionListGroup>
+            <DescriptionListTerm>{t('Node sets')}</DescriptionListTerm>
+            <DescriptionListDescription>
+              {formatNodeSetsForReview(values.spec.nodeSetRows)}
+            </DescriptionListDescription>
+          </DescriptionListGroup>
+        </DescriptionList>
+      </StackItem>
+
+      <StackItem>
+        <Title headingLevel="h3">{t('Infrastructure Networking')}</Title>
+      </StackItem>
+      <StackItem>
+        <DescriptionList isHorizontal isCompact>
+          <DescriptionListGroup>
+            <DescriptionListTerm>{t('Network')}</DescriptionListTerm>
+            <DescriptionListDescription>
+              {isCustomNetwork ? t('Custom') : t('Tenant default')}
+            </DescriptionListDescription>
+          </DescriptionListGroup>
+
+          {isCustomNetwork && (
+            <NetworkAttachmentReviewFields
+              virtualNetwork={values.spec.networkAttachment.value.virtualNetwork}
+              subnet={values.spec.networkAttachment.value.subnet}
+              securityGroups={values.spec.networkAttachment.value.securityGroups}
+            />
+          )}
+
+          <DescriptionListGroup>
+            <DescriptionListTerm>{t('Auto attach external IP')}</DescriptionListTerm>
+            <DescriptionListDescription>
+              {values.spec.autoExternalIpAttachment.value ? t('Yes') : t('No')}
+            </DescriptionListDescription>
+          </DescriptionListGroup>
+        </DescriptionList>
+      </StackItem>
+
+      <StackItem>
+        <Title headingLevel="h3">{t('Cluster Networking')}</Title>
+      </StackItem>
+      <StackItem>
+        <DescriptionList isHorizontal isCompact>
+          <DescriptionListGroup>
+            <DescriptionListTerm>{t('Pod CIDR')}</DescriptionListTerm>
+            <DescriptionListDescription>
+              {displayValue(values.spec.network.podCidr.value)}
+            </DescriptionListDescription>
+          </DescriptionListGroup>
+
+          <DescriptionListGroup>
+            <DescriptionListTerm>{t('Service CIDR')}</DescriptionListTerm>
+            <DescriptionListDescription>
+              {displayValue(values.spec.network.serviceCidr.value)}
+            </DescriptionListDescription>
+          </DescriptionListGroup>
+        </DescriptionList>
+      </StackItem>
+    </Stack>
+  );
+};

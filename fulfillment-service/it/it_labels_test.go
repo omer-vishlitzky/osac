@@ -21,46 +21,68 @@ import (
 	. "github.com/onsi/gomega"
 	grpccodes "google.golang.org/grpc/codes"
 	grpcstatus "google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/fieldmaskpb"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
-	publicv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/public/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/uuid"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
 
 var _ = Describe("Labels", func() {
 	var (
-		ctx             context.Context
-		clustersClient  publicv1.ClustersClient
-		hostTypesClient privatev1.HostTypesClient
-		templatesClient privatev1.ClusterTemplatesClient
-		hostTypeId      string
-		templateId      string
+		ctx                       context.Context
+		clustersClient            publicv1.ClustersClient
+		publicAdminClustersClient publicv1.ClustersClient
+		adminClustersClient       privatev1.ClustersClient
+		instanceTypesClient       privatev1.BareMetalInstanceTypesClient
+		templatesClient           privatev1.ClusterTemplatesClient
+		bmitName                  string
+		templateId                string
 	)
 
 	BeforeEach(func() {
 		ctx = context.Background()
+		ensureTenantDefaultNetworkingFixture(ctx, usersGroup, "")
 		clustersClient = publicv1.NewClustersClient(tool.ExternalView().UserConn())
-		hostTypesClient = privatev1.NewHostTypesClient(tool.InternalView().AdminConn())
+		publicAdminClustersClient = publicv1.NewClustersClient(tool.ExternalView().AdminConn())
+		adminClustersClient = privatev1.NewClustersClient(tool.InternalView().AdminConn())
+		instanceTypesClient = privatev1.NewBareMetalInstanceTypesClient(tool.InternalView().AdminConn())
 		templatesClient = privatev1.NewClusterTemplatesClient(tool.InternalView().AdminConn())
 
-		hostTypeId = fmt.Sprintf("my-host-type-%s", uuid.New())
-		_, err := hostTypesClient.Create(ctx, privatev1.HostTypesCreateRequest_builder{
-			Object: privatev1.HostType_builder{
-				Id: hostTypeId,
+		bmitName = fmt.Sprintf("test-bmit-%s", uuid.New()[24:32])
+		_, err := instanceTypesClient.Create(ctx, privatev1.BareMetalInstanceTypesCreateRequest_builder{
+			Object: privatev1.BareMetalInstanceType_builder{
 				Metadata: privatev1.Metadata_builder{
-					Name: fmt.Sprintf("my-host-type-%s", uuid.New()[24:32]),
+					Name: bmitName,
+				}.Build(),
+				Spec: privatev1.BareMetalInstanceTypeSpec_builder{
+					Hardware: privatev1.BareMetalHardwareSpec_builder{
+						Cpu:    privatev1.BareMetalCPUSpec_builder{Cores: 32, Architecture: "amd64", ThreadsPerCore: 2}.Build(),
+						Memory: privatev1.BareMetalMemorySpec_builder{TotalGb: 128}.Build(),
+						NetworkPorts: []*privatev1.BareMetalNetworkPortSpec{
+							privatev1.BareMetalNetworkPortSpec_builder{
+								Name:  "eth0",
+								Role:  "fabric",
+								Type:  "Ethernet",
+								Speed: "10Gbps",
+							}.Build(),
+						},
+					}.Build(),
+					HostLabelSelector: privatev1.BareMetalLabelSelector_builder{
+						MatchLabels: map[string]string{"hardware.profile": "compute"},
+					}.Build(),
 				}.Build(),
 			}.Build(),
 		}.Build())
 		Expect(err).ToNot(HaveOccurred())
 		DeferCleanup(func() {
-			_, err := hostTypesClient.Delete(ctx, privatev1.HostTypesDeleteRequest_builder{
-				Id: hostTypeId,
+			_, err := instanceTypesClient.Delete(ctx, privatev1.BareMetalInstanceTypesDeleteRequest_builder{
+				Id: bmitName,
 			}.Build())
 			Expect(err).ToNot(HaveOccurred())
 		})
 
-		templateId = fmt.Sprintf("my-template-%s", uuid.New())
+		templateId = newTemplateID("my_template")
 		_, err = templatesClient.Create(ctx, privatev1.ClusterTemplatesCreateRequest_builder{
 			Object: privatev1.ClusterTemplate_builder{
 				Id: templateId,
@@ -69,12 +91,6 @@ var _ = Describe("Labels", func() {
 				}.Build(),
 				Title:       "My template %s",
 				Description: "My template.",
-				NodeSets: map[string]*privatev1.ClusterTemplateNodeSet{
-					"my-node-set": privatev1.ClusterTemplateNodeSet_builder{
-						HostType: privatev1.HostTypeReference_builder{Id: hostTypeId}.Build(),
-						Size:     3,
-					}.Build(),
-				},
 			}.Build(),
 		}.Build())
 		Expect(err).ToNot(HaveOccurred())
@@ -99,6 +115,7 @@ var _ = Describe("Labels", func() {
 				}.Build(),
 				Spec: publicv1.ClusterSpec_builder{
 					Template: publicv1.ClusterTemplateReference_builder{Id: templateId}.Build(),
+					NodeSets: testClusterNodeSets(bmitName, 3),
 				}.Build(),
 			}.Build(),
 		}.Build())
@@ -133,6 +150,7 @@ var _ = Describe("Labels", func() {
 				}.Build(),
 				Spec: publicv1.ClusterSpec_builder{
 					Template: publicv1.ClusterTemplateReference_builder{Id: templateId}.Build(),
+					NodeSets: testClusterNodeSets(bmitName, 3),
 				}.Build(),
 			}.Build(),
 		}.Build())
@@ -160,6 +178,7 @@ var _ = Describe("Labels", func() {
 					Template: publicv1.ClusterTemplateReference_builder{Id: templateId}.Build(),
 				}.Build(),
 			}.Build(),
+			UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"metadata.labels"}},
 		}.Build())
 		Expect(err).ToNot(HaveOccurred())
 		metadata := updateResponse.GetObject().GetMetadata()
@@ -173,6 +192,99 @@ var _ = Describe("Labels", func() {
 		metadata = getResponse.GetObject().GetMetadata()
 		Expect(metadata.GetLabels()).To(HaveKeyWithValue("example.com/updated", "new-value"))
 		Expect(metadata.GetLabels()).To(HaveKeyWithValue("another", "second"))
+	})
+
+	It("preserves the latest stored reserved labels during public replacement updates", func() {
+		createResponse, err := clustersClient.Create(ctx, publicv1.ClustersCreateRequest_builder{
+			Object: publicv1.Cluster_builder{
+				Metadata: publicv1.Metadata_builder{
+					Name: fmt.Sprintf("labels-reserved-test-%s", uuid.New()[24:32]),
+				}.Build(),
+				Spec: publicv1.ClusterSpec_builder{
+					Template: publicv1.ClusterTemplateReference_builder{Id: templateId}.Build(),
+					NodeSets: testClusterNodeSets(bmitName, 3),
+				}.Build(),
+			}.Build(),
+		}.Build())
+		Expect(err).ToNot(HaveOccurred())
+		object := createResponse.GetObject()
+		DeferCleanup(func() {
+			_, err := clustersClient.Delete(ctx, publicv1.ClustersDeleteRequest_builder{Id: object.GetId()}.Build())
+			Expect(err).ToNot(HaveOccurred())
+		})
+
+		_, err = adminClustersClient.Update(ctx, privatev1.ClustersUpdateRequest_builder{
+			Object: privatev1.Cluster_builder{
+				Id: object.GetId(),
+				Metadata: privatev1.Metadata_builder{
+					Labels: map[string]string{
+						"admin.osac.openshift.io/managed":         "old-system-value",
+						"operator.admin.osac.openshift.io/remove": "removed-by-writer",
+						"ordinary": "stored-before-public-update",
+					},
+				}.Build(),
+			}.Build(),
+			UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"metadata.labels"}},
+		}.Build())
+		Expect(err).ToNot(HaveOccurred())
+		_, err = adminClustersClient.Update(ctx, privatev1.ClustersUpdateRequest_builder{
+			Object: privatev1.Cluster_builder{
+				Id: object.GetId(),
+				Metadata: privatev1.Metadata_builder{
+					Labels: map[string]string{
+						"admin.osac.openshift.io/managed":        "latest-system-value",
+						"operator.admin.osac.openshift.io/added": "added-by-writer",
+						"ordinary":                               "stored-before-public-update",
+					},
+				}.Build(),
+			}.Build(),
+			UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"metadata.labels"}},
+		}.Build())
+		Expect(err).ToNot(HaveOccurred())
+		latestPublicResponse, err := clustersClient.Get(ctx, publicv1.ClustersGetRequest_builder{Id: object.GetId()}.Build())
+		Expect(err).ToNot(HaveOccurred())
+		stalePublicObject := latestPublicResponse.GetObject()
+
+		// The cluster controller can advance the version between Get and Update. Keep this replacement unlocked so the
+		// test exercises metadata merging; the stale-object update below verifies Lock=true behavior.
+		updateResponse, err := clustersClient.Update(ctx, publicv1.ClustersUpdateRequest_builder{
+			Object: publicv1.Cluster_builder{
+				Id: object.GetId(),
+				Metadata: publicv1.Metadata_builder{
+					Name:    object.GetMetadata().GetName(),
+					Version: stalePublicObject.GetMetadata().GetVersion(),
+					Labels:  map[string]string{"public": "replacement"},
+				}.Build(),
+				Spec: publicv1.ClusterSpec_builder{
+					Template: publicv1.ClusterTemplateReference_builder{Id: templateId}.Build(),
+				}.Build(),
+			}.Build(),
+			UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"metadata.labels"}},
+		}.Build())
+		Expect(err).ToNot(HaveOccurred())
+		Expect(updateResponse.GetObject().GetMetadata().GetLabels()).To(Equal(map[string]string{
+			"public": "replacement",
+		}))
+		stalePublicObject.GetMetadata().SetLabels(map[string]string{"stale": "value"})
+		_, err = clustersClient.Update(ctx, publicv1.ClustersUpdateRequest_builder{
+			Object:     stalePublicObject,
+			UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"metadata.labels"}},
+			Lock:       true,
+		}.Build())
+		Expect(grpcstatus.Code(err)).To(Equal(grpccodes.Aborted))
+
+		privateResponse, err := adminClustersClient.Get(ctx, privatev1.ClustersGetRequest_builder{Id: object.GetId()}.Build())
+		Expect(err).ToNot(HaveOccurred())
+		Expect(privateResponse.GetObject().GetMetadata().GetLabels()).To(Equal(map[string]string{
+			"admin.osac.openshift.io/managed":        "latest-system-value",
+			"operator.admin.osac.openshift.io/added": "added-by-writer",
+			"public":                                 "replacement",
+		}))
+		adminPublicResponse, err := publicAdminClustersClient.Get(ctx, publicv1.ClustersGetRequest_builder{Id: object.GetId()}.Build())
+		Expect(err).ToNot(HaveOccurred())
+		Expect(adminPublicResponse.GetObject().GetMetadata().GetLabels()).To(Equal(map[string]string{
+			"public": "replacement",
+		}))
 	})
 
 	DescribeTable(
@@ -204,6 +316,7 @@ var _ = Describe("Labels", func() {
 					}.Build(),
 					Spec: publicv1.ClusterSpec_builder{
 						Template: publicv1.ClusterTemplateReference_builder{Id: templateId}.Build(),
+						NodeSets: testClusterNodeSets(bmitName, 3),
 					}.Build(),
 				}.Build(),
 			}.Build())
@@ -229,6 +342,7 @@ var _ = Describe("Labels", func() {
 						Template: publicv1.ClusterTemplateReference_builder{Id: templateId}.Build(),
 					}.Build(),
 				}.Build(),
+				UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"metadata.labels"}},
 			}.Build())
 			Expect(err).To(HaveOccurred())
 			status, ok = grpcstatus.FromError(err)
@@ -249,6 +363,12 @@ var _ = Describe("Labels", func() {
 			"value",
 			"field 'metadata.labels' key 'bad_prefix/name' prefix segment must only contain lowercase "+
 				"letters (a-z), digits (0-9) and hyphens (-), but contains '_' at position 3",
+		),
+		Entry(
+			"Reserved administrator namespace",
+			"operator.admin.osac.openshift.io/managed",
+			"system",
+			"Label or annotation is reserved for use by the system.",
 		),
 	)
 })

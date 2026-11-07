@@ -13,14 +13,13 @@ language governing permissions and limitations under the License.
 
 package externalipattachment
 
-//go:generate mockgen -source=../../api/osac/private/v1/external_ip_attachments_service_grpc.pb.go -destination=external_ip_attachments_client_mock.go -package=externalipattachment ExternalIPAttachmentsClient
+//go:generate mockgen -destination=external_ip_attachments_client_mock.go -package=externalipattachment github.com/osac-project/osac/proto/gen/osac/private/v1 ExternalIPAttachmentsClient
 
 import (
 	"context"
 	"errors"
 	"fmt"
 	"log/slog"
-	"math/rand/v2"
 	"slices"
 
 	"google.golang.org/grpc"
@@ -30,12 +29,11 @@ import (
 
 	osacv1alpha1 "github.com/osac-project/osac/osac-operator/api/v1alpha1"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/controllers"
 	"github.com/osac-project/osac/fulfillment-service/internal/controllers/finalizers"
-	"github.com/osac-project/osac/fulfillment-service/internal/kubernetes/annotations"
 	"github.com/osac-project/osac/fulfillment-service/internal/kubernetes/labels"
 	"github.com/osac-project/osac/fulfillment-service/internal/masks"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
 const objectPrefix = "externalipattachment-"
@@ -51,7 +49,7 @@ type function struct {
 	logger                      *slog.Logger
 	hubCache                    controllers.HubCache
 	externalIPAttachmentsClient privatev1.ExternalIPAttachmentsClient
-	hubsClient                  privatev1.HubsClient
+	networkingHubReader         controllers.NetworkingHubReader
 	maskCalculator              *masks.Calculator
 }
 
@@ -101,10 +99,18 @@ func (b *FunctionBuilder) Build() (result controllers.ReconcilerFunction[*privat
 		return
 	}
 
+	networkingHubReader, err := controllers.NewNetworkingHubReader().
+		SetNetworkClassesClient(privatev1.NewNetworkClassesClient(b.connection)).
+		SetHubCache(b.hubCache).
+		Build()
+	if err != nil {
+		return nil, err
+	}
+
 	object := &function{
 		logger:                      b.logger,
 		externalIPAttachmentsClient: privatev1.NewExternalIPAttachmentsClient(b.connection),
-		hubsClient:                  privatev1.NewHubsClient(b.connection),
+		networkingHubReader:         networkingHubReader,
 		hubCache:                    b.hubCache,
 		maskCalculator:              masks.NewCalculator().Build(),
 	}
@@ -124,12 +130,22 @@ func (r *function) run(ctx context.Context, externalIPAttachment *privatev1.Exte
 	} else {
 		err = t.update(ctx)
 	}
+	var hubResolutionRetryErr error
+	if err != nil {
+		handled, retry := controllers.HandleResourceNetworkingHubResolutionError(err, t.setPending, t.setFailed)
+		if handled {
+			if retry {
+				hubResolutionRetryErr = err
+			}
+			err = nil
+		}
+	}
 	if err != nil {
 		return err
 	}
 	updateMask := r.maskCalculator.Calculate(oldAttachment, externalIPAttachment)
 	if len(updateMask.GetPaths()) == 0 {
-		return nil
+		return hubResolutionRetryErr
 	}
 
 	_, err = r.externalIPAttachmentsClient.Update(ctx, privatev1.ExternalIPAttachmentsUpdateRequest_builder{
@@ -137,7 +153,10 @@ func (r *function) run(ctx context.Context, externalIPAttachment *privatev1.Exte
 		UpdateMask: updateMask,
 	}.Build())
 
-	return err
+	if err != nil {
+		return err
+	}
+	return hubResolutionRetryErr
 }
 
 func (t *task) update(ctx context.Context) error {
@@ -163,18 +182,17 @@ func (t *task) update(ctx context.Context) error {
 	}
 
 	spec := t.buildSpec()
+	metadata := t.externalIPAttachment.GetMetadata()
 
 	if object == nil {
 		newObject := &osacv1alpha1.ExternalIPAttachment{
 			ObjectMeta: metav1.ObjectMeta{
 				Namespace:    t.hubNamespace,
 				GenerateName: objectPrefix,
-				Labels: map[string]string{
+				Labels: labels.MergeTrustedExternalIPLifecycleLabels(map[string]string{
 					labels.ExternalIPAttachmentUuid: t.externalIPAttachment.GetId(),
-				},
-				Annotations: map[string]string{
-					annotations.Tenant: t.externalIPAttachment.GetMetadata().GetTenant(),
-				},
+				}, metadata.GetLabels(), metadata.GetCreator() == "system"),
+				Annotations: controllers.AutomaticCRAnnotations(t.externalIPAttachment.GetMetadata()),
 			},
 			Spec: spec,
 		}
@@ -191,6 +209,10 @@ func (t *task) update(ctx context.Context) error {
 	} else {
 		update := object.DeepCopy()
 		update.Spec = spec
+		update.Labels = labels.MergeTrustedExternalIPLifecycleLabels(
+			object.GetLabels(), metadata.GetLabels(), metadata.GetCreator() == "system",
+		)
+		update.Labels[labels.ExternalIPAttachmentUuid] = t.externalIPAttachment.GetId()
 		err = t.hubClient.Patch(ctx, update, clnt.MergeFrom(object))
 		if err != nil {
 			return controllers.HandleK8sWriteError(ctx, t.r.logger, err, t.setFailed)
@@ -225,10 +247,15 @@ func (t *task) validateTenant() error {
 func (t *task) delete(ctx context.Context) (err error) {
 	t.hubId = t.externalIPAttachment.GetStatus().GetHub()
 	if t.hubId == "" {
-		t.removeFinalizer()
-		return nil
+		// The CR may exist without status.hub when the controller restarted between its create and the hub
+		// write, so look it up in the canonical hub.
+		if selectErr := t.selectHub(ctx); selectErr != nil {
+			t.removeFinalizer()
+			return nil
+		}
+	} else {
+		err = t.getHub(ctx)
 	}
-	err = t.getHub(ctx)
 	if err != nil {
 		if errors.Is(err, controllers.ErrHubNotFound) {
 			controllers.RemoveFinalizerOnDecommissionedHub(ctx, t.r.logger, t.hubId, "external_ip_attachment_id", t.externalIPAttachment.GetId(), t.removeFinalizer)
@@ -275,28 +302,18 @@ func (t *task) delete(ctx context.Context) (err error) {
 }
 
 func (t *task) selectHub(ctx context.Context) error {
-	t.hubId = t.externalIPAttachment.GetStatus().GetHub()
-	if t.hubId == "" {
-		response, err := t.r.hubsClient.List(ctx, privatev1.HubsListRequest_builder{}.Build())
-		if err != nil {
-			return err
-		}
-		if len(response.Items) == 0 {
-			return errors.New("there are no hubs")
-		}
-		t.hubId = response.Items[rand.IntN(len(response.Items))].GetId()
-	}
-	t.r.logger.DebugContext(
-		ctx,
-		"Selected hub",
-		slog.String("id", t.hubId),
-	)
-	hubEntry, err := t.r.hubCache.Get(ctx, t.hubId)
+	resolution, err := controllers.ResolveResourceNetworkingHub(ctx, t.r.networkingHubReader, t.externalIPAttachment.GetStatus().GetHub())
 	if err != nil {
 		return err
 	}
-	t.hubNamespace = hubEntry.Namespace
-	t.hubClient = hubEntry.Client
+	t.hubId = resolution.HubID
+	t.r.logger.DebugContext(
+		ctx,
+		"Resolved canonical networking hub",
+		slog.String("id", t.hubId),
+	)
+	t.hubNamespace = resolution.Namespace
+	t.hubClient = resolution.Client
 	return nil
 }
 
@@ -362,6 +379,14 @@ func (t *task) removeFinalizer() {
 		})
 		t.externalIPAttachment.GetMetadata().SetFinalizers(list)
 	}
+}
+
+func (t *task) setPending(err error) {
+	if !t.externalIPAttachment.HasStatus() {
+		t.externalIPAttachment.SetStatus(&privatev1.ExternalIPAttachmentStatus{})
+	}
+	t.externalIPAttachment.GetStatus().SetState(privatev1.ExternalIPAttachmentState_EXTERNAL_IP_ATTACHMENT_STATE_PENDING)
+	t.externalIPAttachment.GetStatus().SetMessage(err.Error())
 }
 
 func (t *task) setFailed(err error) {

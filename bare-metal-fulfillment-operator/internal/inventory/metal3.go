@@ -50,6 +50,10 @@ const (
 	Metal3HostTypeLabel  = metal3LabelPrefix + "host-type"
 	Metal3ManagedByLabel = metal3LabelPrefix + "managed-by"
 	Metal3PoolIDLabel    = metal3LabelPrefix + "pool-id"
+
+	// HostInterfaceMACsAnnotation stores an administrator-supplied JSON map of
+	// OSAC logical port names to physical MAC addresses on a BareMetalHost.
+	HostInterfaceMACsAnnotation = metal3LabelPrefix + "interface-macs"
 )
 
 func init() {
@@ -358,6 +362,32 @@ func (m *Metal3Client) GetHostNICs(ctx context.Context, inventoryHostID string) 
 	return nics, nil
 }
 
+// GetHostLogicalPortMACs reads the logical port mapping used for DHCP lease matching.
+func (m *Metal3Client) GetHostLogicalPortMACs(ctx context.Context, inventoryHostID string) (map[string]string, error) {
+	namespace, name, err := ParseHostID(inventoryHostID)
+	if err != nil {
+		return nil, err
+	}
+
+	key := client.ObjectKey{Namespace: namespace, Name: name}
+	bmh := &metal3api.BareMetalHost{}
+	if err := m.client.Get(ctx, key, bmh); err != nil {
+		return nil, fmt.Errorf("failed to get BareMetalHost %s: %w", inventoryHostID, err)
+	}
+
+	raw, ok := bmh.Annotations[HostInterfaceMACsAnnotation]
+	if !ok || raw == "" {
+		return map[string]string{}, nil
+	}
+
+	macs := map[string]string{}
+	if err := json.Unmarshal([]byte(raw), &macs); err != nil {
+		return nil, fmt.Errorf("host %s: failed to parse %s annotation: %w", inventoryHostID, HostInterfaceMACsAnnotation, err)
+	}
+
+	return macs, nil
+}
+
 func metal3HostNICs(details *metal3api.HardwareDetails) []HostNIC {
 	if details == nil || len(details.NIC) == 0 {
 		return nil
@@ -372,7 +402,7 @@ func metal3HostNICs(details *metal3api.HardwareDetails) []HostNIC {
 	return nics
 }
 
-func (m *Metal3Client) UnassignHost(ctx context.Context, inventoryHostID string, labels []string) error {
+func (m *Metal3Client) UnassignHost(ctx context.Context, inventoryHostID, bareMetalInstanceID string, labels []string) error {
 	namespace, name, err := ParseHostID(inventoryHostID)
 	if err != nil {
 		return err
@@ -381,6 +411,10 @@ func (m *Metal3Client) UnassignHost(ctx context.Context, inventoryHostID string,
 	bmh := &metal3api.BareMetalHost{}
 	if err := m.client.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, bmh); err != nil {
 		return fmt.Errorf("failed to get BareMetalHost %s: %w", inventoryHostID, err)
+	}
+
+	if bmh.Spec.ConsumerRef == nil || bmh.Spec.ConsumerRef.Name != bareMetalInstanceID {
+		return nil
 	}
 
 	for _, label := range labels {
@@ -429,6 +463,6 @@ func bmhToHost(bmh *metal3api.BareMetalHost, hostClass string) *Host {
 		HostClass:           hostClass,
 		ProvisionState:      string(bmh.Status.Provisioning.State),
 		ManagedBy:           managedBy,
-		Ready:               true, // Metal3 BMHs are pre-existing, immediately usable
+		Available:           true, // Metal3 BMHs are pre-existing, immediately usable
 	}
 }

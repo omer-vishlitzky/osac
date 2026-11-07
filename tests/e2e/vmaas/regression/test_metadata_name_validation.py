@@ -1,26 +1,19 @@
 from __future__ import annotations
 
-import re
 import subprocess
 import uuid
 
 import pytest
 
 from tests.e2e.core.grpc_client import PUBLIC_API, GRPCClient
-from tests.e2e.core.helpers import (
-    assert_grpc_rejected,
-    wait_for_virtual_network_cr,
-    wait_for_virtual_network_deletion,
-    wait_for_virtual_network_ready,
-)
+from tests.e2e.core.helpers import assert_grpc_rejected, grpc_error_message
 from tests.e2e.core.k8s_client import K8sClient
-from tests.e2e.core.runner import poll_until
+from tests.e2e.vmaas.networking_lifecycle_helpers import (
+    create_and_wait_for_virtual_network,
+    delete_and_wait_for_virtual_network,
+)
 
-
-def _grpc_error_message(exc: subprocess.CalledProcessError) -> str:
-    combined = (exc.stderr or "") + (exc.stdout or "")
-    match = re.search(r"Message:\s*(.+)", combined)
-    return match.group(1).strip() if match else ""
+pytestmark = pytest.mark.regression
 
 
 class TestVirtualNetworkNameValidation:
@@ -30,10 +23,10 @@ class TestVirtualNetworkNameValidation:
         with pytest.raises(subprocess.CalledProcessError) as exc_info:
             grpc.call(
                 service=f"{PUBLIC_API}.VirtualNetworks/Create",
-                data={"object": {"spec": {"ipv4_cidr": "10.100.0.0/16"}}},
+                data={"object": {"spec": {"ipv4_cidr": "172.20.0.0/16"}}},
             )
         assert_grpc_rejected(exc_info, "InvalidArgument")
-        grpc_msg = _grpc_error_message(exc_info.value)
+        grpc_msg = grpc_error_message(exc_info.value)
         assert "metadata is required" in grpc_msg.lower(), "gRPC rejection should reference metadata is required"
 
     @pytest.mark.parametrize(
@@ -45,28 +38,16 @@ class TestVirtualNetworkNameValidation:
         with pytest.raises(subprocess.CalledProcessError) as exc_info:
             grpc.call(
                 service=f"{PUBLIC_API}.VirtualNetworks/Create",
-                data={"object": {"metadata": {"name": invalid_name}, "spec": {"ipv4_cidr": "10.100.0.0/16"}}},
+                data={"object": {"metadata": {"name": invalid_name}, "spec": {"ipv4_cidr": "172.20.0.0/16"}}},
             )
         assert_grpc_rejected(exc_info, "InvalidArgument")
 
     def test_create_with_valid_dns_name(self, grpc: GRPCClient, k8s_hub_client: K8sClient) -> None:
         vn_name = f"test-valid-dns-{uuid.uuid4().hex[:8]}"
-        vn_id: str = grpc.create_virtual_network(name=vn_name, ipv4_cidr="10.110.0.0/16")
-        cr_name: str | None = None
+        vn_id, cr_name = create_and_wait_for_virtual_network(grpc, k8s_hub_client, vn_name, "172.23.0.0/16")
         try:
-            cr_name = wait_for_virtual_network_cr(k8s=k8s_hub_client, uuid=vn_id)
-            wait_for_virtual_network_ready(k8s=k8s_hub_client, name=cr_name)
-
             vn: dict = grpc.get_virtual_network(vn_id=vn_id)
             assert vn["object"]["metadata"]["name"] == vn_name
         finally:
-            grpc.delete_virtual_network(vn_id=vn_id)
             if cr_name:
-                wait_for_virtual_network_deletion(k8s=k8s_hub_client, name=cr_name)
-            poll_until(
-                fn=lambda: vn_id not in grpc.list_virtual_network_ids(),
-                until=lambda v: v is True,
-                retries=30,
-                delay=5,
-                description=f"VirtualNetwork {vn_id} removal from API",
-            )
+                delete_and_wait_for_virtual_network(grpc, k8s_hub_client, vn_id, cr_name)

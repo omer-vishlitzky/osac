@@ -14,6 +14,7 @@ language governing permissions and limitations under the License.
 package label
 
 import (
+	"context"
 	"embed"
 	"fmt"
 	"log/slog"
@@ -21,10 +22,10 @@ import (
 
 	"github.com/spf13/cobra"
 	"google.golang.org/grpc"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/osac-project/osac/fulfillment-service/internal/config"
 	"github.com/osac-project/osac/fulfillment-service/internal/logging"
-	"github.com/osac-project/osac/fulfillment-service/internal/packages"
 	"github.com/osac-project/osac/fulfillment-service/internal/reflection"
 	"github.com/osac-project/osac/fulfillment-service/internal/terminal"
 )
@@ -88,6 +89,7 @@ func (c *runnerContext) run(cmd *cobra.Command, args []string) error {
 		SetConnection(c.conn).
 		AddPackages(cfg.Packages()).
 		SetTenantFunc(config.TenantFromContext).
+		SetProjectFunc(config.ProjectFromContext).
 		Build()
 	if err != nil {
 		return fmt.Errorf("failed to create reflection tool: %w", err)
@@ -131,17 +133,21 @@ func (c *runnerContext) run(cmd *cobra.Command, args []string) error {
 	}
 
 	// Find the object by identifier or name:
-	object, err := c.helper.FindObject(ctx, ref, c.console)
+	original, err := c.helper.FindObject(ctx, ref, c.console)
 	if err != nil {
 		return err
 	}
 
-	// Apply the label operations:
-	metadata := c.helper.GetMetadata(object)
+	// Apply the label operations to a copy so the computed update mask is
+	// derived from the original state:
+	edited := proto.Clone(original)
+	metadata := c.helper.GetMetadata(edited)
 	c.applyLabelOperations(metadata, operations)
 
-	// Save the result:
-	_, err = c.helper.Update(ctx, object)
+	// Save the result. The explicit diff mask preserves the clear intent of
+	// a removed final label, which an omitted mask cannot express because an
+	// empty map is indistinguishable from omission.
+	_, err = c.helper.UpdateWithMask(ctx, original, edited)
 	if err != nil {
 		return err
 	}
@@ -213,7 +219,11 @@ func completeObjectTypes(cmd *cobra.Command, args []string, toComplete string) (
 	if len(args) != 0 {
 		return nil, cobra.ShellCompDirectiveNoFileComp
 	}
-	return reflection.ObjectTypeNames(packages.Public...), cobra.ShellCompDirectiveNoFileComp
+	var ctx context.Context
+	if cmd != nil {
+		ctx = cmd.Context()
+	}
+	return reflection.ObjectTypeNames(config.PackageNamesFromContext(ctx)...), cobra.ShellCompDirectiveNoFileComp
 }
 
 const shortHelp = `Add or remove labels from objects`
@@ -249,4 +259,9 @@ Adding and removing labels can be combined in a single command:
 {{ bt 3 }}
 
 Objects can be referenced by their identifier or by their name.
+
+Keys in the {{ bt }}admin.osac.openshift.io{{ bt }} domain and its subdomains are reserved for
+system use. Use an authorized private API session to manage these labels. The public API hides them;
+public Create and Update requests that include one are rejected, and removing a hidden label with
+{{ bt }}key-{{ bt }} through a public session does not remove its stored value.
 `

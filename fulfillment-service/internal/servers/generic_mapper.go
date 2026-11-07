@@ -21,8 +21,12 @@ import (
 	"slices"
 	"strings"
 
+	grpccodes "google.golang.org/grpc/codes"
+	grpcstatus "google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protoreflect"
+
+	metadatautil "github.com/osac-project/osac/fulfillment-service/internal/metadata"
 )
 
 // GenericMapperBuilder contains the data and logic neede to create new generic mapper.
@@ -123,7 +127,193 @@ func (m *GenericMapper[From, To]) Copy(ctx context.Context, from From, to To) er
 	if !fromReflect.IsValid() || !toReflect.IsValid() {
 		return nil
 	}
-	return m.copyMessage(fromReflect, toReflect)
+	if err := validatePublicObjectMetadata(from); err != nil {
+		return err
+	}
+	if err := m.copyMessage(fromReflect, toReflect); err != nil {
+		return err
+	}
+	if toReflect.Descriptor().ParentFile().Package() == "osac.public.v1" {
+		filterReservedMetadata(toReflect)
+	}
+	return nil
+}
+
+const reservedMetadataError = "Label or annotation is reserved for use by the system."
+
+func restoreReservedMetadata(current, candidate proto.Message) {
+	if current == nil || candidate == nil {
+		return
+	}
+	currentMessage := current.ProtoReflect()
+	candidateMessage := candidate.ProtoReflect()
+	if !currentMessage.IsValid() || !candidateMessage.IsValid() ||
+		currentMessage.Descriptor().FullName() != candidateMessage.Descriptor().FullName() {
+		return
+	}
+	currentMetadataField := currentMessage.Descriptor().Fields().ByName("metadata")
+	candidateMetadataField := candidateMessage.Descriptor().Fields().ByName("metadata")
+	if currentMetadataField == nil || candidateMetadataField == nil ||
+		currentMetadataField.Message() == nil || candidateMetadataField.Message() == nil ||
+		!currentMessage.Has(currentMetadataField) {
+		return
+	}
+	currentMetadata := currentMessage.Get(currentMetadataField).Message()
+	hasCurrentReservedMetadata := false
+	for _, name := range []protoreflect.Name{"labels", "annotations"} {
+		currentField := currentMetadata.Descriptor().Fields().ByName(name)
+		if currentField == nil || !currentField.IsMap() || currentField.MapValue().Kind() != protoreflect.StringKind {
+			continue
+		}
+		currentMetadata.Get(currentField).Map().Range(func(key protoreflect.MapKey, _ protoreflect.Value) bool {
+			if metadatautil.IsReservedMetadataKey(key.String()) {
+				hasCurrentReservedMetadata = true
+				return false
+			}
+			return true
+		})
+	}
+	if !candidateMessage.Has(candidateMetadataField) && !hasCurrentReservedMetadata {
+		return
+	}
+	candidateMetadata := candidateMessage.Mutable(candidateMetadataField).Message()
+	for _, name := range []protoreflect.Name{"labels", "annotations"} {
+		currentField := currentMetadata.Descriptor().Fields().ByName(name)
+		candidateField := candidateMetadata.Descriptor().Fields().ByName(name)
+		if currentField == nil || candidateField == nil || !currentField.IsMap() || !candidateField.IsMap() ||
+			currentField.MapValue().Kind() != protoreflect.StringKind || candidateField.MapValue().Kind() != protoreflect.StringKind {
+			continue
+		}
+		candidateValues := candidateMetadata.Mutable(candidateField).Map()
+		var candidateReservedKeys []protoreflect.MapKey
+		candidateValues.Range(func(key protoreflect.MapKey, _ protoreflect.Value) bool {
+			if metadatautil.IsReservedMetadataKey(key.String()) {
+				candidateReservedKeys = append(candidateReservedKeys, key)
+			}
+			return true
+		})
+		for _, key := range candidateReservedKeys {
+			candidateValues.Clear(key)
+		}
+		currentMetadata.Get(currentField).Map().Range(func(key protoreflect.MapKey, value protoreflect.Value) bool {
+			if metadatautil.IsReservedMetadataKey(key.String()) {
+				candidateValues.Set(key, value)
+			}
+			return true
+		})
+	}
+}
+
+func walkPublicMetadata(message protoreflect.Message, visit func(protoreflect.Message) error) error {
+	if !message.IsValid() {
+		return nil
+	}
+	if message.Descriptor().FullName() == "osac.public.v1.Metadata" {
+		if err := visit(message); err != nil {
+			return err
+		}
+	}
+
+	fields := message.Descriptor().Fields()
+	for i := range fields.Len() {
+		field := fields.Get(i)
+		if !message.Has(field) {
+			continue
+		}
+		if field.IsList() {
+			if field.Message() == nil {
+				continue
+			}
+			list := message.Get(field).List()
+			for j := range list.Len() {
+				if err := walkPublicMetadata(list.Get(j).Message(), visit); err != nil {
+					return err
+				}
+			}
+			continue
+		}
+		if field.IsMap() {
+			if field.MapValue().Message() == nil {
+				continue
+			}
+			var validationErr error
+			message.Get(field).Map().Range(func(_ protoreflect.MapKey, value protoreflect.Value) bool {
+				validationErr = walkPublicMetadata(value.Message(), visit)
+				return validationErr == nil
+			})
+			if validationErr != nil {
+				return validationErr
+			}
+			continue
+		}
+		if field.Message() != nil {
+			if err := walkPublicMetadata(message.Get(field).Message(), visit); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func validatePublicMetadata(message protoreflect.Message) error {
+	return walkPublicMetadata(message, func(metadata protoreflect.Message) error {
+		for _, name := range []protoreflect.Name{"labels", "annotations"} {
+			field := metadata.Descriptor().Fields().ByName(name)
+			if field == nil || !metadata.Has(field) {
+				continue
+			}
+			reserved := false
+			metadata.Get(field).Map().Range(func(key protoreflect.MapKey, _ protoreflect.Value) bool {
+				reserved = metadatautil.IsReservedMetadataKey(key.String())
+				return !reserved
+			})
+			if reserved {
+				return grpcstatus.Error(grpccodes.InvalidArgument, reservedMetadataError)
+			}
+		}
+		return nil
+	})
+}
+
+func validatePublicObjectMetadata(object proto.Message) error {
+	if object == nil {
+		return nil
+	}
+	message := object.ProtoReflect()
+	if !message.IsValid() || message.Descriptor().ParentFile().Package() != "osac.public.v1" {
+		return nil
+	}
+	return validatePublicMetadata(message)
+}
+
+func publicInputMappingError(err error, message string) error {
+	if grpcstatus.Code(err) == grpccodes.InvalidArgument {
+		return err
+	}
+	return grpcstatus.Error(grpccodes.Internal, message)
+}
+
+func filterReservedMetadata(message protoreflect.Message) {
+	_ = walkPublicMetadata(message, func(metadata protoreflect.Message) error {
+		for _, name := range []protoreflect.Name{"labels", "annotations"} {
+			field := metadata.Descriptor().Fields().ByName(name)
+			if field == nil || !metadata.Has(field) {
+				continue
+			}
+			values := metadata.Get(field).Map()
+			var reservedKeys []protoreflect.MapKey
+			values.Range(func(key protoreflect.MapKey, _ protoreflect.Value) bool {
+				if metadatautil.IsReservedMetadataKey(key.String()) {
+					reservedKeys = append(reservedKeys, key)
+				}
+				return true
+			})
+			for _, key := range reservedKeys {
+				values.Clear(key)
+			}
+		}
+		return nil
+	})
 }
 
 func (m *GenericMapper[From, To]) copyMessage(from, to protoreflect.Message) error {

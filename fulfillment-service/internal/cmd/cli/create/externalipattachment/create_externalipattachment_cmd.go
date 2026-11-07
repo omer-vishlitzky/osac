@@ -21,17 +21,19 @@ import (
 	"github.com/spf13/cobra"
 	"google.golang.org/protobuf/proto"
 
-	publicv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/public/v1"
+	"github.com/osac-project/osac/fulfillment-service/internal/cmd/cli/create/metautil"
 	"github.com/osac-project/osac/fulfillment-service/internal/cmd/cli/lookup"
 	"github.com/osac-project/osac/fulfillment-service/internal/config"
 	"github.com/osac-project/osac/fulfillment-service/internal/logging"
 	"github.com/osac-project/osac/fulfillment-service/internal/terminal"
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
 
 func Cmd() *cobra.Command {
 	runner := &runnerContext{}
 	result := &cobra.Command{
 		Use:                   "externalipattachment [FLAG...]",
+		Aliases:               []string{string(proto.MessageName((*publicv1.ExternalIPAttachment)(nil)))},
 		Short:                 shortHelp,
 		Long:                  longHelp,
 		DisableFlagsInUseLine: true,
@@ -203,11 +205,8 @@ func (c *runnerContext) run(cmd *cobra.Command, args []string) error {
 	attachClient := publicv1.NewExternalIPAttachmentsClient(conn)
 
 	attachment := publicv1.ExternalIPAttachment_builder{
-		Metadata: publicv1.Metadata_builder{
-			Name:   c.args.name,
-			Tenant: cfg.Tenant(),
-		}.Build(),
-		Spec: spec.Build(),
+		Metadata: metautil.ForCreate(ctx, c.args.name).Build(),
+		Spec:     spec.Build(),
 	}.Build()
 
 	response, err := attachClient.Create(ctx, publicv1.ExternalIPAttachmentsCreateRequest_builder{

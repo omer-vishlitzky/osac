@@ -1,0 +1,465 @@
+/*
+Copyright (c) 2026 Red Hat Inc.
+
+Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on an
+"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the
+specific language governing permissions and limitations under the License.
+*/
+
+package servers
+
+import (
+	"strings"
+
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
+
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
+)
+
+func policyTestInt32(value int32) *int32 { return &value }
+
+func policyTestSubnet(name string) *privatev1.SubnetLocalReference {
+	return privatev1.SubnetLocalReference_builder{Name: name}.Build()
+}
+
+func policyTestSecurityGroup(name string) *privatev1.SecurityGroupLocalReference {
+	return privatev1.SecurityGroupLocalReference_builder{Name: name}.Build()
+}
+
+var _ = Describe("Shared typed-policy helper", func() {
+	It("distinguishes omitted and empty additional disks", func() {
+		disk := privatev1.ComputeInstanceDisk_builder{SizeGib: policyTestInt32(20)}.Build()
+		fields := privatev1.ComputeInstanceCatalogItemFields_builder{
+			AdditionalDisks: privatev1.ComputeInstanceDiskListFieldPolicy_builder{
+				Editable: privatev1.EditableComputeInstanceDiskList_builder{
+					DefaultValue: privatev1.ComputeInstanceDiskList_builder{Items: []*privatev1.ComputeInstanceDisk{disk}}.Build(),
+				}.Build(),
+			}.Build(),
+		}.Build()
+
+		omitted := &privatev1.ComputeInstanceSpec{}
+		Expect(applyComputeInstanceCatalogItemPolicies(omitted, fields)).To(Succeed())
+		Expect(omitted.GetAdditionalDisks().GetItems()).To(HaveLen(1))
+
+		explicitEmpty := &privatev1.ComputeInstanceSpec{}
+		err := protojson.Unmarshal([]byte(`{"additional_disks":{"items":[]}}`), explicitEmpty)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(applyComputeInstanceCatalogItemPolicies(explicitEmpty, fields)).To(Succeed())
+		Expect(explicitEmpty.GetAdditionalDisks()).NotTo(BeNil())
+		Expect(explicitEmpty.GetAdditionalDisks().GetItems()).To(BeEmpty())
+
+		locked := privatev1.ComputeInstanceCatalogItemFields_builder{
+			AdditionalDisks: privatev1.ComputeInstanceDiskListFieldPolicy_builder{
+				Locked: privatev1.ComputeInstanceDiskList_builder{Items: []*privatev1.ComputeInstanceDisk{disk}}.Build(),
+			}.Build(),
+		}.Build()
+		Expect(applyComputeInstanceCatalogItemPolicies(explicitEmpty, locked)).To(MatchError(ContainSubstring("field is not editable")))
+	})
+
+	Describe("Cluster CIDR policies", func() {
+		It("canonicalizes IPv6 defaults", func() {
+			value := "2001:db8:1::1/48"
+			policy := privatev1.StringFieldPolicy_builder{
+				Editable: privatev1.EditableStringField_builder{DefaultValue: &value}.Build(),
+			}.Build()
+			Expect(canonicalizeCatalogItemCIDRPolicy(policy, "fields.network.pod_cidr")).To(Succeed())
+			Expect(policy.GetEditable().GetDefaultValue()).To(Equal("2001:db8:1::/48"))
+		})
+
+		It("qualifies invalid values once", func() {
+			value := "invalid"
+			policy := privatev1.StringFieldPolicy_builder{Locked: &value}.Build()
+			err := canonicalizeCatalogItemCIDRPolicy(policy, "fields.network.pod_cidr")
+			Expect(err).To(HaveOccurred())
+			Expect(strings.Count(err.Error(), "fields.network.pod_cidr")).To(Equal(1))
+		})
+	})
+
+	It("applies scalar precedence", func() {
+		locked := "locked"
+		got := ""
+		set := func(value string) { got = value }
+		Expect(applyPolicy(privatev1.StringFieldPolicy_builder{Locked: &locked}.Build(), false, set, decodeStringPolicy, identity[string])).To(Succeed())
+		Expect(got).To(Equal(locked))
+		Expect(applyPolicy(privatev1.StringFieldPolicy_builder{Locked: &locked}.Build(), true, set, decodeStringPolicy, identity[string])).To(MatchError(ContainSubstring("field is not editable")))
+		Expect(applyPolicy(&privatev1.StringFieldPolicy{}, false, set, decodeStringPolicy, identity[string])).To(MatchError(ContainSubstring("string policy has no behavior")))
+	})
+
+	DescribeTable("validates inline source policy content", func(locked bool, content string, validate, invalid bool) {
+		source := privatev1.UserDataSource_builder{Inline: &content}.Build()
+		policy := privatev1.UserDataSourceFieldPolicy_builder{Locked: source}.Build()
+		if !locked {
+			policy = privatev1.UserDataSourceFieldPolicy_builder{
+				Editable: privatev1.EditableUserDataSourceField_builder{DefaultValue: source}.Build(),
+			}.Build()
+		}
+		var validator func([]byte) error
+		if validate {
+			validator = isPureXMLNoDTD
+		}
+		err := validateCatalogItemUserDataSourcePolicy(ctx, referenceScope{}, policy, nil, validator)
+		if invalid {
+			Expect(err).To(MatchError(ContainSubstring("fields.user_data_source.inline")))
+		} else {
+			Expect(err).NotTo(HaveOccurred())
+		}
+	},
+		Entry("validates a locked inline source", true, "<unattend/>", true, false),
+		Entry("validates an inline default", false, "<unattend/>", true, false),
+		Entry("rejects an invalid locked source", true, "not XML", true, true),
+		Entry("rejects an invalid default", false, "not XML", true, true),
+		Entry("validates explicitly empty inline content", true, "", true, true),
+		Entry("defers validation without a validator", false, "not XML", false, false),
+	)
+
+	It("skips inline validation when no source value is configured", func() {
+		for _, policy := range []*privatev1.UserDataSourceFieldPolicy{
+			nil,
+			privatev1.UserDataSourceFieldPolicy_builder{Editable: privatev1.EditableUserDataSourceField_builder{}.Build()}.Build(),
+		} {
+			Expect(validateCatalogItemUserDataSourcePolicy(ctx, referenceScope{}, policy, nil, isPureXMLNoDTD)).To(Succeed())
+		}
+	})
+
+	Describe("user_data_source.secret policy application", func() {
+		It("applies locked user_data_source.secret to compute spec", func() {
+			lockedSecret := privatev1.SecretLocalReference_builder{
+				Id: "secret-id", Name: "user-data-secret",
+			}.Build()
+			fields := privatev1.ComputeInstanceCatalogItemFields_builder{
+				UserDataSource: privatev1.UserDataSourceFieldPolicy_builder{
+					Locked: privatev1.UserDataSource_builder{Secret: lockedSecret}.Build(),
+				}.Build(),
+			}.Build()
+			spec := &privatev1.ComputeInstanceSpec{}
+			Expect(applyComputeInstanceCatalogItemPolicies(spec, fields)).To(Succeed())
+			Expect(spec.GetUserDataSource().GetSecret()).NotTo(BeNil())
+			Expect(spec.GetUserDataSource().GetSecret().GetId()).To(Equal("secret-id"))
+			Expect(spec.GetUserDataSource().GetSecret().GetName()).To(Equal("user-data-secret"))
+		})
+
+		It("applies editable default user_data_source.secret to compute spec", func() {
+			defaultSecret := privatev1.SecretLocalReference_builder{
+				Id: "default-id", Name: "default-name",
+			}.Build()
+			fields := privatev1.ComputeInstanceCatalogItemFields_builder{
+				UserDataSource: privatev1.UserDataSourceFieldPolicy_builder{
+					Editable: privatev1.EditableUserDataSourceField_builder{
+						DefaultValue: privatev1.UserDataSource_builder{Secret: defaultSecret}.Build(),
+					}.Build(),
+				}.Build(),
+			}.Build()
+			omitted := &privatev1.ComputeInstanceSpec{}
+			Expect(applyComputeInstanceCatalogItemPolicies(omitted, fields)).To(Succeed())
+			Expect(omitted.GetUserDataSource().GetSecret().GetId()).To(Equal("default-id"))
+
+			supplied := privatev1.ComputeInstanceSpec_builder{
+				UserDataSource: privatev1.UserDataSource_builder{Inline: new("")}.Build(),
+			}.Build()
+			Expect(applyComputeInstanceCatalogItemPolicies(supplied, fields)).To(Succeed())
+			Expect(supplied.GetUserDataSource().HasInline()).To(BeTrue())
+			Expect(supplied.GetUserDataSource().GetInline()).To(BeEmpty())
+			Expect(supplied.GetUserDataSource().GetSecret()).To(BeNil())
+		})
+
+		It("rejects caller value for locked user_data_source.secret on compute", func() {
+			fields := privatev1.ComputeInstanceCatalogItemFields_builder{
+				UserDataSource: privatev1.UserDataSourceFieldPolicy_builder{
+					Locked: privatev1.UserDataSource_builder{Secret: privatev1.SecretLocalReference_builder{Id: "locked-id"}.Build()}.Build(),
+				}.Build(),
+			}.Build()
+			spec := privatev1.ComputeInstanceSpec_builder{
+				UserDataSource: privatev1.UserDataSource_builder{Secret: privatev1.SecretLocalReference_builder{Id: "caller-id"}.Build()}.Build(),
+			}.Build()
+			Expect(applyComputeInstanceCatalogItemPolicies(spec, fields)).To(MatchError(ContainSubstring("not editable")))
+		})
+
+		It("applies locked user_data_source.secret to bare metal spec", func() {
+			lockedSecret := privatev1.SecretLocalReference_builder{
+				Id: "bm-secret-id", Name: "bm-user-data",
+			}.Build()
+			fields := privatev1.BareMetalInstanceCatalogItemFields_builder{
+				UserDataSource: privatev1.UserDataSourceFieldPolicy_builder{
+					Locked: privatev1.UserDataSource_builder{Secret: lockedSecret}.Build(),
+				}.Build(),
+			}.Build()
+			spec := &privatev1.BareMetalInstanceSpec{}
+			Expect(applyBareMetalInstanceCatalogItemPolicies(spec, fields)).To(Succeed())
+			Expect(spec.GetUserDataSource().GetSecret()).NotTo(BeNil())
+			Expect(spec.GetUserDataSource().GetSecret().GetId()).To(Equal("bm-secret-id"))
+		})
+
+		It("applies editable default user_data_source.secret to bare metal spec", func() {
+			defaultSecret := privatev1.SecretLocalReference_builder{
+				Id: "bm-default-id",
+			}.Build()
+			fields := privatev1.BareMetalInstanceCatalogItemFields_builder{
+				UserDataSource: privatev1.UserDataSourceFieldPolicy_builder{
+					Editable: privatev1.EditableUserDataSourceField_builder{
+						DefaultValue: privatev1.UserDataSource_builder{Secret: defaultSecret}.Build(),
+					}.Build(),
+				}.Build(),
+			}.Build()
+			omitted := &privatev1.BareMetalInstanceSpec{}
+			Expect(applyBareMetalInstanceCatalogItemPolicies(omitted, fields)).To(Succeed())
+			Expect(omitted.GetUserDataSource().GetSecret().GetId()).To(Equal("bm-default-id"))
+
+			supplied := privatev1.BareMetalInstanceSpec_builder{
+				UserDataSource: privatev1.UserDataSource_builder{Inline: new("")}.Build(),
+			}.Build()
+			Expect(applyBareMetalInstanceCatalogItemPolicies(supplied, fields)).To(Succeed())
+			Expect(supplied.GetUserDataSource().HasInline()).To(BeTrue())
+			Expect(supplied.GetUserDataSource().GetInline()).To(BeEmpty())
+			Expect(supplied.GetUserDataSource().GetSecret()).To(BeNil())
+		})
+
+		It("rejects caller value for locked user_data_source.secret on bare metal", func() {
+			fields := privatev1.BareMetalInstanceCatalogItemFields_builder{
+				UserDataSource: privatev1.UserDataSourceFieldPolicy_builder{
+					Locked: privatev1.UserDataSource_builder{Secret: privatev1.SecretLocalReference_builder{Id: "locked-id"}.Build()}.Build(),
+				}.Build(),
+			}.Build()
+			spec := privatev1.BareMetalInstanceSpec_builder{
+				UserDataSource: privatev1.UserDataSource_builder{Secret: privatev1.SecretLocalReference_builder{Id: "caller-id"}.Build()}.Build(),
+			}.Build()
+			Expect(applyBareMetalInstanceCatalogItemPolicies(spec, fields)).To(MatchError(ContainSubstring("not editable")))
+		})
+	})
+
+	It("leaves specs unchanged when no typed policies are present", func() {
+		empty := "existing"
+		spec := privatev1.ComputeInstanceSpec_builder{UserDataSource: privatev1.UserDataSource_builder{Inline: &empty}.Build()}.Build()
+		before := proto.Clone(spec)
+		item := privatev1.ComputeInstanceCatalogItem_builder{
+			Fields: privatev1.ComputeInstanceCatalogItemFields_builder{}.Build(),
+		}.Build()
+
+		Expect(applyComputeInstanceCatalogItemPolicies(spec, item.GetFields())).To(Succeed())
+		Expect(proto.Equal(before, spec)).To(BeTrue())
+	})
+
+	It("applies editable defaults and preserves supplied values", func() {
+		By("applying compute instance disk-image defaults")
+		diskImage := privatev1.DiskImageReference_builder{Name: "default-image"}.Build()
+		computeFields := privatev1.ComputeInstanceCatalogItemFields_builder{
+			DiskImage: privatev1.DiskImageReferenceFieldPolicy_builder{
+				Editable: privatev1.EditableDiskImageReferenceField_builder{DefaultValue: diskImage}.Build(),
+			}.Build(),
+		}.Build()
+		defaultedCompute := &privatev1.ComputeInstanceSpec{}
+		Expect(applyComputeInstanceCatalogItemPolicies(defaultedCompute, privatev1.ComputeInstanceCatalogItem_builder{Fields: computeFields}.Build().GetFields())).To(Succeed())
+		Expect(defaultedCompute.GetDiskImage().GetName()).To(Equal("default-image"))
+
+		suppliedImage := privatev1.DiskImageReference_builder{Name: "supplied-image"}.Build()
+		suppliedCompute := privatev1.ComputeInstanceSpec_builder{DiskImage: suppliedImage}.Build()
+		Expect(applyComputeInstanceCatalogItemPolicies(suppliedCompute, privatev1.ComputeInstanceCatalogItem_builder{Fields: computeFields}.Build().GetFields())).To(Succeed())
+		Expect(suppliedCompute.GetDiskImage()).To(BeIdenticalTo(suppliedImage))
+
+		By("applying cluster version and node-set defaults")
+		version := privatev1.ClusterVersionReference_builder{Name: "default-version"}.Build()
+		clusterFields := privatev1.ClusterCatalogItemFields_builder{
+			Version: privatev1.ClusterVersionReferenceFieldPolicy_builder{
+				Editable: privatev1.EditableClusterVersionReferenceField_builder{DefaultValue: version}.Build(),
+			}.Build(),
+			NodeSets: privatev1.ClusterNodeSetMapPolicy_builder{
+				Editable: privatev1.EditableClusterNodeSetMap_builder{
+					DefaultValue: privatev1.ClusterNodeSetMap_builder{Items: map[string]*privatev1.ClusterCatalogNodeSet{
+						"workers": privatev1.ClusterCatalogNodeSet_builder{Size: 3}.Build(),
+					}}.Build(),
+				}.Build(),
+			}.Build(),
+		}.Build()
+		defaultedCluster := &privatev1.ClusterSpec{}
+		Expect(applyClusterCatalogItemPolicies(defaultedCluster, privatev1.ClusterCatalogItem_builder{Fields: clusterFields}.Build().GetFields())).To(Succeed())
+		Expect(defaultedCluster.GetVersion().GetName()).To(Equal("default-version"))
+		Expect(defaultedCluster.GetNodeSets()["workers"].GetSize()).To(Equal(int32(3)))
+
+		suppliedVersion := privatev1.ClusterVersionReference_builder{Name: "supplied-version"}.Build()
+		suppliedCluster := privatev1.ClusterSpec_builder{Version: suppliedVersion, NodeSets: map[string]*privatev1.ClusterNodeSet{
+			"workers": privatev1.ClusterNodeSet_builder{Size: policyTestInt32(5)}.Build(),
+		}}.Build()
+		Expect(applyClusterCatalogItemPolicies(suppliedCluster, privatev1.ClusterCatalogItem_builder{Fields: clusterFields}.Build().GetFields())).To(Succeed())
+		Expect(suppliedCluster.GetVersion()).To(BeIdenticalTo(suppliedVersion))
+		Expect(suppliedCluster.GetNodeSets()["workers"].GetSize()).To(Equal(int32(5)))
+
+		By("applying bare metal disk-image defaults")
+		image := privatev1.DiskImageReference_builder{Name: "default"}.Build()
+		bareMetalFields := privatev1.BareMetalInstanceCatalogItemFields_builder{
+			DiskImage: privatev1.DiskImageReferenceFieldPolicy_builder{
+				Editable: privatev1.EditableDiskImageReferenceField_builder{DefaultValue: image}.Build(),
+			}.Build(),
+		}.Build()
+		defaultedBareMetal := &privatev1.BareMetalInstanceSpec{}
+		Expect(applyBareMetalInstanceCatalogItemPolicies(defaultedBareMetal, privatev1.BareMetalInstanceCatalogItem_builder{Fields: bareMetalFields}.Build().GetFields())).To(Succeed())
+		Expect(defaultedBareMetal.GetDiskImage().GetName()).To(Equal("default"))
+
+		suppliedBareMetalImage := privatev1.DiskImageReference_builder{Name: "supplied"}.Build()
+		suppliedBareMetal := privatev1.BareMetalInstanceSpec_builder{DiskImage: suppliedBareMetalImage}.Build()
+		Expect(applyBareMetalInstanceCatalogItemPolicies(suppliedBareMetal, privatev1.BareMetalInstanceCatalogItem_builder{Fields: bareMetalFields}.Build().GetFields())).To(Succeed())
+		Expect(suppliedBareMetal.GetDiskImage()).To(BeIdenticalTo(suppliedBareMetalImage))
+	})
+
+	It("applies BMaaS SSH-key policies without dropping SecretReference scope", func() {
+		defaultReference := privatev1.SecretReference_builder{
+			Name:    "default-key",
+			Project: "",
+			Shared:  true,
+		}.Build()
+		fields := privatev1.BareMetalInstanceCatalogItemFields_builder{
+			SshKey: privatev1.FullSecretReferenceFieldPolicy_builder{
+				Editable: privatev1.EditableFullSecretReferenceField_builder{DefaultValue: defaultReference}.Build(),
+			}.Build(),
+		}.Build()
+
+		spec := &privatev1.BareMetalInstanceSpec{}
+		Expect(applyBareMetalInstanceCatalogItemPolicies(spec, fields)).To(Succeed())
+		Expect(spec.GetSshKey()).To(Equal(defaultReference))
+		Expect(spec.GetSshKey().GetProject()).To(BeEmpty())
+		Expect(spec.GetSshKey().GetShared()).To(BeTrue())
+
+		namedReference := privatev1.SecretReference_builder{Name: "project-key", Project: "project-a"}.Build()
+		lockedFields := privatev1.BareMetalInstanceCatalogItemFields_builder{
+			SshKey: privatev1.FullSecretReferenceFieldPolicy_builder{Locked: namedReference}.Build(),
+		}.Build()
+		lockedSpec := &privatev1.BareMetalInstanceSpec{}
+		Expect(applyBareMetalInstanceCatalogItemPolicies(lockedSpec, lockedFields)).To(Succeed())
+		Expect(lockedSpec.GetSshKey()).To(Equal(namedReference))
+	})
+
+	It("rejects nil message payloads without mutating the target", func() {
+		malformed := &privatev1.DiskImageReferenceFieldPolicy{
+			Behavior: &privatev1.DiskImageReferenceFieldPolicy_Locked{},
+		}
+		fields := privatev1.ComputeInstanceCatalogItemFields_builder{DiskImage: malformed}.Build()
+		spec := &privatev1.ComputeInstanceSpec{}
+		before := proto.Clone(spec)
+
+		Expect(applyComputeInstanceCatalogItemPolicies(spec, privatev1.ComputeInstanceCatalogItem_builder{Fields: fields}.Build().GetFields())).To(MatchError(ContainSubstring("locked disk image policy is empty")))
+		Expect(proto.Equal(before, spec)).To(BeTrue())
+	})
+
+	It("rejects explicit false, zero, and empty string values for locked policies", func() {
+		By("rejecting an explicitly false external-IP setting")
+		falseValue := false
+		boolSpec := &privatev1.ComputeInstanceSpec{}
+		boolSpec.SetAutoExternalIpAttachment(falseValue)
+		boolItem := privatev1.ComputeInstanceCatalogItem_builder{
+			Fields: privatev1.ComputeInstanceCatalogItemFields_builder{
+				AutoExternalIpAttachment: privatev1.BoolFieldPolicy_builder{Locked: &falseValue}.Build(),
+			}.Build(),
+		}.Build()
+		Expect(applyComputeInstanceCatalogItemPolicies(boolSpec, boolItem.GetFields())).To(MatchError(ContainSubstring("field is not editable")))
+		Expect(boolSpec.HasAutoExternalIpAttachment()).To(BeTrue())
+		Expect(boolSpec.GetAutoExternalIpAttachment()).To(BeFalse())
+
+		By("rejecting an explicitly zero boot-disk size")
+		zero := int32(0)
+		sizeSpec := &privatev1.ComputeInstanceSpec{}
+		sizeSpec.SetBootDisk(privatev1.ComputeInstanceDisk_builder{SizeGib: &zero}.Build())
+		lockedSize := int32(10)
+		sizeItem := privatev1.ComputeInstanceCatalogItem_builder{
+			Fields: privatev1.ComputeInstanceCatalogItemFields_builder{
+				BootDisk: privatev1.ComputeInstanceBootDiskFieldPolicies_builder{
+					SizeGib: privatev1.Int32FieldPolicy_builder{Locked: &lockedSize}.Build(),
+				}.Build(),
+			}.Build(),
+		}.Build()
+		Expect(applyComputeInstanceCatalogItemPolicies(sizeSpec, sizeItem.GetFields())).To(MatchError(ContainSubstring("field is not editable")))
+		Expect(sizeSpec.GetBootDisk().HasSizeGib()).To(BeTrue())
+		Expect(sizeSpec.GetBootDisk().GetSizeGib()).To(Equal(zero))
+	})
+
+	It("treats empty network and map inputs as omitted", func() {
+		By("defaulting an empty compute network attachment list")
+		computeAttachment := privatev1.ComputeNetworkAttachment_builder{Subnet: policyTestSubnet("compute-subnet")}.Build()
+		computeSpec := &privatev1.ComputeInstanceSpec{}
+		computeSpec.SetNetworkAttachments([]*privatev1.ComputeNetworkAttachment{})
+		computeFields := privatev1.ComputeInstanceCatalogItemFields_builder{
+			NetworkAttachments: privatev1.ComputeNetworkAttachmentListFieldPolicy_builder{
+				Locked: privatev1.ComputeNetworkAttachmentList_builder{Items: []*privatev1.ComputeNetworkAttachment{computeAttachment}}.Build(),
+			}.Build(),
+		}.Build()
+		Expect(applyComputeInstanceCatalogItemPolicies(computeSpec, privatev1.ComputeInstanceCatalogItem_builder{Fields: computeFields}.Build().GetFields())).To(Succeed())
+		Expect(computeSpec.GetNetworkAttachments()).To(HaveLen(1))
+
+		By("defaulting an empty cluster node-set map")
+		clusterSize := int32(2)
+		clusterSpec := &privatev1.ClusterSpec{}
+		clusterSpec.SetNodeSets(map[string]*privatev1.ClusterNodeSet{})
+		clusterFields := privatev1.ClusterCatalogItemFields_builder{
+			NodeSets: privatev1.ClusterNodeSetMapPolicy_builder{
+				Locked: privatev1.ClusterNodeSetMap_builder{Items: map[string]*privatev1.ClusterCatalogNodeSet{"workers": privatev1.ClusterCatalogNodeSet_builder{Size: clusterSize}.Build()}}.Build(),
+			}.Build(),
+		}.Build()
+		Expect(applyClusterCatalogItemPolicies(clusterSpec, privatev1.ClusterCatalogItem_builder{Fields: clusterFields}.Build().GetFields())).To(Succeed())
+		Expect(clusterSpec.GetNodeSets()).To(HaveLen(1))
+
+		By("defaulting an empty bare metal attachment list")
+		bareMetalAttachment := privatev1.BareMetalNetworkAttachment_builder{Subnet: policyTestSubnet("bare-metal-subnet")}.Build()
+		bareMetalSpec := &privatev1.BareMetalInstanceSpec{}
+		bareMetalSpec.SetNetworkAttachments([]*privatev1.BareMetalNetworkAttachment{})
+		bareMetalFields := privatev1.BareMetalInstanceCatalogItemFields_builder{
+			NetworkAttachments: privatev1.BareMetalNetworkAttachmentListFieldPolicy_builder{
+				Locked: privatev1.BareMetalNetworkAttachmentList_builder{Items: []*privatev1.BareMetalNetworkAttachment{bareMetalAttachment}}.Build(),
+			}.Build(),
+		}.Build()
+		Expect(applyBareMetalInstanceCatalogItemPolicies(bareMetalSpec, privatev1.BareMetalInstanceCatalogItem_builder{Fields: bareMetalFields}.Build().GetFields())).To(Succeed())
+		Expect(bareMetalSpec.GetNetworkAttachments()).To(HaveLen(1))
+	})
+
+	It("applies add-on operator list policies with empty input semantics", func() {
+		lockedReference := privatev1.AddOnOperatorReference_builder{Id: "locked-id", Name: "locked"}.Build()
+		lockedFields := privatev1.ClusterCatalogItemFields_builder{
+			AddOnOperators: privatev1.AddOnOperatorReferenceListFieldPolicy_builder{
+				Locked: privatev1.AddOnOperatorReferenceList_builder{
+					Items: []*privatev1.AddOnOperatorReference{lockedReference},
+				}.Build(),
+			}.Build(),
+		}.Build()
+
+		lockedSpec := &privatev1.ClusterSpec{}
+		Expect(applyClusterCatalogItemPolicies(lockedSpec, privatev1.ClusterCatalogItem_builder{Fields: lockedFields}.Build().GetFields())).To(Succeed())
+		Expect(lockedSpec.GetAddOnOperators()).To(HaveLen(1))
+		Expect(lockedSpec.GetAddOnOperators()[0].GetId()).To(Equal("locked-id"))
+
+		suppliedLockedSpec := privatev1.ClusterSpec_builder{
+			AddOnOperators: []*privatev1.AddOnOperatorReference{
+				privatev1.AddOnOperatorReference_builder{Id: "caller-id", Name: "caller"}.Build(),
+			},
+		}.Build()
+		Expect(applyClusterCatalogItemPolicies(suppliedLockedSpec, privatev1.ClusterCatalogItem_builder{Fields: lockedFields}.Build().GetFields())).To(MatchError(ContainSubstring("field is not editable")))
+
+		defaultReference := privatev1.AddOnOperatorReference_builder{Id: "default-id", Name: "default"}.Build()
+		editableFields := privatev1.ClusterCatalogItemFields_builder{
+			AddOnOperators: privatev1.AddOnOperatorReferenceListFieldPolicy_builder{
+				Editable: privatev1.EditableAddOnOperatorReferenceList_builder{
+					DefaultValue: privatev1.AddOnOperatorReferenceList_builder{
+						Items: []*privatev1.AddOnOperatorReference{defaultReference},
+					}.Build(),
+				}.Build(),
+			}.Build(),
+		}.Build()
+
+		emptyEditableSpec := privatev1.ClusterSpec{}
+		emptyEditableSpec.SetAddOnOperators([]*privatev1.AddOnOperatorReference{})
+		Expect(applyClusterCatalogItemPolicies(&emptyEditableSpec, privatev1.ClusterCatalogItem_builder{Fields: editableFields}.Build().GetFields())).To(Succeed())
+		Expect(emptyEditableSpec.GetAddOnOperators()).To(HaveLen(1))
+		Expect(emptyEditableSpec.GetAddOnOperators()[0].GetName()).To(Equal("default"))
+
+		callerReference := privatev1.AddOnOperatorReference_builder{Id: "caller-id", Name: "caller"}.Build()
+		callerEditableSpec := privatev1.ClusterSpec_builder{AddOnOperators: []*privatev1.AddOnOperatorReference{callerReference}}.Build()
+		Expect(applyClusterCatalogItemPolicies(callerEditableSpec, privatev1.ClusterCatalogItem_builder{Fields: editableFields}.Build().GetFields())).To(Succeed())
+		Expect(callerEditableSpec.GetAddOnOperators()).To(HaveLen(1))
+		Expect(callerEditableSpec.GetAddOnOperators()[0].GetId()).To(Equal("caller-id"))
+		Expect(callerEditableSpec.GetAddOnOperators()[0].GetName()).To(Equal("caller"))
+	})
+
+})

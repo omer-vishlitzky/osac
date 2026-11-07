@@ -7,6 +7,7 @@ import (
 )
 
 const (
+	ClusterOrderControllerName          = "clusterorder-controller"
 	subjectKindServiceAccount    string = "ServiceAccount"
 	defaultServiceAccountName    string = "osac"
 	defaultHostedClusterName     string = "cluster"
@@ -23,13 +24,14 @@ const (
 )
 
 var (
+	agentInstanceTypeLabel            string = "osac.openshift.io/instance_type"
+	agentNodeSetLabel                 string = "osac.openshift.io/node-set"
 	osacClusterOrderNameLabel         string = fmt.Sprintf("%s/clusterorder", osacPrefix)
 	osacClusterOrderIDLabel           string = fmt.Sprintf("%s/clusterorder-uuid", osacPrefix)
 	osacFinalizer                     string = fmt.Sprintf("%s/finalizer", osacPrefix)
+	osacAddOnOperatorFinalizer        string = fmt.Sprintf("%s/addon-operator", osacPrefix)
 	osacManagementStateAnnotation     string = fmt.Sprintf("%s/management-state", osacPrefix)
 	osacClusterOrderFeedbackFinalizer string = fmt.Sprintf("%s/clusterorder-feedback", osacPrefix)
-	osacAutoProvisionedLabel          string = fmt.Sprintf("%s/auto-provisioned", osacPrefix)
-	osacAutoProvisionedForLabel       string = fmt.Sprintf("%s/auto-provisioned-for", osacPrefix)
 )
 
 func generateNamespaceName(instance *v1alpha1.ClusterOrder) string {

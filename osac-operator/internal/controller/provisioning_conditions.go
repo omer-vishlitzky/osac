@@ -16,37 +16,22 @@ limitations under the License.
 
 package controller
 
-import (
-	v1alpha1 "github.com/osac-project/osac/osac-operator/api/v1alpha1"
-	apimeta "k8s.io/apimachinery/pkg/api/meta"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-)
-
-func setReadyConditionFailed(conditions *[]metav1.Condition, message string) {
-	apimeta.SetStatusCondition(conditions, metav1.Condition{
-		Type:    v1alpha1.ConditionReady,
-		Status:  metav1.ConditionFalse,
-		Reason:  v1alpha1.ReasonProvisioningFailed,
-		Message: message,
-	})
-}
-
-func setReadyConditionTrue(conditions *[]metav1.Condition) {
-	apimeta.SetStatusCondition(conditions, metav1.Condition{
-		Type:   v1alpha1.ConditionReady,
-		Status: metav1.ConditionTrue,
-		Reason: v1alpha1.ReasonAsExpected,
-	})
-}
-
-// setReadyConditionBlocked marks Ready=False for a precondition that is expected to
-// self-heal once satisfied (e.g. no dispatcher-resolvable manager yet), as opposed to
-// setReadyConditionFailed's terminal provisioning failure.
-func setReadyConditionBlocked(conditions *[]metav1.Condition, reason, message string) {
-	apimeta.SetStatusCondition(conditions, metav1.Condition{
-		Type:    v1alpha1.ConditionReady,
-		Status:  metav1.ConditionFalse,
-		Reason:  reason,
-		Message: message,
-	})
+// noopMessageFromOutputs returns the human-readable no-op message
+// from provisioning job outputs when the backend signals that no real
+// effect was applied (osac_noop: true). Returns "" when the outputs
+// carry no no-op signal.
+func noopMessageFromOutputs(outputs map[string]any) string {
+	if outputs == nil {
+		return ""
+	}
+	noop, _ := outputs["osac_noop"].(bool)
+	if !noop {
+		return ""
+	}
+	msg, _ := outputs["osac_noop_message"].(string)
+	if msg == "" {
+		msg = "Resource accepted as a no-op: " +
+			"no backend policy was applied."
+	}
+	return msg
 }

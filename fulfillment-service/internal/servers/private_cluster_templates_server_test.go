@@ -23,9 +23,9 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/database/dao"
 	"github.com/osac-project/osac/fulfillment-service/internal/uuid"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
 var _ = Describe("Private cluster templates server", func() {
@@ -99,6 +99,68 @@ var _ = Describe("Private cluster templates server", func() {
 			object := response.GetObject()
 			Expect(object).ToNot(BeNil())
 			Expect(object.GetId()).ToNot(BeEmpty())
+		})
+
+		It("derives metadata for a template created with only an ID", func() {
+			response, err := server.Create(ctx, privatev1.ClusterTemplatesCreateRequest_builder{
+				Object: privatev1.ClusterTemplate_builder{
+					Id:    "osac.templates.integration_test",
+					Title: "Integration test template",
+				}.Build(),
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+			Expect(response.GetObject().GetMetadata().GetName()).To(Equal("integration-test"))
+		})
+
+		It("resolves an SSH key default from the selected tenant project", func() {
+			const (
+				keyName    = "cluster-template-project-key"
+				keyProject = "cluster-template-key-project"
+			)
+			projects, err := dao.NewGenericDAO[*privatev1.Project]().
+				SetLogger(logger).
+				SetTenancyLogic(tenancy).
+				Build()
+			Expect(err).ToNot(HaveOccurred())
+			_, err = projects.Create().SetObject(privatev1.Project_builder{
+				Id:       keyProject,
+				Metadata: privatev1.Metadata_builder{Name: keyProject, Tenant: testTenant}.Build(),
+			}.Build()).Do(ctx)
+			Expect(err).ToNot(HaveOccurred())
+
+			secrets, err := dao.NewGenericDAO[*privatev1.Secret]().
+				SetLogger(logger).
+				SetTenancyLogic(tenancy).
+				Build()
+			Expect(err).ToNot(HaveOccurred())
+			root, err := secrets.Create().SetObject(privatev1.Secret_builder{
+				Metadata: privatev1.Metadata_builder{Name: keyName, Tenant: testTenant}.Build(),
+				Type:     privatev1.SecretType_SECRET_TYPE_SSH_PUBLIC_KEY,
+				Data:     map[string][]byte{"public_key": []byte(testSSHPublicKey)},
+			}.Build()).Do(ctx)
+			Expect(err).ToNot(HaveOccurred())
+			project, err := secrets.Create().SetObject(privatev1.Secret_builder{
+				Metadata: privatev1.Metadata_builder{Name: keyName, Tenant: testTenant, Project: keyProject}.Build(),
+				Type:     privatev1.SecretType_SECRET_TYPE_SSH_PUBLIC_KEY,
+				Data:     map[string][]byte{"public_key": []byte(testSSHPublicKey)},
+			}.Build()).Do(ctx)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(project.GetObject().GetId()).NotTo(Equal(root.GetObject().GetId()))
+
+			response, err := server.Create(ctx, privatev1.ClusterTemplatesCreateRequest_builder{
+				Object: privatev1.ClusterTemplate_builder{
+					Metadata: privatev1.Metadata_builder{Name: "template-with-project-key"}.Build(),
+					Title:    "Template with project key",
+					SpecDefaults: privatev1.ClusterTemplateSpecDefaults_builder{
+						SshKey: privatev1.SecretReference_builder{Name: keyName, Project: keyProject}.Build(),
+					}.Build(),
+				}.Build(),
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+			stored := response.GetObject().GetSpecDefaults().GetSshKey()
+			Expect(stored.GetId()).To(Equal(project.GetObject().GetId()))
+			Expect(stored.GetName()).To(Equal(keyName))
+			Expect(stored.GetProject()).To(Equal(keyProject))
 		})
 
 		It("List objects", func() {
@@ -452,6 +514,24 @@ var _ = Describe("Private cluster templates server", func() {
 					SetTenancyLogic(tenancy).
 					Build()
 				Expect(err).ToNot(HaveOccurred())
+			})
+
+			It("Rejects create with spec_defaults.version without a disk image", func() {
+				seedClusterVersionWithoutDiskImage(ctx, privatev1.ClusterVersion_builder{
+					Metadata: privatev1.Metadata_builder{Name: "version-without-disk-image", Tenant: testTenant}.Build(),
+					Spec:     privatev1.ClusterVersionSpec_builder{Version: "4.20.0", Image: "quay.io/ocp:4.20.0", Enabled: proto.Bool(true)}.Build(),
+				}.Build())
+				_, err := validatedServer.Create(ctx, privatev1.ClusterTemplatesCreateRequest_builder{
+					Object: privatev1.ClusterTemplate_builder{
+						Metadata: privatev1.Metadata_builder{Name: "template-without-disk-image"}.Build(),
+						Title:    "Template without a disk image",
+						SpecDefaults: privatev1.ClusterTemplateSpecDefaults_builder{
+							Version: &privatev1.ClusterVersionReference{Name: "version-without-disk-image"},
+						}.Build(),
+					}.Build(),
+				}.Build())
+				Expect(grpcstatus.Code(err)).To(Equal(grpccodes.FailedPrecondition))
+				Expect(grpcstatus.Convert(err).Message()).To(ContainSubstring("disk image"))
 			})
 
 			It("Rejects create with non-existent spec_defaults.version", func() {

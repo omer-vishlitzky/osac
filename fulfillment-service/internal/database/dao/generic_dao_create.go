@@ -183,15 +183,6 @@ func (r *CreateRequest[O]) do(ctx context.Context) (response *CreateResponse[O],
 	created.SetId(id)
 	r.setMetadata(created, metadata)
 
-	// Fire the event:
-	err = r.fireEvent(ctx, Event{
-		Type:   EventTypeCreated,
-		Object: created,
-	})
-	if err != nil {
-		return
-	}
-
 	// Create the response:
 	response = &CreateResponse[O]{
 		object: created,
@@ -214,6 +205,10 @@ func (r *CreateRequest[O]) translateError(ctx context.Context, id, tenant, proje
 			ConstraintName: pgErr.ConstraintName,
 		}
 	case errReferenceCode:
+		return &ErrReference{
+			Reason: pgErr.Message,
+		}
+	case errOwnerReferenceCode:
 		return &ErrReference{
 			Reason: pgErr.Message,
 		}

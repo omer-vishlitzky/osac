@@ -1,0 +1,170 @@
+---
+# Kubernetes create_subnet: the VirtualNetwork's hub network.
+#
+# OVN-Kubernetes needs its own IP-VRF VNI per network and the fabric gives one
+# per VirtualNetwork, so cudn_evpn builds one ClusterUserDefinedNetwork per
+# VirtualNetwork, named osac-vn-<VN API ID> and owned by one Subnet (contract
+# "cudn_evpn limit"). Creating it is the atomic claim: the API server lets one
+# create of that name succeed, and the CUDN records the owner Subnet's API ID.
+#   - absent:                 check the VTEP, create it for this Subnet;
+#   - owned by this Subnet:   check it matches, fix its metadata and selector;
+#   - owned by another:       succeed without changes (VM attachments on this
+#                             Subnet then fail with the implementation limit);
+#   - being deleted:          retry, so this Subnet can claim it once it is gone.
+# The owner waits until OVN-Kubernetes reports the network ready.
+- name: Run cudn_evpn create_subnet
+  block:
+    - name: Plan the task
+      ansible.builtin.include_tasks: _plan.yaml
+
+    - name: Read the VirtualNetwork's hub network
+      kubernetes.core.k8s_info:
+        api_version: k8s.ovn.org/v1
+        kind: ClusterUserDefinedNetwork
+        name: "{{ cudn_evpn.cudn_name }}"
+      register: _cudn_evpn_live
+
+    - name: Assess the existing hub network
+      ansible.builtin.set_fact:
+        _cudn_evpn_assess: >-
+          {{ (_cudn_evpn_live.resources | first | osac.templates.cudn_evpn_cudn_assess(cudn_evpn))
+             if _cudn_evpn_live.resources | length > 0 else {'state': 'absent'} }}
+
+    - name: Stop when the hub network belongs to something else
+      when: _cudn_evpn_assess.state == 'foreign'
+      ansible.builtin.include_tasks: _stop.yaml
+      vars:
+        cudn_evpn_stop:
+          message: >-
+            cudn_evpn create_subnet: ClusterUserDefinedNetwork {{ cudn_evpn.cudn_name }} exists
+            without this VirtualNetwork's tenant and VirtualNetwork labels. A cluster administrator
+            must remove it.
+          retryable: false
+
+    - name: Stop while the previous hub network is being deleted
+      when: _cudn_evpn_assess.state == 'terminating'
+      ansible.builtin.include_tasks: _stop.yaml
+      vars:
+        cudn_evpn_stop:
+          message: >-
+            cudn_evpn create_subnet: the VirtualNetwork's hub network is still being deleted;
+            OSAC retries the task, and this Subnet claims the network once it is gone.
+          retryable: true
+
+    - name: Leave a hub network owned by another Subnet unchanged
+      when: _cudn_evpn_assess.state == 'other'
+      ansible.builtin.debug:
+        msg: >-
+          Subnet {{ cudn_evpn.subnet_id }} does not own the hub network {{ cudn_evpn.cudn_name }}
+          (owner Subnet {{ _cudn_evpn_assess.owner }}); nothing to change. VM attachments on this
+          Subnet fail with the cudn_evpn implementation limit.
+
+    - name: Stop when the owned hub network no longer matches the Subnet
+      when:
+        - _cudn_evpn_assess.state == 'owner'
+        - _cudn_evpn_assess.drift | length > 0
+      ansible.builtin.include_tasks: _stop.yaml
+      vars:
+        cudn_evpn_stop:
+          message: >-
+            cudn_evpn create_subnet: ClusterUserDefinedNetwork {{ cudn_evpn.cudn_name }} differs from
+            this Subnet's address layout or network segment ({{ _cudn_evpn_assess.drift | join(', ') }}).
+            cudn_evpn does not change a network that VMs may use; a cluster administrator must restore it.
+          retryable: false
+
+    - name: Check the hub prerequisites before claiming or reconciling the network
+      when: _cudn_evpn_assess.state in ['absent', 'owner']
+      block:
+        - name: Read the installer's VTEP
+          kubernetes.core.k8s_info:
+            api_version: k8s.ovn.org/v1
+            kind: VTEP
+            name: "{{ cudn_evpn.vtep_name }}"
+          register: _cudn_evpn_vtep
+
+        - name: Stop while the VTEP is missing or not accepted
+          when: not _vtep.ready
+          ansible.builtin.include_tasks: _stop.yaml
+          vars:
+            _vtep: "{{ _cudn_evpn_vtep | osac.templates.cudn_evpn_vtep_state(cudn_evpn.vtep_name) }}"
+            cudn_evpn_stop:
+              message: >-
+                cudn_evpn create_subnet: hub prerequisite missing: {{ _vtep.message }}. The OSAC installer's
+                EVPN host networking (osac-infra evpn values) creates it; OSAC retries the task.
+              retryable: true
+
+    # Server-side apply without force under this Subnet's own field manager:
+    # it creates the network when it is absent, and when another Subnet's
+    # network appeared since the read, the owner fields it manages conflict
+    # (HTTP 409, retryable), so the claim can never take over another owner.
+    - name: Claim the hub network for this Subnet
+      when: _cudn_evpn_assess.state == 'absent'
+      kubernetes.core.k8s:
+        state: present
+        apply: true
+        server_side_apply:
+          field_manager: "cudn-evpn-{{ cudn_evpn.subnet_id }}"
+          force_conflicts: false
+        definition: "{{ cudn_evpn.cudn_manifest }}"
+
+    - name: Restore the hub network's namespace selector
+      when:
+        - _cudn_evpn_assess.state == 'owner'
+        - _cudn_evpn_assess.selector_patch is not none
+      kubernetes.core.k8s_json_patch:
+        api_version: k8s.ovn.org/v1
+        kind: ClusterUserDefinedNetwork
+        name: "{{ cudn_evpn.cudn_name }}"
+        patch: "{{ _cudn_evpn_assess.selector_patch }}"
+
+    - name: Restore the hub network's labels and annotations
+      when:
+        - _cudn_evpn_assess.state == 'owner'
+        - _cudn_evpn_assess.metadata_patch is not none
+      kubernetes.core.k8s:
+        state: patched
+        api_version: k8s.ovn.org/v1
+        kind: ClusterUserDefinedNetwork
+        name: "{{ cudn_evpn.cudn_name }}"
+        definition: "{{ _cudn_evpn_assess.metadata_patch }}"
+
+    - name: Wait until the hub network is ready
+      when: _cudn_evpn_assess.state in ['absent', 'owner']
+      block:
+        - name: Wait for the OVN-Kubernetes conditions of the hub network
+          kubernetes.core.k8s_info:
+            api_version: k8s.ovn.org/v1
+            kind: ClusterUserDefinedNetwork
+            name: "{{ cudn_evpn.cudn_name }}"
+          register: _cudn_evpn_wait
+          until: (_cudn_evpn_wait.resources | default([]) | first | default({}) | osac.templates.cudn_evpn_cudn_ready).ready
+          retries: "{{ cudn_evpn_ready_retries }}"
+          delay: "{{ cudn_evpn_ready_delay }}"
+          ignore_errors: true
+
+        - name: Stop when the hub network is not ready
+          when: _cudn_evpn_wait is failed
+          ansible.builtin.include_tasks: _stop.yaml
+          vars:
+            _ready: "{{ _cudn_evpn_wait.resources | default([]) | first | default({}) | osac.templates.cudn_evpn_cudn_ready }}"
+            cudn_evpn_stop:
+              message: >-
+                cudn_evpn create_subnet: the hub network {{ cudn_evpn.cudn_name }} is not ready after
+                {{ cudn_evpn_ready_retries * cudn_evpn_ready_delay }} seconds
+                ({{ _ready.pending | join(', ') }}); OSAC retries the task.
+              retryable: true
+
+    - name: Publish compute eligibility independently of Subnet readiness
+      ansible.builtin.set_stats:
+        aggregate: false
+        per_host: false
+        data:
+          osac_result:
+            compute_instance_supported: "{{ _cudn_evpn_assess.state != 'other' }}"
+            compute_instance_unsupported_reason: >-
+              {{ 'cudn_evpn supports VMs only on its VirtualNetwork owner Subnet'
+                 if _cudn_evpn_assess.state == 'other' else '' }}
+
+  rescue:
+    - name: Report the failure to OSAC
+      ansible.builtin.include_tasks: _fail.yaml

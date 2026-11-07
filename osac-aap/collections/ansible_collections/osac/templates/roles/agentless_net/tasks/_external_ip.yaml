@@ -1,0 +1,59 @@
+---
+- name: Apply AgentlessNet ExternalIP task
+  block:
+    - name: Validate the ExternalIP task input
+      ansible.builtin.include_tasks: _validate_task_input.yaml
+      vars:
+        agentless_net_expected_kind: ExternalIP
+        agentless_net_expected_tasks: [create_external_ip, delete_external_ip]
+
+    - name: Require the controller-supplied pool snapshot
+      ansible.builtin.assert:
+        that:
+          - osac_job_vars.external_ip_pool is mapping
+          - osac_job_vars.external_ip_pool.id == osac_job_vars.resource.spec.pool
+          - osac_job_vars.external_ip_pool.spec.cidrs is sequence
+          - osac_job_vars.external_ip_pool.spec.cidrs is not string
+          - osac_job_vars.external_ip_pool.spec.cidrs | length == 1
+      no_log: true
+
+    - name: Classify provider failures as retryable
+      ansible.builtin.set_fact:
+        _agentless_net_failure_retryable: true
+
+    - name: Load AgentlessNet provider inventory
+      ansible.builtin.include_tasks: _load_network_node_inventory.yaml
+      vars:
+        agentless_net_require_switches: false
+
+    - name: Reserve or release the ExternalIP by API ID
+      osac.templates.agentless_net_state:
+        action: "{{ agentless_net_external_ip_action }}"
+        state_file: "{{ agentless_net_network_state_file }}"
+        uid: "{{ osac_job_vars.resource.id }}"
+        fulfillment_id: "{{ osac_job_vars.resource.id }}"
+        tenant_id: "{{ osac_job_vars.tenant }}"
+        pool_uid: "{{ osac_job_vars.external_ip_pool.id }}"
+        pool_fulfillment_id: "{{ osac_job_vars.external_ip_pool.id }}"
+        pool_tenant_id: shared
+        pool_cidr: "{{ osac_job_vars.external_ip_pool.spec.cidrs[0] }}"
+      delegate_to: "{{ groups['agentless_net_vn_network_node'][0] }}"
+      become: true
+      register: _agentless_net_external_ip
+      no_log: true
+
+    - name: Return the typed ExternalIP address
+      ansible.builtin.set_stats:
+        aggregate: false
+        per_host: false
+        data:
+          osac_result:
+            external_ip:
+              address: "{{ _agentless_net_external_ip.external_ip.address }}"
+      when: agentless_net_external_ip_action == 'reserve_external_ip'
+  rescue:
+    - name: Publish a sanitized ExternalIP error
+      ansible.builtin.include_tasks: _report_task_error.yaml
+  always:
+    - name: Remove temporary AgentlessNet SSH credentials
+      ansible.builtin.include_tasks: _cleanup_network_node_inventory.yaml

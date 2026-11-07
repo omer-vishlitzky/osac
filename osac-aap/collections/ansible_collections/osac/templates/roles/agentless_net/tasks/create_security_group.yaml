@@ -1,0 +1,8 @@
+---
+# AgentlessNet has no physical policy backend. The contract explicitly permits
+# a documented Fabric SecurityGroup no-op; no task result is emitted.
+- name: Validate the AgentlessNet SecurityGroup create task
+  ansible.builtin.include_tasks: _validate_task_input.yaml
+  vars:
+    agentless_net_expected_kind: SecurityGroup
+    agentless_net_expected_tasks: [create_security_group]

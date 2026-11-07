@@ -21,15 +21,16 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/fieldmaskpb"
+	"google.golang.org/protobuf/types/known/timestamppb"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	clnt "sigs.k8s.io/controller-runtime/pkg/client"
-	ctrllog "sigs.k8s.io/controller-runtime/pkg/log"
 	mcmanager "sigs.k8s.io/multicluster-runtime/pkg/manager"
 
 	"github.com/osac-project/osac/osac-operator/api/v1alpha1"
-	privatev1 "github.com/osac-project/osac/osac-operator/internal/api/osac/private/v1"
 	"github.com/osac-project/osac/osac-operator/internal/controller/feedback"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
 var ErrExternalIPNotFound = errors.New("external IP not found in fulfillment service")
@@ -41,7 +42,7 @@ type ExternalIPFeedbackReconciler struct {
 }
 
 // NewExternalIPFeedbackReconciler creates a reconciler that sends to the fulfillment service updates about external IPs.
-func NewExternalIPFeedbackReconciler(hubClient clnt.Client, grpcConn *grpc.ClientConn, networkingNamespace string) *ExternalIPFeedbackReconciler {
+func NewExternalIPFeedbackReconciler(hubClient clnt.Client, grpcConn grpc.ClientConnInterface, networkingNamespace string) *ExternalIPFeedbackReconciler {
 	eipClient := privatev1.NewExternalIPsClient(grpcConn)
 	r := &ExternalIPFeedbackReconciler{networkingNamespace: networkingNamespace}
 	r.bridge = &feedback.Bridge[*v1alpha1.ExternalIP, *privatev1.ExternalIP]{
@@ -74,7 +75,15 @@ func NewExternalIPFeedbackReconciler(hubClient clnt.Client, grpcConn *grpc.Clien
 		Save: func(ctx context.Context, remote *privatev1.ExternalIP) error {
 			_, err := eipClient.Update(ctx, privatev1.ExternalIPsUpdateRequest_builder{
 				Object: remote,
+				UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{
+					feedbackStatusStatePath, feedbackStatusMessagePath, "status.address", feedbackStatusStateTransitionTimePath,
+				}},
 			}.Build())
+			if err != nil {
+				return err
+			}
+			// Signal on change, so the fulfillment service acts on the new state.
+			_, err = eipClient.Signal(ctx, privatev1.ExternalIPsSignalRequest_builder{Id: remote.GetId()}.Build())
 			return err
 		},
 		Signal: func(ctx context.Context, id string) error {
@@ -108,37 +117,51 @@ func (r *ExternalIPFeedbackReconciler) Reconcile(ctx context.Context, request ct
 	return r.bridge.Reconcile(ctx, request)
 }
 
-func syncExternalIPUpdate(ctx context.Context, obj *v1alpha1.ExternalIP, remote *privatev1.ExternalIP) error {
-	syncExternalIPState(ctx, obj, remote)
-	syncExternalIPAddress(obj, remote)
-	return nil
-}
-
-func syncExternalIPDelete(_ context.Context, obj *v1alpha1.ExternalIP, remote *privatev1.ExternalIP) error {
-	if obj.Status.State == v1alpha1.ExternalIPStateFailed {
-		remote.GetStatus().SetState(privatev1.ExternalIPState_EXTERNAL_IP_STATE_FAILED)
+func syncExternalIPUpdate(_ context.Context, obj *v1alpha1.ExternalIP, remote *privatev1.ExternalIP) error {
+	status := remote.GetStatus()
+	// The API marks an ExternalIP DELETING when it accepts the delete, before the CR has a deletion
+	// timestamp. Until then the CR still reports its old state, which the API would reject.
+	if obj.GetDeletionTimestamp().IsZero() && status.GetState() == privatev1.ExternalIPState_EXTERNAL_IP_STATE_DELETING {
 		return nil
 	}
-	remote.GetStatus().SetState(privatev1.ExternalIPState_EXTERNAL_IP_STATE_DELETING)
+	state, message := networkFeedback(obj, obj.Status.Conditions)
+	switch state {
+	case networkFeedbackReady:
+		// ALLOCATED exactly when the address is set and the ExternalIP is not being deleted.
+		if obj.Status.Address != "" {
+			status.SetState(privatev1.ExternalIPState_EXTERNAL_IP_STATE_ALLOCATED)
+		} else {
+			status.SetState(privatev1.ExternalIPState_EXTERNAL_IP_STATE_PENDING)
+		}
+	case networkFeedbackFailed:
+		status.SetState(privatev1.ExternalIPState_EXTERNAL_IP_STATE_FAILED)
+	case networkFeedbackDeleting:
+		status.SetState(privatev1.ExternalIPState_EXTERNAL_IP_STATE_DELETING)
+	default:
+		status.SetState(privatev1.ExternalIPState_EXTERNAL_IP_STATE_PENDING)
+	}
+	feedbackMessage(message, status.SetMessage, status.ClearMessage)
+	if obj.Status.Address != "" {
+		status.SetAddress(obj.Status.Address)
+	}
+	if obj.Status.StateTransitionTime == nil {
+		status.ClearStateTransitionTime()
+	} else {
+		status.SetStateTransitionTime(timestamppb.New(obj.Status.StateTransitionTime.Time))
+	}
 	return nil
 }
 
-func syncExternalIPState(ctx context.Context, obj *v1alpha1.ExternalIP, remote *privatev1.ExternalIP) {
-	switch obj.Status.State {
-	case v1alpha1.ExternalIPStatePending:
-		remote.GetStatus().SetState(privatev1.ExternalIPState_EXTERNAL_IP_STATE_PENDING)
-	case v1alpha1.ExternalIPStateAllocated:
-		remote.GetStatus().SetState(privatev1.ExternalIPState_EXTERNAL_IP_STATE_ALLOCATED)
-	case v1alpha1.ExternalIPStateFailed:
-		remote.GetStatus().SetState(privatev1.ExternalIPState_EXTERNAL_IP_STATE_FAILED)
-	default:
-		log := ctrllog.FromContext(ctx)
-		log.Info("Unknown state, will ignore it", "state", obj.Status.State)
+func syncExternalIPDelete(ctx context.Context, obj *v1alpha1.ExternalIP, remote *privatev1.ExternalIP) error {
+	stored := remote.GetStatus().GetStateTransitionTime()
+	if err := syncExternalIPUpdate(ctx, obj, remote); err != nil {
+		return err
 	}
-}
-
-func syncExternalIPAddress(obj *v1alpha1.ExternalIP, remote *privatev1.ExternalIP) {
-	if obj.Status.Address != "" {
-		remote.GetStatus().SetAddress(obj.Status.Address)
+	at, err := deletingTransitionTime(obj.Status.StateTransitionTime, obj.DeletionTimestamp, stored,
+		"external IP", remote.GetId())
+	if err != nil {
+		return err
 	}
+	remote.GetStatus().SetStateTransitionTime(at)
+	return nil
 }

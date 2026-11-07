@@ -1,6 +1,6 @@
 # Build context: mono-repo root (not fulfillment-service/ alone).
 # Invoke with: podman build -f fulfillment-service/Containerfile .
-FROM registry.access.redhat.com/ubi10/go-toolset:1.26.7-1788213683 AS builder
+FROM registry.access.redhat.com/ubi10/go-toolset:1.26-1791462472 AS builder
 
 ARG DEBUG=false
 
@@ -10,6 +10,7 @@ ARG DEBUG=false
 # the build using the go.sum files already copied in per module.
 WORKDIR /opt/app-root/src
 COPY --chown=1001:1001 go.work ./
+COPY --chown=1001:1001 proto/go.mod proto/go.sum proto/
 COPY --chown=1001:1001 fulfillment-service/go.mod fulfillment-service/go.sum fulfillment-service/
 COPY --chown=1001:1001 bare-metal-fulfillment-operator/go.mod bare-metal-fulfillment-operator/go.sum bare-metal-fulfillment-operator/
 COPY --chown=1001:1001 osac-operator/go.mod osac-operator/go.sum osac-operator/
@@ -18,20 +19,31 @@ COPY --chown=1001:1001 osac-csi-driver/go.mod osac-csi-driver/go.sum osac-csi-dr
 COPY --chown=1001:1001 osac-metering/schema/go.mod osac-metering/schema/go.sum osac-metering/schema/
 COPY --chown=1001:1001 osac-metering/metering-service/go.mod osac-metering/metering-service/go.sum osac-metering/metering-service/
 COPY --chown=1001:1001 osac-metering/adapters/go.mod osac-metering/adapters/go.sum osac-metering/adapters/
-RUN \
+COPY --chown=1001:1001 osac-ui/proxy/go.mod osac-ui/proxy/go.sum osac-ui/proxy/
+# [ -f /cachi2/cachi2.env ] && . ... sources Hermeto/Cachi2's generated env
+# (GOPROXY/GOFLAGS pointed at the prefetched module cache) when present --
+# i.e. a hermetic Konflux build. Absent entirely for local/non-hermetic
+# builds, where go mod download falls back to the real network as before.
+# Share module downloads and checksum database state across component builds.
+RUN --mount=type=cache,id=osac-go-pkg,target=/opt/app-root/src/go/pkg,uid=1001,gid=0 \
   set -e; \
-  cd fulfillment-service && go mod download
+  cd fulfillment-service; \
+  [ -f /cachi2/cachi2.env ] && . /cachi2/cachi2.env; \
+  GODEBUG=http2client=0 go mod download
 
 ARG VERSION=""
 
 # Copy source for fulfillment-service and its workspace dependencies.
+COPY --chown=1001:1001 proto/ proto/
 COPY --chown=1001:1001 fulfillment-service/ fulfillment-service/
 COPY --chown=1001:1001 bare-metal-fulfillment-operator/ bare-metal-fulfillment-operator/
 COPY --chown=1001:1001 osac-operator/api/ osac-operator/api/
 
 WORKDIR /opt/app-root/src/fulfillment-service
-RUN \
+RUN --mount=type=cache,id=osac-go-pkg,target=/opt/app-root/src/go/pkg,uid=1001,gid=0 \
+    --mount=type=cache,id=osac-go-build,target=/opt/app-root/src/.cache/go-build,uid=1001,gid=0 \
   set -e; \
+  [ -f /cachi2/cachi2.env ] && . /cachi2/cachi2.env; \
   version="${VERSION}"; \
   if [[ -z "${version}" ]]; then \
     version=$(git describe --tags --always 2>/dev/null || echo "dev"); \
@@ -41,15 +53,20 @@ RUN \
   if [[ "${DEBUG}" == "true" ]]; then \
     gcflags="all=-N -l"; \
   fi; \
-  go build -gcflags="${gcflags}" -ldflags="${ldflags}" ./cmd/fulfillment-service
+  go build -gcflags="${gcflags}" -ldflags="${ldflags}" ./cmd/fulfillment-service; \
+  go build -gcflags="${gcflags}" -ldflags="${ldflags}" ./cmd/osac
 
 # dlv stage — only pulled into the build graph when targeting runtime-debug.
 FROM builder AS dlv-builder
 RUN go install github.com/go-delve/delve/cmd/dlv@latest
 
-# Common runtime base with the service binary.
-FROM registry.access.redhat.com/ubi10-minimal:10.2 AS runtime-base
+# Common runtime base with the service binary. osac (the CLI) ships
+# alongside it -- one image, one build, always version-matched to the
+# service it was built with; no separate release mechanism to keep in
+# sync (see docs/RELEASING.md).
+FROM registry.access.redhat.com/ubi10-minimal:1791444565 AS runtime-base
 COPY --from=builder /opt/app-root/src/fulfillment-service/fulfillment-service /usr/local/bin
+COPY --from=builder /opt/app-root/src/fulfillment-service/osac /usr/local/bin
 USER 1001
 
 # Debug variant — adds dlv on top of the base; build with: podman build --target runtime-debug .
@@ -58,3 +75,16 @@ COPY --from=dlv-builder /opt/app-root/src/go/bin/dlv /usr/local/bin
 
 # Default (non-debug) runtime — must stay last so plain `podman build .` targets it.
 FROM runtime-base AS runtime
+# Stamped to the real release version on osac-build-and-publish.yaml's
+# temp branch before tagging (same mechanism as Chart.yaml's own
+# version field) -- the committed default below is only ever what a
+# local/dev build sees. Surfaced as a real OCI label so Konflux's
+# release-side {{ oci_version }} tag templating resolves to it instead
+# of silently falling back to the base image's own inherited version
+# label. Separate from the internal.version.id ldflags above (that one
+# is baked into the binary for `osac version`/CLI reporting; this one is
+# the registry/OCI-level label, invisible to the binary).
+ARG VERSION=dev
+LABEL name="cloud-extensions/fulfillment-service-rhel10"
+LABEL cpe="cpe:/a:redhat:cloud_extensions:0.1::el10"
+LABEL org.opencontainers.image.version="${VERSION}"

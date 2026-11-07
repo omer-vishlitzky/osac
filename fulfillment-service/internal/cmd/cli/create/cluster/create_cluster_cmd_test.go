@@ -19,12 +19,16 @@ import (
 	"log/slog"
 
 	. "github.com/onsi/ginkgo/v2/dsl/core"
+	. "github.com/onsi/ginkgo/v2/dsl/table"
 	. "github.com/onsi/gomega"
 	"google.golang.org/grpc"
 
-	publicv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/public/v1"
+	"github.com/osac-project/osac/fulfillment-service/internal/config"
 	"github.com/osac-project/osac/fulfillment-service/internal/exit"
+	"github.com/osac-project/osac/fulfillment-service/internal/logging"
 	"github.com/osac-project/osac/fulfillment-service/internal/terminal"
+	testutils "github.com/osac-project/osac/fulfillment-service/internal/testing"
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
 
 // mockClusterVersionsClient is a minimal mock that intercepts List calls.
@@ -35,6 +39,20 @@ type mockClusterVersionsClient struct {
 
 func (m *mockClusterVersionsClient) List(ctx context.Context, req *publicv1.ClusterVersionsListRequest, opts ...grpc.CallOption) (*publicv1.ClusterVersionsListResponse, error) {
 	return m.listFunc(ctx, req, opts...)
+}
+
+type mockClusterCatalogItemsServer struct {
+	publicv1.UnimplementedClusterCatalogItemsServer
+}
+
+func (mockClusterCatalogItemsServer) List(context.Context, *publicv1.ClusterCatalogItemsListRequest) (*publicv1.ClusterCatalogItemsListResponse, error) {
+	return publicv1.ClusterCatalogItemsListResponse_builder{
+		Items: []*publicv1.ClusterCatalogItem{
+			publicv1.ClusterCatalogItem_builder{Id: "catalog-item-id"}.Build(),
+		},
+		Size:  1,
+		Total: 1,
+	}.Build(), nil
 }
 
 var _ = Describe("Create cluster flag registration", func() {
@@ -71,6 +89,64 @@ var _ = Describe("Create cluster flag registration", func() {
 		flag := cmd.Flags().Lookup("template")
 		Expect(flag).NotTo(BeNil())
 		Expect(flag.Shorthand).To(Equal("t"))
+	})
+
+	It("should register --node-set flag", func() {
+		cmd := Cmd()
+		cmd.SetOut(GinkgoWriter)
+		cmd.SetErr(GinkgoWriter)
+		flag := cmd.Flags().Lookup("node-set")
+		Expect(flag).NotTo(BeNil())
+		Expect(flag.Usage).To(ContainSubstring("Node set configuration"))
+	})
+
+	It("should register --add-on-operator flag", func() {
+		cmd := Cmd()
+		cmd.SetOut(GinkgoWriter)
+		cmd.SetErr(GinkgoWriter)
+		flag := cmd.Flags().Lookup("add-on-operator")
+		Expect(flag).NotTo(BeNil())
+		Expect(flag.Usage).To(ContainSubstring("Add-on operator"))
+	})
+})
+
+var _ = Describe("Parse cluster node set flag", func() {
+	It("should parse comma-separated key=value assignments", func() {
+		name, ns, err := parseClusterNodeSetFlag("name=workers,size=4,baremetal-instance-type=ci-worker-bm")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(name).To(Equal("workers"))
+		Expect(ns.GetSize()).To(Equal(int32(4)))
+		Expect(ns.GetBaremetalInstanceType().GetName()).To(Equal("ci-worker-bm"))
+	})
+
+	It("should require an explicit node set name", func() {
+		_, _, err := parseClusterNodeSetFlag("size=2,baremetal-instance-type=ci-worker-bm")
+		Expect(err).To(MatchError("--node-set name is required"))
+	})
+
+	It("should reject the underscore spelling of the bare metal instance type key", func() {
+		_, _, err := parseClusterNodeSetFlag("name=workers,baremetal_instance_type=ci-worker-bm")
+		Expect(err).To(HaveOccurred())
+	})
+
+	It("should reject a misspelled node set key", func() {
+		_, _, err := parseClusterNodeSetFlag("name=workers,szie=4")
+		Expect(err).To(HaveOccurred())
+	})
+
+	It("should reject a node set assignment without a value", func() {
+		_, _, err := parseClusterNodeSetFlag("name=workers,size=")
+		Expect(err).To(HaveOccurred())
+	})
+
+	It("should reject a non-integer node set size", func() {
+		_, _, err := parseClusterNodeSetFlag("name=workers,size=two")
+		Expect(err).To(HaveOccurred())
+	})
+
+	It("should reject a node set size outside the 32-bit range", func() {
+		_, _, err := parseClusterNodeSetFlag("name=workers,size=2147483648")
+		Expect(err).To(HaveOccurred())
 	})
 })
 
@@ -260,6 +336,41 @@ var _ = Describe("Create cluster pull secret flags", func() {
 
 })
 
+var _ = Describe("Create cluster SSH key flags", func() {
+	It("should register --ssh-key flag", func() {
+		cmd := Cmd()
+		flag := cmd.Flags().Lookup("ssh-key")
+		Expect(flag).NotTo(BeNil())
+		Expect(flag.DefValue).To(Equal(""))
+	})
+
+	It("sets --ssh-key as a registered Secret reference", func() {
+		runner := &runnerContext{}
+		runner.args.template = "sandbox"
+		runner.args.sshKey = "tenant-login"
+
+		specBuilder := &publicv1.ClusterSpec_builder{}
+		err := runner.applyOptionalSpecFields(specBuilder)
+		Expect(err).ToNot(HaveOccurred())
+		spec := specBuilder.Build()
+		Expect(spec.GetSshKey()).NotTo(BeNil())
+		Expect(spec.GetSshKey().GetName()).To(Equal("tenant-login"))
+	})
+
+	It("sets a project-qualified --ssh-key reference", func() {
+		runner := &runnerContext{}
+		runner.args.template = "sandbox"
+		runner.args.sshKey = "name=tenant-login,project=platform-access"
+
+		specBuilder := &publicv1.ClusterSpec_builder{}
+		err := runner.applyOptionalSpecFields(specBuilder)
+		Expect(err).ToNot(HaveOccurred())
+		spec := specBuilder.Build()
+		Expect(spec.GetSshKey().GetName()).To(Equal("tenant-login"))
+		Expect(spec.GetSshKey().GetProject()).To(Equal("platform-access"))
+	})
+})
+
 var _ = Describe("Create cluster networking flags", func() {
 	It("should register --network-attachment flag", func() {
 		cmd := Cmd()
@@ -344,5 +455,192 @@ var _ = Describe("parseClusterNetworkAttachmentFlag", func() {
 		Expect(err).NotTo(HaveOccurred())
 		Expect(na.GetSecurityGroups()[0].GetName()).To(Equal("named-sg"))
 		Expect(na.GetSecurityGroups()[0].GetId()).To(BeEmpty())
+	})
+})
+
+var _ = Describe("Create cluster metadata propagation", func() {
+	DescribeTable("uses effective tenant and project from command context",
+		func(savedTenant, effectiveTenant, savedProject, effectiveProject string) {
+			logger := slog.New(slog.NewTextHandler(GinkgoWriter, nil))
+			console, err := terminal.NewConsole().
+				SetLogger(logger).
+				SetStdout(GinkgoWriter).
+				SetStderr(GinkgoWriter).
+				Build()
+			Expect(err).NotTo(HaveOccurred())
+
+			settings, err := config.NewSettings().
+				SetLogger(logger).
+				SetDir(GinkgoT().TempDir()).
+				Build()
+			Expect(err).NotTo(HaveOccurred())
+			settings.SetTenant(savedTenant)
+			settings.SetProject(savedProject)
+			settings.SetPlaintext(true)
+
+			server := testutils.NewServer()
+			DeferCleanup(server.Stop)
+			publicv1.RegisterClusterCatalogItemsServer(server.Registrar(), mockClusterCatalogItemsServer{})
+			createRequests := make(chan *publicv1.ClustersCreateRequest, 1)
+			publicv1.RegisterClustersServer(server.Registrar(), &testutils.ClustersServerFuncs{
+				CreateFunc: func(_ context.Context, request *publicv1.ClustersCreateRequest) (*publicv1.ClustersCreateResponse, error) {
+					createRequests <- request
+					return publicv1.ClustersCreateResponse_builder{
+						Object: publicv1.Cluster_builder{Id: "created-cluster"}.Build(),
+					}.Build(), nil
+				},
+			})
+			server.Start()
+			settings.SetAddress(server.Address())
+
+			ctx := logging.LoggerIntoContext(context.Background(), logger)
+			ctx = terminal.ConsoleIntoContext(ctx, console)
+			ctx = config.SettingsIntoContext(ctx, settings)
+			// The root pre-run resolves --tenant and --project into the command context.
+			ctx = config.TenantIntoContext(ctx, effectiveTenant)
+			ctx = config.ProjectIntoContext(ctx, effectiveProject)
+
+			cmd := Cmd()
+			cmd.SetArgs([]string{
+				"--catalog-item", "catalog-item-id",
+				"--name", "test-cluster",
+			})
+			cmd.SetOut(GinkgoWriter)
+			cmd.SetErr(GinkgoWriter)
+			Expect(cmd.ExecuteContext(ctx)).To(Succeed())
+
+			request := <-createRequests
+			cluster := request.GetObject()
+			Expect(cluster.GetMetadata().GetProject()).To(Equal(effectiveProject))
+			Expect(cluster.GetMetadata().GetTenant()).To(Equal(effectiveTenant))
+			Expect(cluster.GetMetadata().GetName()).To(Equal("test-cluster"))
+		},
+		Entry("flags override saved tenant and project",
+			"saved-tenant", "flag-tenant", "saved-project", "flag-project"),
+		Entry("flags work when no tenant or project is saved",
+			"", "flag-tenant", "", "flag-project"),
+	)
+})
+
+var _ = Describe("Create cluster node sets", func() {
+	It("creates a cluster with multiple explicitly named node sets", func() {
+		logger := slog.New(slog.NewTextHandler(GinkgoWriter, nil))
+		console, err := terminal.NewConsole().
+			SetLogger(logger).
+			SetStdout(GinkgoWriter).
+			SetStderr(GinkgoWriter).
+			Build()
+		Expect(err).NotTo(HaveOccurred())
+
+		settings, err := config.NewSettings().
+			SetLogger(logger).
+			SetDir(GinkgoT().TempDir()).
+			Build()
+		Expect(err).NotTo(HaveOccurred())
+		settings.SetTenant("tenant-a")
+		settings.SetPlaintext(true)
+
+		server := testutils.NewServer()
+		DeferCleanup(server.Stop)
+		publicv1.RegisterClusterCatalogItemsServer(server.Registrar(), mockClusterCatalogItemsServer{})
+		createRequests := make(chan *publicv1.ClustersCreateRequest, 1)
+		publicv1.RegisterClustersServer(server.Registrar(), &testutils.ClustersServerFuncs{
+			CreateFunc: func(_ context.Context, request *publicv1.ClustersCreateRequest) (*publicv1.ClustersCreateResponse, error) {
+				createRequests <- request
+				return publicv1.ClustersCreateResponse_builder{
+					Object: publicv1.Cluster_builder{Id: "created-cluster"}.Build(),
+				}.Build(), nil
+			},
+		})
+		server.Start()
+		settings.SetAddress(server.Address())
+
+		ctx := logging.LoggerIntoContext(context.Background(), logger)
+		ctx = terminal.ConsoleIntoContext(ctx, console)
+		ctx = config.SettingsIntoContext(ctx, settings)
+		ctx = config.TenantIntoContext(ctx, settings.Tenant())
+
+		cmd := Cmd()
+		cmd.SetArgs([]string{
+			"--catalog-item", "catalog-item-id",
+			"--name", "test-cluster",
+			"--node-set", "name=compute,size=2,baremetal-instance-type=compute-bm",
+			"--node-set", "name=accelerator,size=1,baremetal-instance-type=accelerator-bm",
+		})
+		cmd.SetOut(GinkgoWriter)
+		cmd.SetErr(GinkgoWriter)
+		Expect(cmd.ExecuteContext(ctx)).To(Succeed())
+
+		request := <-createRequests
+		cluster := request.GetObject()
+		Expect(cluster.GetMetadata().GetName()).To(Equal("test-cluster"))
+		Expect(cluster.GetMetadata().GetTenant()).To(Equal("tenant-a"))
+		Expect(cluster.GetSpec().GetCatalogItem().GetId()).To(Equal("catalog-item-id"))
+
+		nodeSets := cluster.GetSpec().GetNodeSets()
+		Expect(nodeSets).To(HaveLen(2))
+		Expect(nodeSets).To(HaveKey("compute"))
+		Expect(nodeSets).To(HaveKey("accelerator"))
+		Expect(nodeSets["compute"].GetSize()).To(Equal(int32(2)))
+		Expect(nodeSets["compute"].GetBaremetalInstanceType().GetName()).To(Equal("compute-bm"))
+		Expect(nodeSets["accelerator"].GetSize()).To(Equal(int32(1)))
+		Expect(nodeSets["accelerator"].GetBaremetalInstanceType().GetName()).To(Equal("accelerator-bm"))
+	})
+})
+
+var _ = Describe("Create cluster add-on operators", func() {
+	It("passes repeated add-on operator names to cluster creation", func() {
+		logger := slog.New(slog.NewTextHandler(GinkgoWriter, nil))
+		console, err := terminal.NewConsole().
+			SetLogger(logger).
+			SetStdout(GinkgoWriter).
+			SetStderr(GinkgoWriter).
+			Build()
+		Expect(err).NotTo(HaveOccurred())
+
+		settings, err := config.NewSettings().
+			SetLogger(logger).
+			SetDir(GinkgoT().TempDir()).
+			Build()
+		Expect(err).NotTo(HaveOccurred())
+		settings.SetTenant("tenant-a")
+		settings.SetPlaintext(true)
+
+		server := testutils.NewServer()
+		DeferCleanup(server.Stop)
+		publicv1.RegisterClusterCatalogItemsServer(server.Registrar(), mockClusterCatalogItemsServer{})
+		createRequests := make(chan *publicv1.ClustersCreateRequest, 1)
+		publicv1.RegisterClustersServer(server.Registrar(), &testutils.ClustersServerFuncs{
+			CreateFunc: func(_ context.Context, request *publicv1.ClustersCreateRequest) (*publicv1.ClustersCreateResponse, error) {
+				createRequests <- request
+				return publicv1.ClustersCreateResponse_builder{
+					Object: publicv1.Cluster_builder{Id: "created-cluster"}.Build(),
+				}.Build(), nil
+			},
+		})
+		server.Start()
+		settings.SetAddress(server.Address())
+
+		ctx := logging.LoggerIntoContext(context.Background(), logger)
+		ctx = terminal.ConsoleIntoContext(ctx, console)
+		ctx = config.SettingsIntoContext(ctx, settings)
+		ctx = config.TenantIntoContext(ctx, settings.Tenant())
+
+		cmd := Cmd()
+		cmd.SetArgs([]string{
+			"--catalog-item", "catalog-item-id",
+			"--name", "test-cluster",
+			"--add-on-operator", "cert-manager",
+			"--add-on-operator", "gpu-operator",
+		})
+		cmd.SetOut(GinkgoWriter)
+		cmd.SetErr(GinkgoWriter)
+		Expect(cmd.ExecuteContext(ctx)).To(Succeed())
+
+		request := <-createRequests
+		operators := request.GetObject().GetSpec().GetAddOnOperators()
+		Expect(operators).To(HaveLen(2))
+		Expect(operators[0].GetName()).To(Equal("cert-manager"))
+		Expect(operators[1].GetName()).To(Equal("gpu-operator"))
 	})
 })

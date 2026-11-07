@@ -23,10 +23,9 @@ import (
 	grpccodes "google.golang.org/grpc/codes"
 	grpcstatus "google.golang.org/grpc/status"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
-	publicv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/public/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
-	"github.com/osac-project/osac/fulfillment-service/internal/events"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
 
 var diskImageFilterDefaults = []filterDefault{
@@ -38,7 +37,6 @@ var diskImageFilterDefaults = []filterDefault{
 
 type DiskImagesServerBuilder struct {
 	logger            *slog.Logger
-	notifier          events.Notifier
 	attributionLogic  auth.AttributionLogic
 	tenancyLogic      auth.TenancyLogic
 	metricsRegisterer prometheus.Registerer
@@ -61,11 +59,6 @@ func NewDiskImagesServer() *DiskImagesServerBuilder {
 
 func (b *DiskImagesServerBuilder) SetLogger(value *slog.Logger) *DiskImagesServerBuilder {
 	b.logger = value
-	return b
-}
-
-func (b *DiskImagesServerBuilder) SetNotifier(value events.Notifier) *DiskImagesServerBuilder {
-	b.notifier = value
 	return b
 }
 
@@ -115,7 +108,6 @@ func (b *DiskImagesServerBuilder) Build() (result *DiskImagesServer, err error) 
 
 	delegate, err := NewPrivateDiskImagesServer().
 		SetLogger(b.logger).
-		SetNotifier(b.notifier).
 		SetAttributionLogic(b.attributionLogic).
 		SetTenancyLogic(b.tenancyLogic).
 		SetMetricsRegisterer(b.metricsRegisterer).
@@ -218,7 +210,7 @@ func (s *DiskImagesServer) Create(ctx context.Context,
 			"Failed to map public disk image to private",
 			slog.Any("error", err),
 		)
-		err = grpcstatus.Errorf(grpccodes.Internal, "failed to process disk image")
+		err = publicInputMappingError(err, "failed to process disk image")
 		return
 	}
 
@@ -249,6 +241,11 @@ func (s *DiskImagesServer) Create(ctx context.Context,
 
 func (s *DiskImagesServer) Update(ctx context.Context,
 	request *publicv1.DiskImagesUpdateRequest) (response *publicv1.DiskImagesUpdateResponse, err error) {
+	ctx = withPublicAPIView(ctx)
+	if err := validatePublicObjectMetadata(request.GetObject()); err != nil {
+		return nil, err
+	}
+
 	publicDiskImage := request.GetObject()
 	if publicDiskImage == nil {
 		err = grpcstatus.Errorf(grpccodes.InvalidArgument, "object is mandatory")
@@ -281,7 +278,7 @@ func (s *DiskImagesServer) Update(ctx context.Context,
 			"Failed to map public disk image to private",
 			slog.Any("error", err),
 		)
-		err = grpcstatus.Errorf(grpccodes.Internal, "failed to process disk image")
+		err = publicInputMappingError(err, "failed to process disk image")
 		return
 	}
 

@@ -1,10 +1,36 @@
+"""Shared fixtures and configuration for storage E2E tests."""
+
 from __future__ import annotations
 
 import os
+import textwrap
+from collections.abc import Iterator
 
 import pytest
 
+from tests.e2e.core.helpers import registered_ssh_key_secret
+from tests.e2e.core.osac_cli import OsacCLI
 from tests.e2e.core.runner import env, run_unchecked
+
+# ---------------------------------------------------------------------------
+# Shared K8s manifest templates used across storage test files.
+# ---------------------------------------------------------------------------
+
+NAMESPACE_MANIFEST = textwrap.dedent("""\
+    apiVersion: v1
+    kind: Namespace
+    metadata:
+      name: {name}
+""")
+
+TENANT_MANIFEST = textwrap.dedent("""\
+    apiVersion: osac.openshift.io/v1alpha1
+    kind: Tenant
+    metadata:
+      name: {name}
+      namespace: {namespace}
+    spec: {{}}
+""")
 
 
 def _storage_controller_configured(namespace: str) -> bool:
@@ -59,6 +85,10 @@ def _storage_controller_configured(namespace: str) -> bool:
 
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    """Skip storage tests when the storage controller is not configured."""
+    # Collection-only checks import readiness and do not need cluster discovery.
+    if config.getoption("collectonly"):
+        return
     namespace: str = env("OSAC_NAMESPACE", "osac-devel")
     if not _storage_controller_configured(namespace):
         skip_storage = pytest.mark.skip(
@@ -79,19 +109,39 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
 
 @pytest.fixture(scope="session")
 def storage_config_namespace() -> str:
+    """Namespace where storage configuration secrets are stored (OSAC_STORAGE_CONFIG_NAMESPACE)."""
     return env("OSAC_STORAGE_CONFIG_NAMESPACE", "osac-system")
 
 
 @pytest.fixture(scope="session")
 def cluster_template() -> str:
+    """Cluster template name for CaaS cluster provisioning (OSAC_CLUSTER_TEMPLATE)."""
     return env("OSAC_CLUSTER_TEMPLATE", "ocp-ci-small")
 
 
 @pytest.fixture(scope="session")
 def pull_secret_path() -> str:
+    """Filesystem path to the pull secret for CaaS cluster provisioning (OSAC_PULL_SECRET_PATH)."""
     return env("OSAC_PULL_SECRET_PATH")
 
 
 @pytest.fixture(scope="session")
 def ssh_public_key_path() -> str:
+    """Filesystem path to the SSH public key, default ~/.ssh/id_rsa.pub (OSAC_SSH_PUBLIC_KEY_PATH)."""
     return env("OSAC_SSH_PUBLIC_KEY_PATH", os.path.expanduser("~/.ssh/id_rsa.pub"))
+
+
+@pytest.fixture(scope="session")
+def ssh_key_secret(cli: OsacCLI, ssh_public_key_path: str) -> Iterator[str]:
+    """Register the configured SSH public key as a tenant Secret for the storage CaaS journey.
+
+    The Cluster API only accepts a registered SSH-key Secret reference, so the
+    key is registered once per session with the same CLI identity that creates
+    the cluster, and cleaned up afterward.
+    """
+    from pathlib import Path
+    from uuid import uuid4
+
+    public_key = Path(ssh_public_key_path).read_text().strip()
+    with registered_ssh_key_secret(cli, public_key, f"e2e-storage-caas-key-{uuid4().hex[:8]}") as name:
+        yield name

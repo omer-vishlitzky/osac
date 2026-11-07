@@ -23,10 +23,10 @@ import (
 	"github.com/spf13/cobra"
 	"google.golang.org/protobuf/proto"
 
-	publicv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/public/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/cmd/cli/lookup"
 	"github.com/osac-project/osac/fulfillment-service/internal/config"
 	"github.com/osac-project/osac/fulfillment-service/internal/terminal"
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
 
 // Cmd creates the command to describe a disk image.
@@ -104,7 +104,7 @@ func renderDiskImage(w io.Writer, di *publicv1.DiskImage) {
 
 		archStrings := make([]string, len(spec.GetArchitecture()))
 		for i, a := range spec.GetArchitecture() {
-			archStrings[i] = strings.TrimPrefix(a.String(), "ARCHITECTURE_")
+			archStrings[i] = strings.ToLower(strings.TrimPrefix(a.String(), "ARCHITECTURE_"))
 		}
 		fmt.Fprintf(writer, "Architecture:\t%s\n", strings.Join(archStrings, ", "))
 

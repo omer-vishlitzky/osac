@@ -15,13 +15,16 @@ package securitygroup
 
 import (
 	"context"
+	"errors"
 	"slices"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"go.uber.org/mock/gomock"
 	"google.golang.org/grpc"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/validation/field"
@@ -29,19 +32,38 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/controllers"
 	"github.com/osac-project/osac/fulfillment-service/internal/controllers/finalizers"
+	"github.com/osac-project/osac/fulfillment-service/internal/kubernetes/labels"
 	"github.com/osac-project/osac/fulfillment-service/internal/masks"
 	osacv1alpha1 "github.com/osac-project/osac/osac-operator/api/v1alpha1"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
+
+type fakeNetworkingHubReader struct {
+	result controllers.NetworkingHubResolution
+	err    error
+	calls  int
+}
+
+func (f *fakeNetworkingHubReader) Resolve(context.Context) (controllers.NetworkingHubResolution, error) {
+	f.calls++
+	return f.result, f.err
+}
+
+func readyNetworkingHubReader(id, namespace string, client clnt.Client) *fakeNetworkingHubReader {
+	return &fakeNetworkingHubReader{result: controllers.NetworkingHubResolution{
+		NetworkingHub: controllers.NetworkingHub{ID: id, Namespace: namespace, Client: client},
+		HubID:         id,
+		State:         privatev1.NetworkClassState_NETWORK_CLASS_STATE_READY,
+	}}
+}
 
 var _ = Describe("buildSpec", func() {
 	It("Includes virtualNetwork and rules", func() {
 		portFrom := int32(80)
 		portTo := int32(443)
 		ipv4 := "10.0.0.0/8"
-		ipv6 := "2001:db8::/32"
 
 		t := &task{
 			securityGroup: privatev1.SecurityGroup_builder{
@@ -59,14 +81,15 @@ var _ = Describe("buildSpec", func() {
 					Egress: []*privatev1.SecurityRule{
 						privatev1.SecurityRule_builder{
 							Protocol: privatev1.Protocol_PROTOCOL_ALL,
-							Ipv6Cidr: &ipv6,
+							Ipv4Cidr: &ipv4,
 						}.Build(),
 					},
 				}.Build(),
 			}.Build(),
 		}
 
-		spec := t.buildSpec()
+		spec, err := t.buildSpec()
+		Expect(err).ToNot(HaveOccurred())
 
 		Expect(spec.VirtualNetwork).To(Equal("vnet-123"))
 
@@ -75,10 +98,12 @@ var _ = Describe("buildSpec", func() {
 		Expect(*spec.IngressRules[0].PortFrom).To(Equal(int32(80)))
 		Expect(*spec.IngressRules[0].PortTo).To(Equal(int32(443)))
 		Expect(spec.IngressRules[0].SourceCIDR).To(Equal("10.0.0.0/8"))
+		Expect(spec.IngressRules[0].DestinationCIDR).To(BeEmpty())
 
 		Expect(spec.EgressRules).To(HaveLen(1))
 		Expect(string(spec.EgressRules[0].Protocol)).To(Equal("all"))
-		Expect(spec.EgressRules[0].DestinationCIDR).To(Equal("2001:db8::/32"))
+		Expect(spec.EgressRules[0].DestinationCIDR).To(Equal("10.0.0.0/8"))
+		Expect(spec.EgressRules[0].SourceCIDR).To(BeEmpty())
 		Expect(spec.EgressRules[0].PortFrom).To(BeNil())
 		Expect(spec.EgressRules[0].PortTo).To(BeNil())
 	})
@@ -93,11 +118,33 @@ var _ = Describe("buildSpec", func() {
 			}.Build(),
 		}
 
-		spec := t.buildSpec()
+		spec, err := t.buildSpec()
+		Expect(err).ToNot(HaveOccurred())
 
 		Expect(spec.VirtualNetwork).To(Equal("vnet-456"))
 		Expect(spec.IngressRules).To(BeEmpty())
 		Expect(spec.EgressRules).To(BeEmpty())
+	})
+
+	It("Rejects an ingress rule with an empty IPv4 CIDR", func() {
+		ipv4 := ""
+		t := &task{
+			securityGroup: privatev1.SecurityGroup_builder{
+				Id: "sg-empty-cidr",
+				Spec: privatev1.SecurityGroupSpec_builder{
+					VirtualNetwork: privatev1.VirtualNetworkLocalReference_builder{Id: "vnet-empty-cidr"}.Build(),
+					Ingress: []*privatev1.SecurityRule{
+						privatev1.SecurityRule_builder{
+							Protocol: privatev1.Protocol_PROTOCOL_ALL,
+							Ipv4Cidr: &ipv4,
+						}.Build(),
+					},
+				}.Build(),
+			}.Build(),
+		}
+
+		_, err := t.buildSpec()
+		Expect(err).To(MatchError("security group ingress rule 0 must contain an IPv4 CIDR"))
 	})
 })
 
@@ -113,6 +160,15 @@ var _ = Describe("protocolToString", func() {
 // hasFinalizer checks if the fulfillment-controller finalizer is present on the security group.
 func hasFinalizer(sg *privatev1.SecurityGroup) bool {
 	return slices.Contains(sg.GetMetadata().GetFinalizers(), finalizers.Controller)
+}
+
+func expectDeletionRetry(err error) {
+	var retryable interface{ RequeueAfter() time.Duration }
+	Expect(errors.As(err, &retryable)).To(BeTrue())
+	Expect(retryable.RequeueAfter()).To(Equal(time.Second))
+	var backoff interface{ UseExponentialBackoff() bool }
+	Expect(errors.As(err, &backoff)).To(BeTrue())
+	Expect(backoff.UseExponentialBackoff()).To(BeFalse())
 }
 
 var _ = Describe("validateTenant", func() {
@@ -287,23 +343,12 @@ var _ = Describe("delete", func() {
 		DeferCleanup(ctrl.Finish)
 	})
 
-	It("should remove finalizer when hub cache returns ErrHubNotFound", func() {
-		// This test verifies the core behavior: when a hub is decommissioned/deleted,
-		// the reconciler removes its finalizer to allow the security group to be archived.
+	It("should remove finalizer for a legacy resource when the canonical Hub is not found", func() {
 
-		// Mock HubsClient to return a hub
-		hubsClient := controllers.NewMockHubsClient(ctrl)
-		hubsClient.EXPECT().
-			List(gomock.Any(), gomock.Any()).
-			Return(&privatev1.HubsListResponse{
-				Items: []*privatev1.Hub{privatev1.Hub_builder{Id: hubID}.Build()},
-			}, nil)
-
-		// Mock HubCache to return ErrHubNotFound (hub decommissioned)
-		mockHubCache := controllers.NewMockHubCache(ctrl)
-		mockHubCache.EXPECT().
-			Get(gomock.Any(), hubID).
-			Return(nil, controllers.ErrHubNotFound)
+		resolver := &fakeNetworkingHubReader{
+			result: controllers.NetworkingHubResolution{HubID: hubID},
+			err:    controllers.ErrCanonicalHubNotFound,
+		}
 
 		sg := privatev1.SecurityGroup_builder{
 			Id: sgID,
@@ -316,9 +361,8 @@ var _ = Describe("delete", func() {
 		}.Build()
 
 		f := &function{
-			logger:     logger,
-			hubsClient: hubsClient,
-			hubCache:   mockHubCache,
+			logger:              logger,
+			networkingHubReader: resolver,
 		}
 
 		t := &task{
@@ -333,6 +377,71 @@ var _ = Describe("delete", func() {
 		Expect(err).ToNot(HaveOccurred())
 		// Finalizer should be removed to allow archiving
 		Expect(hasFinalizer(t.securityGroup)).To(BeFalse())
+	})
+
+	It("should remove finalizer when its assigned Hub has been decommissioned", func() {
+		hubCache := controllers.NewMockHubCache(ctrl)
+		hubCache.EXPECT().Get(ctx, hubID).Return(nil, controllers.ErrHubNotFound)
+		sg := privatev1.SecurityGroup_builder{
+			Id: sgID,
+			Metadata: privatev1.Metadata_builder{
+				Finalizers: []string{finalizers.Controller},
+			}.Build(),
+			Status: privatev1.SecurityGroupStatus_builder{Hub: hubID}.Build(),
+		}.Build()
+		t := &task{
+			r:             &function{logger: logger, hubCache: hubCache},
+			securityGroup: sg,
+		}
+
+		Expect(t.delete(ctx)).To(Succeed())
+		Expect(hasFinalizer(sg)).To(BeFalse())
+	})
+
+	It("should delete the Kubernetes object from its assigned Hub after the canonical Hub changes", func() {
+		scheme := runtime.NewScheme()
+		Expect(osacv1alpha1.AddToScheme(scheme)).To(Succeed())
+
+		oldHubClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(&osacv1alpha1.SecurityGroup{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "securitygroup-old",
+					Namespace: "old-hub-ns",
+					Labels:    map[string]string{labels.SecurityGroupUuid: sgID},
+				},
+			}).
+			Build()
+		newHubClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+		resolver := readyNetworkingHubReader("new-hub", "new-hub-ns", newHubClient)
+		hubCache := controllers.NewMockHubCache(ctrl)
+		hubCache.EXPECT().Get(ctx, "old-hub").Return(&controllers.HubEntry{
+			Namespace: "old-hub-ns",
+			Client:    oldHubClient,
+		}, nil)
+
+		sg := privatev1.SecurityGroup_builder{
+			Id: sgID,
+			Metadata: privatev1.Metadata_builder{
+				Finalizers: []string{finalizers.Controller},
+			}.Build(),
+			Status: privatev1.SecurityGroupStatus_builder{Hub: "old-hub"}.Build(),
+		}.Build()
+		f := &function{
+			logger:              logger,
+			networkingHubReader: resolver,
+			hubCache:            hubCache,
+		}
+		t := &task{r: f, securityGroup: sg}
+
+		err := t.delete(ctx)
+		expectDeletionRetry(err)
+		Expect(resolver.calls).To(BeZero())
+
+		remaining := &osacv1alpha1.SecurityGroupList{}
+		Expect(oldHubClient.List(ctx, remaining, clnt.InNamespace("old-hub-ns"))).To(Succeed())
+		Expect(remaining.Items).To(BeEmpty())
+		Expect(hasFinalizer(sg)).To(BeTrue())
 	})
 })
 
@@ -394,7 +503,135 @@ var _ = Describe("removeFinalizer", func() {
 	})
 })
 
+var _ = Describe("canonical networking Hub resolution", func() {
+	It("uses the canonical Hub repeatedly and does not fall back when it is unavailable", func() {
+		kubeClient := fake.NewClientBuilder().Build()
+		resolver := readyNetworkingHubReader("hub-a", "hub-a-ns", kubeClient)
+		r := &function{logger: logger, networkingHubReader: resolver}
+		t := &task{r: r, securityGroup: privatev1.SecurityGroup_builder{}.Build()}
+		Expect(t.selectHub(context.Background())).To(Succeed())
+		Expect(t.hubId).To(Equal("hub-a"))
+		Expect(t.hubNamespace).To(Equal("hub-a-ns"))
+		Expect(t.hubClient).To(BeIdenticalTo(kubeClient))
+		Expect(t.selectHub(context.Background())).To(Succeed())
+		Expect(resolver.calls).To(Equal(2))
+
+		for _, resolutionErr := range []error{
+			controllers.ErrNoNetworkingHubs,
+			controllers.ErrMultipleNetworkingHubs,
+			controllers.ErrCanonicalHubUnavailable,
+		} {
+			resolver.err = resolutionErr
+			failed := &task{r: r, securityGroup: privatev1.SecurityGroup_builder{}.Build()}
+			Expect(failed.selectHub(context.Background())).To(MatchError(resolutionErr))
+			Expect(failed.hubClient).To(BeNil())
+		}
+	})
+
+	It("preserves the stored Hub assignment and rejects a changed canonical Hub", func() {
+		resolver := readyNetworkingHubReader("new-hub", "new-hub-ns", fake.NewClientBuilder().Build())
+		t := &task{
+			r: &function{logger: logger, networkingHubReader: resolver},
+			securityGroup: privatev1.SecurityGroup_builder{
+				Status: privatev1.SecurityGroupStatus_builder{Hub: "old-hub"}.Build(),
+			}.Build(),
+		}
+
+		Expect(t.selectHub(context.Background())).To(MatchError(ContainSubstring(controllers.ErrResourceHubConflict.Error())))
+		Expect(t.hubId).To(Equal("new-hub"))
+		Expect(t.securityGroup.GetStatus().GetHub()).To(Equal("old-hub"))
+	})
+
+	It("creates the Kubernetes object and persists the Hub assignment in the same reconcile", func() {
+		ctx := context.Background()
+		ctrl := gomock.NewController(GinkgoT())
+		DeferCleanup(ctrl.Finish)
+
+		scheme := runtime.NewScheme()
+		Expect(osacv1alpha1.AddToScheme(scheme)).To(Succeed())
+		kubeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+		resolver := readyNetworkingHubReader("hub-a", "hub-a-ns", kubeClient)
+		updates := 0
+		securityGroupsClient := NewMockSecurityGroupsClient(ctrl)
+		securityGroupsClient.EXPECT().
+			Update(gomock.Any(), gomock.Any(), gomock.Any()).
+			DoAndReturn(func(_ context.Context, req *privatev1.SecurityGroupsUpdateRequest, _ ...grpc.CallOption) (*privatev1.SecurityGroupsUpdateResponse, error) {
+				updates++
+				if updates > 1 {
+					return &privatev1.SecurityGroupsUpdateResponse{Object: req.GetObject()}, nil
+				}
+				Expect(req.GetObject().GetStatus().GetHub()).To(Equal("hub-a"))
+				Expect(req.GetUpdateMask().GetPaths()).To(ContainElement("status.hub"))
+				return &privatev1.SecurityGroupsUpdateResponse{Object: req.GetObject()}, nil
+			}).MinTimes(1)
+
+		sg := privatev1.SecurityGroup_builder{
+			Id: "sg-hub-assignment",
+			Metadata: privatev1.Metadata_builder{
+				Finalizers: []string{finalizers.Controller},
+				Tenant:     "test-tenant",
+			}.Build(),
+			Spec: privatev1.SecurityGroupSpec_builder{
+				VirtualNetwork: privatev1.VirtualNetworkLocalReference_builder{Id: "vnet-1"}.Build(),
+			}.Build(),
+			Status: privatev1.SecurityGroupStatus_builder{
+				State: privatev1.SecurityGroupState_SECURITY_GROUP_STATE_PENDING,
+			}.Build(),
+		}.Build()
+		f := &function{
+			logger:               logger,
+			securityGroupsClient: securityGroupsClient,
+			networkingHubReader:  resolver,
+			maskCalculator:       masks.NewCalculator().Build(),
+		}
+
+		Expect(f.run(ctx, sg)).To(Succeed())
+		Expect(sg.GetStatus().GetHub()).To(Equal("hub-a"))
+		objects := &osacv1alpha1.SecurityGroupList{}
+		Expect(kubeClient.List(ctx, objects, clnt.InNamespace("hub-a-ns"))).To(Succeed())
+		Expect(objects.Items).To(HaveLen(1))
+	})
+})
+
 var _ = Describe("Kubernetes validation error handling", func() {
+	It("should mark a rule without an IPv4 CIDR as failed without contacting Kubernetes", func() {
+		ctx := context.Background()
+		ctrl := gomock.NewController(GinkgoT())
+		DeferCleanup(ctrl.Finish)
+
+		resolver := readyNetworkingHubReader("hub-1", "test-ns", nil)
+
+		sg := privatev1.SecurityGroup_builder{
+			Id: "sg-legacy-ipv6",
+			Metadata: privatev1.Metadata_builder{
+				Finalizers: []string{finalizers.Controller},
+				Tenant:     "test-tenant",
+			}.Build(),
+			Spec: privatev1.SecurityGroupSpec_builder{
+				VirtualNetwork: privatev1.VirtualNetworkLocalReference_builder{Id: "vnet-1"}.Build(),
+				Ingress: []*privatev1.SecurityRule{
+					privatev1.SecurityRule_builder{}.Build(),
+				},
+			}.Build(),
+			Status: privatev1.SecurityGroupStatus_builder{
+				State: privatev1.SecurityGroupState_SECURITY_GROUP_STATE_PENDING,
+			}.Build(),
+		}.Build()
+
+		t := &task{
+			r: &function{
+				logger:              logger,
+				networkingHubReader: resolver,
+			},
+			securityGroup: sg,
+		}
+
+		err := t.update(ctx)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(sg.GetStatus().GetState()).To(Equal(privatev1.SecurityGroupState_SECURITY_GROUP_STATE_FAILED))
+		Expect(sg.GetStatus().GetMessage()).To(ContainSubstring("must contain an IPv4 CIDR"))
+	})
+
 	It("should set state to FAILED when K8s Create returns Invalid error", func() {
 		ctx := context.Background()
 		ctrl := gomock.NewController(GinkgoT())
@@ -422,18 +659,7 @@ var _ = Describe("Kubernetes validation error handling", func() {
 			}).
 			Build()
 
-		hubsClient := controllers.NewMockHubsClient(ctrl)
-		hubsClient.EXPECT().
-			List(gomock.Any(), gomock.Any()).
-			Return(&privatev1.HubsListResponse{
-				Items: []*privatev1.Hub{privatev1.Hub_builder{Id: "hub-1"}.Build()},
-			}, nil)
-
-		hubCache := controllers.NewMockHubCache(ctrl)
-		hubCache.EXPECT().
-			Get(gomock.Any(), "hub-1").
-			Return(&controllers.HubEntry{Namespace: "test-ns", Client: fakeClient}, nil).
-			AnyTimes()
+		resolver := readyNetworkingHubReader("hub-1", "test-ns", fakeClient)
 
 		securityGroupsClient := NewMockSecurityGroupsClient(ctrl)
 		securityGroupsClient.EXPECT().
@@ -459,12 +685,13 @@ var _ = Describe("Kubernetes validation error handling", func() {
 
 		f := &function{
 			logger:               logger,
-			hubCache:             hubCache,
 			securityGroupsClient: securityGroupsClient,
-			hubsClient:           hubsClient,
+			networkingHubReader:  resolver,
 			maskCalculator:       masks.NewCalculator().Build(),
 		}
 
+		// The first pass stores the Hub assignment. The next pass creates the Kubernetes object.
+		Expect(f.run(ctx, sg)).To(Succeed())
 		err := f.run(ctx, sg)
 		Expect(err).ToNot(HaveOccurred())
 

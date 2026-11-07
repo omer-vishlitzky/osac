@@ -17,6 +17,7 @@ package auth
 
 import (
 	"context"
+	"strings"
 
 	"github.com/golang-jwt/jwt/v5"
 )
@@ -26,12 +27,27 @@ type contextKey int
 
 const (
 	subjectContextKey contextKey = iota
-	tokenContextKey   contextKey = iota
+	tokenContextKey
+	authenticationMethodContextKey
 )
 
 // ContextWithSubject creates a new context containing the given subject.
 func ContextWithSubject(parent context.Context, subject *Subject) context.Context {
 	return context.WithValue(parent, subjectContextKey, subject)
+}
+
+// ContextWithAuthenticationMethod records how the request was authenticated.
+func ContextWithAuthenticationMethod(parent context.Context, method string) context.Context {
+	return context.WithValue(parent, authenticationMethodContextKey, method)
+}
+
+// IsServiceAccount reports whether the authenticated caller is the named
+// Kubernetes service account. The authentication method check prevents a JWT
+// user with the same username from being treated as a service account.
+func IsServiceAccount(ctx context.Context, name string) bool {
+	subject, subjectOK := ctx.Value(subjectContextKey).(*Subject)
+	method, methodOK := ctx.Value(authenticationMethodContextKey).(string)
+	return subjectOK && methodOK && method == "serviceaccount" && subject.User == name
 }
 
 // SubjectFromContext extracts the subject from the context. Panics if there is no subject in the
@@ -44,6 +60,38 @@ func SubjectFromContext(ctx context.Context) *Subject {
 	default:
 		panic("failed to get subject from context")
 	}
+}
+
+// IsControllerServiceAccount reports whether the authenticated caller is the
+// fulfillment controller service account. This is intentionally narrower than
+// IsAdmin: it is used only for controller-owned lifecycle operations that must
+// remain unavailable to ordinary administrators and users.
+func IsControllerServiceAccount(ctx context.Context) bool {
+	subject, ok := ctx.Value(subjectContextKey).(*Subject)
+	return ok && (subject.User == "service-account-osac-controller" ||
+		strings.HasSuffix(subject.User, ":service-account-osac-controller"))
+}
+
+// IsTenantAdmin reports whether the authenticated JWT grants the tenant-admin realm role.
+func IsTenantAdmin(ctx context.Context) bool {
+	token := TokenFromContext(ctx)
+	if token == nil {
+		return false
+	}
+	authContext, err := ExtractAuthContext(token)
+	if err != nil || authContext.RealmAccess == nil {
+		return false
+	}
+	roles, ok := authContext.RealmAccess["roles"].([]any)
+	if !ok {
+		return false
+	}
+	for _, role := range roles {
+		if role == "tenant-admin" {
+			return true
+		}
+	}
+	return false
 }
 
 // ContextWithToken creates a new context containing the given validated JWT token.

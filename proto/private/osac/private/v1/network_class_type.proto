@@ -1,0 +1,202 @@
+//
+// Copyright (c) 2025 Red Hat, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with
+// the License. You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on
+// an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the
+// specific language governing permissions and limitations under the License.
+//
+
+syntax = "proto3";
+
+package osac.private.v1;
+
+import "buf/validate/validate.proto";
+import "cleanapi/cleanapi.proto";
+import "google/api/field_behavior.proto";
+import "osac/private/v1/metadata_type.proto";
+import "osac/private/v1/security_rule_type.proto";
+
+option (cleanapi.file).private = true;
+
+// The deployment's NetworkClass: which managers implement networking and the defaults new tenants get.
+//
+// A deployment has exactly one NetworkClass. The installer creates it from the Helm values, and its spec,
+// `spec.address_plan` included, never changes afterwards; only OSAC writes its status. Tenants do not select a NetworkClass.
+//
+// buf:lint:ignore OSAC_OBJECT_SHAPE
+message NetworkClass {
+  // Unique identifier of the network class.
+  string id = 1;
+
+  // Metadata of the network class.
+  Metadata metadata = 2;
+
+  // Human friendly short description of the network class, only a few words, suitable for displaying in one single
+  // line on a UI or CLI.
+  string title = 3;
+
+  // Human friendly long description of the network class, using Markdown format.
+  string description = 4;
+
+  // Reserved field numbers for removed fields (do not reuse).
+  reserved 5, 6, 7, 9;
+  reserved "implementation_strategy", "constraints", "capabilities", "is_default";
+
+  // Current operational status of the network class.
+  NetworkClassStatus status = 8 [(google.api.field_behavior) = OUTPUT_ONLY];
+
+  // Name of the registered Fabric Manager that handles every networking resource. Required.
+  string fabric_manager = 10 [(buf.validate.field).string.min_len = 1];
+
+  // Name of the OSAC Kubernetes Manager (for example "cudn_evpn"). Required to run VMs; unset when VMaaS is
+  // disabled.
+  optional string k8s_manager = 11;
+
+  // Desired configuration for this network class.
+  NetworkClassSpec spec = 12;
+}
+
+// Desired configuration for a NetworkClass.
+message NetworkClassSpec {
+  // Default networking configuration for tenant onboarding. Required.
+  NetworkDefaults defaults = 1 [(buf.validate.field).required = true];
+
+  // Reserved field numbers for removed fields (do not reuse).
+  reserved 2, 3, 4;
+  reserved "disable_capabilities", "vip_prefix_length", "east_west_config";
+
+  // East-west capabilities the deployment offers.
+  NetworkClassEastWestCapabilities east_west_capabilities = 5;
+
+  // How each Subnet's addresses are split between the overlay, fabric and load balancer VIP ranges. Set by the
+  // installer; required on create; immutable.
+  AddressPlan address_plan = 6;
+}
+
+// Shares of each Subnet's address space. Each share is a multiple of 1/16 from 0 to 1, and the shares sum to 1.
+message AddressPlan {
+  option (buf.validate.message).cel = {
+    id: "address_plan_sum"
+    message: "overlay, fabric and lb_vip must sum to exactly 1"
+    expression: "this.overlay + this.fabric + this.lb_vip == 1.0"
+  };
+
+  // Share of the overlay range (VM addresses on the Kubernetes overlay).
+  double overlay = 1 [(buf.validate.field).double = {
+    gte: 0,
+    lte: 1
+  }];
+
+  // Share of the fabric range (physical servers' DHCP addresses).
+  double fabric = 2 [(buf.validate.field).double = {
+    gte: 0,
+    lte: 1
+  }];
+
+  // Share of the load balancer VIP range (Cluster endpoints).
+  double lb_vip = 3 [(buf.validate.field).double = {
+    gte: 0,
+    lte: 1
+  }];
+}
+
+// East-west capabilities of a deployment.
+message NetworkClassEastWestCapabilities {
+  // Whether FabricDomains of type Ethernet east-west can be created.
+  bool supports_east_west_ethernet = 1;
+}
+
+// Default networking configuration used during tenant onboarding.
+//
+// The default networking manager creates each tenant's default VirtualNetwork, Subnet and SecurityGroup from these
+// values.
+message NetworkDefaults {
+  // Reserved field numbers for removed fields (do not reuse).
+  reserved 5, 6, 7;
+  reserved "virtual_network_ipv6_cidr", "subnet_ipv6_cidr", "enable_nat_gateway";
+
+  // IPv4 CIDR of each tenant's default VirtualNetwork. Required. Example: "10.200.0.0/16"
+  string virtual_network_ipv4_cidr = 1 [(buf.validate.field).cel = {
+    id: "valid_ipv4_cidr"
+    message: "must be valid IPv4 CIDR notation (e.g., '10.0.0.0/16')"
+    expression: "this.isIpPrefix(4, true)"
+  }];
+
+  // IPv4 CIDR of each tenant's default Subnet, inside virtual_network_ipv4_cidr. Required. Example: "10.200.0.0/20"
+  string subnet_ipv4_cidr = 2 [(buf.validate.field).cel = {
+    id: "valid_ipv4_cidr"
+    message: "must be valid IPv4 CIDR notation (e.g., '10.0.1.0/24')"
+    expression: "this.isIpPrefix(4, true)"
+  }];
+
+  // Ingress rules of each tenant's default SecurityGroup.
+  repeated SecurityRule ingress_rules = 3;
+
+  // Egress rules of each tenant's default SecurityGroup.
+  repeated SecurityRule egress_rules = 4;
+}
+
+// Represents the current operational state of a NetworkClass.
+message NetworkClassStatus {
+  // READY once the operator found the registrations of the configured managers.
+  NetworkClassState state = 1;
+
+  // Human-readable details, for example which registration is missing.
+  optional string message = 2;
+
+  // Identifier of the hub that was selected for this network class.
+  string hub = 3;
+
+  // Reserved field numbers for removed fields (do not reuse).
+  reserved 4, 5;
+  reserved "manager_state", "manager_message";
+
+  // The registered managers the operator resolved. Written by the operator.
+  NetworkManagers network_managers = 6;
+
+  // The network type the managers share (for example "evpn"); empty without a Kubernetes Manager.
+  string network_type = 7;
+
+  // Whether every resolved manager declares the security_group_icmp capability, so SecurityGroup rules can use
+  // protocol icmp. Written by the operator with network_managers. Unset while the managers are not resolved, for
+  // example with provider networking disabled.
+  optional bool security_group_icmp = 8;
+}
+
+// The managers of a NetworkClass as the operator resolved them from their registrations.
+message NetworkManagers {
+  // The Fabric Manager.
+  NetworkManager fabric = 1;
+
+  // The Kubernetes Manager, when the NetworkClass names one.
+  optional NetworkManager kubernetes = 2;
+}
+
+// A registered network manager.
+message NetworkManager {
+  // Registration name.
+  string name = 1;
+
+  // Ansible role that implements the manager's tasks.
+  string ansible_role = 2;
+}
+
+// Lifecycle states for NetworkClass resources.
+enum NetworkClassState {
+  // State is unknown or has not been determined yet.
+  NETWORK_CLASS_STATE_UNSPECIFIED = 0;
+
+  // The network class is being initialized and is not yet ready for use.
+  NETWORK_CLASS_STATE_PENDING = 1;
+
+  // The network class is fully operational.
+  NETWORK_CLASS_STATE_READY = 2;
+
+  // The network class has encountered an error, for example a missing registration.
+  NETWORK_CLASS_STATE_FAILED = 3;
+}

@@ -41,8 +41,8 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/reflect/protoregistry"
+	k8sruntime "k8s.io/apimachinery/pkg/runtime"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
 	"github.com/osac-project/osac/fulfillment-service/internal/database"
 	"github.com/osac-project/osac/fulfillment-service/internal/database/dao"
@@ -51,7 +51,10 @@ import (
 	"github.com/osac-project/osac/fulfillment-service/internal/packages"
 	"github.com/osac-project/osac/fulfillment-service/internal/recovery"
 	"github.com/osac-project/osac/fulfillment-service/internal/servers"
+	"github.com/osac-project/osac/fulfillment-service/internal/services"
 	itesting "github.com/osac-project/osac/fulfillment-service/internal/testing"
+	"github.com/osac-project/osac/fulfillment-service/internal/vault"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
 func TestRegisterServers(t *testing.T) {
@@ -60,13 +63,15 @@ func TestRegisterServers(t *testing.T) {
 }
 
 var (
-	ctx         context.Context
-	ctrl        *gomock.Controller
-	logger      *slog.Logger
-	dbContainer *database.Container
-	attribution *auth.MockAttributionLogic
-	tenancy     *auth.MockTenancyLogic
-	conn        *grpc.ClientConn
+	ctx          context.Context
+	ctrl         *gomock.Controller
+	logger       *slog.Logger
+	dbContainer  *database.Container
+	attribution  *auth.MockAttributionLogic
+	tenancy      *auth.MockTenancyLogic
+	conn         *grpc.ClientConn
+	hubScheme    *k8sruntime.Scheme
+	tierResolver servers.TierResolverFunc
 )
 
 var _ = BeforeSuite(func() {
@@ -104,12 +109,12 @@ var _ = BeforeSuite(func() {
 		SetLogger(logger).
 		Build()
 	Expect(err).ToNot(HaveOccurred())
-	err = dbContainer.Start(startupCtx)
-	Expect(err).ToNot(HaveOccurred())
 	DeferCleanup(func(ctx context.Context) {
 		err := dbContainer.Stop(ctx)
 		Expect(err).ToNot(HaveOccurred())
 	})
+	err = dbContainer.Start(startupCtx)
+	Expect(err).ToNot(HaveOccurred())
 
 	ctx = context.Background()
 
@@ -146,19 +151,7 @@ var _ = BeforeSuite(func() {
 		Build()
 	Expect(err).ToNot(HaveOccurred())
 
-	// Create the notifier. ExternalIPPoolsServerBuilder, ProjectsServerBuilder, and PrivateProjectsServerBuilder
-	// require a concrete *database.Notifier (see register_servers.go), so this can't be nil or a different
-	// events.Notifier implementation.
-	notifier, err := database.NewNotifier().
-		SetLogger(logger).
-		SetChannel("events").
-		SetPool(pool).
-		Build()
-	Expect(err).ToNot(HaveOccurred())
-	err = notifier.Start(ctx)
-	Expect(err).ToNot(HaveOccurred())
-
-	hubScheme, err := hubscheme.NewHub()
+	hubScheme, err = hubscheme.NewHub()
 	Expect(err).ToNot(HaveOccurred())
 	metricsRegisterer := prometheus.NewRegistry()
 
@@ -174,37 +167,40 @@ var _ = BeforeSuite(func() {
 		SetTenancyLogic(tenancy).
 		Build()
 	Expect(err).ToNot(HaveOccurred())
-	tierResolver := newDAOTierResolver(storageTiersDAO, storageBackendsDAO)
+	tierResolver = newDAOTierResolver(storageTiersDAO, storageBackendsDAO)
 
 	// Create the private users server, exactly as production does in start_grpc_server_cmd.go's run(). It's
 	// constructed outside RegisterResourceServers there because the JIT provisioning interceptor needs it before
 	// the interceptor chain is built — see ResourceServerDeps.PrivateUsersServer's doc comment.
 	privateUsersServer, err := servers.NewPrivateUsersServer().
 		SetLogger(logger).
-		SetNotifier(notifier).
 		SetAttributionLogic(attribution).
 		SetTenancyLogic(tenancy).
 		SetMetricsRegisterer(metricsRegisterer).
 		Build()
 	Expect(err).ToNot(HaveOccurred())
 
-	// Start a real gRPC server, with the same transaction interceptor production uses, and register every
-	// filterable resource through the exact same function production calls:
+	// Start a real gRPC server with the transaction and reference interceptors production uses, and
+	// register every filterable resource through the same function production calls:
+	referenceValidator, err := newReferenceValidator(logger, tenancy, metricsRegisterer)
+	Expect(err).ToNot(HaveOccurred())
 	server := itesting.NewServer(grpc.ChainUnaryInterceptor(
 		panicInterceptor.UnaryServer,
 		txInterceptor.UnaryServer,
+		referenceValidator.UnaryServer,
 	))
 	DeferCleanup(server.Stop)
 	_, err = RegisterResourceServers(ctx, server.Registrar(), ResourceServerDeps{
 		Logger:                  logger,
-		Notifier:                notifier,
 		PrivateAttributionLogic: attribution,
 		PublicAttributionLogic:  attribution,
 		TenancyLogic:            tenancy,
 		MetricsRegisterer:       metricsRegisterer,
 		HubScheme:               hubScheme,
+		SecretStore:             vault.NewMockSecretStore(ctrl),
 		TierResolver:            tierResolver,
 		PrivateUsersServer:      privateUsersServer,
+		Services:                &services.Flags{CaaS: true, VMaaS: true, BMaaS: true, MaaS: true},
 	})
 	Expect(err).ToNot(HaveOccurred())
 	server.Start()
@@ -452,3 +448,177 @@ func dedupeByResource(cases []filterOracleCase) []filterOracleCase {
 	}
 	return result
 }
+
+// registerWithFlags creates a gRPC server, registers resource servers with the given service flags,
+// and returns the registered service names via GetServiceInfo.
+func registerWithFlags(svcFlags *services.Flags) (map[string]grpc.ServiceInfo, *ResourceServers, error) {
+	srv := grpc.NewServer()
+	rs, err := RegisterResourceServers(ctx, srv, ResourceServerDeps{
+		Logger:                  logger,
+		PrivateAttributionLogic: attribution,
+		PublicAttributionLogic:  attribution,
+		TenancyLogic:            tenancy,
+		MetricsRegisterer:       prometheus.NewRegistry(),
+		HubScheme:               hubScheme,
+		SecretStore:             vault.NewMockSecretStore(ctrl),
+		TierResolver:            tierResolver,
+		PrivateUsersServer:      nil,
+		Services:                svcFlags,
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	return srv.GetServiceInfo(), rs, nil
+}
+
+var _ = Describe("Conditional service registration", func() {
+	// CaaS service names (both public and private)
+	caasServices := []string{
+		"osac.public.v1.ClusterTemplates",
+		"osac.public.v1.AddOnOperators",
+		"osac.public.v1.ClusterCatalogItems",
+		"osac.public.v1.Clusters",
+		"osac.public.v1.ClusterVersions",
+		"osac.private.v1.ClusterTemplates",
+		"osac.private.v1.AddOnOperators",
+		"osac.private.v1.ClusterCatalogItems",
+		"osac.private.v1.Clusters",
+		"osac.private.v1.ClusterVersions",
+	}
+
+	// VMaaS service names
+	vmaasServices := []string{
+		"osac.public.v1.ComputeInstanceTemplates",
+		"osac.public.v1.ComputeInstanceCatalogItems",
+		"osac.public.v1.ComputeInstances",
+		"osac.public.v1.DiskImages",
+		"osac.public.v1.InstanceTypes",
+		"osac.private.v1.ComputeInstanceTemplates",
+		"osac.private.v1.ComputeInstanceCatalogItems",
+		"osac.private.v1.ComputeInstances",
+		"osac.private.v1.DiskImages",
+		"osac.private.v1.InstanceTypes",
+		"osac.private.v1.Volumes",
+	}
+
+	// BMaaS service names
+	bmaasServices := []string{
+		"osac.public.v1.BareMetalInstanceTemplates",
+		"osac.public.v1.BareMetalInstanceCatalogItems",
+		"osac.public.v1.BareMetalInstances",
+		"osac.public.v1.BareMetalInstanceTypes",
+		"osac.private.v1.BareMetalInstanceTemplates",
+		"osac.private.v1.BareMetalInstanceCatalogItems",
+		"osac.private.v1.BareMetalInstances",
+		"osac.private.v1.BareMetalInstanceTypes",
+	}
+
+	// Shared infrastructure services (always registered regardless of flags)
+	sharedServices := []string{
+		"osac.public.v1.VirtualNetworks",
+		"osac.public.v1.Subnets",
+		"osac.public.v1.SecurityGroups",
+		"osac.public.v1.Roles",
+		"osac.public.v1.RoleBindings",
+		"osac.public.v1.ServiceAccounts",
+		"osac.public.v1.ProjectMemberships",
+		"osac.public.v1.ExternalIPPools",
+		"osac.public.v1.ExternalIPs",
+		"osac.public.v1.ExternalIPAttachments",
+		"osac.public.v1.NATGateways",
+		"osac.public.v1.Tenants",
+		"osac.public.v1.IdentityProviders",
+		"osac.public.v1.Projects",
+		"osac.public.v1.Users",
+		"osac.public.v1.Secrets",
+		"osac.public.v1.StorageTiers",
+		"osac.private.v1.Hubs",
+		"osac.private.v1.VirtualNetworks",
+		"osac.private.v1.Subnets",
+		"osac.private.v1.SecurityGroups",
+		"osac.private.v1.NetworkClasses",
+		"osac.private.v1.Roles",
+		"osac.private.v1.RoleBindings",
+		"osac.private.v1.ServiceAccounts",
+		"osac.private.v1.ProjectMemberships",
+		"osac.private.v1.ExternalIPPools",
+		"osac.private.v1.ExternalIPs",
+		"osac.private.v1.ExternalIPAttachments",
+		"osac.private.v1.NATGateways",
+		"osac.private.v1.Tenants",
+		"osac.private.v1.IdentityProviders",
+		"osac.private.v1.Projects",
+		"osac.private.v1.Users",
+		"osac.private.v1.StorageBackends",
+		"osac.private.v1.Secrets",
+		"osac.private.v1.StorageTiers",
+	}
+
+	It("registers all services when all flags are enabled", func() {
+		info, _, err := registerWithFlags(&services.Flags{CaaS: true, VMaaS: true, BMaaS: true, MaaS: true})
+		Expect(err).ToNot(HaveOccurred())
+
+		for _, svc := range append(append(append(caasServices, vmaasServices...), bmaasServices...), sharedServices...) {
+			Expect(info).To(HaveKey(svc), "expected service %s to be registered", svc)
+		}
+	})
+
+	It("excludes BMaaS services when BMaaS is disabled", func() {
+		info, _, err := registerWithFlags(&services.Flags{CaaS: true, VMaaS: true, BMaaS: false, MaaS: false})
+		Expect(err).ToNot(HaveOccurred())
+
+		for _, svc := range bmaasServices {
+			Expect(info).ToNot(HaveKey(svc), "expected BMaaS service %s to NOT be registered", svc)
+		}
+		for _, svc := range caasServices {
+			Expect(info).To(HaveKey(svc), "expected CaaS service %s to be registered", svc)
+		}
+		for _, svc := range vmaasServices {
+			Expect(info).To(HaveKey(svc), "expected VMaaS service %s to be registered", svc)
+		}
+	})
+
+	It("excludes CaaS and BMaaS services when only VMaaS is enabled", func() {
+		info, _, err := registerWithFlags(&services.Flags{CaaS: false, VMaaS: true, BMaaS: false, MaaS: false})
+		Expect(err).ToNot(HaveOccurred())
+
+		for _, svc := range caasServices {
+			Expect(info).ToNot(HaveKey(svc), "expected CaaS service %s to NOT be registered", svc)
+		}
+		for _, svc := range bmaasServices {
+			Expect(info).ToNot(HaveKey(svc), "expected BMaaS service %s to NOT be registered", svc)
+		}
+		for _, svc := range vmaasServices {
+			Expect(info).To(HaveKey(svc), "expected VMaaS service %s to be registered", svc)
+		}
+	})
+
+	It("registers DiskImages when only BMaaS is enabled", func() {
+		info, _, err := registerWithFlags(&services.Flags{CaaS: false, VMaaS: false, BMaaS: true, MaaS: false})
+		Expect(err).ToNot(HaveOccurred())
+
+		Expect(info).To(HaveKey("osac.public.v1.DiskImages"))
+		Expect(info).To(HaveKey("osac.private.v1.DiskImages"))
+	})
+
+	It("always registers shared infrastructure regardless of flags", func() {
+		info, _, err := registerWithFlags(&services.Flags{CaaS: false, VMaaS: false, BMaaS: false, MaaS: false})
+		Expect(err).ToNot(HaveOccurred())
+
+		for _, svc := range sharedServices {
+			Expect(info).To(HaveKey(svc), "expected shared service %s to always be registered", svc)
+		}
+	})
+
+	It("returns nil PrivateComputeInstancesServer when VMaaS is disabled", func() {
+		_, rs, err := registerWithFlags(&services.Flags{CaaS: true, VMaaS: false, BMaaS: true, MaaS: false})
+		Expect(err).ToNot(HaveOccurred())
+		Expect(rs.PrivateComputeInstancesServer).To(BeNil())
+	})
+
+	It("returns non-nil PrivateComputeInstancesServer when VMaaS is enabled", func() {
+		_, rs, err := registerWithFlags(&services.Flags{CaaS: true, VMaaS: true, BMaaS: false, MaaS: false})
+		Expect(err).ToNot(HaveOccurred())
+		Expect(rs.PrivateComputeInstancesServer).ToNot(BeNil())
+	})
+})

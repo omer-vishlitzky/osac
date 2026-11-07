@@ -14,6 +14,7 @@ language governing permissions and limitations under the License.
 package utils
 
 import (
+	"google.golang.org/protobuf/proto"
 	"testing"
 
 	. "github.com/onsi/ginkgo/v2/dsl/core"
@@ -23,7 +24,7 @@ import (
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
 func TestTemplateParameters(t *testing.T) {
@@ -178,6 +179,28 @@ var _ = Describe("ValidateTemplateParameters", func() {
 			err = ValidateTemplateParameters(template, params)
 			Expect(err).To(HaveOccurred())
 			Expect(status.Code(err)).To(Equal(codes.InvalidArgument))
+			Expect(err.Error()).To(ContainSubstring(
+				"template 'empty-template' does not accept any template parameters",
+			))
+		})
+
+		It("should return clear error for multiple provided parameters on empty template", func() {
+			stringValue1 := wrapperspb.String("value1")
+			anyValue1, err := anypb.New(stringValue1)
+			Expect(err).ToNot(HaveOccurred())
+			params["param1"] = anyValue1
+
+			stringValue2 := wrapperspb.String("value2")
+			anyValue2, err := anypb.New(stringValue2)
+			Expect(err).ToNot(HaveOccurred())
+			params["param2"] = anyValue2
+
+			err = ValidateTemplateParameters(template, params)
+			Expect(err).To(HaveOccurred())
+			Expect(status.Code(err)).To(Equal(codes.InvalidArgument))
+			Expect(err.Error()).To(ContainSubstring(
+				"template 'empty-template' does not accept any template parameters",
+			))
 		})
 
 		It("should pass validation with no parameters", func() {
@@ -701,4 +724,34 @@ func (m *mockParameter) GetType() string {
 
 func (m *mockParameter) GetDefault() *anypb.Any {
 	return m.defaultValue
+}
+
+func TestApplyTemplateParameterDefaultsAndValidate(t *testing.T) {
+	value, err := anypb.New(wrapperspb.Bool(false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	template := ComputeInstanceTemplateAdapter{ComputeInstanceTemplate: privatev1.ComputeInstanceTemplate_builder{
+		Parameters: []*privatev1.ComputeInstanceTemplateParameterDefinition{
+			privatev1.ComputeInstanceTemplateParameterDefinition_builder{Name: "enabled", Required: true, Type: value.GetTypeUrl(), Default: value}.Build(),
+		},
+	}.Build()}
+	resolved, err := ApplyTemplateParameterDefaultsAndValidate(template, nil)
+	if err != nil || !proto.Equal(resolved["enabled"], value) {
+		t.Fatalf("required parameter was not satisfied by its Template default: %v", err)
+	}
+	for _, supplied := range []map[string]*anypb.Any{
+		{"unknown": value},
+		{"enabled": nil},
+		{"enabled": {TypeUrl: value.GetTypeUrl(), Value: []byte{0xff}}},
+		{"enabled": {TypeUrl: "type.googleapis.com/google.protobuf.StringValue"}},
+	} {
+		if _, err := ApplyTemplateParameterDefaultsAndValidate(template, supplied); err == nil {
+			t.Fatalf("invalid input was accepted: %v", supplied)
+		}
+	}
+	resolved["enabled"].Value = []byte{0xff}
+	if proto.Equal(resolved["enabled"], value) {
+		t.Fatal("resolved parameter aliases the Template default")
+	}
 }

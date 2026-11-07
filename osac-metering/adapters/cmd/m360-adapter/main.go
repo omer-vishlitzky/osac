@@ -27,34 +27,15 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/IBM/sarama"
+
 	"github.com/go-logr/stdr"
-	"github.com/osac-project/osac-metering/adapters"
-	"github.com/osac-project/osac-metering/adapters/envutil"
+
+	"github.com/osac-project/osac-metering/adapters/internal/envutil"
+	"github.com/osac-project/osac-metering/adapters/internal/kafka"
+	"github.com/osac-project/osac-metering/adapters/internal/runner"
+	"github.com/osac-project/osac-metering/adapters/m360"
 )
-
-type m360Adapter struct {
-	client *m360Client
-}
-
-func (a *m360Adapter) Name() string { return "m360" }
-
-func (a *m360Adapter) Submit(ctx context.Context, event adapters.MeteringEvent) error {
-	endpoint, payload, err := translateEvent(event.CloudEvent)
-	if err != nil {
-		return err
-	}
-	return a.client.post(ctx, endpoint, payload)
-}
-
-func (a *m360Adapter) Flush(_ context.Context) (adapters.SubmitResult, error) {
-	return adapters.SubmitResult{Idempotent: true}, nil
-}
-
-func (a *m360Adapter) HealthCheck(ctx context.Context) error {
-	return a.client.healthCheck(ctx)
-}
-
-func (a *m360Adapter) Close() error { return nil }
 
 func main() {
 	brokers := envutil.RequireEnv("KAFKA_BROKERS")
@@ -63,14 +44,6 @@ func main() {
 
 	apiKey := envutil.ReadFileOrFatal(apiKeyFile)
 	apiVersion := envutil.EnvOrDefault("M360_API_VERSION", "v1")
-
-	topics := adapters.AllTopics
-	if v := os.Getenv("KAFKA_TOPICS"); v != "" {
-		topics = envutil.SplitAndTrim(v, ",")
-		if len(topics) == 0 {
-			log.Fatal("KAFKA_TOPICS must contain at least one topic")
-		}
-	}
 
 	group := envutil.EnvOrDefault("KAFKA_CONSUMER_GROUP", "m360-adapter")
 
@@ -90,37 +63,48 @@ func main() {
 
 	logger := stdr.New(log.New(os.Stderr, "", log.LstdFlags))
 
-	kafkaCfg := adapters.KafkaConfigFromEnv()
+	kafkaCfg := kafka.KafkaConfigFromEnv()
 
-	dlqOpt, dlqClose, err := adapters.DLQOptionFromEnv(brokers, kafkaCfg)
+	// The DLQ is mandatory: the adapter refuses to start without one, so a rejected
+	// heartbeat is never dropped. Each rejection goes to the tenant's dead-letter
+	// topic.
+	dlq, err := runner.NewPerTenantDLQProducer(brokers, kafkaCfg)
 	if err != nil {
-		log.Fatalf("setting up DLQ: %v", err)
+		log.Fatalf("creating DLQ producer: %v", err)
 	}
 	defer func() {
-		if err := dlqClose(); err != nil {
+		if err := dlq.Close(); err != nil {
 			log.Printf("DLQ producer close failed: %v", err)
 		}
 	}()
-	var opts []adapters.RunnerOption
-	if dlqOpt != nil {
-		opts = append(opts, dlqOpt)
-		log.Printf("DLQ enabled: topic=%s", envutil.EnvOrDefault("DLQ_TOPIC", adapters.TopicDLQ))
+
+	// Every metered tenant's heartbeat topic plus the shared MaaS inference topic,
+	// rediscovered as tenants come and go. The consumer group shares this client: the
+	// runner closes only the group, so the client stays open for the defer below to close.
+	discoveryConfig, err := kafka.NewConsumerConfig(kafkaCfg)
+	if err != nil {
+		log.Fatalf("creating kafka client config: %v", err)
+	}
+	discoveryClient, err := sarama.NewClient(kafka.SplitAndTrimBrokers(brokers, ","), discoveryConfig)
+	if err != nil {
+		log.Fatalf("creating kafka client: %v", err)
+	}
+	defer func() { _ = discoveryClient.Close() }()
+	consumerGroup, err := sarama.NewConsumerGroupFromClient(group, discoveryClient)
+	if err != nil {
+		log.Fatalf("creating consumer group: %v", err)
 	}
 
-	client := newM360Client(m360URL, apiVersion, apiKey)
-	client.logger = logger
-
-	adapter := &m360Adapter{client: client}
-	runner := adapters.NewRunner(adapter, adapters.RunnerConfig{
-		Brokers:       brokers,
-		ConsumerGroup: group,
-		Topics:        topics,
+	adapter := m360.NewAdapter(m360URL, apiVersion, apiKey, logger)
+	r := runner.NewRunner(adapter, runner.RunnerConfig{
 		FlushInterval: flushInterval,
-		Kafka:         kafkaCfg,
-	}, logger, opts...)
+		TopicsProvider: func(ctx context.Context) ([]string, error) {
+			return kafka.ConsumeTopics(discoveryClient)
+		},
+	}, logger, runner.WithDLQ(dlq))
 
 	mux := http.NewServeMux()
-	mux.Handle("/metrics", runner.MetricsHandler())
+	mux.Handle("/metrics", r.MetricsHandler())
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
@@ -150,10 +134,10 @@ func main() {
 		syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	log.Printf("starting m360 adapter: topics=%v group=%s api_version=%s flush=%s",
-		topics, group, apiVersion, flushInterval)
+	log.Printf("starting m360 adapter: group=%s api_version=%s flush=%s",
+		group, apiVersion, flushInterval)
 
-	runErr := runner.Run(ctx)
+	runErr := r.Run(ctx, consumerGroup)
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer shutdownCancel()

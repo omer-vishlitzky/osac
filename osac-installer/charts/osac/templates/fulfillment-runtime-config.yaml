@@ -1,0 +1,33 @@
+{{/*
+The operator needs the issuer URL for OAuth even when the hub CSI driver is
+disabled. The ConfigMap also carries names and keys for secret-backed
+credentials used by installer AAP jobs. Secret values remain in Kubernetes
+Secrets. The endpoint is optional when the installation does not expose
+Fulfillment outside the cluster.
+*/}}
+{{- if .Values.operator.enabled }}
+{{- $operatorConfigMapName := required "operator.fulfillment.configMap.name is required when operator.enabled is true" .Values.operator.fulfillment.configMap.name }}
+{{- $operatorIssuer := tpl (required "service.auth.issuerUrl is required when operator.enabled is true" .Values.service.auth.issuerUrl) . }}
+{{- $operatorEndpoint := .Values.global.fulfillment.endpoint }}
+{{- if and (not $operatorEndpoint) .Values.service.externalHostname }}
+{{- $operatorEndpoint = printf "%s:443" .Values.service.externalHostname }}
+{{- end }}
+{{- $clientIDCredential := include "osac.fulfillmentAuthCredential" (list . "client-id") | fromJson }}
+{{- $clientSecretCredential := include "osac.fulfillmentAuthCredential" (list . "client-secret") | fromJson }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $operatorConfigMapName | quote }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    osac.openshift.io/fulfillment-auth-config: "true"
+data:
+  OSAC_FULFILLMENT_ISSUER_URL: {{ $operatorIssuer | quote }}
+  {{- if $operatorEndpoint }}
+  OSAC_FULFILLMENT_ENDPOINT: {{ $operatorEndpoint | quote }}
+  {{- end }}
+  OSAC_FULFILLMENT_CLIENT_ID_SECRET_NAME: {{ $clientIDCredential.name | quote }}
+  OSAC_FULFILLMENT_CLIENT_ID_SECRET_KEY: {{ $clientIDCredential.key | quote }}
+  OSAC_FULFILLMENT_CLIENT_SECRET_SECRET_NAME: {{ $clientSecretCredential.name | quote }}
+  OSAC_FULFILLMENT_CLIENT_SECRET_SECRET_KEY: {{ $clientSecretCredential.key | quote }}
+{{- end }}

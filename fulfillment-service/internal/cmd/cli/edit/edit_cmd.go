@@ -31,13 +31,13 @@ import (
 	"google.golang.org/protobuf/reflect/protoreflect"
 	"gopkg.in/yaml.v3"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
-	publicv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/public/v1"
+	"github.com/osac-project/osac/fulfillment-service/internal/cmd/cli/updatable"
 	"github.com/osac-project/osac/fulfillment-service/internal/config"
 	"github.com/osac-project/osac/fulfillment-service/internal/logging"
-	"github.com/osac-project/osac/fulfillment-service/internal/packages"
 	"github.com/osac-project/osac/fulfillment-service/internal/reflection"
 	"github.com/osac-project/osac/fulfillment-service/internal/terminal"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
 
 //go:embed templates
@@ -118,6 +118,7 @@ func (c *runnerContext) run(cmd *cobra.Command, args []string) error {
 		SetConnection(c.conn).
 		AddPackages(cfg.Packages()).
 		SetTenantFunc(config.TenantFromContext).
+		SetProjectFunc(config.ProjectFromContext).
 		UseGetForStructuredOutput(&publicv1.Secret{}).
 		Build()
 	if err != nil {
@@ -142,6 +143,9 @@ func (c *runnerContext) run(cmd *cobra.Command, args []string) error {
 		})
 		return nil
 	}
+	if err := updatable.Ensure(c.helper); err != nil {
+		return err
+	}
 
 	// Check the flags:
 	if c.format != outputFormatJson && c.format != outputFormatYaml {
@@ -159,7 +163,7 @@ func (c *runnerContext) run(cmd *cobra.Command, args []string) error {
 	key := args[1]
 
 	// Find the object by identifier or name:
-	object, err := c.fetchObject(ctx, key)
+	original, err := c.fetchObject(ctx, key)
 	if err != nil {
 		return err
 	}
@@ -172,7 +176,7 @@ func (c *runnerContext) run(cmd *cobra.Command, args []string) error {
 	default:
 		render = c.renderYaml
 	}
-	data, err := render(object)
+	data, err := render(original)
 	if err != nil {
 		return err
 	}
@@ -193,7 +197,7 @@ func (c *runnerContext) run(cmd *cobra.Command, args []string) error {
 			)
 		}
 	}()
-	objectId := c.helper.GetId(object)
+	objectId := c.helper.GetId(original)
 	tmpFile := filepath.Join(tmpDir, fmt.Sprintf("%s-%s.%s", c.helper, objectId, c.format))
 	err = os.WriteFile(tmpFile, data, 0600)
 	if err != nil {
@@ -235,13 +239,13 @@ func (c *runnerContext) run(cmd *cobra.Command, args []string) error {
 	default:
 		parse = c.parseYaml
 	}
-	object, err = parse(data)
+	edited, err := parse(data)
 	if err != nil {
 		return fmt.Errorf("failed to parse modified object: %w", err)
 	}
 
 	// Save the result:
-	updated, err := c.update(ctx, object)
+	updated, err := c.update(ctx, original, edited)
 	if err != nil {
 		return err
 	}
@@ -294,9 +298,17 @@ func (c *runnerContext) fetchObject(ctx context.Context, key string) (proto.Mess
 	return object, nil
 }
 
-func (c *runnerContext) update(ctx context.Context, object proto.Message) (result proto.Message, err error) {
-	result, err = c.helper.Update(ctx, object)
-	return
+func (c *runnerContext) update(ctx context.Context, original, edited proto.Message) (proto.Message, error) {
+	result, err := c.helper.UpdateWithMask(ctx, original, edited)
+	if err != nil {
+		return nil, err
+	}
+	for _, warning := range result.Warnings {
+		if _, err := fmt.Fprintf(c.console.Stderr(), "Warning: %s\n", warning); err != nil {
+			return result.Object, fmt.Errorf("update succeeded, but failed to write warning to stderr: %w", err)
+		}
+	}
+	return result.Object, nil
 }
 
 func (c *runnerContext) isWatchable() bool {
@@ -390,7 +402,11 @@ func completeObjectTypes(cmd *cobra.Command, args []string, toComplete string) (
 	if len(args) != 0 {
 		return nil, cobra.ShellCompDirectiveNoFileComp
 	}
-	return reflection.ObjectTypeNames(packages.Public...), cobra.ShellCompDirectiveNoFileComp
+	var ctx context.Context
+	if cmd != nil {
+		ctx = cmd.Context()
+	}
+	return reflection.UpdatableObjectTypeNames(config.PackageNamesFromContext(ctx)...), cobra.ShellCompDirectiveNoFileComp
 }
 
 const shortHelp = `Edit objects`

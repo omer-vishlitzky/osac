@@ -23,10 +23,9 @@ import (
 	grpccodes "google.golang.org/grpc/codes"
 	grpcstatus "google.golang.org/grpc/status"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
-	publicv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/public/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
-	"github.com/osac-project/osac/fulfillment-service/internal/events"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
 
 // clusterVersionFilterDefaults defines per-field default predicates for public List requests.
@@ -47,7 +46,6 @@ var clusterVersionFilterDefaults = []filterDefault{
 
 type ClusterVersionsServerBuilder struct {
 	logger            *slog.Logger
-	notifier          events.Notifier
 	attributionLogic  auth.AttributionLogic
 	tenancyLogic      auth.TenancyLogic
 	metricsRegisterer prometheus.Registerer
@@ -71,12 +69,6 @@ func NewClusterVersionsServer() *ClusterVersionsServerBuilder {
 // SetLogger sets the logger to use. This is mandatory.
 func (b *ClusterVersionsServerBuilder) SetLogger(value *slog.Logger) *ClusterVersionsServerBuilder {
 	b.logger = value
-	return b
-}
-
-// SetNotifier sets the notifier to use. This is optional.
-func (b *ClusterVersionsServerBuilder) SetNotifier(value events.Notifier) *ClusterVersionsServerBuilder {
-	b.notifier = value
 	return b
 }
 
@@ -128,7 +120,6 @@ func (b *ClusterVersionsServerBuilder) Build() (*ClusterVersionsServer, error) {
 
 	delegate, err := NewPrivateClusterVersionsServer().
 		SetLogger(b.logger).
-		SetNotifier(b.notifier).
 		SetAttributionLogic(b.attributionLogic).
 		SetTenancyLogic(b.tenancyLogic).
 		SetMetricsRegisterer(b.metricsRegisterer).
@@ -229,7 +220,7 @@ func (s *ClusterVersionsServer) Create(ctx context.Context,
 			"Failed to map public cluster version to private",
 			slog.Any("error", err),
 		)
-		return nil, grpcstatus.Errorf(grpccodes.Internal, "failed to process cluster version")
+		return nil, publicInputMappingError(err, "failed to process cluster version")
 	}
 
 	privateRequest := &privatev1.ClusterVersionsCreateRequest{}
@@ -258,6 +249,11 @@ func (s *ClusterVersionsServer) Create(ctx context.Context,
 
 func (s *ClusterVersionsServer) Update(ctx context.Context,
 	request *publicv1.ClusterVersionsUpdateRequest) (*publicv1.ClusterVersionsUpdateResponse, error) {
+	ctx = withPublicAPIView(ctx)
+	if err := validatePublicObjectMetadata(request.GetObject()); err != nil {
+		return nil, err
+	}
+
 	publicClusterVersion := request.GetObject()
 	if publicClusterVersion == nil {
 		return nil, grpcstatus.Errorf(grpccodes.InvalidArgument, "object is mandatory")
@@ -283,7 +279,7 @@ func (s *ClusterVersionsServer) Update(ctx context.Context,
 			"Failed to map public cluster version to private",
 			slog.Any("error", err),
 		)
-		return nil, grpcstatus.Errorf(grpccodes.Internal, "failed to process cluster version")
+		return nil, publicInputMappingError(err, "failed to process cluster version")
 	}
 
 	privateRequest := &privatev1.ClusterVersionsUpdateRequest{}

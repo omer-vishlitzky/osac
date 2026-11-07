@@ -11,9 +11,10 @@
 #      writes workflow links into those paths)
 #   4. Installs workflows (bugfix, implement, prd, design, e2e)
 #   5. Clones skill-relative sibling repos under this checkout
-#      (enhancement-proposals, osac-ux, osac-ui, osac-docs). osac-docs
-#      is osac-project/docs — not docs/. E2E suites live in-tree at
-#      tests/e2e/; osac-test-infra is not cloned.
+#      (enhancement-proposals, osac-ux). osac-project/docs was
+#      merged into this repo's in-tree docs/ and is no longer cloned as a
+#      sibling. E2E suites live in-tree at tests/e2e/; osac-test-infra is
+#      not cloned.
 #      Writeable siblings get a push remote (default name `fork`;
 #      origin = osac-project). --fork-name only rearranges remotes on
 #      those siblings — not this checkout, osac-ux, or vendor clones.
@@ -45,8 +46,8 @@ By default, each writeable sibling is forked to your GitHub account:
 siblings only (origin = your fork, upstream = osac-project). Pick a name
 and stick with it — re-running with a different name mutates remotes.
 This checkout, osac-ux, and vendor clones are never renamed. Skills
-resolve remotes by URL, not by name. The GitHub fork of osac-project/docs
-is named osac-docs (override extra mappings in tools/fork-overrides.sh).
+resolve remotes by URL, not by name (override extra mappings in
+tools/fork-overrides.sh).
 
 osac-ux is a reference clone (no fork). Vendor checkouts (.osac-ai-skills,
 .ai-workflows) are never forked. --no-fork skips forking even when
@@ -97,6 +98,30 @@ if [[ "${OSAC_ALLOW_NESTED_BOOTSTRAP:-}" != "1" ]] \
     echo "To force this script anyway: OSAC_ALLOW_NESTED_BOOTSTRAP=1 $0" >&2
     exit 1
   fi
+fi
+
+# --- graphify (codebase knowledge graph CLI) ---
+# The pip package is "graphifyy" (double y); the CLI command is "graphify".
+# Used by the SessionStart hook (.claude/hooks/fetch-graphify-brain.sh) to
+# fetch and query the CI-published knowledge graph. Idempotent: skips if
+# graphify is already on PATH. Fail-open: a missing graphify never blocks
+# bootstrap — sessions will fall back to cold exploration.
+if command -v graphify &>/dev/null; then
+  echo "graphify already installed ($(graphify --version 2>/dev/null || echo 'unknown version'))."
+elif command -v uv &>/dev/null; then
+  echo "Installing graphify (uv tool install graphifyy)..."
+  if ! uv tool install graphifyy; then
+    echo "  Warning: graphify installation via uv failed. Install manually: uv tool install graphifyy" >&2
+  fi
+elif command -v pipx &>/dev/null; then
+  echo "Installing graphify (pipx install graphifyy)..."
+  if ! pipx install graphifyy; then
+    echo "  Warning: graphify installation via pipx failed. Install manually: pipx install graphifyy" >&2
+  fi
+else
+  echo "Warning: neither uv nor pipx found — cannot install graphify automatically." >&2
+  echo "  Install manually: uv tool install graphifyy (or: pipx install graphifyy)" >&2
+  echo "  The knowledge graph will be unavailable until graphify is installed." >&2
 fi
 
 if [[ "$NO_FORK" == false ]]; then
@@ -247,23 +272,12 @@ AI_WORKFLOWS="bugfix,implement,prd,design,e2e"
 "${AI_WORKFLOWS_DIR}/install.sh" all --project "${PROJECT_ROOT}" --workflows "${AI_WORKFLOWS}"
 
 # Optional tools/fork-overrides.sh may replace or append FORK_OVERRIDE_PAIRS
-# entries ("upstream-repo:github-fork-name"). docs defaults to osac-docs.
+# entries ("upstream-repo:github-fork-name").
 FORK_OVERRIDE_PAIRS=()
 if [[ -f "${SCRIPT_DIR}/fork-overrides.sh" ]]; then
   # shellcheck disable=SC1091
   source "${SCRIPT_DIR}/fork-overrides.sh"
 fi
-_fork_override_has_docs=false
-for _pair in "${FORK_OVERRIDE_PAIRS[@]+"${FORK_OVERRIDE_PAIRS[@]}"}"; do
-  if [[ "${_pair%%:*}" == "docs" ]]; then
-    _fork_override_has_docs=true
-    break
-  fi
-done
-if [[ "$_fork_override_has_docs" == false ]]; then
-  FORK_OVERRIDE_PAIRS+=("docs:osac-docs")
-fi
-unset _fork_override_has_docs _pair
 
 fork_repo_for() {
   local repo="$1" pair
@@ -277,13 +291,10 @@ fork_repo_for() {
 }
 
 # Skill-relative sibling checkouts (gitignored). Local dir name follows the
-# GitHub repo except docs → osac-docs (docs/ is in-tree conventions).
-# Format: "repo" or "repo:local-dir"
+# GitHub repo. Format: "repo" or "repo:local-dir"
 SIBLINGS=(
   "enhancement-proposals"
   "osac-ux"
-  "osac-ui"
-  "docs:osac-docs"
 )
 
 # True when $url is a path or SSH remote for $suffix (e.g. osac-project/docs).
@@ -390,8 +401,8 @@ restore_branch_remotes() {
 }
 
 # True when $GH_USER/$(fork_repo_for "$repo") is a GitHub fork of
-# osac-project/$repo (not an unrelated same-name repo — common for docs,
-# whose fork is osac-docs).
+# osac-project/$repo (not an unrelated same-name repo — relevant whenever
+# tools/fork-overrides.sh maps a sibling to a differently-named fork).
 is_github_fork_of_org_repo() {
   local repo="$1"
   local parent fork_repo
@@ -508,6 +519,38 @@ for entry in "${SIBLINGS[@]}"; do
   dir="${entry#*:}"
   ensure_sibling "${repo}" "${dir}"
 done
+
+PRE_COMMIT_INSTALLER=""
+if command -v rh-multi-pre-commit &>/dev/null; then
+  PRE_COMMIT_INSTALLER="rh-multi-pre-commit"
+elif command -v pre-commit &>/dev/null; then
+  PRE_COMMIT_INSTALLER="pre-commit"
+fi
+
+install_pre_commit_hooks() {
+  local dir="$1" label="$2"
+  [[ -f "${dir}/.pre-commit-config.yaml" && -n "$PRE_COMMIT_INSTALLER" ]] || return 0
+  if [[ "$PRE_COMMIT_INSTALLER" == "rh-multi-pre-commit" ]]; then
+    if ! rh-multi-pre-commit install --force --path "$dir"; then
+      echo "  ${label}: failed to install hooks. Continuing."
+    fi
+  elif ! (cd "$dir" && pre-commit install --overwrite); then
+    echo "  ${label}: failed to install hooks. Continuing."
+  fi
+}
+
+if [[ -z "$PRE_COMMIT_INSTALLER" ]]; then
+  echo "WARNING: pre-commit not found — skipping hook installation."
+else
+  install_pre_commit_hooks "$PROJECT_ROOT" "osac"
+  for entry in "${SIBLINGS[@]}"; do
+    repo="${entry%%:*}"
+    dir="${entry#*:}"
+    if is_expected_sibling "${PROJECT_ROOT}/${dir}" "$repo"; then
+      install_pre_commit_hooks "${PROJECT_ROOT}/${dir}" "$dir"
+    fi
+  done
+fi
 
 echo ""
 echo "AI workflows and OSAC skills installed."

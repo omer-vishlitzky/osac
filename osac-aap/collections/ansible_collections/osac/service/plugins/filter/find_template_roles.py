@@ -180,27 +180,6 @@ class TemplateParameter(Base):
         return None
 
 
-class NodeRequest(Base):
-    """NodeRequest represents the bare metal resources requested for a cluster"""
-
-    resource_class: str = pydantic.Field(..., validation_alias="resourceClass")
-    number_of_nodes: int = pydantic.Field(...,
-                                          validation_alias="numberOfNodes")
-
-
-class HostTypeReference(Base):
-    """Typed reference to a HostType resource (matches the proto HostTypeReference message)."""
-
-    name: str
-
-
-class NodeSet(Base):
-    """NodeSet represents the template's default bare metal resources"""
-
-    host_type: HostTypeReference
-    size: int
-
-
 class DiskImageReference(Base):
     """Reference to a DiskImage resource."""
 
@@ -309,6 +288,7 @@ class TemplateTypeEnum(StrEnum):
     network = "network"
     storage_provider = "storage_provider"
     bare_metal_instance = "bare_metal_instance"
+    addon_operator = "addon_operator"
 
 
 class Metadata(Base):
@@ -320,8 +300,19 @@ class Metadata(Base):
     template_type: TemplateTypeEnum = pydantic.Field(
         default=TemplateTypeEnum.cluster, exclude=True
     )
-    default_node_request: list[NodeRequest] = pydantic.Field(default_factory=list)
-    allowed_resource_classes: list[str] | None = None
+    # AddOnOperator-specific source metadata from meta/osac.yaml. These fields
+    # are forwarded when constructing AddOnOperatorTemplate and remain unset
+    # for other template types.
+    min_ocp_version: str = ""
+    max_ocp_version: str = ""
+    exclusions: list[str] = pydantic.Field(default_factory=list)
+    dependencies: list[str] = pydantic.Field(default_factory=list)
+    package_name: str | None = None
+    channel: str | None = None
+    catalog_source: str | None = None
+    catalog_source_namespace: str | None = None
+    # Capabilities declared by network template roles.
+    capabilities: dict[str, Any] = pydantic.Field(default_factory=dict)
     parameters: list[TemplateParameterDefinition] = pydantic.Field(default_factory=list)
 
     # spec_defaults is used to set optional default values for the related spec fields associated
@@ -359,26 +350,92 @@ class BaseTemplate(Base):
         return {"name": name, "tenant": "shared"}
 
 
+class AddOnOperatorLocalReference(Base):
+    name: str
+
+
+class AddOnOperatorTemplate(BaseTemplate):
+    """Template for an OLM add-on operator."""
+
+    template_type: Literal[TemplateTypeEnum.addon_operator] = pydantic.Field(
+        default=TemplateTypeEnum.addon_operator, exclude=True
+    )
+    title: str
+    parameters: list[TemplateParameter] = pydantic.Field(default_factory=list, exclude=True)
+    min_ocp_version: str = ""
+    max_ocp_version: str = ""
+    exclusions: list[AddOnOperatorLocalReference] = pydantic.Field(default_factory=list)
+    dependencies: list[AddOnOperatorLocalReference] = pydantic.Field(
+        default_factory=list
+    )
+    package_name: str = pydantic.Field(..., exclude=True)
+    channel: str = pydantic.Field(..., exclude=True)
+    catalog_source: str = pydantic.Field(..., exclude=True)
+    catalog_source_namespace: str = pydantic.Field(..., exclude=True)
+
+    @pydantic.field_validator("title")
+    @classmethod
+    def validate_title(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("title must not be blank")
+        return value
+
+    @pydantic.field_validator("exclusions", "dependencies", mode="before")
+    @classmethod
+    def normalize_references(cls, values: Any) -> list[dict[str, str]]:
+        if values is None:
+            raise ValueError("operator references must be a list")
+        if not isinstance(values, list):
+            raise ValueError("operator references must be a list")
+
+        references = []
+        for value in values:
+            if isinstance(value, str):
+                name = value
+            elif isinstance(value, dict):
+                name = value.get("name")
+            else:
+                name = None
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError("operator reference names must not be blank")
+            references.append({"name": name.strip()})
+        return references
+
+    @pydantic.field_validator(
+        "package_name",
+        "channel",
+        "catalog_source",
+        "catalog_source_namespace",
+    )
+    @classmethod
+    def validate_olm_value(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("OLM metadata values must not be blank")
+        return value
+
+    @pydantic.model_validator(mode="after")
+    def validate_references(self) -> Self:
+        operator_names = {
+            self.name,
+            self.name.replace("_", "-"),
+            f"{self.collection}.{self.name}",
+        }
+        if self.metadata_name:
+            operator_names.add(self.metadata_name)
+        references = self.exclusions + self.dependencies
+        if any(reference.name in operator_names for reference in references):
+            raise ValueError("operator references must not reference the operator itself")
+        return self
+
+
 class ClusterTemplate(BaseTemplate):
     """Template for cluster deployments"""
 
     template_type: Literal[TemplateTypeEnum.cluster] = pydantic.Field(
         default=TemplateTypeEnum.cluster, exclude=True
     )
-    default_node_request: list[NodeRequest] = pydantic.Field(default=[], exclude=True)
-    allowed_resource_classes: list[str] | None = pydantic.Field(None, exclude=True)
     spec_defaults: ClusterTemplateSpecDefaults | None = None
-
-    @pydantic.computed_field
-    def node_sets(self) -> dict[str, NodeSet] | None:
-        ret = {
-            nr.resource_class: NodeSet(
-                host_type=HostTypeReference(name=nr.resource_class),
-                size=nr.number_of_nodes,
-            )
-            for nr in self.default_node_request
-        }
-        return ret if ret else None
 
 
 class ComputeInstanceTemplate(BaseTemplate):
@@ -551,9 +608,19 @@ class Collection(Base):
                             )
                         yield ClusterTemplate(
                             **common,
-                            default_node_request=metadata.default_node_request,
-                            allowed_resource_classes=metadata.allowed_resource_classes,
                             spec_defaults=cluster_spec_defaults,
+                        )
+                    elif metadata.template_type == TemplateTypeEnum.addon_operator:
+                        yield AddOnOperatorTemplate(
+                            **common,
+                            min_ocp_version=metadata.min_ocp_version,
+                            max_ocp_version=metadata.max_ocp_version,
+                            exclusions=metadata.exclusions,
+                            dependencies=metadata.dependencies,
+                            package_name=metadata.package_name,
+                            channel=metadata.channel,
+                            catalog_source=metadata.catalog_source,
+                            catalog_source_namespace=metadata.catalog_source_namespace,
                         )
                     elif metadata.template_type == TemplateTypeEnum.network:
                         # Network roles are not published as templates — NetworkClass
@@ -675,6 +742,78 @@ def find_template_roles(requested: list[str]) -> Generator[BaseTemplate, None, N
         yield from collection.templates()
 
 
+def _sort_addon_operator_templates(
+    templates: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Return add-on templates in stable dependency-first order.
+
+    Dependencies can be published automatically. When that behavior is enabled,
+    each dependency must be published before any operator that depends on it.
+
+    A depth-first post-order traversal keeps each dependency immediately
+    before its dependent while preserving discovery order for independent
+    templates. The active stack also provides a useful cycle description.
+    """
+    templates_by_id: dict[str, dict[str, Any]] = {}
+    template_id_by_reference: dict[str, str] = {}
+
+    for template in templates:
+        template_id = template["id"]
+        if template_id in templates_by_id:
+            raise AnsibleFilterError(
+                f"Duplicate add-on operator template ID '{template_id}'"
+            )
+        templates_by_id[template_id] = template
+        template_id_by_reference[template_id] = template_id
+        template_id_by_reference[template_id.rsplit(".", 1)[-1]] = template_id
+        metadata_name = template.get("metadata", {}).get("name")
+        if metadata_name:
+            template_id_by_reference[metadata_name] = template_id
+
+    visiting = 1
+    visited = 2
+    state: dict[str, int] = {}
+    stack: list[str] = []
+    result: list[str] = []
+
+    def visit(template_id: str) -> None:
+        current_state = state.get(template_id, 0)
+        if current_state == visited:
+            return
+        if current_state == visiting:
+            cycle_start = stack.index(template_id)
+            cycle = stack[cycle_start:] + [template_id]
+            raise AnsibleFilterError(
+                "Cyclic add-on operator dependencies: " + " -> ".join(cycle)
+            )
+
+        state[template_id] = visiting
+        stack.append(template_id)
+        for dependency in templates_by_id[template_id].get("dependencies", []):
+            dependency_name = (
+                dependency.get("name") if isinstance(dependency, dict) else dependency
+            )
+            dependency_id = template_id_by_reference.get(dependency_name)
+            if dependency_id is None:
+                raise AnsibleFilterError(
+                    f"Add-on operator '{template_id}' depends on unknown "
+                    f"operator '{dependency_name}'"
+                )
+            if template_id == dependency_id:
+                raise AnsibleFilterError(
+                    f"Add-on operator '{template_id}' cannot depend on itself"
+                )
+            visit(dependency_id)
+        stack.pop()
+        state[template_id] = visited
+        result.append(template_id)
+
+    for template_id in templates_by_id:
+        visit(template_id)
+
+    return [templates_by_id[template_id] for template_id in result]
+
+
 def find_template_roles_filter(template_type: TemplateTypeEnum):
     """Factory function that returns a filter for the specified template type.
 
@@ -695,6 +834,8 @@ def find_template_roles_filter(template_type: TemplateTypeEnum):
                 role.model_dump(by_alias=True, exclude_none=True)
                 for role in roles
             ]
+            if template_type == TemplateTypeEnum.addon_operator:
+                result = _sort_addon_operator_templates(result)
             display.vv(f"Returning {len(result)} {template_type} template(s)")
             return result
 
@@ -720,21 +861,22 @@ class FilterModule:
             "find_cluster_template_roles": find_template_roles_filter(TemplateTypeEnum.cluster),
             "find_compute_instance_template_roles": find_template_roles_filter(TemplateTypeEnum.compute_instance),
             "find_bare_metal_instance_template_roles": find_template_roles_filter(TemplateTypeEnum.bare_metal_instance),
+            "find_addon_operator_template_roles": find_template_roles_filter(TemplateTypeEnum.addon_operator),
         }
 
 
 if __name__ == "__main__":
     import sys
 
-    # Usage: python find_template_roles.py --type cluster|compute_instance|bare_metal_instance collection1 collection2 ...
+    # Usage: python find_template_roles.py --type cluster|compute_instance|bare_metal_instance|addon_operator collection1 collection2 ...
     if "--type" not in sys.argv:
         print("Error: --type parameter is required", file=sys.stderr)
-        print("Usage: python find_template_roles.py --type cluster|compute_instance|bare_metal_instance collection1 collection2 ...", file=sys.stderr)
+        print("Usage: python find_template_roles.py --type cluster|compute_instance|bare_metal_instance|addon_operator collection1 collection2 ...", file=sys.stderr)
         sys.exit(1)
 
     type_idx = sys.argv.index("--type")
     if type_idx + 1 >= len(sys.argv):
-        print("Error: --type requires a value (cluster, compute_instance, or bare_metal_instance)", file=sys.stderr)
+        print("Error: --type requires a value (cluster, compute_instance, bare_metal_instance, or addon_operator)", file=sys.stderr)
         sys.exit(1)
 
     template_type = sys.argv[type_idx + 1]
@@ -742,7 +884,7 @@ if __name__ == "__main__":
 
     if not collections:
         print("Error: At least one collection name is required", file=sys.stderr)
-        print("Usage: python find_template_roles.py --type cluster|compute_instance|bare_metal_instance collection1 collection2 ...", file=sys.stderr)
+        print("Usage: python find_template_roles.py --type cluster|compute_instance|bare_metal_instance|addon_operator collection1 collection2 ...", file=sys.stderr)
         sys.exit(1)
 
     if template_type == TemplateTypeEnum.cluster:
@@ -751,8 +893,10 @@ if __name__ == "__main__":
         filter_func = find_template_roles_filter(TemplateTypeEnum.compute_instance)
     elif template_type == TemplateTypeEnum.bare_metal_instance:
         filter_func = find_template_roles_filter(TemplateTypeEnum.bare_metal_instance)
+    elif template_type == TemplateTypeEnum.addon_operator:
+        filter_func = find_template_roles_filter(TemplateTypeEnum.addon_operator)
     else:
-        print(f"Error: Invalid template type '{template_type}'. Must be 'cluster', 'compute_instance', or 'bare_metal_instance'", file=sys.stderr)
+        print(f"Error: Invalid template type '{template_type}'. Must be 'cluster', 'compute_instance', 'bare_metal_instance', or 'addon_operator'", file=sys.stderr)
         sys.exit(1)
 
     found = filter_func(collections)

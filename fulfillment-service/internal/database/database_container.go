@@ -65,6 +65,8 @@ type Container struct {
 	outWriter      *logging.Writer
 	errWriter      *logging.Writer
 	runCmd         *exec.Cmd
+	runDone        chan struct{}
+	runErr         error
 	count          int
 	instances      []*Instance
 }
@@ -199,21 +201,20 @@ func (c *Container) Start(ctx context.Context) error {
 	)
 	c.runCmd.Stdout = c.outWriter
 	c.runCmd.Stderr = c.errWriter
+	c.runCmd.WaitDelay = time.Second
 	err = c.runCmd.Start()
 	if err != nil {
 		return fmt.Errorf("failed to start database container: %w", err)
 	}
+	c.runDone = make(chan struct{})
+	go func() {
+		c.runErr = c.runCmd.Wait()
+		close(c.runDone)
+	}()
 
 	// Find out the port number assigned to the database server. Because the container runs in the foreground, the
 	// port mapping may not be available immediately, so we retry with exponential backoff.
-	findPortBo := backoff.NewExponentialBackOff()
-	findPortBo.InitialInterval = 100 * time.Millisecond
-	findPortBo.MaxInterval = 1 * time.Second
-	findPortBo.MaxElapsedTime = 30 * time.Second
-	findPortOp := func() error {
-		return c.findPort(ctx)
-	}
-	err = backoff.Retry(findPortOp, backoff.WithContext(findPortBo, ctx))
+	err = c.waitForPort(ctx, 30*time.Second, 3*time.Second)
 	if err != nil {
 		return err
 	}
@@ -222,11 +223,18 @@ func (c *Container) Start(ctx context.Context) error {
 	connectAdminBo := backoff.NewExponentialBackOff()
 	connectAdminBo.InitialInterval = 100 * time.Millisecond
 	connectAdminBo.MaxInterval = 2 * time.Second
-	connectAdminBo.MaxElapsedTime = 30 * time.Second
+	connectAdminBo.MaxElapsedTime = 0
+	connectCtx, connectCancel := context.WithTimeout(ctx, 30*time.Second)
+	defer connectCancel()
 	connectAdminOp := func() error {
-		return c.connectAdmin(ctx)
+		if err := c.checkRunExit(); err != nil {
+			return backoff.Permanent(err)
+		}
+		attemptCtx, attemptCancel := context.WithTimeout(connectCtx, 3*time.Second)
+		defer attemptCancel()
+		return c.connectAdmin(attemptCtx)
 	}
-	err = backoff.Retry(connectAdminOp, backoff.WithContext(connectAdminBo, ctx))
+	err = backoff.Retry(connectAdminOp, backoff.WithContext(connectAdminBo, connectCtx))
 	if err != nil {
 		return err
 	}
@@ -282,6 +290,40 @@ func (c *Container) Start(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+func (c *Container) waitForPort(ctx context.Context, timeout, attemptTimeout time.Duration) error {
+	portCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	findPortBo := backoff.NewExponentialBackOff()
+	findPortBo.InitialInterval = 100 * time.Millisecond
+	findPortBo.MaxInterval = 1 * time.Second
+	findPortBo.MaxElapsedTime = 0
+	findPortOp := func() error {
+		if err := c.checkRunExit(); err != nil {
+			return backoff.Permanent(err)
+		}
+		attemptCtx, attemptCancel := context.WithTimeout(portCtx, attemptTimeout)
+		defer attemptCancel()
+		err := c.findPort(attemptCtx)
+		if runErr := c.checkRunExit(); runErr != nil {
+			return backoff.Permanent(runErr)
+		}
+		return err
+	}
+	return backoff.Retry(findPortOp, backoff.WithContext(findPortBo, portCtx))
+}
+
+func (c *Container) checkRunExit() error {
+	select {
+	case <-c.runDone:
+		if c.runErr != nil {
+			return fmt.Errorf("database container exited during startup: %w", c.runErr)
+		}
+		return errors.New("database container exited during startup")
+	default:
+		return nil
+	}
 }
 
 // createConfigFile creates a temporary configuration file with performance and logging settings. The file name is
@@ -345,6 +387,7 @@ func (c *Container) findPort(ctx context.Context) error {
 	// Run the 'podman port' command to find out the host port mapped to the database server's port 5432:
 	portOut := &bytes.Buffer{}
 	portCmd := exec.CommandContext(ctx, c.tool, "port", c.id, "5432/tcp")
+	portCmd.WaitDelay = time.Second
 	portCmd.Stdout = portOut
 	portCmd.Stderr = c.errWriter
 	err := portCmd.Run()
@@ -476,19 +519,28 @@ func (c *Container) Stop(ctx context.Context) error {
 
 	// Stop the database server and wait for the foreground run command to exit so that all remaining output is
 	// flushed through the writers.
-	killCmd := exec.Command(c.tool, "kill", c.id)
-	killCmd.Stdout = c.outWriter
-	killCmd.Stderr = c.errWriter
-	err := killCmd.Run()
-	if err != nil {
-		c.logger.ErrorContext(
-			ctx,
-			"Failed to kill database container",
-			slog.Any("error", err),
-		)
-	}
-	if c.runCmd != nil {
-		_ = c.runCmd.Wait()
+	if c.runDone != nil {
+		shouldKill := true
+		select {
+		case <-c.runDone:
+			shouldKill = c.runErr != nil
+		default:
+		}
+		if shouldKill {
+			killCmd := exec.CommandContext(ctx, c.tool, "kill", c.id)
+			killCmd.Stdout = c.outWriter
+			killCmd.Stderr = c.errWriter
+			killCmd.WaitDelay = time.Second
+			err := killCmd.Run()
+			if err != nil {
+				c.logger.ErrorContext(ctx, "Failed to kill database container", slog.Any("error", err))
+			}
+		}
+		select {
+		case <-c.runDone:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 
 	return nil
@@ -499,6 +551,7 @@ func (c *Container) Stop(ctx context.Context) error {
 type InstanceBuilder struct {
 	container *Container
 	version   *uint
+	source    *Instance
 }
 
 // Instance is a PostgreSQL database created inside a Container. It delegates user credentials to the container's
@@ -507,6 +560,7 @@ type Instance struct {
 	container *Container
 	name      string
 	version   *uint
+	source    *Instance
 	url       string
 	lock      *sync.Mutex
 }
@@ -526,14 +580,25 @@ func (b *InstanceBuilder) SetVersion(value uint) *InstanceBuilder {
 	return b
 }
 
+// SetSource sets a source database instance to clone from instead of running migrations from scratch. The source
+// instance must already be initialized (e.g. by calling Url or Connection on it). The new database is created as a
+// copy of the source using PostgreSQL's CREATE DATABASE ... TEMPLATE statement. This is significantly faster than
+// running all migrations from scratch when many specs need a database at the same migration version. The source
+// instance must have no active connections at the time the new instance is initialized.
+func (b *InstanceBuilder) SetSource(value *Instance) *InstanceBuilder {
+	b.source = value
+	return b
+}
+
 // Build uses the information stored in the builder to create the database instance. When no version has been set
 // the database is cloned from the pre-migrated template, which is significantly faster than running all migrations.
-// When a specific version has been set the database is created from scratch and only the requested migrations are
-// applied.
+// When a source instance has been set the database is cloned from that source. When a specific version has been set
+// the database is created from scratch and only the requested migrations are applied.
 func (b *InstanceBuilder) Build() (result *Instance, err error) {
 	result = &Instance{
 		container: b.container,
 		version:   b.version,
+		source:    b.source,
 		lock:      &sync.Mutex{},
 	}
 	b.container.instances = append(b.container.instances, result)
@@ -550,6 +615,20 @@ func (i *Instance) initIfNeeded(ctx context.Context) error {
 }
 
 func (i *Instance) init(ctx context.Context) error {
+	// Validate the source before assigning the target name, so that a failed clone leaves the
+	// instance uninitialized and Url/Pool/Connection cannot return a URL for a database that was
+	// never created.
+	if i.source != nil {
+		if i.source.name == "" {
+			return fmt.Errorf("source database hasn't been initialized yet")
+		}
+		if i.source.container != i.container {
+			return fmt.Errorf(
+				"source database belongs to a different container",
+			)
+		}
+	}
+
 	// Calculate the name:
 	i.container.count++
 	i.name = fmt.Sprintf("%s%d", containerTemplateDatabase, i.container.count)
@@ -560,8 +639,12 @@ func (i *Instance) init(ctx context.Context) error {
 		containerTemplateUser, i.container.sharedPassword, i.container.host, i.container.port, i.name,
 	)
 
-	// If a version has been set, we need to create a blank database and run migrations up to the requested version,
-	// otherwise we can clone the template database, which already has all migrations applied.
+	// If a source instance has been set, clone from it. If a version has been set, create a blank database and run
+	// migrations up to the requested version. Otherwise clone the template database, which already has all migrations
+	// applied.
+	if i.source != nil {
+		return i.initFromSource(ctx)
+	}
 	if i.version != nil {
 		return i.initFromScratch(ctx)
 	}
@@ -578,6 +661,20 @@ func (i *Instance) initFromTemplate(ctx context.Context) error {
 	)
 	if err != nil {
 		return fmt.Errorf("failed to create database '%s' from template: %w", i.name, err)
+	}
+	return nil
+}
+
+func (i *Instance) initFromSource(ctx context.Context) error {
+	_, err := i.container.adminConn.Exec(
+		ctx,
+		fmt.Sprintf(
+			"create database %s template %s owner %s",
+			i.name, i.source.name, containerTemplateUser,
+		),
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create database '%s' from source '%s': %w", i.name, i.source.name, err)
 	}
 	return nil
 }

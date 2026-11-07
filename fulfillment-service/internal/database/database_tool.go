@@ -488,7 +488,7 @@ func (t *tool) CheckSchema(ctx context.Context) error {
 }
 
 // listObjectTables returns the sorted list of object table names from the public schema, excluding active companion
-// tables, archive tables, and internal tables like notifications and schema_migrations.
+// tables, archive tables, and internal tables like changes and schema_migrations.
 func (t *tool) listObjectTables(ctx context.Context, pool *pgxpool.Pool) (result []string, err error) {
 	rows, err := pool.Query(
 		ctx,
@@ -505,7 +505,8 @@ func (t *tool) listObjectTables(ctx context.Context, pool *pgxpool.Pool) (result
 			c.relname not like 'active_%' and
 			c.relname not like 'archived_%' and
 			c.relname not in (
-				'notifications',
+				'changes',
+				'installation_settings',
 				'project_membership_subjects',
 				'schema_migrations',
 				'storage_tier_backends',
@@ -583,8 +584,8 @@ func (t *tool) listArchiveTables(ctx context.Context, pool *pgxpool.Pool) (resul
 }
 
 // checkObjectTable performs all consistency checks for a single object table: verifies that it has the expected columns
-// with the correct types, a primary key on 'id', a tenant foreign key, and a corresponding archive table. Returns the
-// number of issues found.
+// with the correct types, a primary key on 'id', a tenant foreign key, a corresponding archive table, and the
+// enqueue_change trigger. Returns the number of issues found.
 func (t *tool) checkObjectTable(ctx context.Context, pool *pgxpool.Pool, table string) int {
 	// Make a copy of the expected columns so that we can adjust it for special cases without interfering with the
 	// original map:
@@ -615,6 +616,9 @@ func (t *tool) checkObjectTable(ctx context.Context, pool *pgxpool.Pool, table s
 
 	issues += t.checkTenantForeignKey(ctx, pool, table)
 	issues += t.checkTableExists(ctx, pool, "archived_"+table)
+	issues += t.checkEnqueueChangeTrigger(ctx, pool, table)
+	issues += t.checkOwnerReferenceTriggers(ctx, pool, table)
+	issues += t.checkMeteringTriggers(ctx, pool, table)
 	return issues
 }
 
@@ -775,6 +779,101 @@ func (t *tool) checkTableExists(ctx context.Context, pool *pgxpool.Pool, table s
 	return 0
 }
 
+// checkEnqueueChangeTrigger verifies that the given object table has the 'enqueue_change' trigger. New object tables
+// created after the original changes migration will not get that trigger automatically, so this check fails the schema
+// unless a later migration attaches it. Returns the number of issues found.
+func (t *tool) checkEnqueueChangeTrigger(ctx context.Context, pool *pgxpool.Pool, table string) int {
+	return t.checkTriggerExists(ctx, pool, table, enqueueChangeTriggerName)
+}
+
+// checkOwnerReferenceTriggers verifies that the tables participating in the owner-reference
+// attribution contract have their triggers: tables that record a reference get the set-once and
+// live-target checks, and tables that are referenced get the owner not-in-use check on delete.
+// A table only participates when it is listed in ownerReferences, which must be extended
+// together with the table mapping in migration 125 when a new resource starts recording an
+// owner reference; CheckSchema then fails the table until a migration attaches its triggers.
+// Returns the number of issues found.
+func (t *tool) checkOwnerReferenceTriggers(ctx context.Context, pool *pgxpool.Pool, table string) int {
+	issues := 0
+	if _, records := ownerReferences[table]; records {
+		issues += t.checkTriggerExists(ctx, pool, table, ownerReferenceTriggerName)
+	}
+	for source := range ownerReferences {
+		if ownerReferences[source] == table {
+			issues += t.checkTriggerExists(ctx, pool, table, ownerReferenceNotInUseTriggerName)
+			break
+		}
+	}
+	return issues
+}
+
+// checkMeteringTriggers verifies that the tables of the resources with metering-tracked fields
+// have the source-contract trigger. A table only participates when the proto annotations of its
+// resource track fields, which must be extended together with the table mapping in metering.go
+// and the tracked-field mapping in the migration that installs the trigger; CheckSchema then
+// fails the table until a migration attaches it. Returns the number of issues found.
+func (t *tool) checkMeteringTriggers(ctx context.Context, pool *pgxpool.Pool, table string) int {
+	fields, err := meteringTableFields()
+	if err != nil {
+		t.logger.ErrorContext(
+			ctx,
+			"Failed to load the metering-tracked fields",
+			slog.Any("error", err),
+		)
+		return 1
+	}
+	if _, tracked := fields[table]; !tracked {
+		return 0
+	}
+	return t.checkTriggerExists(ctx, pool, table, meteringTriggerName)
+}
+
+// checkTriggerExists verifies that the given object table has a trigger with the given name.
+// Returns the number of issues found.
+func (t *tool) checkTriggerExists(ctx context.Context, pool *pgxpool.Pool, table, trigger string) int {
+	var count int
+	err := pool.QueryRow(
+		ctx,
+		`
+		select
+			count(*)
+		from
+			pg_catalog.pg_trigger t
+		join
+			pg_catalog.pg_class c on c.oid = t.tgrelid
+		join
+			pg_catalog.pg_namespace n on n.oid = c.relnamespace
+		where
+			n.nspname = 'public' and
+			c.relname = $1 and
+			t.tgname = $2 and
+			not t.tgisinternal
+		`,
+		table,
+		trigger,
+	).Scan(&count)
+	if err != nil {
+		t.logger.ErrorContext(
+			ctx,
+			"Failed to check trigger",
+			slog.String("table", table),
+			slog.String("trigger", trigger),
+			slog.Any("error", err),
+		)
+		return 1
+	}
+	if count != 1 {
+		t.logger.ErrorContext(
+			ctx,
+			"Object table is missing a required trigger",
+			slog.String("table", table),
+			slog.String("trigger", trigger),
+		)
+		return 1
+	}
+	return 0
+}
+
 // checkTenantForeignKey verifies that the given table has a foreign key constraint on the 'tenant' column referencing
 // the 'id' column of the 'tenants' table. Returns the number of issues found.
 func (t *tool) checkTenantForeignKey(ctx context.Context, pool *pgxpool.Pool, table string) int {
@@ -908,6 +1007,27 @@ var toolFilePathParameters = []string{
 	"sslrootcert",
 	"sslcrl",
 	"sslcrldir",
+}
+
+// enqueueChangeTriggerName is the trigger that copies object-table writes into the changes table for the event
+// publisher.
+const enqueueChangeTriggerName = "enqueue_change"
+
+// Names of the triggers that enforce the owner-reference attribution contract.
+const (
+	ownerReferenceTriggerName         = "check_owner_reference"
+	ownerReferenceNotInUseTriggerName = "check_owner_reference_not_in_use"
+)
+
+// meteringTriggerName is the trigger that enforces the metering source contract.
+const meteringTriggerName = "enforce_metering_fields"
+
+// ownerReferences maps each object table that records an owner reference in its status to the
+// table holding the referenced resource. Extend together with the table and JSON-path mapping
+// functions in migration 125 when a new resource starts recording an owner reference;
+// CheckSchema fails a mapped table whose migration has not attached the attribution triggers.
+var ownerReferences = map[string]string{
+	"bare_metal_instances": "clusters",
 }
 
 // toolObjectColumns maps each column name that the DAO expects in every object table to its expected PostgreSQL

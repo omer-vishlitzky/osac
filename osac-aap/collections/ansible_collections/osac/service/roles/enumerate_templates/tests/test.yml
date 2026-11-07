@@ -43,7 +43,13 @@
         that:
           - osac_cluster_templates is defined
           - osac_cluster_templates | length >= 3
-          - osac_cluster_templates | map(attribute='id') | list is superset(['osac.templates.ocp_small', 'osac.templates.ocp_ci_small', 'osac.templates.ocp_4_20_small_nico'])
+          - >-
+            osac_cluster_templates | map(attribute='id') | list
+            is superset([
+              'osac.templates.ocp_small',
+              'osac.templates.ocp_ci_small',
+              'osac.templates.ocp_4_20_small_nico'
+            ])
         fail_msg: >-
           Expected at least 3 cluster templates (ocp_small, ocp_ci_small, ocp_4_20_small_nico).
           Got: {{ osac_cluster_templates | default([]) | map(attribute='id') | list }}
@@ -56,22 +62,13 @@
           - item.id is defined
           - item.title is defined
           - item.title | length > 0
-          - item.node_sets is defined
-          - item.node_sets | length > 0
+          - item.nodeSets is not defined
+          - item.node_sets is not defined
+          - item.default_node_request is not defined
+          - item.allowed_resource_classes is not defined
         fail_msg: "Cluster template '{{ item.id }}' missing required fields"
         success_msg: "Cluster template '{{ item.id }}' has correct structure"
       loop: "{{ osac_cluster_templates }}"
-      loop_control:
-        label: "{{ item.id }}"
-      when: test_discover_all | default(false) | bool
-
-    - name: Verify known templates include fc430 node set
-      ansible.builtin.assert:
-        that:
-          - "'fc430' in item.node_sets"
-        fail_msg: "Template '{{ item.id }}' expected to have fc430 node set"
-        success_msg: "Template '{{ item.id }}' has fc430 node set"
-      loop: "{{ osac_cluster_templates | selectattr('id', 'in', ['osac.templates.ocp_small']) | list }}"
       loop_control:
         label: "{{ item.id }}"
       when: test_discover_all | default(false) | bool
@@ -86,6 +83,44 @@
           Expected at least 1 compute instance template (ocp_virt_vm).
           Got: {{ osac_compute_instance_templates | default([]) | map(attribute='id') | list }}
         success_msg: "Found {{ osac_compute_instance_templates | length }} compute instance template(s)"
+      when: test_discover_all | default(false) | bool
+
+    - name: Verify add-on operator templates discovered
+      ansible.builtin.assert:
+        that:
+          - osac_addon_operator_templates is defined
+          - osac_addon_operator_templates | length >= 1
+        fail_msg: "Expected at least one supported add-on operator template"
+        success_msg: "Found {{ osac_addon_operator_templates | length }} add-on operator template(s)"
+      when: test_discover_all | default(false) | bool
+
+    - name: Verify add-on operator template metadata fields
+      ansible.builtin.assert:
+        that:
+          - >-
+            osac_addon_operator_templates | selectattr('id', 'defined') | list | length
+            == osac_addon_operator_templates | length
+          - >-
+            osac_addon_operator_templates | selectattr('min_ocp_version', 'defined') | list | length
+            == osac_addon_operator_templates | length
+          - >-
+            osac_addon_operator_templates | selectattr('dependencies', 'defined') | list | length
+            == osac_addon_operator_templates | length
+        fail_msg: >-
+          Expected every add-on operator template to include id, min_ocp_version,
+          and dependencies.
+          Got: {{ osac_addon_operator_templates | default([]) | map(attribute='id') | list }}
+      when: test_discover_all | default(false) | bool
+
+    - name: Verify add-on operator template IDs are unique
+      ansible.builtin.assert:
+        that:
+          - >-
+            osac_addon_operator_templates | map(attribute='id') | list | unique | length
+            == osac_addon_operator_templates | length
+        fail_msg: >-
+          Expected add-on operator template IDs to be unique.
+          Got: {{ osac_addon_operator_templates | default([]) | map(attribute='id') | list }}
       when: test_discover_all | default(false) | bool
 
 # ──────────────────────────────────────────────────────────────
@@ -112,6 +147,8 @@
           - osac_cluster_templates | length == 0
           - osac_compute_instance_templates is defined
           - osac_compute_instance_templates | length == 0
+          - osac_addon_operator_templates is defined
+          - osac_addon_operator_templates | length == 0
         fail_msg: >-
           Expected empty lists for nonexistent collection.
           Clusters: {{ osac_cluster_templates | default([]) | length }},
@@ -143,6 +180,8 @@
           - osac_cluster_templates | length == 0
           - osac_compute_instance_templates is defined
           - osac_compute_instance_templates | length == 0
+          - osac_addon_operator_templates is defined
+          - osac_addon_operator_templates | length == 0
         fail_msg: "Expected empty lists for invalid collection name"
         success_msg: "Invalid collection name handled gracefully"
       when: test_invalid_collection_name | default(false) | bool
@@ -173,6 +212,8 @@
           - osac_cluster_templates | length >= 2
           - osac_compute_instance_templates is defined
           - osac_compute_instance_templates | length >= 1
+          - osac_addon_operator_templates is defined
+          - osac_addon_operator_templates | length >= 1
         fail_msg: >-
           Expected templates from osac.templates despite invalid entries.
           Clusters: {{ osac_cluster_templates | default([]) | length }},

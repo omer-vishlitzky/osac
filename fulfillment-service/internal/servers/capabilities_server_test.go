@@ -19,7 +19,9 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
-	publicv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/public/v1"
+	"github.com/osac-project/osac/fulfillment-service/internal/services"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
 
 var _ = Describe("Capabilities server", func() {
@@ -50,6 +52,54 @@ var _ = Describe("Capabilities server", func() {
 	})
 
 	Describe("Behaviour", func() {
+		DescribeTable("returns enabled services for public and private APIs",
+			func(flags services.Flags, expectedPublic []publicv1.ServiceTier, expectedPrivate []privatev1.ServiceTier) {
+				publicServer, err := NewCapabilitiesServer().
+					SetLogger(logger).
+					SetServiceFlags(&flags).
+					Build()
+				Expect(err).ToNot(HaveOccurred())
+
+				publicResponse, err := publicServer.Get(ctx, &publicv1.CapabilitiesGetRequest{})
+				Expect(err).ToNot(HaveOccurred())
+				Expect(publicResponse.GetEnabledServices()).To(Equal(expectedPublic))
+
+				privateServer, err := NewPrivateCapabilitiesServer().
+					SetLogger(logger).
+					SetServiceFlags(&flags).
+					Build()
+				Expect(err).ToNot(HaveOccurred())
+
+				privateResponse, err := privateServer.Get(ctx, &privatev1.CapabilitiesGetRequest{})
+				Expect(err).ToNot(HaveOccurred())
+				Expect(privateResponse.GetEnabledServices()).To(Equal(expectedPrivate))
+			},
+			Entry("selective services", services.Flags{CaaS: true, VMaaS: true},
+				[]publicv1.ServiceTier{
+					publicv1.ServiceTier_SERVICE_TIER_CAAS,
+					publicv1.ServiceTier_SERVICE_TIER_VMAAS,
+				},
+				[]privatev1.ServiceTier{
+					privatev1.ServiceTier_SERVICE_TIER_CAAS,
+					privatev1.ServiceTier_SERVICE_TIER_VMAAS,
+				},
+			),
+			Entry("all services", services.Flags{CaaS: true, VMaaS: true, BMaaS: true, MaaS: true},
+				[]publicv1.ServiceTier{
+					publicv1.ServiceTier_SERVICE_TIER_CAAS,
+					publicv1.ServiceTier_SERVICE_TIER_VMAAS,
+					publicv1.ServiceTier_SERVICE_TIER_BMAAS,
+					publicv1.ServiceTier_SERVICE_TIER_MAAS,
+				},
+				[]privatev1.ServiceTier{
+					privatev1.ServiceTier_SERVICE_TIER_CAAS,
+					privatev1.ServiceTier_SERVICE_TIER_VMAAS,
+					privatev1.ServiceTier_SERVICE_TIER_BMAAS,
+					privatev1.ServiceTier_SERVICE_TIER_MAAS,
+				},
+			),
+		)
+
 		It("Returns no token issuer", func() {
 			server, err := NewCapabilitiesServer().
 				SetLogger(logger).

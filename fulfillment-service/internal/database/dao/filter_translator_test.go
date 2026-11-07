@@ -22,9 +22,9 @@ import (
 
 	"google.golang.org/protobuf/reflect/protoreflect"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
-	publicv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/public/v1"
-	testsv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/tests/v1"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
+	testsv1 "github.com/osac-project/osac/proto/gen/osac/tests/v1"
 )
 
 var _ = Describe("Filter translator", func() {
@@ -43,6 +43,56 @@ var _ = Describe("Filter translator", func() {
 				Build()
 			Expect(err).ToNot(HaveOccurred())
 		})
+	})
+
+	Describe("Reserved metadata filtering", func() {
+		var publicTranslator, privateTranslator *FilterTranslator
+
+		BeforeEach(func() {
+			var err error
+			publicTranslator, err = NewFilterTranslator().
+				SetLogger(logger).
+				SetDescriptor((*publicv1.Cluster)(nil).ProtoReflect().Descriptor()).
+				Build()
+			Expect(err).ToNot(HaveOccurred())
+
+			privateTranslator, err = NewFilterTranslator().
+				SetLogger(logger).
+				SetDescriptor((*privatev1.Cluster)(nil).ProtoReflect().Descriptor()).
+				Build()
+			Expect(err).ToNot(HaveOccurred())
+		})
+
+		DescribeTable("Rejects explicit references to reserved metadata keys",
+			func(ctx context.Context, filter string) {
+				_, err := publicTranslator.Translate(ctx, filter)
+				Expect(err).To(MatchError(ContainSubstring("reserved metadata key")))
+			},
+			Entry("reserved label index", `this.metadata.labels['admin.osac.openshift.io/managed'] == 'system'`),
+			Entry("reserved annotation index", `this.metadata.annotations['admin.osac.openshift.io/managed'] == 'system'`),
+			Entry("reserved label membership", `'admin.osac.openshift.io/managed' in this.metadata.labels`),
+			Entry("reserved subdomain membership", `'controller.admin.osac.openshift.io/managed' in this.metadata.annotations`),
+			Entry("mixed nested predicate", `this.id == 'known' || this.metadata.labels['admin.osac.openshift.io/managed'] == 'system'`),
+		)
+
+		It("Keeps private metadata filtering and ordinary public keys available", func(ctx context.Context) {
+			filter := `this.metadata.labels['admin.osac.openshift.io/managed'] == 'system'`
+			translated, err := privateTranslator.Translate(ctx, filter)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(translated).To(Equal(`labels @> '{"admin.osac.openshift.io/managed":"system"}'`))
+
+			for _, key := range []string{
+				`adminXosac.openshift.io/managed`,
+				`admin.osac.openshift.io`,
+				`osac.openshift.io/tenant`,
+				`osac.openshift.io/owner-reference`,
+			} {
+				translated, err = publicTranslator.Translate(ctx, "this.metadata.labels['"+key+"'] == 'value'")
+				Expect(err).ToNot(HaveOccurred(), "key %q should remain filterable", key)
+				Expect(translated).To(ContainSubstring(`labels @>`))
+			}
+		})
+
 	})
 
 	Describe("Object translation", func() {
@@ -336,6 +386,11 @@ var _ = Describe("Filter translator", func() {
 				`data->'my_string_list' @> jsonb_build_array(data->>'my_string')`,
 			),
 			Entry(
+				"Size of repeated string field",
+				`this.my_string_list.size() == 0`,
+				`coalesce(jsonb_array_length(data->'my_string_list'), 0) = 0`,
+			),
+			Entry(
 				"Double-quoted string with single quote from %q",
 				`this.id == "it's"`,
 				`id = e'it\'s'`,
@@ -386,6 +441,16 @@ var _ = Describe("Filter translator", func() {
 				`data->'spec'->>'spec_enum' = 'MY_ENUM_VALUE_A'`,
 			),
 			Entry(
+				"Enum field in list",
+				`this.spec.spec_enum in [0, 1, 2]`,
+				`data->'spec'->>'spec_enum' in ('MY_ENUM_UNSPECIFIED', 'MY_ENUM_VALUE_A', 'MY_ENUM_VALUE_B')`,
+			),
+			Entry(
+				"Enum field in single-element list",
+				`this.spec.spec_enum in [1]`,
+				`data->'spec'->>'spec_enum' in ('MY_ENUM_VALUE_A')`,
+			),
+			Entry(
 				"Compare project to string",
 				`this.metadata.project == 'my_project'`,
 				`project = 'my_project'`,
@@ -434,6 +499,10 @@ var _ = Describe("Filter translator", func() {
 			Entry(
 				"Non-literal numeric expression not-equals enum",
 				`this.spec.spec_enum != (1 + 1)`,
+			),
+			Entry(
+				"Unknown enum value in list",
+				`this.spec.spec_enum in [1, 99]`,
 			),
 		)
 
