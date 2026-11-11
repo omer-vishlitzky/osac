@@ -98,10 +98,41 @@ identity E2E is [OSAC-6614](https://redhat.atlassian.net/browse/OSAC-6614).
   `OSAC_QUOTA_COUNTING_RULES`, a missing file means no rules, and rules the
   counter can't apply fail the build. Tenancy and attribution are suite
   doubles; the OPA method grants, including the reviewed reader grant of
-  `QuotaUsage/Get`, are covered by `internal/auth`. Deployed REST or CLI journeys for the quota APIs, the
-  Approve/Deny path under a deployed Cloud Provider Admin identity, and
-  enforcement and warning publishing are not exercised; enforcement is
-  [OSAC-7614](https://redhat.atlassian.net/browse/OSAC-7614).
+  `QuotaUsage/Get`, are covered by `internal/auth`. Deployed REST or CLI journeys for the quota APIs and the
+  Approve/Deny path under a deployed Cloud Provider Admin identity are not
+  exercised.
+- Quota enforcement in the request path
+  ([DEV] [OSAC-7614](https://redhat.atlassian.net/browse/OSAC-7614)):
+  `internal/servers/quota_enforcement_test.go` covers the generic server's
+  check against real PostgreSQL: a create or update over a project,
+  ancestor-project or tenant limit fails with `FAILED_PRECONDITION`,
+  ErrorInfo reason `QUOTA_EXCEEDED` and a `QuotaFailure` detail naming the
+  scope, dimension, limit, usage, added amount and the field paths that add
+  it, and writes nothing; limit resolution in the order project limit,
+  tenant override, default, 0; the dry run of a create runs the check; a
+  create that adds nothing to a dimension fits at limit 0; the check is
+  skipped for the built-in `shared` and `system` tenants; an update whose
+  mask names no annotated spec field is not checked; a resize down frees no
+  quota until the resource runs smaller (the larger-of rule through the
+  counter); two parallel creates for the last vCPU in separate transactions
+  let exactly one pass (the tenant row lock before the count at READ
+  COMMITTED); a cluster create and a VM create that lock the same subnet row
+  in concurrent transactions both finish; crossed thresholds, a threshold
+  set below the usage, and a default-limit change write their quota warnings
+  to the outbox; and the four quota metrics are exposed through a Prometheus
+  registry. The suite's `BeforeEach` seeds generous default limits (including
+  trigger-seeded defaults for host types, storage tiers and GPU resources as
+  they appear), because the check refuses a request that adds to a dimension
+  with no limit, the way an unconfigured provider does. Tenancy and
+  attribution are suite doubles. Deployed coverage:
+  `tests/e2e/core/test_quota_enforcement.py` drives the deployed private
+  API: an admin caps a project, a tenant user's over-limit order is refused
+  with the scope and dimension in the message, and the volume count is
+  unchanged. Not exercised: the quota publisher (the notifications API,
+  [OSAC-75](https://redhat.atlassian.net/browse/OSAC-75), does not exist;
+  warnings accumulate in the outbox by design), and the
+  cluster-hosts-counted-once journey, which requires full bare-metal
+  provisioning and has no owner ticket yet.
 
 ## Coverage gaps
 
