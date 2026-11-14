@@ -15,7 +15,9 @@ package quotausage
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
+	"os"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -230,4 +232,114 @@ var _ = Describe("Usage counter", func() {
 		Expect(usage[""]["storage.volumes"]).To(Equal(int64(3)))
 		Expect(usage[""]["storage.fast.gib"]).To(Equal(int64(300)))
 	})
+})
+
+var _ = Describe("Counting rules", func() {
+	var db *usageDatabase
+
+	// insertHost inserts one host of the shared metal-1tb type with the given status.state.
+	insertHost := func(id, state string) {
+		data := `{"spec": {"instance_type": {"name": "metal-1tb"}}}`
+		if state != "" {
+			data = fmt.Sprintf(`{"spec": {"instance_type": {"name": "metal-1tb"}},
+				"status": {"state": "%s"}}`, state)
+		}
+		db.insertObject("bare_metal_instances", id, "acme", "", "system", "{}", data)
+	}
+
+	// hostsCounted counts the bare_metal.instances.metal-1tb dimension of the default project.
+	hostsCounted := func(counter *Counter) int64 {
+		usage, err := counter.Count(db.ctx, "acme")
+		Expect(err).ToNot(HaveOccurred())
+		return usage[""]["bare_metal.instances.metal-1tb"]
+	}
+
+	BeforeEach(func() {
+		db = newUsageDatabase(context.Background())
+		db.insertObject("bare_metal_instance_types", "metal-1tb", "shared", "", "system", "{}", `{}`)
+		insertHost("host-failed", "BARE_METAL_INSTANCE_STATE_FAILED")
+		insertHost("host-running", "BARE_METAL_INSTANCE_STATE_RUNNING")
+		insertHost("host-no-state", "")
+	})
+
+	It("stops counting rows in the mapped states", func() {
+		released, err := NewCounter().
+			SetLogger(logger).
+			SetCountingRules(map[string][]string{
+				"BareMetalInstance": {"BARE_METAL_INSTANCE_STATE_FAILED"},
+			}).
+			Build()
+		Expect(err).ToNot(HaveOccurred())
+
+		// The failed host releases; the running one and the stateless one keep counting:
+		Expect(hostsCounted(released)).To(Equal(int64(2)))
+	})
+
+	It("counts every row when the kind has no rule", func() {
+		plain, err := NewCounter().
+			SetLogger(logger).
+			SetCountingRules(map[string][]string{}).
+			Build()
+		Expect(err).ToNot(HaveOccurred())
+		Expect(hostsCounted(plain)).To(Equal(int64(3)))
+	})
+
+	It("changes nothing by default", func() {
+		// No injected rules and no OSAC_QUOTA_COUNTING_RULES: the shipped default is empty.
+		counter, err := NewCounter().SetLogger(logger).Build()
+		Expect(err).ToNot(HaveOccurred())
+		Expect(hostsCounted(counter)).To(Equal(int64(3)))
+	})
+
+	It("loads the rules from the file the environment variable names", func() {
+		file, err := os.CreateTemp("", "quota-counting-rules-*.yaml")
+		Expect(err).ToNot(HaveOccurred())
+		DeferCleanup(func() {
+			Expect(file.Close()).To(Succeed())
+			Expect(os.Remove(file.Name())).To(Succeed())
+		})
+		_, err = file.WriteString(`
+counting:
+  BareMetalInstance:
+    stops_counting_in: [BARE_METAL_INSTANCE_STATE_FAILED]
+`)
+		Expect(err).ToNot(HaveOccurred())
+
+		Expect(os.Setenv(countingRulesEnvVar, file.Name())).To(Succeed())
+		DeferCleanup(func() {
+			Expect(os.Unsetenv(countingRulesEnvVar)).To(Succeed())
+		})
+		counter, err := NewCounter().SetLogger(logger).Build()
+		Expect(err).ToNot(HaveOccurred())
+		Expect(hostsCounted(counter)).To(Equal(int64(2)))
+	})
+
+	It("means no rules when the variable names a missing file", func() {
+		Expect(os.Setenv(countingRulesEnvVar, "/tmp/opencode/no-such-quota-counting-rules.yaml")).To(Succeed())
+		DeferCleanup(func() {
+			Expect(os.Unsetenv(countingRulesEnvVar)).To(Succeed())
+		})
+		counter, err := NewCounter().SetLogger(logger).Build()
+		Expect(err).ToNot(HaveOccurred())
+		Expect(hostsCounted(counter)).To(Equal(int64(3)))
+	})
+
+	DescribeTable("refuses rules the counter can't apply",
+		func(rules map[string][]string, message string) {
+			_, err := NewCounter().
+				SetLogger(logger).
+				SetCountingRules(rules).
+				Build()
+			Expect(err).To(MatchError(ContainSubstring(message)))
+		},
+		Entry("an unknown kind", map[string][]string{
+			"Subnet": {"SUBNET_STATE_FAILED"},
+		}, "kind 'Subnet', which carries no quota annotations"),
+		Entry("a kind whose status has no state enum", map[string][]string{
+			"DiskImage": {"DISK_IMAGE_LIFECYCLE_DEPRECATED"},
+		}, "whose status.state is not an enum"),
+		Entry("a state the enum has no value of", map[string][]string{
+			"BareMetalInstance": {"BARE_METAL_INSTANCE_STATE_BOGUS"},
+		}, "which its status.state enum has no value of"),
+	)
 })

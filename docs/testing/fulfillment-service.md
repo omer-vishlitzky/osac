@@ -92,9 +92,13 @@ identity E2E is [OSAC-6614](https://redhat.atlassian.net/browse/OSAC-6614).
   registry-driven usage counter by `internal/quotausage/counter_test.go`
   against real resource rows, including the larger-of rule for a mid-resize
   VM and created resources counting in their own kind with the parent adding
-  only the excess. Tenancy and attribution are suite doubles; the OPA method
-  grants, including the reviewed reader grant of `QuotaUsage/Get`, are covered
-  by `internal/auth`. Deployed REST or CLI journeys for the quota APIs, the
+  only the excess. The same suite covers the counting rules (the release map
+  of the quota state standard): rows in a mapped state stop counting, an
+  empty default changes nothing, rules load from the file named by
+  `OSAC_QUOTA_COUNTING_RULES`, a missing file means no rules, and rules the
+  counter can't apply fail the build. Tenancy and attribution are suite
+  doubles; the OPA method grants, including the reviewed reader grant of
+  `QuotaUsage/Get`, are covered by `internal/auth`. Deployed REST or CLI journeys for the quota APIs, the
   Approve/Deny path under a deployed Cloud Provider Admin identity, and
   enforcement and warning publishing are not exercised; enforcement is
   [OSAC-7614](https://redhat.atlassian.net/browse/OSAC-7614).

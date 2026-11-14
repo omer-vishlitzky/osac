@@ -23,7 +23,9 @@ specific language governing permissions and limitations under the License.
 // row asks for beyond what OSAC has already created for it. Created resources count in their own
 // kind's statement, so a parent only adds the excess: greatest(asked - linked, 0). A resource
 // counts until it is archived, so the statements read the main tables without filtering on the
-// deletion timestamp.
+// deletion timestamp. A kind's counting rules (see counting_rules.go) can release earlier: the
+// states they map stop counting while the record still exists, because they provably hold
+// nothing physical.
 package quotausage
 
 import (
@@ -59,13 +61,15 @@ var tables = map[protoreflect.FullName]string{
 
 // Counter counts a tenant's usage, one SQL statement per counted kind. Create it with NewCounter.
 type Counter struct {
-	logger *slog.Logger
-	kinds  map[string]*quota.Kind
+	logger          *slog.Logger
+	kinds           map[string]*quota.Kind
+	stopsCountingIn map[string][]string
 }
 
 // CounterBuilder contains the data and logic needed to create a counter.
 type CounterBuilder struct {
-	logger *slog.Logger
+	logger        *slog.Logger
+	countingRules map[string][]string
 }
 
 // NewCounter creates a builder for a usage counter.
@@ -79,8 +83,18 @@ func (b *CounterBuilder) SetLogger(value *slog.Logger) *CounterBuilder {
 	return b
 }
 
+// SetCountingRules sets the counting rules directly, for tests. Without it the counter loads the
+// rules from the file named by OSAC_QUOTA_COUNTING_RULES; an unset variable or a missing file
+// means no rules.
+func (b *CounterBuilder) SetCountingRules(value map[string][]string) *CounterBuilder {
+	b.countingRules = value
+	return b
+}
+
 // Build creates the counter. It fails loudly when the registry and the tables map disagree, so a
 // new annotated kind without a table is a startup failure, not a silently uncounted resource.
+// The counting rules come from the builder or, when the builder sets none, from the file named by
+// OSAC_QUOTA_COUNTING_RULES; rules the counter can't apply fail the build the same way.
 func (b *CounterBuilder) Build() (result *Counter, err error) {
 	if b.logger == nil {
 		err = errors.New("logger is mandatory")
@@ -90,7 +104,13 @@ func (b *CounterBuilder) Build() (result *Counter, err error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to load the quota registry: %w", err)
 	}
-	result = &Counter{logger: b.logger, kinds: map[string]*quota.Kind{}}
+	rules := b.countingRules
+	if rules == nil {
+		if rules, err = loadCountingRules(); err != nil {
+			return nil, err
+		}
+	}
+	result = &Counter{logger: b.logger, kinds: map[string]*quota.Kind{}, stopsCountingIn: rules}
 	for i := range kinds {
 		kind := &kinds[i]
 		result.kinds[kind.Name] = kind
@@ -111,6 +131,9 @@ func (b *CounterBuilder) Build() (result *Counter, err error) {
 		}
 	}
 	if err := checkKinds(result.kinds); err != nil {
+		return nil, err
+	}
+	if err := checkCountingRules(result.kinds, rules); err != nil {
 		return nil, err
 	}
 	return result, nil
@@ -278,6 +301,24 @@ func (g *statementGenerator) nextAlias(prefix string) string {
 	return fmt.Sprintf("%s%d", prefix, g.aliases)
 }
 
+// stopsCountingIn builds the SQL filter that stops counting the rows of a kind whose status.state
+// is one of the mapped states: the release map of the quota state standard. Empty when no state
+// of the kind is mapped, so the default changes nothing.
+func (g *statementGenerator) stopsCountingIn() string {
+	states := g.counter.stopsCountingIn[g.kind.Name]
+	if len(states) == 0 {
+		return ""
+	}
+	quoted := make([]string, len(states))
+	for i, state := range states {
+		quoted[i] = sqlString(state)
+	}
+	return fmt.Sprintf(
+		"and coalesce(r.data #>> '{status,state}', '') not in (%s)",
+		strings.Join(quoted, ", "),
+	)
+}
+
 func (g *statementGenerator) generate() (string, error) {
 	row := "r"
 	if g.kind.Dimension != "" {
@@ -316,9 +357,10 @@ func (g *statementGenerator) generate() (string, error) {
 			where r.tenant = $1
 				and u.dimension is not null
 				and u.dimension <> ''
+				%s
 			group by r.project, u.dimension
 			`,
-			g.table, joinClauses(g.rowJoins), union(g.asks),
+			g.table, joinClauses(g.rowJoins), union(g.asks), g.stopsCountingIn(),
 		), nil
 	}
 	return fmt.Sprintf(`
@@ -341,6 +383,7 @@ func (g *statementGenerator) generate() (string, error) {
 			where r.tenant = $1
 				and u.dimension is not null
 				and u.dimension <> ''
+				%s
 			group by r.id, r.tenant, r.project, u.dimension
 		) p
 		left join lateral (
@@ -353,7 +396,7 @@ func (g *statementGenerator) generate() (string, error) {
 			group by ex.dimension
 		) e on e.dimension = p.dimension
 		`,
-		g.table, joinClauses(g.rowJoins), union(g.asks), union(g.exists),
+		g.table, joinClauses(g.rowJoins), union(g.asks), g.stopsCountingIn(), union(g.exists),
 	), nil
 }
 
