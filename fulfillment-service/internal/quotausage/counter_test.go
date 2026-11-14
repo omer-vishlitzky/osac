@@ -159,7 +159,7 @@ var _ = Describe("Usage counter", func() {
 
 		// One automatic address for vm-1 and one manual one:
 		db.insertObject("external_ips", "ip-auto", "acme", "", "system",
-			`{"osac.openshift.io/auto-created-for": "vm-1", "osac.openshift.io/auto-created-kind": "ComputeInstance"}`,
+			`{"osac.openshift.io/auto-created-for": "vm-1", "osac.openshift.io/auto-created-kind": "compute_instance"}`,
 			`{}`)
 		db.insertObject("external_ips", "ip-manual", "acme", "", "user", "{}", `{}`)
 
@@ -179,7 +179,7 @@ var _ = Describe("Usage counter", func() {
 			"status": {"cluster": {"id": "prod"}}
 		}`)
 		db.insertObject("external_ips", "ip-cluster", "acme", "team", "system",
-			`{"osac.openshift.io/auto-created-for": "prod", "osac.openshift.io/auto-created-kind": "Cluster"}`,
+			`{"osac.openshift.io/auto-created-for": "prod", "osac.openshift.io/auto-created-kind": "cluster"}`,
 			`{}`)
 
 		db.insertObject("nat_gateways", "ng-1", "acme", "team", "user", "{}", `{}`)

@@ -643,6 +643,10 @@ func plannedPrice(kind *quota.Kind, set map[string]string, item string) (result 
 }
 
 // linkCondition builds the condition that ties a created row to the parent it was created for.
+//
+// The kind label's value is the parent kind's proto name in snake_case, such as "cluster" for
+// Cluster: that is the value the private servers write on automatic IP addresses and the
+// attachment reconcilers match, so the link must compare against the same form.
 func linkCondition(createdFor *quota.CreatedFor, linkField, row, parent, parentKind string) (string, error) {
 	switch {
 	case createdFor.NamePrefix != "":
@@ -670,7 +674,7 @@ func linkCondition(createdFor *quota.CreatedFor, linkField, row, parent, parentK
 		return fmt.Sprintf(
 			"%s.labels ->> %s = %s.id and %s.labels ->> %s = '%s'",
 			row, sqlString(createdFor.IDLabel), parent,
-			row, sqlString(createdFor.KindLabel), parentKind,
+			row, sqlString(createdFor.KindLabel), snakeCase(parentKind),
 		), nil
 	case linkField != "":
 		return fmt.Sprintf(
@@ -766,6 +770,23 @@ func dimensionSQL(template string, resolve func(string) string) string {
 // intCast turns the text a jsonb path yields into a bigint amount, defaulting to zero.
 func intCast(expr string) string {
 	return fmt.Sprintf("coalesce((%s)::bigint, 0)", expr)
+}
+
+// snakeCase turns a kind's proto name into the value its automatic children carry in the kind
+// label: Cluster becomes "cluster", ComputeInstance becomes "compute_instance".
+func snakeCase(kind string) string {
+	var result []byte
+	for i := 0; i < len(kind); i++ {
+		letter := kind[i]
+		if letter >= 'A' && letter <= 'Z' {
+			if i > 0 {
+				result = append(result, '_')
+			}
+			letter = letter + ('a' - 'A')
+		}
+		result = append(result, letter)
+	}
+	return string(result)
 }
 
 func sqlString(value string) string {
