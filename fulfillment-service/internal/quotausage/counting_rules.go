@@ -68,7 +68,8 @@ func loadCountingRules() (map[string][]string, error) {
 	if path == "" {
 		return nil, nil
 	}
-	data, err := os.ReadFile(path)
+	// The path is operator configuration, the way the token file of the JWKS cache is.
+	data, err := os.ReadFile(path) //nolint:gosec
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, nil
 	}
