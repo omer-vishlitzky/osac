@@ -91,8 +91,9 @@ identity E2E is [OSAC-6614](https://redhat.atlassian.net/browse/OSAC-6614).
   `internal/servers/quota_servers_test.go` against real PostgreSQL; and the
   registry-driven usage counter by `internal/quotausage/counter_test.go`
   against real resource rows, including the larger-of rule for a mid-resize
-  VM and created resources counting in their own kind with the parent adding
-  only the excess. The same suite covers the counting rules (the release map
+  VM, created resources counting in their own kind with the parent adding
+  only the excess, one parent row's reserved-but-uncreated room read per
+  row, and counting until archive rather than delete. The same suite covers the counting rules (the release map
   of the quota state standard): rows in a mapped state stop counting, an
   empty default changes nothing, rules load from the file named by
   `OSAC_QUOTA_COUNTING_RULES`, a missing file means no rules, and rules the
@@ -120,7 +121,17 @@ identity E2E is [OSAC-6614](https://redhat.atlassian.net/browse/OSAC-6614).
   in concurrent transactions both finish; crossed thresholds, a threshold
   set below the usage, and a default-limit change write their quota warnings
   to the outbox; and the four quota metrics are exposed through a Prometheus
-  registry. The suite's `BeforeEach` seeds generous default limits (including
+  registry. `internal/servers/quota_enforcement_composite_test.go` covers
+  the netting of the operator's creates against the parent's ask: the
+  operator's create of a host linked to an admitted cluster adds nothing at
+  a full tenant and passes, first host and last host alike, and so does the
+  create of a VM's boot-disk volume for an admitted VM.
+  `internal/servers/private_clusters_server_test.go` covers the automatic
+  endpoints of the check: a cluster whose two automatic external IPs exceed
+  the external-IP limit is refused before any write (no cluster, no address,
+  pool capacity unchanged), and a cluster whose two automatic addresses
+  exactly fit the limit passes while a second is refused reporting the two
+  addresses the tenant really holds. The suite's `BeforeEach` seeds generous default limits (including
   trigger-seeded defaults for host types, storage tiers and GPU resources as
   they appear), because the check refuses a request that adds to a dimension
   with no limit, the way an unconfigured provider does. Tenancy and
@@ -131,8 +142,9 @@ identity E2E is [OSAC-6614](https://redhat.atlassian.net/browse/OSAC-6614).
   unchanged. Not exercised: the quota publisher (the notifications API,
   [OSAC-75](https://redhat.atlassian.net/browse/OSAC-75), does not exist;
   warnings accumulate in the outbox by design), and the
-  cluster-hosts-counted-once journey, which requires full bare-metal
-  provisioning and has no owner ticket yet.
+  cluster-hosts-counted-once journey on a deployed cluster, which requires
+  full bare-metal provisioning and has no owner ticket yet (the composite
+  tests above cover the counting itself at the component-integration tier).
 
 ## Coverage gaps
 

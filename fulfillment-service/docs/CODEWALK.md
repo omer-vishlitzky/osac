@@ -112,6 +112,13 @@ serializes two concurrent requests in one tenant so they cannot both pass the ch
 COMMITTED. A request that crosses a warning threshold writes its warning to `quota_outbox` in the
 same transaction.
 
+The check runs before the write and adds the request's price to the tenant's usage. A resource the
+operator creates for an admitted parent adds nothing, because the check subtracts the room the
+parent's ask already reserved for it: the counter prices each parent row as its ask beyond what
+OSAC has already created for it, so a linked child converts reserved room into an existing row and
+moves no total. Only creates the system makes net this way, so a user cannot claim a parent and get
+room for free. A child beyond its parent's ask still adds its full price.
+
 ### Event delivery and reconciliation recovery
 
 Watch events notify controllers that an object may need reconciliation. Controllers read the

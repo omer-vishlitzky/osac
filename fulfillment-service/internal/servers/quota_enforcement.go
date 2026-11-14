@@ -58,6 +58,7 @@ type quotaEnforcer struct {
 	specPaths   map[string][]string
 	kindTables  map[string]string
 	kindMessage map[string]protoreflect.FullName
+	kindLinks   map[string]quota.Link
 	metrics     *quotaMetrics
 }
 
@@ -85,6 +86,10 @@ func newQuotaEnforcer(logger *slog.Logger, registerer prometheus.Registerer) (re
 	if err != nil {
 		return nil, fmt.Errorf("failed to load the quota registry: %w", err)
 	}
+	links, err := quota.Links()
+	if err != nil {
+		return nil, fmt.Errorf("failed to load the quota registry's links: %w", err)
+	}
 	// A type is a kind other kinds resolve through; it counts toward no limit, so creates and
 	// updates of a type are never checked:
 	types := map[string]bool{}
@@ -103,7 +108,13 @@ func newQuotaEnforcer(logger *slog.Logger, registerer prometheus.Registerer) (re
 		specPaths:   map[string][]string{},
 		kindTables:  map[string]string{},
 		kindMessage: map[string]protoreflect.FullName{},
+		kindLinks:   map[string]quota.Link{},
 		metrics:     metrics,
+	}
+	for _, link := range links {
+		if _, ok := result.kindLinks[link.Kind]; !ok {
+			result.kindLinks[link.Kind] = link
+		}
 	}
 	for i := range kinds {
 		kind := kinds[i]
@@ -282,6 +293,8 @@ func (e *quotaEnforcer) checkUpdate(ctx context.Context, current, candidate prot
 // check prices the candidate, counts the tenant's usage from the database and compares each
 // dimension the request adds to against the limits of the request's project, each ancestor
 // project and the tenant. A request that adds nothing to a dimension fits even at a limit of 0.
+// A create the system makes for an admitted parent adds only what the parent's ask didn't
+// already reserve for it (see linkedRelief).
 func (e *quotaEnforcer) check(
 	ctx context.Context, current, candidate proto.Message,
 ) error {
@@ -309,6 +322,19 @@ func (e *quotaEnforcer) check(
 		for dimension, amount := range candidateQuote.Dimensions {
 			if amount > 0 {
 				added[dimension] = amount
+			}
+		}
+		// A resource the system creates for an admitted parent nets against the room the
+		// parent's ask already reserved for it, so it adds only what the parent didn't ask
+		// for:
+		relief, err := e.linkedRelief(ctx, tenant, candidate, candidateQuote.Dimensions)
+		if err != nil {
+			return e.internalCheckError(ctx, tenant, err)
+		}
+		for dimension, amount := range relief {
+			added[dimension] -= amount
+			if added[dimension] <= 0 {
+				delete(added, dimension)
 			}
 		}
 	} else {
@@ -370,6 +396,110 @@ func (e *quotaEnforcer) internalCheckError(ctx context.Context, tenant string, e
 		slog.String("tenant", tenant),
 		slog.Any("error", err))
 	return grpcstatus.Errorf(grpccodes.Internal, "failed to check the quota")
+}
+
+// linkedRelief returns the room the candidate's parent reserved for it, per dimension: the
+// smaller of the parent's reserved-but-uncreated room and the candidate's own price. The usage
+// counter counts a parent's ask beyond what OSAC created for it, so a resource the system
+// creates for an admitted parent converts reserved room into an existing row and adds nothing;
+// a resource beyond the parent's ask, or with no parent, adds its full price. The creator gate
+// is the same trust gate the counter's exists side uses: a user's create never nets, or a user
+// could claim a parent and get room for free.
+func (e *quotaEnforcer) linkedRelief(
+	ctx context.Context, tenant string, candidate proto.Message, price map[string]int64,
+) (map[string]int64, error) {
+	if metadataOf(candidate).GetCreator() != systemCreator {
+		return nil, nil
+	}
+	parentKind, parentID, ok := e.linkedParent(candidate)
+	if !ok {
+		return nil, nil
+	}
+	excess, err := e.counter.ParentExcess(ctx, tenant, parentKind, parentID)
+	if err != nil {
+		return nil, err
+	}
+	relief := map[string]int64{}
+	for dimension, room := range excess {
+		amount := min(room, price[dimension])
+		if amount > 0 {
+			relief[dimension] = amount
+		}
+	}
+	return relief, nil
+}
+
+// linkedParent resolves the parent a linked candidate names, through the link the registry
+// declares for its kind: a field link reads the parent's identifier from the candidate's
+// reference field, such as a host's "status.cluster"; a name-prefix link reads it from the
+// candidate's name, where it is the 36 characters after the literal prefix, because a parent's
+// identifier is a uuidv7. ok is false when the kind links by labels (the parent's kind sits on
+// the candidate itself, and the resources that use that link, the automatic addresses, are
+// inserted through the DAO, past this check), when the kind links to no parent, or when the
+// link names no parent.
+func (e *quotaEnforcer) linkedParent(candidate proto.Message) (parentKind, parentID string, ok bool) {
+	link, found := e.kindLinks[quotaKindName(candidate)]
+	if !found || link.Parent == "" {
+		return "", "", false
+	}
+	switch {
+	case link.Field != "":
+		id, resolved := quotaLinkedParentID(candidate.ProtoReflect(), link.Field)
+		if !resolved {
+			return "", "", false
+		}
+		return link.Parent, id, true
+	case link.NamePrefix != "":
+		id, resolved := quotaParentIDFromName(metadataOf(candidate).GetName(), link.NamePrefix)
+		if !resolved {
+			return "", "", false
+		}
+		return link.Parent, id, true
+	}
+	return "", "", false
+}
+
+// quotaLinkedParentID reads the parent's identifier from the candidate's reference field, the
+// field path the link declares. ok is false when a field along the path isn't set or the
+// reference names nothing.
+func quotaLinkedParentID(candidate protoreflect.Message, path string) (id string, ok bool) {
+	current := candidate
+	segments := strings.Split(path, ".")
+	for i, segment := range segments {
+		field := current.Descriptor().Fields().ByName(protoreflect.Name(segment))
+		if field == nil || !current.Has(field) {
+			return "", false
+		}
+		if i == len(segments)-1 {
+			reference := current.Get(field).Message()
+			idField := reference.Descriptor().Fields().ByName("id")
+			if idField == nil || idField.Kind() != protoreflect.StringKind {
+				return "", false
+			}
+			value := reference.Get(idField).String()
+			if value == "" {
+				return "", false
+			}
+			return value, true
+		}
+		if field.Kind() != protoreflect.MessageKind || field.IsList() || field.IsMap() {
+			return "", false
+		}
+		current = current.Get(field).Message()
+	}
+	return "", false
+}
+
+// quotaParentIDFromName reads the parent's identifier from the candidate's name: the link's
+// name prefix is "ci-{parent}-...", and a parent's identifier is a uuidv7, a fixed 36
+// characters, so the identifier is the 36 characters after the literal prefix. ok is false when
+// the name is too short to carry it.
+func quotaParentIDFromName(name, namePrefix string) (id string, ok bool) {
+	prefix, _, _ := strings.Cut(namePrefix, "{parent}")
+	if len(name) < len(prefix)+36 {
+		return "", false
+	}
+	return name[len(prefix) : len(prefix)+36], true
 }
 
 // refuse builds the FAILED_PRECONDITION error with the ErrorInfo reason and the QuotaFailure

@@ -38,6 +38,7 @@ import (
 
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
 	"github.com/osac-project/osac/fulfillment-service/internal/controllers/finalizers"
+	"github.com/osac-project/osac/fulfillment-service/internal/database"
 	"github.com/osac-project/osac/fulfillment-service/internal/database/dao"
 	"github.com/osac-project/osac/fulfillment-service/internal/references"
 	"github.com/osac-project/osac/fulfillment-service/internal/uuid"
@@ -1151,6 +1152,145 @@ var _ = Describe("Private clusters server", func() {
 			eipList, err = eipDao.List().SetFilter(filter).Do(ctx)
 			Expect(err).ToNot(HaveOccurred())
 			Expect(eipList.GetItems()).To(BeEmpty())
+		})
+
+		It("refuses a cluster whose two automatic ExternalIPs exceed the external-IP limit and writes nothing", func() {
+			// A tenant override below the two addresses a cluster with automatic endpoints
+			// creates, so the create's full effect, the cluster and its two addresses,
+			// cannot fit:
+			tx, err := database.TxFromContext(ctx)
+			Expect(err).ToNot(HaveOccurred())
+			_, err = tx.Exec(ctx,
+				`insert into quota_limits (id, name, tenant, project, creator, data)
+				values ('limit-eips', 'limit-eips', $1, ''::ltree, 'system',
+				'{"spec":{"dimension":"network.external_ips","value":1}}')`, testTenant,
+			)
+			Expect(err).ToNot(HaveOccurred())
+
+			poolDao, err := dao.NewGenericDAO[*privatev1.ExternalIPPool]().
+				SetLogger(logger).
+				SetTenancyLogic(tenancy).
+				Build()
+			Expect(err).ToNot(HaveOccurred())
+			pool, err := poolDao.Create().SetObject(privatev1.ExternalIPPool_builder{
+				Id:       "quota-auto-eip-pool",
+				Metadata: privatev1.Metadata_builder{Name: "quota-auto-eip-pool", Tenant: auth.SharedTenant}.Build(),
+				Spec: privatev1.ExternalIPPoolSpec_builder{
+					Cidrs: []string{"192.0.2.0/24"}, IpFamily: privatev1.IPFamily_IP_FAMILY_IPV4,
+				}.Build(),
+				Status: privatev1.ExternalIPPoolStatus_builder{
+					State:     privatev1.ExternalIPPoolState_EXTERNAL_IP_POOL_STATE_READY,
+					Total:     5,
+					Available: 5,
+				}.Build(),
+			}.Build()).Do(ctx)
+			Expect(err).ToNot(HaveOccurred())
+
+			name := fmt.Sprintf("quota-eip-%s", uuid.New()[24:32])
+			response, createErr := server.Create(ctx, privatev1.ClustersCreateRequest_builder{
+				Object: privatev1.Cluster_builder{
+					Metadata: privatev1.Metadata_builder{Name: name}.Build(),
+					Spec: privatev1.ClusterSpec_builder{
+						Template: privatev1.ClusterTemplateReference_builder{Id: "acme.templates.caas-capable"}.Build(),
+					}.Build(),
+				}.Build(),
+			}.Build())
+			Expect(response).To(BeNil())
+			Expect(grpcstatus.Code(createErr)).To(Equal(grpccodes.FailedPrecondition))
+			var failure *publicv1.QuotaFailure
+			for _, detail := range grpcstatus.Convert(createErr).Details() {
+				if quoted, ok := detail.(*publicv1.QuotaFailure); ok {
+					failure = quoted
+				}
+			}
+			Expect(failure).ToNot(BeNil())
+			Expect(failure.GetScope()).To(Equal("tenant"))
+			Expect(failure.GetDimension()).To(Equal("network.external_ips"))
+			Expect(failure.GetLimit()).To(Equal(int64(1)))
+			Expect(failure.GetUsage()).To(Equal(int64(0)))
+
+			// The refusal wrote nothing: no cluster, no automatic address, and the pool
+			// kept its capacity:
+			clustersDao, err := dao.NewGenericDAO[*privatev1.Cluster]().SetLogger(logger).SetTenancyLogic(tenancy).Build()
+			Expect(err).ToNot(HaveOccurred())
+			stored, err := clustersDao.List().SetFilter(fmt.Sprintf("this.metadata.name == %q", name)).Do(ctx)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(stored.GetItems()).To(BeEmpty())
+			eips, err := server.externalIPDao.List().SetFilter(
+				fmt.Sprintf("this.metadata.labels['%s'] == 'true'", autoCreatedLabel)).Do(ctx)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(eips.GetItems()).To(BeEmpty())
+			after, err := poolDao.Get().SetId(pool.GetObject().GetId()).Do(ctx)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(after.GetObject().GetStatus().GetAvailable()).To(Equal(int64(5)))
+			Expect(after.GetObject().GetStatus().GetAllocated()).To(Equal(int64(0)))
+		})
+
+		It("creates a cluster whose two automatic ExternalIPs exactly fit the external-IP limit", func() {
+			// The limit covers exactly the two addresses this create writes. The automatic
+			// addresses must count once, through their own rows, so the create fits. If the
+			// addresses counted twice, once through their rows and once through the cluster's
+			// unconverted ask, this create would be refused at usage 4:
+			tx, err := database.TxFromContext(ctx)
+			Expect(err).ToNot(HaveOccurred())
+			_, err = tx.Exec(ctx,
+				`insert into quota_limits (id, name, tenant, project, creator, data)
+				values ('limit-eips-fit', 'limit-eips-fit', $1, ''::ltree, 'system',
+				'{"spec":{"dimension":"network.external_ips","value":2}}')`, testTenant,
+			)
+			Expect(err).ToNot(HaveOccurred())
+
+			poolDao, err := dao.NewGenericDAO[*privatev1.ExternalIPPool]().
+				SetLogger(logger).
+				SetTenancyLogic(tenancy).
+				Build()
+			Expect(err).ToNot(HaveOccurred())
+			_, err = poolDao.Create().SetObject(privatev1.ExternalIPPool_builder{
+				Id:       "quota-auto-eip-fit-pool",
+				Metadata: privatev1.Metadata_builder{Name: "quota-auto-eip-fit-pool", Tenant: auth.SharedTenant}.Build(),
+				Spec: privatev1.ExternalIPPoolSpec_builder{
+					Cidrs: []string{"192.0.2.0/24"}, IpFamily: privatev1.IPFamily_IP_FAMILY_IPV4,
+				}.Build(),
+				Status: privatev1.ExternalIPPoolStatus_builder{
+					State:     privatev1.ExternalIPPoolState_EXTERNAL_IP_POOL_STATE_READY,
+					Total:     5,
+					Available: 5,
+				}.Build(),
+			}.Build()).Do(ctx)
+			Expect(err).ToNot(HaveOccurred())
+
+			response, createErr := server.Create(ctx, privatev1.ClustersCreateRequest_builder{
+				Object: privatev1.Cluster_builder{
+					Metadata: privatev1.Metadata_builder{Name: "quota-eip-fits"}.Build(),
+					Spec: privatev1.ClusterSpec_builder{
+						Template: privatev1.ClusterTemplateReference_builder{Id: "acme.templates.caas-capable"}.Build(),
+					}.Build(),
+				}.Build(),
+			}.Build())
+			Expect(createErr).ToNot(HaveOccurred())
+			Expect(response.GetObject().GetSpec().GetAutoExternalIpAttachment()).To(BeTrue())
+
+			// A second such cluster no longer fits, and the refusal reports the two
+			// addresses the tenant really holds, not four:
+			_, secondErr := server.Create(ctx, privatev1.ClustersCreateRequest_builder{
+				Object: privatev1.Cluster_builder{
+					Metadata: privatev1.Metadata_builder{Name: "quota-eip-fits-2"}.Build(),
+					Spec: privatev1.ClusterSpec_builder{
+						Template: privatev1.ClusterTemplateReference_builder{Id: "acme.templates.caas-capable"}.Build(),
+					}.Build(),
+				}.Build(),
+			}.Build())
+			Expect(grpcstatus.Code(secondErr)).To(Equal(grpccodes.FailedPrecondition))
+			var failure *publicv1.QuotaFailure
+			for _, detail := range grpcstatus.Convert(secondErr).Details() {
+				if quoted, ok := detail.(*publicv1.QuotaFailure); ok {
+					failure = quoted
+				}
+			}
+			Expect(failure).ToNot(BeNil())
+			Expect(failure.GetDimension()).To(Equal("network.external_ips"))
+			Expect(failure.GetUsage()).To(Equal(int64(2)))
+			Expect(failure.GetAdded()).To(Equal(int64(2)))
 		})
 
 		It("keeps automatic ExternalIPs while an attachment finalizer holds public deletion", func() {
