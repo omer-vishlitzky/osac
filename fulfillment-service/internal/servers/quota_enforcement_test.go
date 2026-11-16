@@ -695,6 +695,30 @@ var _ = Describe("Quota enforcement", func() {
 			Expect(rows[0]["data"]).To(MatchJSON(`{"dimension":"storage.fast.gib","threshold":2,"usage":2,"limit":10}`))
 		})
 
+		It("writes no outbox row for a dry run that crosses a threshold", func() {
+			insertThreshold("team", "storage.fast.gib", 2)
+			_, err := volumes.Create(dryRunCtx(), privatev1.VolumesCreateRequest_builder{
+				Object: privatev1.Volume_builder{
+					Metadata: privatev1.Metadata_builder{Name: "dry", Tenant: testTenant, Project: "team"}.Build(),
+					Spec: privatev1.VolumeSpec_builder{
+						StorageTier: "fast",
+						SizeGib:     2,
+						AccessMode:  privatev1.VolumeAccessMode_VOLUME_ACCESS_MODE_READ_WRITE_ONCE,
+					}.Build(),
+				}.Build(),
+			}.Build())
+			Expect(err).To(Succeed())
+			// The dry run never moved usage, so it must leave no warning behind:
+			Expect(outboxRows()).To(BeEmpty())
+
+			// The same create for real writes the crossing once:
+			Expect(createVolume("vol-1", "team", "fast", 2)).To(Succeed())
+			rows := outboxRows()
+			Expect(rows).To(HaveLen(1))
+			Expect(rows[0]["project"]).To(Equal("team"))
+			Expect(rows[0]["dimension"]).To(Equal("storage.fast.gib"))
+		})
+
 		It("writes no warning when the usage stays below the threshold", func() {
 			insertThreshold("team", "storage.fast.gib", 5)
 			Expect(createVolume("vol-1", "team", "fast", 1)).To(Succeed())

@@ -384,8 +384,13 @@ func (e *quotaEnforcer) check(
 				added[dimension], candidateQuote.Sources[dimension])
 		}
 	}
-	if err = e.warnCrossings(ctx, tenant, usage, state, scopes, added); err != nil {
-		return e.internalCheckError(ctx, tenant, err)
+	// A dry run writes nothing, so it leaves no warning: usage never moves, so the
+	// crossing would fire again on every repeated dry run and pile up outbox rows for a
+	// request that never happened.
+	if !isDryRun(ctx) {
+		if err = e.warnCrossings(ctx, tenant, usage, state, scopes, added); err != nil {
+			return e.internalCheckError(ctx, tenant, err)
+		}
 	}
 	return nil
 }
