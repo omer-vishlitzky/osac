@@ -1138,7 +1138,10 @@ func (s *PrivateBareMetalInstancesServer) autoProvisionExternalIP(
 		Metadata: privatev1.Metadata_builder{
 			Name:   fmt.Sprintf("auto-eip-%s", shortID),
 			Tenant: tenant,
-			Labels: eipLabels,
+			// The address counts in the instance's project, so a project's external-IP
+			// limit binds it:
+			Project: bmi.GetMetadata().GetProject(),
+			Labels:  eipLabels,
 			Annotations: map[string]string{
 				tenantAnnotation:         tenant,
 				ownerReferenceAnnotation: bmiID,

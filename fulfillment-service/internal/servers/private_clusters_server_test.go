@@ -1293,6 +1293,92 @@ var _ = Describe("Private clusters server", func() {
 			Expect(failure.GetAdded()).To(Equal(int64(2)))
 		})
 
+		It("counts a named project's automatic ExternalIPs under that project", func() {
+			projectsDao, err := dao.NewGenericDAO[*privatev1.Project]().
+				SetLogger(logger).
+				SetTenancyLogic(tenancy).
+				Build()
+			Expect(err).ToNot(HaveOccurred())
+			_, err = projectsDao.Create().SetObject(privatev1.Project_builder{
+				Metadata: privatev1.Metadata_builder{Name: "team", Tenant: testTenant}.Build(),
+			}.Build()).Do(ctx)
+			Expect(err).ToNot(HaveOccurred())
+
+			poolDao, err := dao.NewGenericDAO[*privatev1.ExternalIPPool]().
+				SetLogger(logger).
+				SetTenancyLogic(tenancy).
+				Build()
+			Expect(err).ToNot(HaveOccurred())
+			_, err = poolDao.Create().SetObject(privatev1.ExternalIPPool_builder{
+				Id:       "quota-auto-eip-project-pool",
+				Metadata: privatev1.Metadata_builder{Name: "quota-auto-eip-project-pool", Tenant: auth.SharedTenant}.Build(),
+				Spec: privatev1.ExternalIPPoolSpec_builder{
+					Cidrs: []string{"192.0.2.0/24"}, IpFamily: privatev1.IPFamily_IP_FAMILY_IPV4,
+				}.Build(),
+				Status: privatev1.ExternalIPPoolStatus_builder{
+					State:     privatev1.ExternalIPPoolState_EXTERNAL_IP_POOL_STATE_READY,
+					Total:     5,
+					Available: 5,
+				}.Build(),
+			}.Build()).Do(ctx)
+			Expect(err).ToNot(HaveOccurred())
+
+			response, createErr := server.Create(ctx, privatev1.ClustersCreateRequest_builder{
+				Object: privatev1.Cluster_builder{
+					Metadata: privatev1.Metadata_builder{
+						Name: "quota-eip-project", Tenant: testTenant, Project: "team",
+					}.Build(),
+					Spec: privatev1.ClusterSpec_builder{
+						Template: privatev1.ClusterTemplateReference_builder{Id: "acme.templates.caas-capable"}.Build(),
+					}.Build(),
+				}.Build(),
+			}.Build())
+			Expect(createErr).ToNot(HaveOccurred())
+			Expect(response.GetObject().GetSpec().GetAutoExternalIpAttachment()).To(BeTrue())
+
+			usageServer, err := NewQuotaUsageServer().
+				SetLogger(logger).
+				SetTenancyLogic(tenancy).
+				Build()
+			Expect(err).ToNot(HaveOccurred())
+			usage, err := usageServer.Get(ctx, publicv1.QuotaUsageGetRequest_builder{
+				Tenant: testTenant,
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+
+			findProject := func(name string) *publicv1.QuotaUsageProject {
+				for _, project := range usage.GetReport().GetProjects() {
+					if project.GetProject() == name {
+						return project
+					}
+				}
+				return nil
+			}
+			findDimension := func(
+				project *publicv1.QuotaUsageProject, name string,
+			) *publicv1.QuotaUsageDimension {
+				for _, dimension := range project.GetDimensions() {
+					if dimension.GetDimension() == name {
+						return dimension
+					}
+				}
+				return nil
+			}
+
+			// The two automatic addresses count in the cluster's project, so the
+			// project's external-IP limit binds them:
+			team := findProject("team")
+			Expect(team).ToNot(BeNil())
+			teamAddresses := findDimension(team, "network.external_ips")
+			Expect(teamAddresses).ToNot(BeNil())
+			Expect(teamAddresses.GetUsage()).To(Equal(int64(2)))
+
+			// The default project holds none of them:
+			defaultProject := findProject("")
+			Expect(defaultProject).ToNot(BeNil())
+			Expect(findDimension(defaultProject, "network.external_ips")).To(BeNil())
+		})
+
 		It("keeps automatic ExternalIPs while an attachment finalizer holds public deletion", func() {
 			poolDao, err := dao.NewGenericDAO[*privatev1.ExternalIPPool]().
 				SetLogger(logger).
