@@ -212,12 +212,11 @@ var _ = Describe("Usage counter", func() {
 			"network.nat_gateways":           1,
 			"network.virtual_networks":       1,
 		}))
-	})
 
-	It("counts only the tenant's rows", func(ctx context.Context) {
-		usage, err := counter.Count(db.ctx, "other")
+		// The other tenant's VM counts for it and never for acme, whose counts above exclude it:
+		other, err := counter.Count(db.ctx, "other")
 		Expect(err).ToNot(HaveOccurred())
-		Expect(usage).To(Equal(map[string]map[string]int64{
+		Expect(other).To(Equal(map[string]map[string]int64{
 			"": {
 				"compute.vcpus":      6,
 				"compute.memory_gib": 24,
@@ -275,15 +274,6 @@ var _ = Describe("Counting rules", func() {
 		Expect(hostsCounted(released)).To(Equal(int64(2)))
 	})
 
-	It("counts every row when the kind has no rule", func() {
-		plain, err := NewCounter().
-			SetLogger(logger).
-			SetCountingRules(map[string][]string{}).
-			Build()
-		Expect(err).ToNot(HaveOccurred())
-		Expect(hostsCounted(plain)).To(Equal(int64(3)))
-	})
-
 	It("changes nothing by default", func() {
 		// No injected rules and no OSAC_QUOTA_COUNTING_RULES: the shipped default is empty.
 		counter, err := NewCounter().SetLogger(logger).Build()
@@ -324,6 +314,36 @@ counting:
 		Expect(hostsCounted(counter)).To(Equal(int64(3)))
 	})
 
+	DescribeTable("reads the counting rules file the variable names",
+		func(content, expectedError string) {
+			file, err := os.CreateTemp("", "quota-counting-rules-*.yaml")
+			Expect(err).ToNot(HaveOccurred())
+			DeferCleanup(func() {
+				Expect(file.Close()).To(Succeed())
+				Expect(os.Remove(file.Name())).To(Succeed())
+			})
+			_, err = file.WriteString(content)
+			Expect(err).ToNot(HaveOccurred())
+
+			Expect(os.Setenv(countingRulesEnvVar, file.Name())).To(Succeed())
+			DeferCleanup(func() {
+				Expect(os.Unsetenv(countingRulesEnvVar)).To(Succeed())
+			})
+			counter, err := NewCounter().SetLogger(logger).Build()
+			if expectedError == "" {
+				// An empty file loads as no rules, so every host keeps counting:
+				Expect(err).ToNot(HaveOccurred())
+				Expect(hostsCounted(counter)).To(Equal(int64(3)))
+				return
+			}
+			Expect(err).To(MatchError(ContainSubstring(expectedError)))
+		},
+		Entry("fails on a file that does not parse", "counting: [", "invalid counting rules file"),
+		Entry("fails on an unknown key", "counting:\n  BareMetalInstance:\n    bogus: []",
+			"field bogus not found"),
+		Entry("loads an empty file as no rules", "", ""),
+	)
+
 	DescribeTable("refuses rules the counter can't apply",
 		func(rules map[string][]string, message string) {
 			_, err := NewCounter().
@@ -341,5 +361,77 @@ counting:
 		Entry("a state the enum has no value of", map[string][]string{
 			"BareMetalInstance": {"BARE_METAL_INSTANCE_STATE_BOGUS"},
 		}, "which its status.state enum has no value of"),
+	)
+})
+
+var _ = Describe("Parent counting", func() {
+	var db *usageDatabase
+
+	// insertCluster inserts a cluster whose compute node set asks for the given number of
+	// metal-1tb hosts. Zero leaves no node set in the spec, the world a removed node set
+	// leaves behind while its host rows remain.
+	insertCluster := func(size int) {
+		nodeSets := "{}"
+		if size > 0 {
+			nodeSets = fmt.Sprintf(`{"compute": {"size": %d,
+				"baremetal_instance_type": {"name": "metal-1tb"}}}`, size)
+		}
+		db.insertObject("clusters", "prod", "acme", "team", "user", "{}",
+			fmt.Sprintf(`{"spec": {"node_sets": %s}}`, nodeSets))
+	}
+
+	// insertHost inserts one system-created host linked to the cluster, with the given
+	// status.state.
+	insertHost := func(id, state string) {
+		stateField := ""
+		if state != "" {
+			stateField = fmt.Sprintf(`, "state": "%s"`, state)
+		}
+		db.insertObject("bare_metal_instances", id, "acme", "team", "system", "{}", fmt.Sprintf(`{
+			"spec": {"instance_type": {"name": "metal-1tb"}},
+			"status": {"cluster": {"id": "prod"}%s}
+		}`, stateField))
+	}
+
+	// hostsCounted counts the bare_metal.instances.metal-1tb dimension of the team project.
+	hostsCounted := func(counter *Counter) int64 {
+		usage, err := counter.Count(db.ctx, "acme")
+		Expect(err).ToNot(HaveOccurred())
+		return usage["team"]["bare_metal.instances.metal-1tb"]
+	}
+
+	BeforeEach(func() {
+		db = newUsageDatabase(context.Background())
+		db.insertObject("bare_metal_instance_types", "metal-1tb", "shared", "", "system", "{}", `{}`)
+	})
+
+	DescribeTable("counts the larger of the parent's ask and its countable children",
+		func(ask int, states []string, rules map[string][]string, expectedTotal, expectedRoom int64) {
+			counter, err := NewCounter().
+				SetLogger(logger).
+				SetCountingRules(rules).
+				Build()
+			Expect(err).ToNot(HaveOccurred())
+
+			insertCluster(ask)
+			for i, state := range states {
+				insertHost(fmt.Sprintf("host-%d", i+1), state)
+			}
+			total := hostsCounted(counter)
+			Expect(total).To(Equal(expectedTotal))
+
+			// Removing the node set from the spec leaves the hosts counting on their own,
+			// so what the total loses is exactly the room the parent demanded beyond them:
+			db.exec(`update clusters set data = data #- '{spec,node_sets}' where id = 'prod'`)
+			Expect(total - hostsCounted(counter)).To(Equal(expectedRoom))
+		},
+		Entry("no children yet", 3, nil, nil, int64(3), int64(3)),
+		Entry("partial children", 3, []string{"", ""}, nil, int64(3), int64(1)),
+		Entry("children beyond the ask", 1, []string{"", ""}, nil, int64(2), int64(0)),
+		Entry("children stopped by counting rules", 3,
+			[]string{"BARE_METAL_INSTANCE_STATE_RUNNING", "BARE_METAL_INSTANCE_STATE_FAILED"},
+			map[string][]string{"BareMetalInstance": {"BARE_METAL_INSTANCE_STATE_FAILED"}},
+			int64(3), int64(2)),
+		Entry("a node set removed while the host rows remain", 0, []string{"", ""}, nil, int64(2), int64(0)),
 	)
 })
