@@ -154,12 +154,19 @@ identity E2E is [OSAC-6614](https://redhat.atlassian.net/browse/OSAC-6614).
   `tests/e2e/core/test_quota_enforcement.py` drives the deployed private
   API: an admin caps a project, a tenant user's over-limit order is refused
   with the scope and dimension in the message, and the volume count is
-  unchanged. Not exercised: the quota publisher (the notifications API,
-  [OSAC-75](https://redhat.atlassian.net/browse/OSAC-75), does not exist;
-  warnings accumulate in the outbox by design), and the
-  cluster-hosts-counted-once journey on a deployed cluster, which requires
-  full bare-metal provisioning and has no owner ticket yet (the composite
-  tests above cover the counting itself at the component-integration tier).
+  unchanged. `tests/e2e/caas/regression/test_cluster_host_quota.py` drives
+  the deployed cluster-hosts-counted-once journey on real bare metal: the
+  tenant's host-type limit leaves room for exactly one cluster's node-set
+  ask, the usage report shows the full ask before any host exists and
+  exactly the ask after the cluster is Ready with all its hosts, and a
+  second cluster of the same size is refused upfront. The E2E suite sets
+  generous default limits at session start (tests/e2e/conftest.py) and
+  where it creates types, tiers and GPU resources, because a dimension
+  with no default has limit 0. Not exercised: the quota publisher (the
+  notifications API, [OSAC-75](https://redhat.atlassian.net/browse/OSAC-75),
+  does not exist; warnings accumulate in the outbox by design), and the
+  host-retry journey, whose retrying count is not implemented
+  ([OSAC-7791](https://redhat.atlassian.net/browse/OSAC-7791)).
 
 ## Coverage gaps
 
