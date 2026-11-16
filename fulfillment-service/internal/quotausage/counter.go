@@ -25,7 +25,8 @@ specific language governing permissions and limitations under the License.
 // counts until it is archived, so the statements read the main tables without filtering on the
 // deletion timestamp. A kind's counting rules (see counting_rules.go) can release earlier: the
 // states they map stop counting while the record still exists, because they provably hold
-// nothing physical.
+// nothing physical. The release applies both to the kind's own rows and to the linked rows a
+// parent nets its ask against, so a released child never eats the parent's room.
 package quotausage
 
 import (
@@ -301,11 +302,11 @@ func (g *statementGenerator) nextAlias(prefix string) string {
 	return fmt.Sprintf("%s%d", prefix, g.aliases)
 }
 
-// stopsCountingIn builds the SQL filter that stops counting the rows of a kind whose status.state
-// is one of the mapped states: the release map of the quota state standard. Empty when no state
-// of the kind is mapped, so the default changes nothing.
-func (g *statementGenerator) stopsCountingIn() string {
-	states := g.counter.stopsCountingIn[g.kind.Name]
+// stopsCountingIn builds the SQL filter that stops counting the rows of the named kind whose
+// status.state is one of the mapped states: the release map of the quota state standard. Empty
+// when no state of the kind is mapped, so the default changes nothing.
+func (g *statementGenerator) stopsCountingIn(kind, row string) string {
+	states := g.counter.stopsCountingIn[kind]
 	if len(states) == 0 {
 		return ""
 	}
@@ -314,8 +315,8 @@ func (g *statementGenerator) stopsCountingIn() string {
 		quoted[i] = sqlString(state)
 	}
 	return fmt.Sprintf(
-		"and coalesce(r.data #>> '{status,state}', '') not in (%s)",
-		strings.Join(quoted, ", "),
+		"and coalesce(%s.data #>> '{status,state}', '') not in (%s)",
+		row, strings.Join(quoted, ", "),
 	)
 }
 
@@ -360,7 +361,7 @@ func (g *statementGenerator) generate() (string, error) {
 				%s
 			group by r.project, u.dimension
 			`,
-			g.table, joinClauses(g.rowJoins), union(g.asks), g.stopsCountingIn(),
+			g.table, joinClauses(g.rowJoins), union(g.asks), g.stopsCountingIn(g.kind.Name, "r"),
 		), nil
 	}
 	return fmt.Sprintf(`
@@ -396,7 +397,7 @@ func (g *statementGenerator) generate() (string, error) {
 			group by ex.dimension
 		) e on e.dimension = p.dimension
 		`,
-		g.table, joinClauses(g.rowJoins), union(g.asks), g.stopsCountingIn(), union(g.exists),
+		g.table, joinClauses(g.rowJoins), union(g.asks), g.stopsCountingIn(g.kind.Name, "r"), union(g.exists),
 	), nil
 }
 
@@ -543,8 +544,10 @@ func (g *statementGenerator) addCreates(field quota.Field) error {
 	}
 
 	// The exists side: the created rows linked to the parent, priced like any stored row of their
-	// kind. A link is trusted only for rows the system created. Several creates fields can name
-	// the same kind; the linked rows are scanned once per kind, not once per field.
+	// kind. A link is trusted only for rows the system created, and the rows stop counting in the
+	// states their kind's rules map, so a released child no longer nets against its parent's ask.
+	// Several creates fields can name the same kind; the linked rows are scanned once per kind,
+	// not once per field.
 	if g.existsKinds[creates.Kind] {
 		return nil
 	}
@@ -578,8 +581,9 @@ func (g *statementGenerator) addCreates(field quota.Field) error {
 		where %s.tenant = p.tenant
 			and %s.creator = 'system'
 			and %s
+			%s
 		`,
-		from, union(prices), row, row, link,
+		from, union(prices), row, row, link, g.stopsCountingIn(creates.Kind, row),
 	))
 	return nil
 }
