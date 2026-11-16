@@ -366,31 +366,76 @@ func (e *quotaEnforcer) check(
 		return e.internalCheckError(ctx, tenant, err)
 	}
 
-	scopes := quotaProjectChain(project)
-	for i, scope := range scopes {
-		scopeUsage := quotaSubtreeUsage(usage, scope)
-		for _, dimension := range quotaSortedDimensions(added) {
-			limit := state.limitOf(scope, dimension)
-			if scopeUsage[dimension]+added[dimension] > limit {
-				return e.refuse(tenant, scope, i, dimension, limit, scopeUsage[dimension],
-					added[dimension], candidateQuote.Sources[dimension])
-			}
-		}
-	}
-	tenantUsage := quotaSubtreeUsage(usage, "")
-	for _, dimension := range quotaSortedDimensions(added) {
-		limit := state.limitOf("", dimension)
-		if tenantUsage[dimension]+added[dimension] > limit {
-			return e.refuse(tenant, "", -1, dimension, limit, tenantUsage[dimension],
-				added[dimension], candidateQuote.Sources[dimension])
-		}
+	refusal := firstQuotaRefusal(added, usage, state, project)
+	if refusal != nil {
+		return e.refuse(tenant, refusal, candidateQuote.Sources[refusal.dimension])
 	}
 	// A dry run writes nothing, so it leaves no warning: usage never moves, so the
 	// crossing would fire again on every repeated dry run and pile up outbox rows for a
 	// request that never happened.
 	if !isDryRun(ctx) {
+		scopes := quotaProjectChain(project)
 		if err = e.warnCrossings(ctx, tenant, usage, state, scopes, added); err != nil {
 			return e.internalCheckError(ctx, tenant, err)
+		}
+	}
+	return nil
+}
+
+// quotaRefusal names the first limit a request would take its scope over: the scope
+// ("project", "ancestor_project" or "tenant"), the refusing scope's project, the
+// dimension, the limit, the usage and what the request adds.
+type quotaRefusal struct {
+	scope     string
+	project   string
+	dimension string
+	limit     int64
+	usage     int64
+	added     int64
+}
+
+// firstQuotaRefusal compares what the request adds against the usage and the limits of
+// each scope it touches: its project, each ancestor project, then the tenant. It returns
+// the first crossing, or nil when every dimension fits. The dimensions are compared
+// sorted, so the first refusal a caller sees is stable.
+func firstQuotaRefusal(
+	added map[string]int64,
+	usage map[string]map[string]int64,
+	limits *quotaLimits,
+	project string,
+) *quotaRefusal {
+	scopes := quotaProjectChain(project)
+	for i, scope := range scopes {
+		scopeKind := "ancestor_project"
+		if i == 0 {
+			scopeKind = "project"
+		}
+		scopeUsage := quotaSubtreeUsage(usage, scope)
+		for _, dimension := range quotaSortedDimensions(added) {
+			limit := limits.limitOf(scope, dimension)
+			if scopeUsage[dimension]+added[dimension] > limit {
+				return &quotaRefusal{
+					scope:     scopeKind,
+					project:   scope,
+					dimension: dimension,
+					limit:     limit,
+					usage:     scopeUsage[dimension],
+					added:     added[dimension],
+				}
+			}
+		}
+	}
+	tenantUsage := quotaSubtreeUsage(usage, "")
+	for _, dimension := range quotaSortedDimensions(added) {
+		limit := limits.limitOf("", dimension)
+		if tenantUsage[dimension]+added[dimension] > limit {
+			return &quotaRefusal{
+				scope:     "tenant",
+				dimension: dimension,
+				limit:     limit,
+				usage:     tenantUsage[dimension],
+				added:     added[dimension],
+			}
 		}
 	}
 	return nil
@@ -515,40 +560,31 @@ func quotaParentIDFromName(name, namePrefix string) (id string, ok bool) {
 
 // refuse builds the FAILED_PRECONDITION error with the ErrorInfo reason and the QuotaFailure
 // detail that name the failing scope, the dimension, the limit, the usage and what the request
-// adds. scopeIndex -1 names the tenant, 0 the request's project, above that an ancestor project.
-func (e *quotaEnforcer) refuse(
-	tenant, project string, scopeIndex int, dimension string,
-	limit, usage, added int64, sources []string,
-) error {
-	e.metrics.recordRefusal(dimension)
-	scope := "project"
-	if scopeIndex < 0 {
-		scope = "tenant"
-	} else if scopeIndex > 0 {
-		scope = "ancestor_project"
-	}
-	scopeName := project
+// adds.
+func (e *quotaEnforcer) refuse(tenant string, refusal *quotaRefusal, sources []string) error {
+	e.metrics.recordRefusal(refusal.dimension)
+	scopeName := refusal.project
 	if scopeName == "" {
 		scopeName = "default project"
 	}
 	subject := fmt.Sprintf("project %s", scopeName)
-	if scope == "tenant" {
+	if refusal.scope == "tenant" {
 		subject = fmt.Sprintf("tenant %s", tenant)
 	}
 	status := grpcstatus.New(grpccodes.FailedPrecondition, fmt.Sprintf(
 		"quota exceeded: %s, %s: limit %d, usage %d, adding %d",
-		subject, dimension, limit, usage, added,
+		subject, refusal.dimension, refusal.limit, refusal.usage, refusal.added,
 	))
 	detailed, err := status.WithDetails(
 		&errdetails.ErrorInfo{Reason: quotaExceededReason, Domain: "osac"},
 		publicv1.QuotaFailure_builder{
-			Scope:     scope,
+			Scope:     refusal.scope,
 			Tenant:    tenant,
-			Project:   project,
-			Dimension: dimension,
-			Limit:     limit,
-			Usage:     usage,
-			Added:     added,
+			Project:   refusal.project,
+			Dimension: refusal.dimension,
+			Limit:     refusal.limit,
+			Usage:     refusal.usage,
+			Added:     refusal.added,
 			Sources:   sources,
 		}.Build(),
 	)

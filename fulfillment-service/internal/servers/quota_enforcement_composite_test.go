@@ -245,10 +245,10 @@ var _ = Describe("Quota netting of created children", func() {
 		),
 		Entry("a host after the cluster's node set was removed, which leaves no room",
 			nettingWorld{
-				clusterSpec:  `{"spec":{"node_sets":{}}}`,
-				hostTypes:    []string{"metal-1tb"},
+				clusterSpec:   `{"spec":{"node_sets":{}}}`,
+				hostTypes:     []string{"metal-1tb"},
 				existingHosts: []string{"host-1", "host-2", "host-3", "host-4", "host-5"},
-				limits:       map[string]int64{"bare_metal.instances.metal-1tb": 5},
+				limits:        map[string]int64{"bare_metal.instances.metal-1tb": 5},
 				refusal: &nettingRefusal{
 					dimension: "bare_metal.instances.metal-1tb", usage: 5, added: 1,
 				},

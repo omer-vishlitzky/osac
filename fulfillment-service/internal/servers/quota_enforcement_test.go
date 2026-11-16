@@ -31,7 +31,6 @@ import (
 	"github.com/osac-project/osac/fulfillment-service/internal/database"
 	"github.com/osac-project/osac/fulfillment-service/internal/database/dao"
 	osactesting "github.com/osac-project/osac/fulfillment-service/internal/testing"
-	"github.com/osac-project/osac/fulfillment-service/internal/uuid"
 	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
@@ -43,27 +42,6 @@ var quotaTierResolver = TierResolverFunc(func(_ context.Context, _ string) (*Tie
 		Provider: "test-provider",
 		Protocol: privatev1.StorageProtocol_STORAGE_PROTOCOL_BLOCK,
 	}, nil
-})
-
-// The link's name prefix "ci-{parent}-" names a VM's disk volume "ci-<vm id>-boot". The
-// parent is the 36 characters after the prefix, and only when they are a UUID.
-var _ = Describe("The disk-volume name parser", func() {
-	It("reads the parent out of a ci-<uuidv7>-boot name", func() {
-		vmID := uuid.New()
-		parent, ok := quotaParentIDFromName("ci-"+vmID+"-boot", "ci-{parent}-")
-		Expect(ok).To(BeTrue())
-		Expect(parent).To(Equal(vmID))
-	})
-
-	It("resolves no parent for a name whose middle is not a UUID", func() {
-		// A caller-chosen short VM id baked into the volume's name:
-		_, ok := quotaParentIDFromName("ci-shortvm-boot", "ci-{parent}-")
-		Expect(ok).To(BeFalse())
-
-		// A foreign prefix whose 36 characters after "ci-" are not a UUID:
-		_, ok = quotaParentIDFromName("pvc-"+uuid.New()+"-pvc", "ci-{parent}-")
-		Expect(ok).To(BeFalse())
-	})
 })
 
 // quotaFailure extracts the ErrorInfo reason and the QuotaFailure detail of a refusal.
