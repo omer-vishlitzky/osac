@@ -740,18 +740,20 @@ var _ = Describe("Quota enforcement", func() {
 			Expect(rows[0]["dimension"]).To(Equal("storage.fast.gib"))
 		})
 
-		createTeamLimit := func(value int64) *publicv1.QuotaLimit {
+		// createLimit makes a limit of the suite's dimension through the server: a
+		// project limit when project names one, a tenant override when it is empty.
+		createLimit := func(project string, value int64) *publicv1.QuotaLimit {
 			response, createErr := limits.Create(ctx, publicv1.QuotaLimitsCreateRequest_builder{
 				Object: publicv1.QuotaLimit_builder{
-					Metadata: publicv1.Metadata_builder{Tenant: testTenant, Project: "team"}.Build(),
+					Metadata: publicv1.Metadata_builder{Tenant: testTenant, Project: project}.Build(),
 					Spec:     publicv1.QuotaLimitSpec_builder{Dimension: "storage.fast.gib", Value: value}.Build(),
 				}.Build(),
 			}.Build())
-			Expect(createErr).ToNot(HaveOccurred())
+			ExpectWithOffset(1, createErr).ToNot(HaveOccurred())
 			return response.GetObject()
 		}
 
-		updateTeamLimit := func(limit *publicv1.QuotaLimit, value int64) error {
+		updateLimit := func(limit *publicv1.QuotaLimit, value int64) error {
 			_, updateErr := limits.Update(ctx, publicv1.QuotaLimitsUpdateRequest_builder{
 				Object: publicv1.QuotaLimit_builder{
 					Id:       limit.GetId(),
@@ -766,23 +768,23 @@ var _ = Describe("Quota enforcement", func() {
 			// Replace the raw-seeded team limit with a server-created one, so the update
 			// below passes name validation:
 			deleteRow("quota_limits", "limit-storage.fast.gib-team")
-			limit := createTeamLimit(10)
+			limit := createLimit("team", 10)
 			insertThreshold("team", "storage.fast.gib", 2)
 			Expect(createVolume("vol-1", "team", "fast", 3)).To(Succeed())
 			Expect(outboxRows()).To(HaveLen(1))
 
-			Expect(updateTeamLimit(limit, 20)).To(Succeed())
+			Expect(updateLimit(limit, 20)).To(Succeed())
 			Expect(outboxRows()).To(HaveLen(1))
 		})
 
 		It("writes a warning when a limit change lowers the limit", func() {
 			deleteRow("quota_limits", "limit-storage.fast.gib-team")
-			limit := createTeamLimit(10)
+			limit := createLimit("team", 10)
 			insertThreshold("team", "storage.fast.gib", 2)
 			Expect(createVolume("vol-1", "team", "fast", 3)).To(Succeed())
 			Expect(outboxRows()).To(HaveLen(1))
 
-			Expect(updateTeamLimit(limit, 5)).To(Succeed())
+			Expect(updateLimit(limit, 5)).To(Succeed())
 			rows := outboxRows()
 			Expect(rows).To(HaveLen(2))
 			payloads := []any{}
@@ -791,6 +793,124 @@ var _ = Describe("Quota enforcement", func() {
 			}
 			Expect(payloads).To(ContainElement(
 				MatchJSON(`{"dimension":"storage.fast.gib","threshold":2,"usage":3,"limit":5}`)))
+		})
+
+		It("writes a warning when a created limit is tighter than the usage it applies to", func() {
+			// The volume lands while the project falls back to the tenant's limit of
+			// ten, so nothing warns yet:
+			deleteRow("quota_limits", "limit-storage.fast.gib-team")
+			Expect(createVolume("vol-1", "team", "fast", 3)).To(Succeed())
+			insertThreshold("team", "storage.fast.gib", 2)
+			Expect(outboxRows()).To(BeEmpty())
+
+			// A created project limit below the fallback tightens the scope:
+			createLimit("team", 5)
+			rows := outboxRows()
+			Expect(rows).To(HaveLen(1))
+			Expect(rows[0]["data"]).To(MatchJSON(
+				`{"dimension":"storage.fast.gib","threshold":2,"usage":3,"limit":5}`))
+		})
+
+		It("writes a warning when a lowered tenant override puts descendant projects at or above their thresholds", func() {
+			// team.web carries the threshold and no limit of its own, so the tenant's
+			// override binds it:
+			createProject("team.web")
+			deleteRow("quota_limits", "limit-storage.fast.gib-team")
+			// Replace the raw-seeded override with a server-created one, so the update
+			// below passes name validation. Nothing warns on the way in: no threshold
+			// exists yet:
+			deleteRow("quota_limits", "limit-storage.fast.gib-")
+			override := createLimit("", 10)
+			Expect(createVolume("vol-1", "team.web", "fast", 3)).To(Succeed())
+			insertThreshold("team.web", "storage.fast.gib", 2)
+
+			Expect(updateLimit(override, 5)).To(Succeed())
+
+			rows := outboxRows()
+			Expect(rows).To(HaveLen(1))
+			Expect(rows[0]["project"]).To(Equal("team.web"))
+			Expect(rows[0]["data"]).To(MatchJSON(
+				`{"dimension":"storage.fast.gib","threshold":2,"usage":3,"limit":5}`))
+		})
+
+		It("writes a warning when a limit request approval tightens the approved scope", func() {
+			requests, err := NewQuotaLimitRequestsServer().
+				SetLogger(logger).
+				SetAttributionLogic(attribution).
+				SetTenancyLogic(tenancy).
+				Build()
+			Expect(err).ToNot(HaveOccurred())
+
+			// The tenant's override of ten is what the approval lowers, and team holds
+			// no limit of its own, so the approved five is what binds it:
+			deleteRow("quota_limits", "limit-storage.fast.gib-team")
+			Expect(createVolume("vol-1", "team", "fast", 3)).To(Succeed())
+			insertThreshold("team", "storage.fast.gib", 2)
+
+			created, err := requests.Create(ctx, publicv1.QuotaLimitRequestsCreateRequest_builder{
+				Object: publicv1.QuotaLimitRequest_builder{
+					Metadata: publicv1.Metadata_builder{Tenant: testTenant}.Build(),
+					Spec: publicv1.QuotaLimitRequestSpec_builder{
+						Dimension: "storage.fast.gib", RequestedValue: 5,
+					}.Build(),
+				}.Build(),
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+			_, err = requests.Approve(ctx, publicv1.QuotaLimitRequestsApproveRequest_builder{
+				Id: created.GetObject().GetId(),
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+
+			rows := outboxRows()
+			Expect(rows).To(HaveLen(1))
+			Expect(rows[0]["project"]).To(Equal("team"))
+			Expect(rows[0]["data"]).To(MatchJSON(
+				`{"dimension":"storage.fast.gib","threshold":2,"usage":3,"limit":5}`))
+		})
+
+		It("writes a warning when a threshold update lowers it below the usage", func() {
+			// A threshold above the usage warns nothing on the way in:
+			created, err := thresholds.Create(ctx, publicv1.QuotaThresholdsCreateRequest_builder{
+				Object: publicv1.QuotaThreshold_builder{
+					Metadata: publicv1.Metadata_builder{Tenant: testTenant, Project: "team"}.Build(),
+					Spec:     publicv1.QuotaThresholdSpec_builder{Dimension: "storage.fast.gib", Value: 5}.Build(),
+				}.Build(),
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+			Expect(createVolume("vol-1", "team", "fast", 3)).To(Succeed())
+			Expect(outboxRows()).To(BeEmpty())
+
+			_, err = thresholds.Update(ctx, publicv1.QuotaThresholdsUpdateRequest_builder{
+				Object: publicv1.QuotaThreshold_builder{
+					Id:       created.GetObject().GetId(),
+					Metadata: created.GetObject().GetMetadata(),
+					Spec:     publicv1.QuotaThresholdSpec_builder{Dimension: "storage.fast.gib", Value: 2}.Build(),
+				}.Build(),
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+
+			rows := outboxRows()
+			Expect(rows).To(HaveLen(1))
+			Expect(rows[0]["data"]).To(MatchJSON(
+				`{"dimension":"storage.fast.gib","threshold":2,"usage":3,"limit":10}`))
+		})
+
+		It("writes no warning when a threshold is deleted", func() {
+			created, err := thresholds.Create(ctx, publicv1.QuotaThresholdsCreateRequest_builder{
+				Object: publicv1.QuotaThreshold_builder{
+					Metadata: publicv1.Metadata_builder{Tenant: testTenant, Project: "team"}.Build(),
+					Spec:     publicv1.QuotaThresholdSpec_builder{Dimension: "storage.fast.gib", Value: 2}.Build(),
+				}.Build(),
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+			Expect(createVolume("vol-1", "team", "fast", 3)).To(Succeed())
+			Expect(outboxRows()).To(HaveLen(1))
+
+			_, err = thresholds.Delete(ctx, publicv1.QuotaThresholdsDeleteRequest_builder{
+				Id: created.GetObject().GetId(),
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+			Expect(outboxRows()).To(HaveLen(1))
 		})
 
 		It("rolls a limit create back when its warning fails to land", func() {
