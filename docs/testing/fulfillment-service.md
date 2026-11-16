@@ -104,9 +104,9 @@ identity E2E is [OSAC-6614](https://redhat.atlassian.net/browse/OSAC-6614).
   exercised.
 - Quota enforcement in the request path
   ([DEV] [OSAC-7614](https://redhat.atlassian.net/browse/OSAC-7614)):
-  `internal/servers/quota_enforcement_test.go` covers the generic server's
-  check against real PostgreSQL: a create or update over a project,
-  ancestor-project or tenant limit fails with `FAILED_PRECONDITION`,
+  `internal/servers/quota_enforcement_test.go` (31 Ginkgo specs) covers the
+  generic server's check against real PostgreSQL: a create or update over a
+  project, ancestor-project or tenant limit fails with `FAILED_PRECONDITION`,
   ErrorInfo reason `QUOTA_EXCEEDED` and a `QuotaFailure` detail naming the
   scope, dimension, limit, usage, added amount and the field paths that add
   it, and writes nothing; limit resolution in the order project limit,
@@ -118,20 +118,35 @@ identity E2E is [OSAC-6614](https://redhat.atlassian.net/browse/OSAC-6614).
   counter); two parallel creates for the last vCPU in separate transactions
   let exactly one pass (the tenant row lock before the count at READ
   COMMITTED); a cluster create and a VM create that lock the same subnet row
-  in concurrent transactions both finish; crossed thresholds, a threshold
-  set below the usage, and a default-limit change write their quota warnings
-  to the outbox; and the four quota metrics are exposed through a Prometheus
-  registry. `internal/servers/quota_enforcement_composite_test.go` covers
-  the netting of the operator's creates against the parent's ask: the
-  operator's create of a host linked to an admitted cluster adds nothing at
-  a full tenant and passes, first host and last host alike, and so does the
-  create of a VM's boot-disk volume for an admitted VM.
+  in concurrent transactions both finish; crossed thresholds, a threshold set
+  or lowered below the usage, and a created or lowered limit tighter than
+  the usage it applies to (a project limit, a tenant override whose
+  descendant projects hold the thresholds, an approved limit request, and a
+  lowered default after its change commits) write their quota warnings to
+  the outbox, while a raised limit, a deleted threshold and a tenant whose
+  override keeps its limit warn nothing; and the four quota metrics are
+  exposed through a Prometheus registry.
+  `internal/servers/quota_enforcement_decisions_test.go` (32 plain Go table
+  cases, no database) covers the arithmetic of the refusal decision: the
+  project chain, the subtree sums, the limit resolution order, the scope
+  walk and first crossing of the comparison, the update-mask coverage and
+  the parent-id parser.
+  `internal/servers/quota_enforcement_composite_test.go` (a DescribeTable
+  of eight entries) covers the netting of the system's creates against the
+  parent's ask: the operator's create of a host linked to an admitted
+  cluster adds nothing at a full tenant and passes, first host and last
+  host alike, and so does the create of a VM's boot-disk volume for an
+  admitted VM; a user's create, a host beyond the cluster's ask, a host of
+  a missing parent, a host after the cluster's node set was removed, and a
+  host of a full node set with room in another node set all add their full
+  price.
   `internal/servers/private_clusters_server_test.go` covers the automatic
-  endpoints of the check: a cluster whose two automatic external IPs exceed
-  the external-IP limit is refused before any write (no cluster, no address,
-  pool capacity unchanged), and a cluster whose two automatic addresses
-  exactly fit the limit passes while a second is refused reporting the two
-  addresses the tenant really holds. The suite's `BeforeEach` seeds generous default limits (including
+  endpoints of the check (its two quota specs): a cluster whose two
+  automatic external IPs exceed the external-IP limit is refused before any
+  write (no cluster, no address, pool capacity unchanged), and a cluster
+  whose two automatic addresses exactly fit the limit passes while a second
+  is refused reporting the two addresses the tenant really holds. The
+  suite's `BeforeEach` seeds generous default limits (including
   trigger-seeded defaults for host types, storage tiers and GPU resources as
   they appear), because the check refuses a request that adds to a dimension
   with no limit, the way an unconfigured provider does. Tenancy and
