@@ -39,8 +39,11 @@ type quotaTypeLookup struct {
 	failure  error
 }
 
-// Type returns the message of the named type, or nil when no type of the kind carries the name.
-func (l *quotaTypeLookup) Type(kind, name string) protoreflect.Message {
+// Type returns the message of the type the key points at, or nil when no type of the kind
+// carries it. The key is a reference's id when set, else its name: references are
+// id-or-name with id winning, the way RefKeyStr reads them, and the servers' fill-in
+// stores both, so the row is matched by either and the message carries the row's name.
+func (l *quotaTypeLookup) Type(kind, key string) protoreflect.Message {
 	message, table := l.enforcer.kindMessage[kind], l.enforcer.kindTables[kind]
 	if message == "" || table == "" {
 		return nil
@@ -51,11 +54,12 @@ func (l *quotaTypeLookup) Type(kind, name string) protoreflect.Message {
 		return nil
 	}
 	var data []byte
+	var name string
 	err = tx.QueryRow(l.ctx, fmt.Sprintf(
-		`select data from %s
-		where name = $1 and (tenant = $2 or tenant = 'shared')
-		order by (tenant = $2) desc limit 1`, table), name, l.tenant,
-	).Scan(&data)
+		`select data, name from %s
+		where (id = $1 or name = $1) and (tenant = $2 or tenant = 'shared')
+		order by (tenant = $2) desc limit 1`, table), key, l.tenant,
+	).Scan(&data, &name)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil
 	}
@@ -75,7 +79,8 @@ func (l *quotaTypeLookup) Type(kind, name string) protoreflect.Message {
 	}
 	// The name lives in a column, not in the data document, so put it back before the price
 	// reads it: a type's own dimension names itself, such as
-	// bare_metal.instances.{metadata.name}.
+	// bare_metal.instances.{metadata.name}. The column's value, not the key, is the name:
+	// the key can be the reference's id.
 	metadata := result.Descriptor().Fields().ByName("metadata")
 	nameField := metadata.Message().Fields().ByName("name")
 	result.Mutable(metadata).Message().Set(nameField, protoreflect.ValueOfString(name))

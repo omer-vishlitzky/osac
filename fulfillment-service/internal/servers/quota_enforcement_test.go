@@ -256,6 +256,34 @@ var _ = Describe("Quota enforcement", func() {
 			Expect(countRows("volumes")).To(Equal(0))
 		})
 
+		It("prices a create whose reference carries a type id", func() {
+			// The servers' fill-in stores both the id and the name on a reference, and
+			// the price follows the id, the way RefKeyStr reads references: a name that
+			// no row carries must not misdirect the lookup when the id points at one.
+			tx, err := database.TxFromContext(ctx)
+			Expect(err).ToNot(HaveOccurred())
+			_, err = tx.Exec(ctx,
+				`insert into instance_types (id, name, tenant, project, creator, data)
+				values ('type-id-1', 'gpu-8', 'shared', ''::ltree, 'system',
+				'{"spec":{"vcpus":8,"memory_gib":32}}'::jsonb)`)
+			Expect(err).ToNot(HaveOccurred())
+			insertLimit("", "compute.vcpus", 7)
+
+			var response *privatev1.ComputeInstancesCreateResponse
+			err = instances.Create(ctx, privatev1.ComputeInstancesCreateRequest_builder{
+				Object: privatev1.ComputeInstance_builder{
+					Metadata: privatev1.Metadata_builder{Name: "vm-by-id", Tenant: testTenant}.Build(),
+					Spec: privatev1.ComputeInstanceSpec_builder{
+						InstanceType: &privatev1.InstanceTypeReference{Id: "type-id-1", Name: "no-such-type"},
+					}.Build(),
+				}.Build(),
+			}.Build(), &response)
+			reason, failure := quotaFailure(err)
+			Expect(reason).To(Equal("QUOTA_EXCEEDED"))
+			Expect(failure.GetDimension()).To(Equal("compute.vcpus"))
+			Expect(failure.GetAdded()).To(Equal(int64(8)))
+		})
+
 		It("resolves the limit from the tenant override, the default, then 0", func() {
 			insertDefaultLimit("storage.slow.gib", 3)
 			Expect(createVolume("vol-1", "", "slow", 2)).To(Succeed())
