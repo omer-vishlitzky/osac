@@ -66,6 +66,21 @@ var _ = Describe("The disk-volume name parser", func() {
 	})
 })
 
+// quotaFailure extracts the ErrorInfo reason and the QuotaFailure detail of a refusal.
+func quotaFailure(err error) (reason string, failure *publicv1.QuotaFailure) {
+	status := grpcstatus.Convert(err)
+	ExpectWithOffset(1, status.Code()).To(Equal(grpccodes.FailedPrecondition))
+	for _, detail := range status.Details() {
+		switch detail := detail.(type) {
+		case *errdetails.ErrorInfo:
+			reason = detail.GetReason()
+		case *publicv1.QuotaFailure:
+			failure = detail
+		}
+	}
+	return reason, failure
+}
+
 var _ = Describe("Quota enforcement", func() {
 	var volumes *PrivateVolumesServer
 	var instances *GenericServer[*privatev1.ComputeInstance]
@@ -201,21 +216,6 @@ var _ = Describe("Quota enforcement", func() {
 		}
 		Expect(rows.Err()).To(Succeed())
 		return result
-	}
-
-	// quotaFailure extracts the ErrorInfo reason and the QuotaFailure detail of a refusal.
-	quotaFailure := func(err error) (reason string, failure *publicv1.QuotaFailure) {
-		status := grpcstatus.Convert(err)
-		ExpectWithOffset(1, status.Code()).To(Equal(grpccodes.FailedPrecondition))
-		for _, detail := range status.Details() {
-			switch detail := detail.(type) {
-			case *errdetails.ErrorInfo:
-				reason = detail.GetReason()
-			case *publicv1.QuotaFailure:
-				failure = detail
-			}
-		}
-		return reason, failure
 	}
 
 	firstInstanceId := func() string {
