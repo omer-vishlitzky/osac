@@ -817,6 +817,62 @@ var _ = Describe("Quota enforcement", func() {
 			Expect(payloads).To(ContainElement(
 				MatchJSON(`{"dimension":"storage.fast.gib","threshold":2,"usage":3,"limit":5}`)))
 		})
+
+		It("rolls a limit create back when its warning fails to land", func() {
+			// Fail the outbox insert of this transaction only, with a real database trigger
+			// gated by a session setting, the way the metering suites force failures:
+			_, err := testPool.Exec(ctx, `create function fail_quota_outbox_insert() returns trigger language plpgsql as $$
+			begin
+				if current_setting('osac.fail_quota_outbox', true) = 'on' then
+					raise exception 'test outbox failure';
+				end if;
+				return new;
+			end $$;
+			create trigger fail_quota_outbox_insert before insert on quota_outbox
+			for each row execute function fail_quota_outbox_insert()`)
+			Expect(err).ToNot(HaveOccurred())
+
+			// Usage above the threshold, so a limit that tightens the scope warns:
+			insertThreshold("team", "storage.fast.gib", 2)
+			Expect(createVolume("vol-1", "team", "fast", 3)).To(Succeed())
+			Expect(outboxRows()).To(HaveLen(1))
+
+			// Fail every later outbox insert of the suite's transaction:
+			_, err = suiteTx.Exec(ctx, `select set_config('osac.fail_quota_outbox', 'on', true)`)
+			Expect(err).ToNot(HaveOccurred())
+
+			deleteRow("quota_limits", "limit-storage.fast.gib-team")
+			_, err = limits.Create(ctx, publicv1.QuotaLimitsCreateRequest_builder{
+				Object: publicv1.QuotaLimit_builder{
+					Metadata: publicv1.Metadata_builder{Tenant: testTenant, Project: "team"}.Build(),
+					Spec:     publicv1.QuotaLimitSpec_builder{Dimension: "storage.fast.gib", Value: 5}.Build(),
+				}.Build(),
+			}.Build())
+			Expect(grpcstatus.Code(err)).To(Equal(grpccodes.Internal))
+			Expect(grpcstatus.Convert(err).Message()).To(
+				ContainSubstring("failed to write the quota warnings"))
+
+			// The failed warning is reported to the transaction, so ending it rolls the
+			// limit back instead of committing it:
+			committed := false
+			suiteTx.OnCommit(func() { committed = true })
+			Expect(suiteTx.End(ctx)).To(Succeed())
+			Expect(committed).To(BeFalse(), "the failed warning must roll the limit create back")
+
+			// A fresh transaction sees nothing of the rolled-back create:
+			verifyTx, verifyErr := tm.Begin(context.Background())
+			Expect(verifyErr).ToNot(HaveOccurred())
+			verifyCtx := database.TxIntoContext(context.Background(), verifyTx)
+			var count int
+			Expect(verifyTx.QueryRow(verifyCtx, `select count(*) from quota_limits`).Scan(&count)).To(Succeed())
+			Expect(count).To(BeZero())
+			Expect(verifyTx.End(verifyCtx)).To(Succeed())
+
+			// Continue the spec on a fresh transaction:
+			suiteTx, err = tm.Begin(context.Background())
+			Expect(err).ToNot(HaveOccurred())
+			ctx = database.TxIntoContext(ctx, suiteTx)
+		})
 	})
 
 	Describe("Default limit changes", func() {

@@ -26,6 +26,7 @@ import (
 	"google.golang.org/protobuf/reflect/protoreflect"
 
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
+	"github.com/osac-project/osac/fulfillment-service/internal/database"
 	"github.com/osac-project/osac/fulfillment-service/internal/database/dao"
 	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
@@ -224,6 +225,11 @@ func (s *PrivateQuotaLimitRequestsServer) Approve(ctx context.Context,
 		limitRequest.GetSpec().GetDimension(), oldLimit); warnErr != nil {
 		s.logger.ErrorContext(ctx, "Failed to write the quota warnings of an approval",
 			slog.Any("error", warnErr))
+		// The approval and its limit roll back with the failed warning, so a client never
+		// sees an approved request whose warning didn't land:
+		if tx, txErr := database.TxFromContext(ctx); txErr == nil {
+			tx.ReportError(&warnErr)
+		}
 		return nil, grpcstatus.Errorf(grpccodes.Internal, "failed to write the quota warnings")
 	}
 	response = &privatev1.QuotaLimitRequestsApproveResponse{}

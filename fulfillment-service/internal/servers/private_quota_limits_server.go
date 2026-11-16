@@ -196,13 +196,17 @@ func (s *PrivateQuotaLimitsServer) Delete(ctx context.Context,
 
 // warnLimitChange writes the warnings a limit change leaves behind: one for each threshold of
 // the dimension, in the changed scope, whose usage is at or above it. Only a change that
-// tightens the scope's limit warns.
+// tightens the scope's limit warns. The failure is reported to the transaction, so the limit
+// change it follows rolls back with it.
 func (s *PrivateQuotaLimitsServer) warnLimitChange(
 	ctx context.Context, tenant, project, dimension string, oldLimit int64,
 ) error {
 	if warnErr := s.quota.warnScopeAtOrAbove(ctx, tenant, project, dimension, oldLimit); warnErr != nil {
 		s.logger.ErrorContext(ctx, "Failed to write the quota warnings of a limit change",
 			slog.Any("error", warnErr))
+		if tx, txErr := database.TxFromContext(ctx); txErr == nil {
+			tx.ReportError(&warnErr)
+		}
 		return grpcstatus.Errorf(grpccodes.Internal, "failed to write the quota warnings")
 	}
 	return nil
@@ -210,13 +214,17 @@ func (s *PrivateQuotaLimitsServer) warnLimitChange(
 
 // warnCreatedLimit writes the warnings a newly created limit leaves behind. The scope's old
 // limit is what it falls back to without a row: the tenant's limit for a project, the default
-// for the tenant.
+// for the tenant. The failure is reported to the transaction, so the created limit rolls back
+// with it.
 func (s *PrivateQuotaLimitsServer) warnCreatedLimit(
 	ctx context.Context, tenant, project, dimension string,
 ) error {
 	if warnErr := s.quota.warnCreatedLimit(ctx, tenant, project, dimension); warnErr != nil {
 		s.logger.ErrorContext(ctx, "Failed to write the quota warnings of a limit change",
 			slog.Any("error", warnErr))
+		if tx, txErr := database.TxFromContext(ctx); txErr == nil {
+			tx.ReportError(&warnErr)
+		}
 		return grpcstatus.Errorf(grpccodes.Internal, "failed to write the quota warnings")
 	}
 	return nil
