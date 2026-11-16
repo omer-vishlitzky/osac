@@ -309,6 +309,12 @@ func (s *PrivateComputeInstancesServer) Get(ctx context.Context,
 
 func (s *PrivateComputeInstancesServer) Create(ctx context.Context, request *privatev1.ComputeInstancesCreateRequest) (response *privatev1.ComputeInstancesCreateResponse, err error) {
 	var warnings []string
+	// Every stored VM id is a server-generated uuidv7, the way volumes clear theirs: the
+	// disk-volume netting reads the VM's identifier out of the volume's ci-<uuid>-boot
+	// name, so a caller-chosen id would break it.
+	if object := request.GetObject(); object != nil {
+		object.SetId("")
+	}
 	err = s.generic.CreateWithCandidatePreparation(ctx, request, &response, func(ctx context.Context, _ *privatev1.ComputeInstance, candidate *privatev1.ComputeInstance) error {
 		if err := lockTenantForCreate(ctx, candidate.GetMetadata().GetTenant()); err != nil {
 			return err

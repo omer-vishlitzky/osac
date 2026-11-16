@@ -21,6 +21,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
 	"github.com/osac-project/osac/fulfillment-service/internal/database"
 	"github.com/osac-project/osac/fulfillment-service/internal/logging"
@@ -379,6 +380,34 @@ var _ = Describe("Compute instances server", func() {
 			Expect(object.GetStatus().GetState()).To(Equal(publicv1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_UNSPECIFIED))
 			Expect(object.GetStatus().GetComputeNetworkAttachmentStatuses()).To(BeEmpty())
 			Expect(object.GetStatus().GetVolumes()).To(BeEmpty())
+		})
+
+		It("replaces a caller-chosen identifier with a server one", func() {
+			createTemplate("general.small")
+
+			response, err := server.Create(ctx, publicv1.ComputeInstancesCreateRequest_builder{
+				Object: publicv1.ComputeInstance_builder{
+					Id:       "ci-shortvm",
+					Metadata: publicv1.Metadata_builder{Name: "chosen-id-vm"}.Build(),
+					Spec: publicv1.ComputeInstanceSpec_builder{
+						Template: publicv1.ComputeInstanceTemplateReference_builder{Id: "general.small"}.Build(),
+						NetworkAttachments: []*publicv1.ComputeNetworkAttachment{
+							publicv1.ComputeNetworkAttachment_builder{
+								Subnet: publicv1.SubnetLocalReference_builder{Id: "test-subnet"}.Build(),
+							}.Build(),
+						},
+					}.Build(),
+				}.Build(),
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+			id := response.GetObject().GetId()
+			// Every stored VM id is a server-generated uuidv7, never the caller's choice,
+			// so the disk-volume netting can read it out of the volume's ci-<uuid>-boot
+			// name:
+			Expect(id).ToNot(Equal("ci-shortvm"))
+			parsed, parseErr := uuid.Parse(id)
+			Expect(parseErr).ToNot(HaveOccurred())
+			Expect(parsed.Version()).To(Equal(uuid.Version(7)))
 		})
 
 		It("List objects", func() {

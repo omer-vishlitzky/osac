@@ -22,6 +22,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgerrcode"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -497,14 +498,19 @@ func quotaLinkedParentID(candidate protoreflect.Message, path string) (id string
 
 // quotaParentIDFromName reads the parent's identifier from the candidate's name: the link's
 // name prefix is "ci-{parent}-...", and a parent's identifier is a uuidv7, a fixed 36
-// characters, so the identifier is the 36 characters after the literal prefix. ok is false when
-// the name is too short to carry it.
+// characters, so the identifier is the 36 characters after the literal prefix. ok is false
+// when the name is too short to carry it or the 36 characters are not a UUID, so a
+// caller-chosen name resolves to no parent instead of a wrong one.
 func quotaParentIDFromName(name, namePrefix string) (id string, ok bool) {
 	prefix, _, _ := strings.Cut(namePrefix, "{parent}")
 	if len(name) < len(prefix)+36 {
 		return "", false
 	}
-	return name[len(prefix) : len(prefix)+36], true
+	id = name[len(prefix) : len(prefix)+36]
+	if _, err := uuid.Parse(id); err != nil {
+		return "", false
+	}
+	return id, true
 }
 
 // refuse builds the FAILED_PRECONDITION error with the ErrorInfo reason and the QuotaFailure
