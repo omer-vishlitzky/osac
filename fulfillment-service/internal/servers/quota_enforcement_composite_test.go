@@ -15,14 +15,11 @@ License.
 package servers
 
 import (
-	"fmt"
-
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"go.uber.org/mock/gomock"
 
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
-	"github.com/osac-project/osac/fulfillment-service/internal/database"
 	"github.com/osac-project/osac/fulfillment-service/internal/uuid"
 	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
@@ -48,23 +45,6 @@ var _ = Describe("Quota netting of created children", func() {
 			Build()
 		Expect(err).ToNot(HaveOccurred())
 	})
-
-	insertRow := func(table, id, tenant, project, data string) {
-		tx, err := database.TxFromContext(ctx)
-		Expect(err).ToNot(HaveOccurred())
-		_, err = tx.Exec(ctx,
-			`insert into `+table+` (id, name, tenant, project, creator, data)
-			values ($1, $1, $2, $3::ltree, 'system', $4::jsonb)`,
-			id, tenant, project, data,
-		)
-		Expect(err).ToNot(HaveOccurred())
-	}
-
-	// A tenant override, so the seeded default of the type's dimension doesn't apply.
-	setTenantLimit := func(dimension string, value int64) {
-		insertRow("quota_limits", "limit-"+dimension, testTenant, "",
-			`{"spec":{"dimension":"`+dimension+`","value":`+fmt.Sprint(value)+`}}`)
-	}
 
 	// nettingRefusal is the refusal one world expects.
 	type nettingRefusal struct {
@@ -137,7 +117,7 @@ var _ = Describe("Quota netting of created children", func() {
 				insertRow("bare_metal_instance_types", hostType, auth.SharedTenant, "", `{}`)
 			}
 			for dimension, value := range world.limits {
-				setTenantLimit(dimension, value)
+				insertQuotaLimit(testTenant, "", dimension, value)
 			}
 
 			parentID := "cluster-1"

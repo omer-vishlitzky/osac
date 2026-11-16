@@ -38,7 +38,6 @@ import (
 
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
 	"github.com/osac-project/osac/fulfillment-service/internal/controllers/finalizers"
-	"github.com/osac-project/osac/fulfillment-service/internal/database"
 	"github.com/osac-project/osac/fulfillment-service/internal/database/dao"
 	"github.com/osac-project/osac/fulfillment-service/internal/references"
 	"github.com/osac-project/osac/fulfillment-service/internal/uuid"
@@ -1158,14 +1157,7 @@ var _ = Describe("Private clusters server", func() {
 			// A tenant override below the two addresses a cluster with automatic endpoints
 			// creates, so the create's full effect, the cluster and its two addresses,
 			// cannot fit:
-			tx, err := database.TxFromContext(ctx)
-			Expect(err).ToNot(HaveOccurred())
-			_, err = tx.Exec(ctx,
-				`insert into quota_limits (id, name, tenant, project, creator, data)
-				values ('limit-eips', 'limit-eips', $1, ''::ltree, 'system',
-				'{"spec":{"dimension":"network.external_ips","value":1}}')`, testTenant,
-			)
-			Expect(err).ToNot(HaveOccurred())
+			insertQuotaLimit(testTenant, "", "network.external_ips", 1)
 
 			poolDao, err := dao.NewGenericDAO[*privatev1.ExternalIPPool]().
 				SetLogger(logger).
@@ -1196,14 +1188,7 @@ var _ = Describe("Private clusters server", func() {
 				}.Build(),
 			}.Build())
 			Expect(response).To(BeNil())
-			Expect(grpcstatus.Code(createErr)).To(Equal(grpccodes.FailedPrecondition))
-			var failure *publicv1.QuotaFailure
-			for _, detail := range grpcstatus.Convert(createErr).Details() {
-				if quoted, ok := detail.(*publicv1.QuotaFailure); ok {
-					failure = quoted
-				}
-			}
-			Expect(failure).ToNot(BeNil())
+			_, failure := quotaFailure(createErr)
 			Expect(failure.GetScope()).To(Equal("tenant"))
 			Expect(failure.GetDimension()).To(Equal("network.external_ips"))
 			Expect(failure.GetLimit()).To(Equal(int64(1)))
@@ -1231,14 +1216,7 @@ var _ = Describe("Private clusters server", func() {
 			// addresses must count once, through their own rows, so the create fits. If the
 			// addresses counted twice, once through their rows and once through the cluster's
 			// unconverted ask, this create would be refused at usage 4:
-			tx, err := database.TxFromContext(ctx)
-			Expect(err).ToNot(HaveOccurred())
-			_, err = tx.Exec(ctx,
-				`insert into quota_limits (id, name, tenant, project, creator, data)
-				values ('limit-eips-fit', 'limit-eips-fit', $1, ''::ltree, 'system',
-				'{"spec":{"dimension":"network.external_ips","value":2}}')`, testTenant,
-			)
-			Expect(err).ToNot(HaveOccurred())
+			insertQuotaLimit(testTenant, "", "network.external_ips", 2)
 
 			poolDao, err := dao.NewGenericDAO[*privatev1.ExternalIPPool]().
 				SetLogger(logger).
@@ -1280,14 +1258,7 @@ var _ = Describe("Private clusters server", func() {
 					}.Build(),
 				}.Build(),
 			}.Build())
-			Expect(grpcstatus.Code(secondErr)).To(Equal(grpccodes.FailedPrecondition))
-			var failure *publicv1.QuotaFailure
-			for _, detail := range grpcstatus.Convert(secondErr).Details() {
-				if quoted, ok := detail.(*publicv1.QuotaFailure); ok {
-					failure = quoted
-				}
-			}
-			Expect(failure).ToNot(BeNil())
+			_, failure := quotaFailure(secondErr)
 			Expect(failure.GetDimension()).To(Equal("network.external_ips"))
 			Expect(failure.GetUsage()).To(Equal(int64(2)))
 			Expect(failure.GetAdded()).To(Equal(int64(2)))

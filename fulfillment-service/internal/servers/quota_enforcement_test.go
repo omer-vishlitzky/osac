@@ -21,7 +21,6 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	grpccodes "google.golang.org/grpc/codes"
 	grpcstatus "google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
@@ -44,20 +43,7 @@ var quotaTierResolver = TierResolverFunc(func(_ context.Context, _ string) (*Tie
 	}, nil
 })
 
-// quotaFailure extracts the ErrorInfo reason and the QuotaFailure detail of a refusal.
-func quotaFailure(err error) (reason string, failure *publicv1.QuotaFailure) {
-	status := grpcstatus.Convert(err)
-	ExpectWithOffset(1, status.Code()).To(Equal(grpccodes.FailedPrecondition))
-	for _, detail := range status.Details() {
-		switch detail := detail.(type) {
-		case *errdetails.ErrorInfo:
-			reason = detail.GetReason()
-		case *publicv1.QuotaFailure:
-			failure = detail
-		}
-	}
-	return reason, failure
-}
+// quotaFailure and the row-seeding helpers live in quota_test_fixtures_test.go.
 
 var _ = Describe("Quota enforcement", func() {
 	var volumes *PrivateVolumesServer
@@ -82,16 +68,17 @@ var _ = Describe("Quota enforcement", func() {
 		Expect(err).ToNot(HaveOccurred())
 	})
 
-	// insertRow inserts one row of an object table with the standard columns.
-	insertRow := func(table, id, tenant, project, data string) {
-		tx, err := database.TxFromContext(ctx)
+	// committed runs the function in its own transaction, committed, so concurrent
+	// transactions and the after-commit scans can see what it wrote. Inside the
+	// function, ctx carries that transaction, so the seeding helpers write to it.
+	committed := func(fn func()) {
+		tx, err := tm.Begin(ctx)
 		Expect(err).ToNot(HaveOccurred())
-		_, err = tx.Exec(ctx,
-			`insert into `+table+` (id, name, tenant, project, creator, data)
-			values ($1, $1, $2, $3::ltree, 'system', $4::jsonb)`,
-			id, tenant, project, data,
-		)
-		Expect(err).ToNot(HaveOccurred())
+		saved := ctx
+		ctx = database.TxIntoContext(ctx, tx)
+		fn()
+		ctx = saved
+		Expect(tx.End(ctx)).To(Succeed())
 	}
 
 	deleteRow := func(table, id string) {
@@ -99,11 +86,6 @@ var _ = Describe("Quota enforcement", func() {
 		Expect(err).ToNot(HaveOccurred())
 		_, err = tx.Exec(ctx, `delete from `+table+` where id = $1`, id)
 		Expect(err).ToNot(HaveOccurred())
-	}
-
-	insertLimit := func(project, dimension string, value int64) {
-		insertRow("quota_limits", "limit-"+dimension+"-"+project, testTenant, project,
-			`{"spec":{"dimension":"`+dimension+`","value":`+fmt.Sprint(value)+`}}`)
 	}
 
 	insertDefaultLimit := func(dimension string, value int64) {
@@ -206,8 +188,8 @@ var _ = Describe("Quota enforcement", func() {
 
 	Describe("Creates over a limit", func() {
 		BeforeEach(func() {
-			insertLimit("", "storage.volumes", 100)
-			insertLimit("", "storage.fast.gib", 10)
+			insertQuotaLimit(testTenant, "", "storage.volumes", 100)
+			insertQuotaLimit(testTenant, "", "storage.fast.gib", 10)
 		})
 
 		It("refuses a create over the tenant limit and writes nothing", func() {
@@ -228,7 +210,7 @@ var _ = Describe("Quota enforcement", func() {
 
 		It("refuses a create over a project limit and names the project", func() {
 			createProject("team")
-			insertLimit("team", "storage.fast.gib", 4)
+			insertQuotaLimit(testTenant, "team", "storage.fast.gib", 4)
 
 			err := createVolume("vol-1", "team", "fast", 5)
 			reason, failure := quotaFailure(err)
@@ -245,7 +227,7 @@ var _ = Describe("Quota enforcement", func() {
 		It("refuses a create over an ancestor project's limit and names the ancestor", func() {
 			createProject("team")
 			createProject("team.web")
-			insertLimit("team", "storage.fast.gib", 4)
+			insertQuotaLimit(testTenant, "team", "storage.fast.gib", 4)
 
 			err := createVolume("vol-1", "team.web", "fast", 5)
 			reason, failure := quotaFailure(err)
@@ -267,7 +249,7 @@ var _ = Describe("Quota enforcement", func() {
 				values ('type-id-1', 'gpu-8', 'shared', ''::ltree, 'system',
 				'{"spec":{"vcpus":8,"memory_gib":32}}'::jsonb)`)
 			Expect(err).ToNot(HaveOccurred())
-			insertLimit("", "compute.vcpus", 7)
+			insertQuotaLimit(testTenant, "", "compute.vcpus", 7)
 
 			var response *privatev1.ComputeInstancesCreateResponse
 			err = instances.Create(ctx, privatev1.ComputeInstancesCreateRequest_builder{
@@ -284,24 +266,68 @@ var _ = Describe("Quota enforcement", func() {
 			Expect(failure.GetAdded()).To(Equal(int64(8)))
 		})
 
-		It("resolves the limit from the tenant override, the default, then 0", func() {
-			insertDefaultLimit("storage.slow.gib", 3)
-			Expect(createVolume("vol-1", "", "slow", 2)).To(Succeed())
+		// limitResolution is one scenario of the order: the seeded defaults and
+		// overrides, the volume sizes that fit, the refused create's size, and the
+		// refusal's limit, usage and added.
+		type limitResolution struct {
+			defaults  map[string]int64
+			overrides map[string]int64
+			tier      string
+			fitting   []int64
+			refused   int64
+			expected  int64
+			usage     int64
+			added     int64
+		}
 
-			err := createVolume("vol-2", "", "slow", 2)
-			_, failure := quotaFailure(err)
-			Expect(failure.GetScope()).To(Equal("tenant"))
-			Expect(failure.GetLimit()).To(Equal(int64(3)))
+		DescribeTable("resolves the limit from the tenant override, the default, then 0",
+			func(scenario limitResolution) {
+				for dimension, value := range scenario.defaults {
+					insertDefaultLimit(dimension, value)
+				}
+				for dimension, value := range scenario.overrides {
+					insertQuotaLimit(testTenant, "", dimension, value)
+				}
+				for i, size := range scenario.fitting {
+					Expect(createVolume(fmt.Sprintf("vol-%d", i+1), "", scenario.tier, size)).
+						To(Succeed())
+				}
 
-			// The tenant's override replaces the default for the dimension:
-			insertLimit("", "storage.archive.gib", 10)
-			insertDefaultLimit("storage.archive.gib", 3)
-			Expect(createVolume("vol-3", "", "archive", 5)).To(Succeed())
-			Expect(createVolume("vol-4", "", "archive", 5)).To(Succeed())
-			err = createVolume("vol-5", "", "archive", 1)
-			_, failure = quotaFailure(err)
-			Expect(failure.GetLimit()).To(Equal(int64(10)))
-		})
+				_, failure := quotaFailure(createVolume(
+					fmt.Sprintf("vol-%d", len(scenario.fitting)+1), "", scenario.tier, scenario.refused))
+				Expect(failure.GetScope()).To(Equal("tenant"))
+				Expect(failure.GetLimit()).To(Equal(scenario.expected))
+				Expect(failure.GetUsage()).To(Equal(scenario.usage))
+				Expect(failure.GetAdded()).To(Equal(scenario.added))
+			},
+
+			Entry("the default when the tenant sets no override",
+				limitResolution{
+					defaults: map[string]int64{"storage.slow.gib": 3},
+					tier:     "slow",
+					fitting:  []int64{2},
+					refused:  2,
+					expected: 3, usage: 2, added: 2,
+				},
+			),
+			Entry("the tenant's override over the default",
+				limitResolution{
+					defaults:  map[string]int64{"storage.archive.gib": 3},
+					overrides: map[string]int64{"storage.archive.gib": 10},
+					tier:      "archive",
+					fitting:   []int64{5, 5},
+					refused:   1,
+					expected:  10, usage: 10, added: 1,
+				},
+			),
+			Entry("zero when nothing sets the dimension",
+				limitResolution{
+					tier:     "slow",
+					refused:  1,
+					expected: 0, usage: 0, added: 1,
+				},
+			),
+		)
 
 		It("runs the check on a dry run and writes nothing", func() {
 			_, err := volumes.Create(dryRunCtx(), privatev1.VolumesCreateRequest_builder{
@@ -390,8 +416,8 @@ var _ = Describe("Quota enforcement", func() {
 		}
 
 		It("refuses an update that adds over the limit and writes nothing", func() {
-			insertLimit("", "compute.vcpus", 4)
-			insertLimit("", "compute.memory_gib", 100)
+			insertQuotaLimit(testTenant, "", "compute.vcpus", 4)
+			insertQuotaLimit(testTenant, "", "compute.memory_gib", 100)
 			insertInstanceType("small", 2, 4)
 			insertInstanceType("large", 6, 8)
 			Expect(createInstance("vm-1", "", "small")).To(Succeed())
@@ -412,8 +438,8 @@ var _ = Describe("Quota enforcement", func() {
 		})
 
 		It("does not check an update whose mask names no annotated spec field", func() {
-			insertLimit("", "compute.vcpus", 0)
-			insertLimit("", "compute.memory_gib", 0)
+			insertQuotaLimit(testTenant, "", "compute.vcpus", 0)
+			insertQuotaLimit(testTenant, "", "compute.memory_gib", 0)
 			insertInstanceType("small", 2, 4)
 			Expect(createInstance("vm-1", "", "small")).ToNot(Succeed())
 
@@ -434,8 +460,8 @@ var _ = Describe("Quota enforcement", func() {
 		})
 
 		It("checks an update with no field mask", func() {
-			insertLimit("", "compute.vcpus", 4)
-			insertLimit("", "compute.memory_gib", 100)
+			insertQuotaLimit(testTenant, "", "compute.vcpus", 4)
+			insertQuotaLimit(testTenant, "", "compute.memory_gib", 100)
 			insertInstanceType("small", 2, 4)
 			insertInstanceType("large", 6, 8)
 			Expect(createInstance("vm-1", "", "small")).To(Succeed())
@@ -454,8 +480,8 @@ var _ = Describe("Quota enforcement", func() {
 		})
 
 		It("does not free quota on a resize down until the resource runs smaller", func() {
-			insertLimit("", "compute.vcpus", 10)
-			insertLimit("", "compute.memory_gib", 100)
+			insertQuotaLimit(testTenant, "", "compute.vcpus", 10)
+			insertQuotaLimit(testTenant, "", "compute.memory_gib", 100)
 			insertInstanceType("small", 2, 4)
 			insertInstanceType("large", 6, 8)
 			Expect(createInstance("vm-1", "", "large")).To(Succeed())
@@ -482,43 +508,19 @@ var _ = Describe("Quota enforcement", func() {
 	})
 
 	Describe("Concurrent requests in one tenant", func() {
-		// committed runs the function in its own transaction, committed, so concurrent
-		// transactions can see what it wrote.
-		committed := func(fn func(runCtx context.Context)) {
-			tx, err := tm.Begin(ctx)
-			Expect(err).ToNot(HaveOccurred())
-			fn(database.TxIntoContext(ctx, tx))
-			Expect(tx.End(ctx)).To(Succeed())
-		}
-
 		BeforeEach(func() {
-			committed(func(runCtx context.Context) {
-				tx, err := database.TxFromContext(runCtx)
+			committed(func() {
+				tx, err := database.TxFromContext(ctx)
 				Expect(err).ToNot(HaveOccurred())
-				_, err = tx.Exec(runCtx,
+				_, err = tx.Exec(ctx,
 					`insert into tenants (id, name, tenant, creator, data)
 					values ('acme', 'acme', 'acme', 'system', '{}')`)
 				Expect(err).ToNot(HaveOccurred())
-				for _, limit := range []struct {
-					id, dimension string
-					value         int64
-				}{
-					{"limit-vcpus", "compute.vcpus", 1},
-					{"limit-memory", "compute.memory_gib", 100},
-					{"limit-caas", "caas.control_planes", 10},
-				} {
-					_, err = tx.Exec(runCtx,
-						`insert into quota_limits (id, name, tenant, project, creator, data)
-						values ($1, $1, 'acme', ''::ltree, 'system', $2)`,
-						limit.id, `{"spec":{"dimension":"`+limit.dimension+`","value":`+fmt.Sprint(limit.value)+`}}`,
-					)
-					Expect(err).ToNot(HaveOccurred())
-				}
-				_, err = tx.Exec(runCtx,
-					`insert into instance_types (id, name, tenant, project, creator, data)
-					values ('small', 'small', 'shared', ''::ltree, 'system',
-					'{"spec":{"vcpus":1,"memory_gib":2}}')`)
-				Expect(err).ToNot(HaveOccurred())
+				insertQuotaLimit("acme", "", "compute.vcpus", 1)
+				insertQuotaLimit("acme", "", "compute.memory_gib", 100)
+				insertQuotaLimit("acme", "", "caas.control_planes", 10)
+				insertRow("instance_types", "small", auth.SharedTenant, "",
+					`{"spec":{"vcpus":1,"memory_gib":2}}`)
 			})
 		})
 
@@ -570,13 +572,8 @@ var _ = Describe("Quota enforcement", func() {
 				SetTenancyLogic(tenancy).
 				Build()
 			Expect(err).ToNot(HaveOccurred())
-			committed(func(runCtx context.Context) {
-				tx, err := database.TxFromContext(runCtx)
-				Expect(err).ToNot(HaveOccurred())
-				_, err = tx.Exec(runCtx,
-					`insert into subnets (id, name, tenant, project, creator, data)
-					values ('subnet', 'subnet', 'acme', ''::ltree, 'system', '{}')`)
-				Expect(err).ToNot(HaveOccurred())
+			committed(func() {
+				insertRow("subnets", "subnet", "acme", "", `{}`)
 			})
 
 			// Both fill-ins lock the subnet's row after the tenant lock, the way the
@@ -676,9 +673,9 @@ var _ = Describe("Quota enforcement", func() {
 				Build()
 			Expect(err).ToNot(HaveOccurred())
 			createProject("team")
-			insertLimit("", "storage.volumes", 100)
-			insertLimit("", "storage.fast.gib", 10)
-			insertLimit("team", "storage.fast.gib", 10)
+			insertQuotaLimit(testTenant, "", "storage.volumes", 100)
+			insertQuotaLimit(testTenant, "", "storage.fast.gib", 10)
+			insertQuotaLimit(testTenant, "team", "storage.fast.gib", 10)
 		})
 
 		It("writes one outbox row when a request crosses a threshold", func() {
@@ -832,10 +829,10 @@ var _ = Describe("Quota enforcement", func() {
 
 			// The failed warning is reported to the transaction, so ending it rolls the
 			// limit back instead of committing it:
-			committed := false
-			suiteTx.OnCommit(func() { committed = true })
+			didCommit := false
+			suiteTx.OnCommit(func() { didCommit = true })
 			Expect(suiteTx.End(ctx)).To(Succeed())
-			Expect(committed).To(BeFalse(), "the failed warning must roll the limit create back")
+			Expect(didCommit).To(BeFalse(), "the failed warning must roll the limit create back")
 
 			// A fresh transaction sees nothing of the rolled-back create:
 			verifyTx, verifyErr := tm.Begin(context.Background())
@@ -854,108 +851,94 @@ var _ = Describe("Quota enforcement", func() {
 	})
 
 	Describe("Default limit changes", func() {
-		It("warns, after the change commits, the tenants a lowered default tightens", func() {
-			// The scan runs in its own transactions after the commit, so everything it
-			// reads must be committed first:
-			committed := func(fn func(runCtx context.Context)) {
-				tx, err := tm.Begin(ctx)
-				Expect(err).ToNot(HaveOccurred())
-				fn(database.TxIntoContext(ctx, tx))
-				Expect(tx.End(ctx)).To(Succeed())
-			}
-			committed(func(runCtx context.Context) {
-				tx, err := database.TxFromContext(runCtx)
-				Expect(err).ToNot(HaveOccurred())
-				_, err = tx.Exec(runCtx,
-					`insert into tenants (id, name, tenant, creator, data)
-					values ('acme', 'acme', 'acme', 'system', '{}')`)
-				Expect(err).ToNot(HaveOccurred())
-				_, err = tx.Exec(runCtx,
-					`insert into projects (id, tenant, project, name, creator, data)
-					values (uuidv7(), 'acme', ''::ltree, 'team'::ltree, 'system', '{}')`)
-				Expect(err).ToNot(HaveOccurred())
-				_, err = tx.Exec(runCtx,
-					`insert into quota_default_limits (id, name, creator, data)
-					values ('default', 'default', 'system',
-					'{"spec":{"dimension":"storage.slow.gib","value":10}}')`)
-				Expect(err).ToNot(HaveOccurred())
-				_, err = tx.Exec(runCtx,
-					`insert into quota_limits (id, name, tenant, project, creator, data)
-					values ('limit', 'limit', 'acme', 'team'::ltree, 'system',
-					'{"spec":{"dimension":"storage.slow.gib","value":10}}')`)
-				Expect(err).ToNot(HaveOccurred())
-				_, err = tx.Exec(runCtx,
-					`insert into quota_thresholds (id, name, tenant, project, creator, data)
-					values ('threshold', 'threshold', 'acme', 'team'::ltree, 'system',
-					'{"spec":{"dimension":"storage.slow.gib","value":2}}')`)
-				Expect(err).ToNot(HaveOccurred())
-				_, err = tx.Exec(runCtx,
-					`insert into volumes (id, name, tenant, project, creator, data)
-					values ('vol', 'vol', 'acme', 'team'::ltree, 'system',
-					'{"spec":{"storage_tier":"slow","size_gib":3}}')`)
-				Expect(err).ToNot(HaveOccurred())
-			})
+		var limits *PrivateQuotaLimitsServer
 
-			limits, err := NewPrivateQuotaLimitsServer().
+		BeforeEach(func() {
+			var err error
+			limits, err = NewPrivateQuotaLimitsServer().
 				SetLogger(logger).
 				SetAttributionLogic(attribution).
 				SetTenancyLogic(tenancy).
 				Build()
 			Expect(err).ToNot(HaveOccurred())
+		})
 
+		// seedTightenedDefault commits the world a lowered default tightens: the tenant
+		// acme, its project team, a default and a team limit of ten, a threshold of two
+		// and a volume of three above it. The scan runs in its own transactions after
+		// the change commits, so everything it reads must be committed first.
+		seedTightenedDefault := func() {
+			committed(func() {
+				tx, err := database.TxFromContext(ctx)
+				Expect(err).ToNot(HaveOccurred())
+				_, err = tx.Exec(ctx,
+					`insert into tenants (id, name, tenant, creator, data)
+					values ('acme', 'acme', 'acme', 'system', '{}')`)
+				Expect(err).ToNot(HaveOccurred())
+				_, err = tx.Exec(ctx,
+					`insert into projects (id, tenant, project, name, creator, data)
+					values (uuidv7(), 'acme', ''::ltree, 'team'::ltree, 'system', '{}')`)
+				Expect(err).ToNot(HaveOccurred())
+				insertDefaultLimit("storage.slow.gib", 10)
+				insertQuotaLimit("acme", "team", "storage.slow.gib", 10)
+				insertRow("quota_thresholds", "threshold", "acme", "team",
+					`{"spec":{"dimension":"storage.slow.gib","value":2}}`)
+				insertRow("volumes", "vol", "acme", "team",
+					`{"spec":{"storage_tier":"slow","size_gib":3}}`)
+			})
+		}
+
+		// lowerDefault commits a SetDefault of the dimension in its own transaction,
+		// the way the deployed server does, so the after-commit scan can run.
+		lowerDefault := func(value int64) {
 			tx, err := tm.Begin(ctx)
 			Expect(err).ToNot(HaveOccurred())
 			managerCtx := database.TxManagerIntoContext(ctx, tm)
 			setCtx := database.TxIntoContext(managerCtx, tx)
-			DeferCleanup(func() {
-				if tx != nil {
-					Expect(tx.End(ctx)).To(Succeed())
-					tx = nil
-				}
-			})
 			_, err = limits.SetDefault(setCtx,
 				privatev1.QuotaLimitsSetDefaultRequest_builder{
 					Object: privatev1.QuotaDefaultLimit_builder{
 						Spec: privatev1.QuotaDefaultLimitSpec_builder{
 							Dimension: "storage.slow.gib",
-							Value:     1,
+							Value:     value,
 						}.Build(),
 					}.Build(),
 				}.Build())
 			Expect(err).ToNot(HaveOccurred())
 			Expect(tx.End(ctx)).To(Succeed())
-			tx = nil
+		}
 
-			// The scan runs after the commit, detached from the request, so its warnings
-			// appear once it finishes:
-			committedOutbox := func() []map[string]any {
-				readTx, err := tm.Begin(ctx)
-				Expect(err).ToNot(HaveOccurred())
-				readCtx := database.TxIntoContext(ctx, readTx)
-				rows, err := readTx.Query(readCtx,
-					`select tenant, project::text, dimension, data from quota_outbox`)
-				Expect(err).ToNot(HaveOccurred())
-				defer rows.Close()
-				var result []map[string]any
-				for rows.Next() {
-					var tenant, project, dimension string
-					var data []byte
-					Expect(rows.Scan(&tenant, &project, &dimension, &data)).To(Succeed())
-					result = append(result, map[string]any{
-						"tenant": tenant, "project": project, "dimension": dimension, "data": data,
-					})
-				}
-				Expect(rows.Err()).To(Succeed())
-				Expect(readTx.End(ctx)).To(Succeed())
-				return result
-			}
-			var result []map[string]any
+		It("warns, after the change commits, the tenants a lowered default tightens", func() {
+			seedTightenedDefault()
+			lowerDefault(1)
+
+			// The scan runs after the commit, detached from the request, so its warning
+			// appears once it finishes:
+			var rows []map[string]any
 			Eventually(func(g Gomega) {
-				result = committedOutbox()
-				g.Expect(result).To(HaveLen(1))
+				rows = outboxRows()
+				g.Expect(rows).To(HaveLen(1))
 			}).WithTimeout(10 * time.Second).Should(Succeed())
-			Expect(result[0]["tenant"]).To(Equal("acme"))
-			Expect(result[0]["project"]).To(Equal("team"))
+			Expect(rows[0]["tenant"]).To(Equal("acme"))
+			Expect(rows[0]["project"]).To(Equal("team"))
+			Expect(rows[0]["data"]).To(MatchJSON(
+				`{"dimension":"storage.slow.gib","threshold":2,"usage":3,"limit":10}`))
+		})
+
+		It("writes no warning for a tenant whose override keeps its limit", func() {
+			seedTightenedDefault()
+			// acme's own override of ten survives the lowered default, so the change
+			// tightens nothing the tenant is held to:
+			committed(func() {
+				insertQuotaLimit("acme", "", "storage.slow.gib", 10)
+			})
+			lowerDefault(1)
+
+			// The scan runs within milliseconds of the commit; two seconds of silence
+			// cover it:
+			Consistently(func() int {
+				return len(outboxRows())
+			}).WithTimeout(2 * time.Second).Should(BeZero())
 		})
 	})
 
@@ -974,8 +957,8 @@ var _ = Describe("Quota enforcement", func() {
 			Expect(err).ToNot(HaveOccurred())
 
 			createProject("team")
-			insertLimit("", "storage.volumes", 100)
-			insertLimit("team", "storage.fast.gib", 10)
+			insertQuotaLimit(testTenant, "", "storage.volumes", 100)
+			insertQuotaLimit(testTenant, "team", "storage.fast.gib", 10)
 			insertThreshold("team", "storage.fast.gib", 2)
 
 			metricVolume := func(name string, sizeGib int64) error {
