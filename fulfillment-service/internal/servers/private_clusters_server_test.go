@@ -2417,6 +2417,38 @@ var _ = Describe("Private clusters server", func() {
 			Expect(err).To(MatchError(ContainSubstring("node_sets")))
 		})
 
+		It("rejects a node-set update that adds a NodeSet without size or hardware", func() {
+			workers := privatev1.ClusterNodeSet_builder{
+				Size:                  proto.Int32(2),
+				BaremetalInstanceType: privatev1.BareMetalInstanceTypeReference_builder{Id: "acme-bmit-id", Shared: true}.Build(),
+			}.Build()
+			created, err := server.Create(ctx, newCaaSNodeSetCreateRequest("incomplete-new-node-set", map[string]*privatev1.ClusterNodeSet{
+				"workers": workers,
+			}, nil))
+			Expect(err).ToNot(HaveOccurred())
+
+			_, err = server.Update(ctx, privatev1.ClustersUpdateRequest_builder{
+				Object: privatev1.Cluster_builder{
+					Id: created.GetObject().GetId(),
+					Spec: privatev1.ClusterSpec_builder{NodeSets: map[string]*privatev1.ClusterNodeSet{
+						"workers": workers,
+						"gpu":     privatev1.ClusterNodeSet_builder{}.Build(),
+					}}.Build(),
+				}.Build(),
+				UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"spec.node_sets"}},
+			}.Build())
+			Expect(grpcstatus.Code(err)).To(Equal(grpccodes.InvalidArgument))
+			Expect(err).To(MatchError(ContainSubstring("size for node set 'gpu' is required")))
+
+			// Nothing was written: the stored cluster keeps its one complete node set:
+			stored, err := server.Get(ctx, privatev1.ClustersGetRequest_builder{
+				Id: created.GetObject().GetId(),
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+			Expect(stored.GetObject().GetSpec().GetNodeSets()).To(HaveLen(1))
+			Expect(stored.GetObject().GetSpec().GetNodeSets()).To(HaveKey("workers"))
+		})
+
 		It("Creates object with template specified by name and bare metal instance type in node set", func() {
 			// Create a cluster specifying the template by name and the bare metal instance type by name:
 			response, err := server.Create(ctx, privatev1.ClustersCreateRequest_builder{

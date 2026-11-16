@@ -548,6 +548,18 @@ func (s *PrivateClustersServer) prepareUpdatedCluster(ctx context.Context, curre
 	if err := s.prepareUpdatedClusterNodeSets(ctx, current, candidate, mask, sizeOnlyNodeSets); err != nil {
 		return err
 	}
+	// The prepared candidate must never carry an incomplete node set: validateNodeSetsUpdate
+	// checks only map shape and immutability, while the quota walk reads every node set's
+	// size and hardware and fails as Internal when one is incomplete. The check runs
+	// whenever the update delivers a node-set map; the candidate's map is the stored,
+	// complete one whenever the update leaves node_sets alone, and a full-object update
+	// that omits node_sets keeps its legacy behavior. Create and catalog paths run the
+	// same check through resolveClusterNodeSets.
+	if len(candidate.GetSpec().GetNodeSets()) > 0 {
+		if err := validateClusterNodeSetMap(candidate.GetSpec().GetNodeSets()); err != nil {
+			return grpcstatus.Errorf(grpccodes.InvalidArgument, "node_sets: %s", err)
+		}
+	}
 	mergeClusterUpgradeHistory(current, candidate, mask)
 	preserveNodeSetVersions(current, candidate)
 	initializeAddedNodeSetVersions(current, candidate)
