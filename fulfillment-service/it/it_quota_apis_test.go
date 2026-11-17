@@ -53,7 +53,7 @@ var _ = Describe("Quota APIs", func() {
 					"metadata": map[string]any{"tenant": tenant},
 					"spec":     map[string]any{"dimension": "images.count", "value": 5},
 				})
-			Expect(code).To(Equal(http.StatusOK))
+			Expect(code).To(Equal(http.StatusOK), "POST quota_limits returned %d: %v", code, override)
 			Expect(override["spec"]).To(HaveKeyWithValue("dimension", "images.count"))
 			Expect(override["spec"]).To(HaveKeyWithValue("value", "5"))
 			Expect(override["metadata"]).To(HaveKeyWithValue("tenant", tenant))
@@ -194,10 +194,32 @@ var _ = Describe("Quota APIs", func() {
 				}
 				Expect(err).NotTo(HaveOccurred())
 			})
+			// The request row has a foreign key to the tenant, so the tenant cleanup
+			// cannot archive the tenant while it exists:
+			DeferCleanup(func(ctx context.Context) {
+				_, err := adminRequests.Delete(ctx, publicv1.QuotaLimitRequestsDeleteRequest_builder{
+					Id: created.GetId(),
+				}.Build())
+				if status.Code(err) == codes.NotFound {
+					return
+				}
+				Expect(err).NotTo(HaveOccurred())
+			})
 		})
 
 		It("Denies the tenant identity the approval of a request", func() {
 			created := createRequest("compute.memory_gib", 8)
+			// The request row has a foreign key to the tenant, so the tenant cleanup
+			// cannot archive the tenant while it exists:
+			DeferCleanup(func(ctx context.Context) {
+				_, err := adminRequests.Delete(ctx, publicv1.QuotaLimitRequestsDeleteRequest_builder{
+					Id: created.GetId(),
+				}.Build())
+				if status.Code(err) == codes.NotFound {
+					return
+				}
+				Expect(err).NotTo(HaveOccurred())
+			})
 			Expect(created.GetStatus().GetState()).To(Equal(
 				publicv1.QuotaLimitRequestState_QUOTA_LIMIT_REQUEST_STATE_PENDING))
 
