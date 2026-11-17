@@ -152,7 +152,8 @@ func (s *quotaDefaultLimitsStore) set(
 	}
 	// Lock the row of the dimension, if any, so two sets of the same dimension can't race. Two
 	// first-time sets can still both miss the lock and race on the insert; the loser of that race
-	// updates the row the winner committed instead of surfacing the unique-index error.
+	// rolls back to the savepoint (a unique violation aborts the whole PostgreSQL transaction,
+	// even at READ COMMITTED) and then updates the row the winner committed.
 	probe := fmt.Sprintf(
 		"select id from %s where data -> 'spec' ->> 'dimension' = $1 for update", quotaDefaultLimitsTable)
 	write := fmt.Sprintf(
@@ -166,6 +167,12 @@ func (s *quotaDefaultLimitsStore) set(
 		if id == "" {
 			id = uuid.New().String()
 		}
+		// The savepoint keeps the insert's unique violation from aborting the whole transaction,
+		// so the recovery path below can still query and update.
+		_, err = tx.Exec(ctx, "savepoint sp_default_insert")
+		if err != nil {
+			return nil, err
+		}
 		_, err = tx.Exec(
 			ctx,
 			fmt.Sprintf(
@@ -175,6 +182,10 @@ func (s *quotaDefaultLimitsStore) set(
 			id, object.GetMetadata().GetName(), object.GetMetadata().GetCreator(), data,
 		)
 		if isUniqueViolation(err) {
+			_, err = tx.Exec(ctx, "rollback to savepoint sp_default_insert")
+			if err != nil {
+				return nil, err
+			}
 			err = tx.QueryRow(ctx, probe, object.GetSpec().GetDimension()).Scan(&id)
 			if err == nil {
 				_, err = tx.Exec(

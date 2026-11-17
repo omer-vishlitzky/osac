@@ -24,6 +24,7 @@ import (
 
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
 	"github.com/osac-project/osac/fulfillment-service/internal/collections"
+	"github.com/osac-project/osac/fulfillment-service/internal/database"
 	"github.com/osac-project/osac/fulfillment-service/internal/database/dao"
 	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
@@ -257,6 +258,48 @@ var _ = Describe("Quota servers", func() {
 			ExpectWithOffset(1, err).ToNot(HaveOccurred())
 			return response.GetObject()
 		}
+
+		It("recovers a default insert's unique violation through the savepoint", func() {
+			// The race this pins: two concurrent SetDefaults of one fresh dimension.
+			// Both probes miss, both inserts run, the winner commits first, and the
+			// loser's insert hits the unique index. A unique violation aborts the
+			// whole PostgreSQL transaction even at READ COMMITTED, so without the
+			// savepoint the loser's recovery probe dies with SQLSTATE 25P02 and the
+			// caller sees Internal. With the savepoint, the loser rolls back to
+			// before the insert, re-probes, finds the winner's row, and updates it.
+			//
+			// The race itself needs two transactions probing before either commits,
+			// which the suite's shared transaction cannot arrange. This test pins
+			// the recovery mechanics directly: a conflicting insert inside the
+			// savepoint, the rollback, and the transaction staying usable.
+			tx, err := database.TxFromContext(ctx)
+			Expect(err).ToNot(HaveOccurred())
+
+			// The winner's row, already in the index.
+			_, err = tx.Exec(ctx, `insert into quota_default_limits (id, name, creator, data)
+				values ('race-winner', 'race-winner', 'system',
+				'{"spec":{"dimension":"race.savepoint.recovery","value":"10"}}')`)
+			Expect(err).ToNot(HaveOccurred())
+
+			// The loser's insert: savepoint, insert (unique violation), rollback.
+			_, err = tx.Exec(ctx, "savepoint sp_default_insert")
+			Expect(err).ToNot(HaveOccurred())
+
+			_, err = tx.Exec(ctx, `insert into quota_default_limits (id, name, creator, data)
+				values ('race-loser', 'race-loser', 'system',
+				'{"spec":{"dimension":"race.savepoint.recovery","value":"20"}}')`)
+			Expect(isUniqueViolation(err)).To(BeTrue(), "the insert must hit the unique index")
+
+			_, err = tx.Exec(ctx, "rollback to savepoint sp_default_insert")
+			Expect(err).ToNot(HaveOccurred(), "the savepoint must keep the transaction alive")
+
+			// Without the savepoint, this query would fail with SQLSTATE 25P02.
+			var value string
+			err = tx.QueryRow(ctx, `select data -> 'spec' ->> 'value' from quota_default_limits
+				where data -> 'spec' ->> 'dimension' = 'race.savepoint.recovery'`).Scan(&value)
+			Expect(err).ToNot(HaveOccurred(), "the transaction must be usable after the recovery")
+			Expect(value).To(Equal("10"))
+		})
 
 		It("sets, lists, gets and clears defaults, replacing the value", func() {
 			first := setDefault("compute.vcpus", 10)
