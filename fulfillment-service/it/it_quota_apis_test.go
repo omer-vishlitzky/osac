@@ -64,7 +64,7 @@ var _ = Describe("Quota APIs", func() {
 			// Set the project limit through the REST gateway:
 			code, projectLimit := quotaRESTRequest(ctx, adminClient, http.MethodPost,
 				"/api/fulfillment/v1/quota_limits", map[string]any{
-					"metadata": map[string]any{"tenant": tenant, "project": project},
+					"metadata": map[string]any{"tenant": tenant, "project": project, "name": "limit-images-count-team"},
 					"spec":     map[string]any{"dimension": "images.count", "value": 3},
 				})
 			Expect(code).To(Equal(http.StatusOK))
