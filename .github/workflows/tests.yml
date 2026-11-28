@@ -797,15 +797,15 @@ jobs:
       - name: Test fulfillment secret reader rendering
         if: inputs.kind == 'helm-unit'
         working-directory: osac-installer
-        run: make service-account-idp-render-test
+        run: python3 scripts/test-service-account-idp-render.py
       - name: Test AAP chart unit tests
         if: inputs.kind == 'helm-unit'
         working-directory: osac-aap
         run: uv run --group development pytest -q tests/unit
-      - name: Test AAP run-instance rendering
+      - name: Test vcluster suite rendering
         if: inputs.kind == 'helm-unit'
         working-directory: osac-installer
-        run: make vcluster-suite-render-test
+        run: uv run --project .. python scripts/test-vcluster-suite-render.py
 
       # --- integration test: osac-installer install preflight on Kind. Helm 3.18.0 is the oldest Helm that prints a
       # failed hook's log (helm.sh/hook-output-log-policy); 4.2.2 is the Helm 4 line.
