@@ -114,11 +114,18 @@ def test_external_aap_without_url_still_renders_and_fails_loudly_in_the_job():
 
 
 def test_external_aap_rejects_a_malformed_url_at_render_time():
-    for url in ("aap.example.com", "https://aap.example.com/api/controller"):
+    for url in (
+        "aap.example.com",
+        "https://aap.example.com/api/controller",
+        # Plain http would carry the admin password in the clear, and a
+        # user:pass@ prefix would put it in the URL itself.
+        "http://aap.example.com",
+        "https://user:pass@aap.example.com",
+    ):
         result = _render("aap.instance.enabled=false", f"controllerUrl={url}")
 
         assert result.returncode != 0
-        assert "controllerUrl must be an http(s) AAP base URL without a path" in result.stderr
+        assert "controllerUrl must be an https:// AAP base URL without a path" in result.stderr
 
 
 def test_in_cluster_instance_keeps_hostname_env_and_instance_derived_secret():

@@ -65,15 +65,18 @@ Admin password Secret key. Same two cases as osac-aap.adminPasswordSecretName.
 {{/*
 External AAP base URL (the umbrella chart's aap.controllerUrl). Empty is
 allowed and fails loudly in the job's wait-for-aap script; a non-empty value
-must be an http(s) URL without a path, because callers append
-/api/controller/v2 themselves.
+must be an https:// URL without a path, because callers append
+/api/controller/v2 themselves. Plain http is rejected: the admin password is
+sent to that URL.
 */}}
 {{- define "osac-aap.controllerUrl" -}}
 {{- if and (not .Values.aap.instance.enabled) .Values.controllerUrl }}
-{{- /* No path, query, fragment or IPv6 literal: callers append their own path,
-     and the netrc hostname derivation handles bare hostnames only. */}}
-{{- if not (regexMatch "^https?://[^/?#\\[\\s]+$" .Values.controllerUrl) }}
-{{- fail (printf "controllerUrl must be an http(s) AAP base URL without a path, for example https://aap.example.com (got %q)" .Values.controllerUrl) }}
+{{- /* No path, query, fragment, IPv6 literal or userinfo: callers append their
+     own path, the netrc hostname derivation handles bare hostnames only, and
+     curl would silently strip a user:pass@ prefix that the password must never
+     travel in. */}}
+{{- if not (regexMatch "^https://[^/?#@\\[\\s]+$" .Values.controllerUrl) }}
+{{- fail (printf "controllerUrl must be an https:// AAP base URL without a path, query, fragment or userinfo, for example https://aap.example.com (got %q)" .Values.controllerUrl) }}
 {{- end -}}
 {{- end -}}
 {{- .Values.controllerUrl -}}
