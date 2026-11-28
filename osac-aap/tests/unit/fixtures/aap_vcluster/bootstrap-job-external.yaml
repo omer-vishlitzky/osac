@@ -10,6 +10,10 @@ metadata:
     app.kubernetes.io/name: osac-aap
     app.kubernetes.io/instance: aap-test
     app.kubernetes.io/managed-by: Helm
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "9"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
 ---
 # Source: osac-aap/templates/bootstrap-job.yaml
 apiVersion: rbac.authorization.k8s.io/v1
@@ -22,6 +26,10 @@ metadata:
     app.kubernetes.io/name: osac-aap
     app.kubernetes.io/instance: aap-test
     app.kubernetes.io/managed-by: Helm
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "9"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
 rules:
   - apiGroups: [""]
     resources: ["secrets"]
@@ -39,6 +47,10 @@ metadata:
     app.kubernetes.io/name: osac-aap
     app.kubernetes.io/instance: aap-test
     app.kubernetes.io/managed-by: Helm
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "9"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
@@ -60,7 +72,7 @@ metadata:
     app.kubernetes.io/instance: aap-test
     app.kubernetes.io/managed-by: Helm
   annotations:
-    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook": pre-install,pre-upgrade
     "helm.sh/hook-weight": "10"
     "helm.sh/hook-delete-policy": before-hook-creation
     "helm.sh/hook-output-log-policy": hook-failed
@@ -286,7 +298,20 @@ spec:
         envFrom:
         - secretRef:
             name: config-as-code-ig
+        - configMapRef:
+            name: aap-fulfillment-secret-reader
+            optional: true
         env:
+        # The dedicated Fulfillment Secret reader credential. config-as-code
+        # asserts it whenever the reader ConfigMap above enables the reader,
+        # so dropping it breaks every install whose umbrella enables the
+        # service. Optional: installs without the reader keep working.
+        - name: OSAC_AAP_SECRET_READER_CLIENT_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: aap-fulfillment-secret-reader
+              key: client-secret
+              optional: true
         # Points config-as-code (Ansible's aap_hostname) at the external AAP;
         # the controller collection appends /api/controller/v2 itself.
         - name: AAP_HOSTNAME

@@ -789,6 +789,23 @@ jobs:
         if: inputs.kind == 'helm-unit'
         working-directory: osac-installer
         run: uv run --script scripts/test-preflight-render.py
+      # The AAP bootstrap Job must keep the Fulfillment Secret reader
+      # credential: config-as-code asserts it whenever the reader ConfigMap
+      # is rendered, so dropping it fails every install whose umbrella
+      # enables the service. It was lost once in a large rebase with no CI
+      # job rendering the chart.
+      - name: Test fulfillment secret reader rendering
+        if: inputs.kind == 'helm-unit'
+        working-directory: osac-installer
+        run: make service-account-idp-render-test
+      - name: Test AAP chart unit tests
+        if: inputs.kind == 'helm-unit'
+        working-directory: osac-aap
+        run: uv run --group development pytest -q tests/unit
+      - name: Test AAP run-instance rendering
+        if: inputs.kind == 'helm-unit'
+        working-directory: osac-installer
+        run: make vcluster-suite-render-test
 
       # --- integration test: osac-installer install preflight on Kind. Helm 3.18.0 is the oldest Helm that prints a
       # failed hook's log (helm.sh/hook-output-log-policy); 4.2.2 is the Helm 4 line.
