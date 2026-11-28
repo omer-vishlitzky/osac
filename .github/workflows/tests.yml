@@ -798,10 +798,14 @@ jobs:
         if: inputs.kind == 'helm-unit'
         working-directory: osac-installer
         run: python3 scripts/test-service-account-idp-render.py
-      - name: Test AAP chart unit tests
+      # The two chart-contract tests only; the it-osac-aap leg runs the
+      # whole unit suite. Together they fail when the bootstrap Job loses a
+      # variable config-as-code asserts.
+      - name: Test AAP chart contract
         if: inputs.kind == 'helm-unit'
         working-directory: osac-aap
-        run: uv run --group development pytest -q tests/unit
+        run: |
+          uv run --group development pytest -q             tests/unit/test_aap_run_instance.py             tests/unit/test_fulfillment_secret_reader_config.py
       - name: Test vcluster suite rendering
         if: inputs.kind == 'helm-unit'
         working-directory: osac-installer
