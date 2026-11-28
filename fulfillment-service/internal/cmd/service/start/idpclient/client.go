@@ -45,8 +45,8 @@ type ClientBuilder struct {
 }
 
 // realmEnvVar overrides the realm derived from the issuer URL. It exists for a
-// deployment whose issuer URL does not end in a realm segment; the start command
-// does not pass a realm flag yet, so the variable is set on the container.
+// deployment whose issuer URL does not end in a realm segment; the start
+// command's --realm flag takes precedence over it.
 const realmEnvVar = "OSAC_IDP_REALM"
 
 // NewClient creates a builder for a Keycloak management client.

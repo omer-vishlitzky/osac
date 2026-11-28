@@ -403,20 +403,29 @@ func (c *VaultLifecycleClient) enableJWTAuth(ctx context.Context, client *vaulta
 	if err != nil {
 		return newProvisioningError("inspect JWT auth mount", tenantName, err)
 	}
+	// These errors reach the tenant status, so the detail goes in the
+	// message: provisioningError.Error reports only its message.
 	mount := mounts[TenantAuthMountPath+"/"]
 	if mount == nil {
-		return fmt.Errorf(
-			"%s auth mount path %q for tenant %q is reported but absent from the "+
-				"auth table; verify the client namespace and auth mount listing permissions",
-			authType, TenantAuthMountPath, tenantName,
+		detail := fmt.Errorf(
+			"%s auth mount path %q is reported but absent from the auth table; "+
+				"verify the client namespace and auth mount listing permissions",
+			authType, TenantAuthMountPath,
 		)
+		return &provisioningError{
+			message: fmt.Sprintf("verify JWT auth mount for tenant %q: %v", tenantName, detail),
+			err:     detail,
+		}
 	}
 	if mount.Type != authType {
-		return fmt.Errorf(
-			"%s auth mount path %q for tenant %q holds the %q auth method; remove it "+
-				"so %s auth can be enabled",
-			authType, TenantAuthMountPath, tenantName, mount.Type, authType,
+		detail := fmt.Errorf(
+			"%s auth mount path %q holds the %q auth method; remove it so %s auth can be enabled",
+			authType, TenantAuthMountPath, mount.Type, authType,
 		)
+		return &provisioningError{
+			message: fmt.Sprintf("verify JWT auth mount for tenant %q: %v", tenantName, detail),
+			err:     detail,
+		}
 	}
 	return nil
 }

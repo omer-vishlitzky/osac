@@ -1549,9 +1549,10 @@ _FILE|DIRECTORY_ - File or directory containing trusted CA certificates.
 `
 
 const realmFlagHelp = `
-_REALM_ - Keycloak realm the admin client targets. Defaults to the realm
-segment of {{ bt }}--auth-issuer-url{{ bt }}; set it when the issuer URL does
-not name the realm. The OSAC_IDP_REALM environment variable overrides it.
+_REALM_ - Keycloak realm the admin client targets. Overrides the
+OSAC_IDP_REALM environment variable and the realm segment of
+{{ bt }}--auth-issuer-url{{ bt }}; set it when the issuer URL does not name
+the realm.
 `
 
 const authIssuerUrlFlagHelp = `

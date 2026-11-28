@@ -88,6 +88,27 @@ def test_unset_settings_render_byte_identical_to_the_vcluster_e2e_base():
     )
 
 
+def test_bootstrap_carries_the_fulfillment_secret_reader_credential():
+    """config-as-code asserts this variable whenever the reader ConfigMap is
+    rendered, so the bootstrap Job must always carry it.
+
+    The goldens cannot catch its removal on their own: a golden regenerated
+    from a broken render matches the broken render. This asserts the entry
+    itself, independently of any committed output.
+    """
+    for set_strings in ([], list(EXTERNAL_ARGS)):
+        job = next(doc for doc in _bootstrap_job(*set_strings) if doc["kind"] == "Job")
+        containers = job["spec"]["template"]["spec"]["containers"]
+        bootstrap = next(c for c in containers if c["name"] == "bootstrap")
+        entry = _env_map(bootstrap).get("OSAC_AAP_SECRET_READER_CLIENT_SECRET")
+        assert entry is not None, f"reader credential missing with {set_strings}"
+        assert entry["valueFrom"]["secretKeyRef"] == {
+            "name": "aap-fulfillment-secret-reader",
+            "key": "client-secret",
+            "optional": True,
+        }
+
+
 def test_instance_id_names_the_config_as_code_run():
     secret = _secret(f"global.instanceId={INSTANCE}")
 
