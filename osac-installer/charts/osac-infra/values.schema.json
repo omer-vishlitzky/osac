@@ -141,6 +141,18 @@
           "type": "boolean",
           "description": "Deploy the bundled PostgreSQL instance.",
           "default": false
+        },
+        "maxConnections": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "POSTGRESQL_MAX_CONNECTIONS for the bundled server.",
+          "default": 300
+        },
+        "poolMaxConns": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "pool_max_conns appended to every bundled database URL.",
+          "default": 8
         }
       }
     },

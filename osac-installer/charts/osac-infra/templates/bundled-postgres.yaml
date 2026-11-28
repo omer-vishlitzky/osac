@@ -14,7 +14,11 @@ metadata:
     {{- include "osac-infra.labels" . | nindent 4 }}
 type: Opaque
 stringData:
-  url: "postgres://{{ .Values.bundledPostgres.database.user }}@postgres:5432/{{ .Values.bundledPostgres.database.name }}?sslmode=verify-full&sslrootcert=/etc/fulfillment-grpc-server/db/sslrootcert&sslcert=/etc/fulfillment-grpc-server/db/sslcert&sslkey=/etc/fulfillment-grpc-server/db/sslkey"
+  # pool_max_conns caps each pgx pool. Without it pgxpool uses
+  # max(4, NumCPU) per pool and three pools per run, so a shared CI node
+  # runs the server out of its 100 connections and the failures read as
+  # test flakes.
+  url: "postgres://{{ .Values.bundledPostgres.database.user }}@postgres:5432/{{ .Values.bundledPostgres.database.name }}?sslmode=verify-full&sslrootcert=/etc/fulfillment-grpc-server/db/sslrootcert&sslcert=/etc/fulfillment-grpc-server/db/sslcert&sslkey=/etc/fulfillment-grpc-server/db/sslkey&pool_max_conns={{ .Values.bundledPostgres.poolMaxConns | default 8 }}"
 ---
 apiVersion: v1
 kind: Secret
@@ -25,7 +29,7 @@ metadata:
     {{- include "osac-infra.labels" . | nindent 4 }}
 type: Opaque
 stringData:
-  url: "postgres://metering@postgres:5432/metering?sslmode=verify-full&sslrootcert=/etc/metering/db/sslrootcert&sslcert=/etc/metering/db/sslcert&sslkey=/etc/metering/db/sslkey"
+  url: "postgres://metering@postgres:5432/metering?sslmode=verify-full&sslrootcert=/etc/metering/db/sslrootcert&sslcert=/etc/metering/db/sslcert&sslkey=/etc/metering/db/sslkey&pool_max_conns={{ .Values.bundledPostgres.poolMaxConns | default 8 }}"
 ---
 apiVersion: cert-manager.io/v1
 kind: Certificate
@@ -270,6 +274,10 @@ spec:
           value: ""
         - name: POSTGRESQL_DATABASE
           value: "default"
+        # The image default is 100 connections. Several concurrent runs,
+        # each with three bounded pools, need more headroom than that.
+        - name: POSTGRESQL_MAX_CONNECTIONS
+          value: {{ .Values.bundledPostgres.maxConnections | default 300 | quote }}
         volumeMounts:
         - name: data
           # Mounted at the whole home dir, not just .../data -- the sclorg

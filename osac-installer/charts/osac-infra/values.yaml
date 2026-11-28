@@ -222,6 +222,11 @@ kafka:
 # --- Shared PostgreSQL (dev/CI only) ---
 bundledPostgres:
   enabled: false
+  # Connection headroom for several concurrent E2E runs on one node. Each
+  # run's three pgx pools are capped by poolMaxConns, so the server total is
+  # bounded; the image default of 100 is too low for shared CI.
+  maxConnections: 300
+  poolMaxConns: 8
   database:
     name: service
     user: service
