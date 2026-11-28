@@ -53,8 +53,9 @@ var tierLabelPattern = regexp.MustCompile(`^[a-z0-9]([a-z0-9._-]*[a-z0-9])?$`)
 
 // osacInstanceIDLabel carries the run's instance id on every object a
 // provisioning job creates in a shared outer cluster (see the AAP
-// osac_instance_labels group var). It is the label that tells two runs'
-// identically named tenant StorageClasses apart.
+// osac_instance_labels group var). It scopes this run's resolution and
+// teardown to the classes its own jobs created; only a name-prefixed
+// provider can keep two identically named classes apart at all.
 const osacInstanceIDLabel = "osac.openshift.io/instance"
 
 // storageInstanceID is this process's run id, from OSAC_INSTANCE_ID. It is

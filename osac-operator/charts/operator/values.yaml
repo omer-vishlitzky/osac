@@ -1,7 +1,7 @@
 global:
   # Run ID of a deployment sharing an outer cluster with other deployments
   # (the umbrella chart's global.instanceId). Empty means this deployment is
-  # alone on the cluster. The operator passes it to the manager as
+  # alone on the cluster. The deployment passes it to the operator as
   # OSAC_INSTANCE_ID, which scopes tenant StorageClass resolution to the
   # StorageClasses this run provisioned.
   instanceId: ""
