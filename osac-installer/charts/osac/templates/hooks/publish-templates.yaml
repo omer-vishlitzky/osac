@@ -45,10 +45,14 @@ spec:
             AAP_TOKEN=$(kubectl get secret osac-aap-api-token -n {{ .Release.Namespace }} \
               -o jsonpath='{.data.token}' | base64 -d)
             [[ -n "${AAP_TOKEN}" ]] || { echo "ERROR: osac-aap-api-token secret is empty"; exit 1; }
+            {{- if not .Values.aap.aap.instance.enabled }}
+            # AAP requests verify the AAP's own CA (/etc/aap-ca-bundle), not the
+            # fulfillment service CA at /etc/ca-bundle.
+            {{- end }}
 
             TEMPLATE_NAME="{{ .Values.operator.aap.templatePrefix | default "osac" }}-publish-templates"
             echo "Looking up ${TEMPLATE_NAME} job template..."
-            JT_RESPONSE=$(curl -sf{{ if .Values.aap.aap.instance.enabled }}{{ else }} --cacert /etc/ca-bundle/bundle.pem{{ end }} -H "Authorization: Bearer ${AAP_TOKEN}" \
+            JT_RESPONSE=$(curl -sf{{ if .Values.aap.aap.instance.enabled }}{{ else }} --cacert /etc/aap-ca-bundle/bundle.pem{{ end }} -H "Authorization: Bearer ${AAP_TOKEN}" \
               "${AAP_URL}/api/controller/v2/job_templates/?name=${TEMPLATE_NAME}")
             JT_ID=$(echo "${JT_RESPONSE}" | python3 -c "
             import sys, json
@@ -61,7 +65,7 @@ spec:
             echo "Job template ID: ${JT_ID}"
 
             echo "Launching ${TEMPLATE_NAME}..."
-            LAUNCH_RESPONSE=$(curl -sf{{ if .Values.aap.aap.instance.enabled }}{{ else }} --cacert /etc/ca-bundle/bundle.pem{{ end }} -X POST \
+            LAUNCH_RESPONSE=$(curl -sf{{ if .Values.aap.aap.instance.enabled }}{{ else }} --cacert /etc/aap-ca-bundle/bundle.pem{{ end }} -X POST \
               -H "Authorization: Bearer ${AAP_TOKEN}" \
               -H "Content-Type: application/json" \
               "${AAP_URL}/api/controller/v2/job_templates/${JT_ID}/launch/")
@@ -75,7 +79,7 @@ spec:
             i=0
             while (( SECONDS < DEADLINE )); do
               i=$(( i + 1 ))
-              HTTP_CODE=$(curl -s{{ if .Values.aap.aap.instance.enabled }}{{ else }} --cacert /etc/ca-bundle/bundle.pem{{ end }} -o /tmp/poll-response.json -w '%{http_code}' \
+              HTTP_CODE=$(curl -s{{ if .Values.aap.aap.instance.enabled }}{{ else }} --cacert /etc/aap-ca-bundle/bundle.pem{{ end }} -o /tmp/poll-response.json -w '%{http_code}' \
                 --connect-timeout 5 --max-time 15 \
                 -H "Authorization: Bearer ${AAP_TOKEN}" \
                 "${AAP_URL}/api/controller/v2/jobs/${JOB_ID}/")
@@ -95,7 +99,7 @@ spec:
                 failed|error|canceled)
                   echo "ERROR: Publish job ${JOB_ID} finished with status: ${STATUS}"
                   echo "--- Job stdout ---"
-                  curl -s{{ if .Values.aap.aap.instance.enabled }}{{ else }} --cacert /etc/ca-bundle/bundle.pem{{ end }} --connect-timeout 5 --max-time 30 \
+                  curl -s{{ if .Values.aap.aap.instance.enabled }}{{ else }} --cacert /etc/aap-ca-bundle/bundle.pem{{ end }} --connect-timeout 5 --max-time 30 \
                     -H "Authorization: Bearer ${AAP_TOKEN}" \
                     "${AAP_URL}/api/controller/v2/jobs/${JOB_ID}/stdout/?format=txt" | tail -30
                   exit 1
@@ -121,6 +125,11 @@ spec:
         - name: ca-bundle
           mountPath: /etc/ca-bundle
           readOnly: true
+        {{- if not .Values.aap.aap.instance.enabled }}
+        - name: aap-ca-bundle
+          mountPath: /etc/aap-ca-bundle
+          readOnly: true
+        {{- end }}
         resources:
           requests:
             cpu: 50m
@@ -143,6 +152,18 @@ spec:
           items:
           - key: bundle.pem
             path: bundle.pem
+      {{- if not .Values.aap.aap.instance.enabled }}
+      # The AAP-facing requests in the main container need the external AAP's
+      # own CA: the ConfigMap the osac-aap bootstrap and create-token hooks
+      # read as their ca-bundle (aap.caBundleConfigMap). The fulfillment
+      # service CA above does not trust a custom-CA AAP.
+      - name: aap-ca-bundle
+        configMap:
+          name: {{ .Values.aap.caBundleConfigMap | default "ca-bundle" }}
+          items:
+          - key: bundle.pem
+            path: bundle.pem
+      {{- end }}
       serviceAccountName: {{ .Values.aap.serviceAccounts.osacSa }}
       restartPolicy: Never
 {{- end }}
