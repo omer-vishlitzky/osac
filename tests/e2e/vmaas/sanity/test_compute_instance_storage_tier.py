@@ -58,43 +58,43 @@ def verify_datavolume_storage_classes(
         )
 
 
-def _tenant_sc_prefix() -> str:
-    """The per-install prefix the storage job puts before a tenant StorageClass.
-
-    A single-cluster install names them ``osac-<tenant>-<tier>``. A vcluster
-    run names them ``osac-<instance-id>-<tenant>-<tier>`` so parallel runs on
-    one outer cluster cannot collide. The instance id equals the run's
-    Keycloak realm name in that flavor.
-    """
-    return os.environ.get("OSAC_INSTANCE_ID", "")
+INSTANCE_ID_ENV = "OSAC_INSTANCE_ID"
 
 
 def _expected_sc_for_tier(
     k8s_hub_client: K8sClient, k8s_virt_client: K8sClient, tier_name: str, tenant_name: str | None
 ) -> str:
-    """Resolve the expected StorageClass, tolerating the per-run prefix.
+    """Resolve this run's tenant StorageClass for a tier.
 
-    The hub's Tenant status always carries the real name; the fallback scan
-    below only runs when the status has not converged yet. In that fallback,
-    accept both the prefixed and the unprefixed pattern of the tier.
+    A shared-cluster (vcluster) run sets OSAC_INSTANCE_ID, the AAP storage job
+    labels each tenant StorageClass with it, and every other run's classes for
+    the same tier live on the same outer cluster. Only the class carrying this
+    run's instance id can be the honest expectation, so scan the labeled
+    classes first. A single-cluster install leaves the variable unset and keeps
+    resolving through Tenant.status, whose ValueError propagates when the tier
+    has no class.
     """
-    resolved = k8s_hub_client.get_storage_class_for_tier(
-        tier_name=tier_name, tenant_name=tenant_name, storage_class_client=k8s_virt_client
-    )
-    prefix = _tenant_sc_prefix()
-    if not prefix or resolved:
-        return resolved
-    # The status lookup returned nothing; retry the labeled scan with the
-    # run prefix so the vcluster flavor does not race the tenant status.
+    instance_id = os.environ.get(INSTANCE_ID_ENV, "").strip()
+    if not instance_id:
+        return k8s_hub_client.get_storage_class_for_tier(
+            tier_name=tier_name, tenant_name=tenant_name, storage_class_client=k8s_virt_client
+        )
+
+    target_tenant = (tenant_name or k8s_hub_client.namespace).strip()
+    normalized_tier = tier_name.strip().lower()
     items = k8s_virt_client.list_json(resource="storageclass").get("items", [])
     for item in items:
         labels = item.get("metadata", {}).get("labels", {})
         if (
-            labels.get("osac.openshift.io/tenant") == tenant_name
-            and labels.get("osac.openshift.io/storage-tier", "").strip().lower() == tier_name.strip().lower()
+            labels.get("osac.openshift.io/tenant", "").strip() == target_tenant
+            and labels.get("osac.openshift.io/instance", "").strip() == instance_id
+            and labels.get("osac.openshift.io/storage-tier", "").strip().lower() == normalized_tier
         ):
-            return item["metadata"]["name"]
-    return resolved
+            return item["metadata"]["name"].strip()
+    raise ValueError(
+        f"No StorageClass labeled with tenant '{target_tenant}', "
+        f"osac.openshift.io/instance '{instance_id}' and tier '{tier_name}'"
+    )
 
 
 def test_compute_instance_explicit_boot_disk_tier(
