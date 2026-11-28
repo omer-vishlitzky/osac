@@ -384,11 +384,39 @@ func mountProvisioningError(operation, engine, tenantName string, err error) err
 
 func (c *VaultLifecycleClient) enableJWTAuth(ctx context.Context, client *vaultapi.Client,
 	tenantName string) error {
+	const authType = "jwt"
+
 	err := client.Sys().EnableAuthWithOptionsWithContext(ctx, TenantAuthMountPath, &vaultapi.EnableAuthOptions{
-		Type: "jwt",
+		Type: authType,
 	})
-	if err != nil && !isAlreadyExistsError(err) {
+	if err == nil {
+		return nil
+	}
+	if !isAlreadyExistsError(err) {
 		return newProvisioningError("failed to enable JWT auth", tenantName, err)
+	}
+
+	// Reuse an occupied auth path only when it already holds the JWT method.
+	// Vault reports this as HTTP 400 and OpenBao as HTTP 409, so the decision is
+	// made from the auth table rather than from the error text.
+	mounts, err := client.Sys().ListAuthWithContext(ctx)
+	if err != nil {
+		return newProvisioningError("inspect JWT auth mount", tenantName, err)
+	}
+	mount := mounts[TenantAuthMountPath+"/"]
+	if mount == nil {
+		return fmt.Errorf(
+			"%s auth mount path %q for tenant %q is reported but absent from the "+
+				"auth table; verify the client namespace and auth mount listing permissions",
+			authType, TenantAuthMountPath, tenantName,
+		)
+	}
+	if mount.Type != authType {
+		return fmt.Errorf(
+			"%s auth mount path %q for tenant %q holds the %q auth method; remove it "+
+				"so %s auth can be enabled",
+			authType, TenantAuthMountPath, tenantName, mount.Type, authType,
+		)
 	}
 	return nil
 }

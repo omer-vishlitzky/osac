@@ -22,6 +22,7 @@ Keycloak and the databases stay on the outer cluster):
 | `OSAC_BMH_KUBECONFIG` | Kubeconfig of the cluster that owns the BareMetalHosts (the outer cluster in a vcluster run). The BMaaS suite reads BMH state through `k8s_bmh_client`. Unset reads them from the hub, which is a single-cluster deployment. |
 | `OSAC_IMPERSONATE_USER` | User kubectl impersonates, default `system:admin`. Set it to an empty value for a vanilla Kubernetes hub (a vcluster), which rejects impersonation, so the kubeconfig identity is used. |
 | `OSAC_NAMESPACE` | Install namespace. Default `osac-devel`; a vcluster run installs into `osac`. |
+| `OSAC_INSTANCE_ID` | Run id on a shared outer cluster, for example `pr2100v1`. The AAP bootstrap labels each run's tenant StorageClasses and its orders namespace with it, so the storage-tier checks resolve this run's class for a tier instead of another run's, and the run teardown deletes only resources that carry this run's id. Leave it unset for a single-instance install, where the class is read from `Tenant.status`. |
 | `OSAC_CLUSTER_DOMAIN` | Outer cluster domain. Required for a vcluster run because a vcluster has no `ingresses.config.openshift.io` to read. |
 | `OSAC_FULFILLMENT_ADDRESS`, `OSAC_FULFILLMENT_PRIVATE_ADDRESS` | `<host>:443` overrides when the derived `fulfillment-api-<namespace>.<domain>` names do not match. |
 | `OSAC_KEYCLOAK_URL`, `OSAC_KEYCLOAK_REALM`, `OSAC_KEYCLOAK_CLIENT_ID` | Keycloak endpoint, realm and CLI client. The realm defaults to `osac`; a vcluster run uses the run name (for example `demoav1`). |

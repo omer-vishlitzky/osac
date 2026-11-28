@@ -447,12 +447,69 @@ var _ = Describe("VaultLifecycleClient", func() {
 					w.Write([]byte(`{"errors":["path already exists at jwt/"]}`))
 					return
 				}
+				if r.URL.Path == "/v1/sys/auth" {
+					w.Write([]byte(`{"data":{"jwt/":{"type":"jwt"}}}`))
+					return
+				}
 				w.WriteHeader(http.StatusOK)
 				w.Write([]byte(`{}`))
 			})
 
 			err := client.EnsureTenantNamespace(ctx, "tenant-a")
 			Expect(err).ToNot(HaveOccurred())
+		})
+
+		It("rejects an auth path occupied by another method after a conflict", func() {
+			client, _ := newTestLifecycleClient(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/v1/sys/auth/jwt":
+					w.WriteHeader(http.StatusConflict)
+					w.Write([]byte(`{"errors":["path is already in use at jwt/"]}`))
+				case "/v1/sys/auth":
+					w.Write([]byte(`{"data":{"jwt/":{"type":"userpass"}}}`))
+				default:
+					w.Write([]byte(`{}`))
+				}
+			})
+
+			err := client.EnsureTenantNamespace(ctx, "tenant-a")
+			Expect(err).To(MatchError(ContainSubstring(`holds the "userpass" auth method`)))
+		})
+
+		It("rejects a missing auth mount after a conflict", func() {
+			client, _ := newTestLifecycleClient(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/v1/sys/auth/jwt":
+					w.WriteHeader(http.StatusBadRequest)
+					w.Write([]byte(`{"errors":["path already exists at jwt/"]}`))
+				case "/v1/sys/auth":
+					w.Write([]byte(`{"data":{"token/":{"type":"token"}}}`))
+				default:
+					w.Write([]byte(`{}`))
+				}
+			})
+
+			err := client.EnsureTenantNamespace(ctx, "tenant-a")
+			Expect(err).To(MatchError(ContainSubstring("absent from the auth table")))
+		})
+
+		It("reports an unreadable auth table after a conflict", func() {
+			client, _ := newTestLifecycleClient(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/v1/sys/auth/jwt":
+					w.WriteHeader(http.StatusConflict)
+					w.Write([]byte(`{"errors":["path is already in use at jwt/"]}`))
+				case "/v1/sys/auth":
+					w.WriteHeader(http.StatusForbidden)
+					w.Write([]byte(`{"errors":["permission denied"]}`))
+				default:
+					w.Write([]byte(`{}`))
+				}
+			})
+
+			err := client.EnsureTenantNamespace(ctx, "tenant-a")
+			Expect(err).To(MatchError(ContainSubstring("inspect JWT auth mount for tenant")))
+			Expect(err.Error()).To(ContainSubstring("HTTP 403"))
 		})
 
 		It("reprovisions a tenant that OpenBao already provisioned", func() {
@@ -465,6 +522,8 @@ var _ = Describe("VaultLifecycleClient", func() {
 					w.Write([]byte(`{"data":{` +
 						`"secret/":{"type":"kv","options":{"version":"2"}},` +
 						`"transit/":{"type":"transit"}}}`))
+				case "/v1/sys/auth":
+					w.Write([]byte(`{"data":{"jwt/":{"type":"jwt"}}}`))
 				case "/v1/sys/namespaces/tenant-a",
 					"/v1/sys/mounts/secret",
 					"/v1/sys/mounts/transit",

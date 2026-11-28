@@ -361,13 +361,6 @@ def test_metering_stop_ends_billing(
             )
 
         # The stop reaches metering through several steps: operator feedback, a
-        # fulfillment status change, the event topic, the fold, and a round. A round that
-        # runs before the stop is folded still sends a full interval, and the real final
-        # partial interval arrives only in the next round, so wait past a full round
-        # before picking the final heartbeat.
-        time.sleep(90)
-
-        # The stop reaches metering through several steps: operator feedback, a
         # fulfillment status change, the event topic, the fold, and a round. A round
         # that runs before the stop is folded still sends a full interval, and the
         # real final partial interval can land several rounds later. The wait keeps

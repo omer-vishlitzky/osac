@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -35,12 +36,18 @@ type ClientBuilder struct {
 	logger           *slog.Logger
 	baseURL          string
 	issuerURL        string
+	realm            string
 	clientID         string
 	clientIDFile     string
 	clientSecret     string
 	clientSecretFile string
 	caPool           *trust.CertPool
 }
+
+// realmEnvVar overrides the realm derived from the issuer URL. It exists for a
+// deployment whose issuer URL does not end in a realm segment; the start command
+// does not pass a realm flag yet, so the variable is set on the container.
+const realmEnvVar = "OSAC_IDP_REALM"
 
 // NewClient creates a builder for a Keycloak management client.
 func NewClient() *ClientBuilder {
@@ -59,6 +66,14 @@ func (b *ClientBuilder) SetBaseURL(value string) *ClientBuilder {
 
 func (b *ClientBuilder) SetIssuerURL(value string) *ClientBuilder {
 	b.issuerURL = value
+	return b
+}
+
+// SetRealm sets the Keycloak realm the management client targets. It overrides
+// the OSAC_IDP_REALM environment variable and the realm derived from the issuer
+// URL, and is mandatory when the issuer URL carries no realm segment.
+func (b *ClientBuilder) SetRealm(value string) *ClientBuilder {
+	b.realm = value
 	return b
 }
 
@@ -98,6 +113,10 @@ func (b *ClientBuilder) Build() (*idp.Client, error) {
 	if b.issuerURL == "" {
 		return nil, errors.New("flag '--auth-issuer-url' is required")
 	}
+	realm, err := b.resolveRealm()
+	if err != nil {
+		return nil, err
+	}
 	clientID, err := credential("idp-client-id", b.clientID, b.clientIDFile)
 	if err != nil {
 		return nil, err
@@ -116,25 +135,59 @@ func (b *ClientBuilder) Build() (*idp.Client, error) {
 		return nil, fmt.Errorf("failed to create IDP token source: %w", err)
 	}
 
-	b.logger.Info("Creating Keycloak IDP client")
+	b.logger.Info("Creating Keycloak IDP client", slog.String("realm", realm))
 	client, err := idp.NewClient().SetLogger(b.logger).SetBaseURL(b.baseURL).
 		SetTokenSource(source).SetCaPool(b.caPool).
-		SetRealmName(realmFromIssuer(b.issuerURL)).Build()
+		SetRealmName(realm).Build()
 	if err != nil {
 		return nil, fmt.Errorf("failed to create Keycloak client: %w", err)
 	}
 	return client, nil
 }
 
-// realmFromIssuer extracts the Keycloak realm from an issuer URL such as
-// https://keycloak.example.com/realms/demoav1. The admin client must target
-// the same realm that issues its tokens; a mismatch is rejected with 403.
-// Falls back to the historical default realm "osac" when parsing fails.
-func realmFromIssuer(issuerURL string) string {
-	if _, realm, found := strings.Cut(issuerURL, "/realms/"); found && realm != "" {
-		return strings.TrimSuffix(realm, "/")
+// resolveRealm returns the realm the management client targets: an explicit
+// realm wins, then the OSAC_IDP_REALM environment variable, then the realm
+// segment of the issuer URL. An issuer URL without that segment is an error
+// rather than a silent fall back to the historical default, because the admin
+// client must target the realm that issues its tokens and a mismatch is only
+// visible later as a 403 on every call.
+func (b *ClientBuilder) resolveRealm() (string, error) {
+	realm := b.realm
+	if realm == "" {
+		realm = strings.TrimSpace(os.Getenv(realmEnvVar))
 	}
-	return "osac"
+	if realm == "" {
+		derived, found := realmFromIssuer(b.issuerURL)
+		if !found {
+			return "", fmt.Errorf(
+				"cannot derive the Keycloak realm from issuer URL %q; set environment "+
+					"variable %q to the realm name",
+				b.issuerURL, realmEnvVar,
+			)
+		}
+		realm = derived
+	}
+	// The realm reaches admin request paths, some of which interpolate it
+	// unescaped, so only a single path-free realm name is accepted.
+	if url.PathEscape(realm) != realm {
+		return "", fmt.Errorf("invalid Keycloak realm %q: it must be a single realm name", realm)
+	}
+	return realm, nil
+}
+
+// realmFromIssuer extracts the Keycloak realm from an issuer URL such as
+// https://keycloak.example.com/realms/demoav1. It reports false when the URL
+// carries no realm segment, leaving the caller to ask for the realm explicitly.
+func realmFromIssuer(issuerURL string) (string, bool) {
+	_, value, ok := strings.Cut(issuerURL, "/realms/")
+	if !ok {
+		return "", false
+	}
+	value = strings.TrimSuffix(value, "/")
+	if value == "" {
+		return "", false
+	}
+	return value, true
 }
 
 func credential(flag, value, path string) (string, error) {
