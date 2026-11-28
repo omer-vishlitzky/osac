@@ -33,11 +33,15 @@ import (
 // failures whose text may reproduce a provider response body.
 func ErrorDetail(err error) string {
 	var details []string
-	for err != nil {
-		if provisioning, ok := err.(*provisioningError); ok {
-			details = append(details, provisioning.Error())
+	for {
+		// A chain can hold more than one provisioning error, so collect each
+		// one and continue past it until the chain has none left.
+		var provisioning *provisioningError
+		if !errors.As(err, &provisioning) {
+			break
 		}
-		err = errors.Unwrap(err)
+		details = append(details, provisioning.Error())
+		err = errors.Unwrap(provisioning)
 	}
 	return strings.Join(details, ": ")
 }
