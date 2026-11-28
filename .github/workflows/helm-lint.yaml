@@ -272,6 +272,11 @@ jobs:
             # other runtime-injected values set below.
             case "${profile}" in
               bmaas-netbox-ci) instance_args+=(--set "bmf.netbox.tokenValue=ci-render-placeholder") ;;
+              # vcluster-ci disables the AAP instance and reaches a shared
+              # external AAP whose URL only the run setup knows; the publish
+              # hook requires it, so supply a render-only https placeholder
+              # like the example.com hostnames below.
+              vcluster-ci) instance_args+=(--set "aap.controllerUrl=https://osac-aap.example.com") ;;
             esac
             # Metering is always deployed, and its billing identity is a
             # required value no profile defaults: supply a render-only one,
