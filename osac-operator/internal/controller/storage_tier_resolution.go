@@ -51,6 +51,23 @@ func (r *tierResolutionResult) conditionMessage() string {
 
 var tierLabelPattern = regexp.MustCompile(`^[a-z0-9]([a-z0-9._-]*[a-z0-9])?$`)
 
+// osacInstanceIDLabel carries the run's instance id on every object a
+// provisioning job creates in a shared outer cluster (see the AAP
+// osac_instance_labels group var). It is the label that tells two runs'
+// identically named tenant StorageClasses apart.
+const osacInstanceIDLabel = "osac.openshift.io/instance"
+
+// storageInstanceID is this process's run id, from OSAC_INSTANCE_ID. It is
+// empty in a deployment that is alone on its cluster: no object then carries
+// the label, and tenant StorageClass resolution stays unscoped as before.
+var storageInstanceID string
+
+// SetStorageInstanceID records the run id that scopes tenant StorageClass
+// resolution. Call it once at controller setup, before the controllers start.
+func SetStorageInstanceID(instanceID string) {
+	storageInstanceID = instanceID
+}
+
 // joinStorageClassNames renders the names of one tier's StorageClasses, sorted: the
 // client's List returns them in no defined order, and a condition or event message
 // that reorders its names between reconciles reads as a new problem.
@@ -84,11 +101,17 @@ func resolveLabeledStorageClasses(
 	targetClient client.Client,
 	tenantLabelValue, resolvedScope, duplicateScope string,
 	expectedTiers map[string]struct{},
+	scopeLabels map[string]string,
 ) (tierResolutionResult, error) {
 	log := ctrllog.FromContext(ctx)
 
+	matchingLabels := map[string]string{osacTenantKey: tenantLabelValue}
+	for key, value := range scopeLabels {
+		matchingLabels[key] = value
+	}
+
 	scList := &storagev1.StorageClassList{}
-	if err := targetClient.List(ctx, scList, client.MatchingLabels{osacTenantKey: tenantLabelValue}); err != nil {
+	if err := targetClient.List(ctx, scList, client.MatchingLabels(matchingLabels)); err != nil {
 		return tierResolutionResult{}, err
 	}
 
@@ -130,7 +153,16 @@ func resolveLabeledStorageClasses(
 }
 
 func getTenantStorageClasses(ctx context.Context, targetClient client.Client, tenantName string) (tierResolutionResult, error) {
-	result, err := resolveLabeledStorageClasses(ctx, targetClient, tenantName, "tenant-specific", "tenant", nil)
+	// A shared outer cluster holds every run's tenant StorageClasses under the
+	// same tenant name. Scope the lookup to the classes this run provisioned
+	// (the storage job labels them with the instance id) so no run resolves —
+	// and provisions a DataVolume through — another run's StorageClass. Runs
+	// without an instance id are alone on their cluster and stay unscoped.
+	var scopeLabels map[string]string
+	if storageInstanceID != "" {
+		scopeLabels = map[string]string{osacInstanceIDLabel: storageInstanceID}
+	}
+	result, err := resolveLabeledStorageClasses(ctx, targetClient, tenantName, "tenant-specific", "tenant", nil, scopeLabels)
 	if err != nil {
 		return tierResolutionResult{}, err
 	}
@@ -158,5 +190,5 @@ func getCSPStorageClasses(
 	targetClient client.Client,
 	cspTiers []provisioning.TierDefinition,
 ) (tierResolutionResult, error) {
-	return resolveLabeledStorageClasses(ctx, targetClient, cspManagedTenantValue, cspManagedTenantValue, cspManagedTenantValue, tierNameSet(cspTiers))
+	return resolveLabeledStorageClasses(ctx, targetClient, cspManagedTenantValue, cspManagedTenantValue, cspManagedTenantValue, tierNameSet(cspTiers), nil)
 }

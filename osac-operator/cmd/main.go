@@ -136,6 +136,10 @@ const (
 	// Tenant configuration
 	envTenantNamespace = "OSAC_TENANT_NAMESPACE"
 
+	// Run identity on a shared outer cluster (the umbrella chart's
+	// global.instanceId). Empty when the deployment is alone on its cluster.
+	envOSACInstanceID = "OSAC_INSTANCE_ID"
+
 	// Remote cluster (tenant, compute-instance, storage, networking, cluster
 	// and bare-metal-instance controllers)
 	envRemoteClusterKubeconfig = "OSAC_REMOTE_CLUSTER_KUBECONFIG"
@@ -802,6 +806,12 @@ func setupControllers(
 	flags *controllerFlags, maxJobHistory int, fulfillmentTrustSourceName string,
 	remoteCluster cluster.Cluster,
 ) error {
+	// Several runs may share one outer cluster under the same tenant names; the
+	// run's instance id scopes tenant StorageClass resolution to the classes
+	// this run provisioned. Unset (a deployment alone on its cluster), the
+	// resolution stays unscoped.
+	controller.SetStorageInstanceID(os.Getenv(envOSACInstanceID))
+
 	if flags.Cluster || flags.ComputeInstance || flags.BareMetalInstance {
 		if err := controller.RegisterAutoExternalIPAttachmentOwnerIndex(mgr.GetLocalManager().GetFieldIndexer()); err != nil {
 			return fmt.Errorf("register ExternalIPAttachment owner index: %w", err)
