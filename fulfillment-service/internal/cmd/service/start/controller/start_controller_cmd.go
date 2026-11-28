@@ -110,6 +110,12 @@ func Cmd() *cobra.Command {
 		authIssuerUrlFlagHelp,
 	)
 	flags.StringVar(
+		&runner.args.realm,
+		"realm",
+		"",
+		realmFlagHelp,
+	)
+	flags.StringVar(
 		&runner.args.authIssuerUrlFile,
 		"auth-issuer-url-file",
 		"",
@@ -205,6 +211,7 @@ type runnerContext struct {
 		sync                 bool
 		caFiles              []string
 		authIssuerUrl        string
+		realm                string
 		authIssuerUrlFile    string
 		authClientId         string
 		authClientIdFile     string
@@ -1504,6 +1511,7 @@ func (r *runnerContext) createIDPClient(ctx context.Context, caPool *trust.CertP
 		SetLogger(r.logger).
 		SetBaseURL(r.args.idpURL).
 		SetIssuerURL(issuerUrl).
+		SetRealm(r.args.realm).
 		SetClientID(r.args.idpClientId).
 		SetClientIDFile(r.args.idpClientIdFile).
 		SetClientSecret(r.args.idpClientSecret).
@@ -1538,6 +1546,12 @@ Event-driven reconciliation, including reconciliation of dependent objects, rema
 
 const caFileFlagHelp = `
 _FILE|DIRECTORY_ - File or directory containing trusted CA certificates.
+`
+
+const realmFlagHelp = `
+_REALM_ - Keycloak realm the admin client targets. Defaults to the realm
+segment of {{ bt }}--auth-issuer-url{{ bt }}; set it when the issuer URL does
+not name the realm. The OSAC_IDP_REALM environment variable overrides it.
 `
 
 const authIssuerUrlFlagHelp = `
