@@ -1566,6 +1566,14 @@ func (r *StorageReconciler) mayHaveOSACStorageFootprint(ctx context.Context, ten
 	for _, managedBy := range osacManagedStorageClassLabels {
 		selector := client.MatchingLabels{osacTenantKey: tenant.GetName()}
 		maps.Copy(selector, managedBy)
+		// Scope to this run's classes when the instance id is set: the
+		// teardown deletes by the same selector, and without the scoping a
+		// parallel run's identically named tenant would hold this tenant's
+		// storage finalizer forever (StorageTeardownBlocked) after its own
+		// classes are gone.
+		if storageInstanceID != "" {
+			selector[osacInstanceIDLabel] = storageInstanceID
+		}
 		var classes storagev1.StorageClassList
 		if err := targetClient.List(ctx, &classes, selector); err != nil {
 			return nil, fmt.Errorf("list OSAC-managed StorageClasses for tenant %s: %w", tenant.GetName(), err)

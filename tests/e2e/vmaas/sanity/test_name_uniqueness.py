@@ -142,11 +142,13 @@ class TestVirtualNetworkProjectScopedUniqueness:
                     "deletion (regression)"
                 )
         finally:
-            if duplicate_vn_id is not None:
-                jwt_grpc_tenant1.delete_virtual_network(vn_id=duplicate_vn_id)
-            # Releasing the hold lets the row archive; the CR teardown follows.
+            # Release the hold FIRST: it must run even when the duplicate
+            # cleanup below raises, or the held row can never archive and
+            # both the row and the CR are left behind.
             if hold_applied or delete_issued:
                 _set_deletion_hold(private_grpc, vn_id=vn_id, present=False)
+            if duplicate_vn_id is not None:
+                jwt_grpc_tenant1.delete_virtual_network(vn_id=duplicate_vn_id)
             if not delete_issued:
                 jwt_grpc_tenant1.delete_virtual_network(vn_id=vn_id)
             wait_for_virtual_network_deletion(k8s=k8s_hub_client, name=cr_name)
