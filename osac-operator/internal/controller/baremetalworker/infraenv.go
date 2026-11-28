@@ -18,6 +18,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	ctrllog "sigs.k8s.io/controller-runtime/pkg/log"
+	mcmanager "sigs.k8s.io/multicluster-runtime/pkg/manager"
 
 	"github.com/osac-project/osac/osac-operator/api/v1alpha1"
 	"github.com/osac-project/osac/osac-operator/internal/controller/assistedservice"
@@ -408,8 +409,14 @@ func (r *Reconciler) buildInfraEnv(co *v1alpha1.ClusterOrder, name, sshAuthorize
 // another cluster, which is the mode that cannot bind it with an owner
 // reference. Unwired, the infrastructure is local and the local garbage
 // collector may own it.
+//
+// A wired target manager alone does not mean remote: cmd/main.go always calls
+// SetTargetCluster, wiring the local manager in single-cluster deployments. Only
+// a target other than the local cluster is remote; treating local mode as remote
+// would label every InfraEnv instead of owning it, leaving the local branch
+// below dead and making ValidateInfraEnvOwner reject what it creates.
 func (r *Reconciler) remoteInfrastructure() bool {
-	return r.targetMgr != nil
+	return r.targetMgr != nil && r.targetCluster != mcmanager.LocalCluster
 }
 
 // setInfrastructureOwnership records that obj belongs to co. Local mode keeps the
