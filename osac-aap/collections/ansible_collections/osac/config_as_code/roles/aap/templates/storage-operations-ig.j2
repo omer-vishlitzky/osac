@@ -95,6 +95,9 @@ spec:
                     fieldPath: metadata.namespace
           - configMap:
               name: openshift-service-ca.crt
+              # Optional: a vcluster has no OpenShift service CA ConfigMap;
+              # on OpenShift it always exists, so optional changes nothing.
+              optional: true
               items:
                 - key: service-ca.crt
                   path: service-ca.crt
