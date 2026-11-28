@@ -19,12 +19,17 @@ aap_vcluster_credential_name: "{{ (aap_prefix ~ '-vcluster') if vcluster_api_url
 aap_admin_password_secret_name: "{{ lookup('env', 'AAP_ADMIN_PASSWORD_SECRET_NAME', default='osac-aap-admin-password') }}"
 aap_admin_password_secret_key: "{{ lookup('env', 'AAP_ADMIN_PASSWORD_SECRET_KEY', default='password') }}"
 
-# The credential itself. verify_ssl is false: the CI CA that signed the
-# vcluster API certificate is not in the controller's trust store. The empty
-# list without a vcluster API URL leaves the dispatcher's credentials step a
-# no-op, like controller_roles in vars/aap.yml.
+# The credentials themselves: the run's vcluster bearer token and, when its
+# issuer URL is configured, the fulfillment-reader credential. Both live in
+# ONE declaration because a second controller_credentials key would silently
+# replace this one (YAML keeps the last), so the vcluster credential the
+# container groups below reference would never be registered. Each entry
+# stays behind its own condition; an empty list leaves the dispatcher's
+# credentials step a no-op for it, like controller_roles in vars/aap.yml.
+# verify_ssl is false: the CI CA that signed the vcluster API certificate is
+# not in the controller's trust store.
 controller_credentials: # noqa: var-naming[no-role-prefix]
-  "{{ [{
+  "{{ ([{
          'name': aap_prefix ~ '-vcluster',
          'description': 'Bearer token for the vcluster API of ' ~ aap_organization_name,
          'organization': aap_organization_name,
@@ -34,7 +39,9 @@ controller_credentials: # noqa: var-naming[no-role-prefix]
            'bearer_token': vcluster_token,
            'verify_ssl': false,
          },
-       }] if vcluster_api_url else [] }}"
+       }] if vcluster_api_url else [])
+      + ([aap_fulfillment_reader_credential]
+         if aap_fulfillment_reader_enabled | bool else []) }}"
 
 # Create a project from the specified git repo. scm_url/scm_branch aren't
 # set here -- configure_project_scm.yml merges them in at runtime from
@@ -58,8 +65,6 @@ aap_fulfillment_reader_credential_name: "{{ aap_prefix }}-fulfillment-secret-rea
 controller_configuration_credentials_secure_logging: true # noqa: var-naming[no-role-prefix]
 controller_credential_types: >- # noqa: var-naming[no-role-prefix]
   {{ [aap_fulfillment_reader_credential_type] if aap_fulfillment_reader_enabled | bool else [] }}
-controller_credentials: >- # noqa: var-naming[no-role-prefix]
-  {{ [aap_fulfillment_reader_credential] if aap_fulfillment_reader_enabled | bool else [] }}
 aap_fulfillment_reader_credential_type:
   name: "{{ aap_fulfillment_reader_credential_name }}"
   kind: cloud
