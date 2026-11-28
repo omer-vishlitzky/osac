@@ -1,7 +1,25 @@
 # Integration tests for osac.workflows collection
 # Note: Must be run from repository root directory
 
-.PHONY: test lint role-coverage role-coverage-report execution-environment-build execution-environment-push kind-load-image
+.PHONY: test lint role-coverage role-coverage-report execution-environment-build execution-environment-push kind-load-image chart-goldens
+
+# The chart goldens are byte-for-byte renders of charts/aap. Regenerate them
+# with this target after any chart change, never by hand: a golden captured
+# from a broken render locks the breakage in (the Fulfillment Secret reader
+# credential went missing this way). Trailing spaces are stripped because
+# the repository's whitespace hook strips them from the committed files.
+chart-goldens:
+	helm template aap-test charts/aap --show-only templates/bootstrap-job.yaml \
+		| sed 's/[[:space:]]*$$//' > tests/unit/fixtures/aap_vcluster/bootstrap-job-default.yaml
+	helm template aap-test charts/aap --show-only templates/bootstrap-job.yaml \
+		--set aap.instance.enabled=false \
+		--set controllerUrl=https://aap.example.com \
+		--set bootstrap.adminPasswordSecret.name=pr2100v1-aap-admin \
+		--set bootstrap.adminPasswordSecret.key=admin-password \
+		| sed 's/[[:space:]]*$$//' > tests/unit/fixtures/aap_vcluster/bootstrap-job-external.yaml
+	helm template aap-test charts/aap --show-only templates/config-as-code-secret.yaml \
+		| sed 's/[[:space:]]*$$//' > tests/unit/fixtures/aap_vcluster/config-as-code-secret-default.yaml
+
 
 # Task and Python coverage of the network manager roles (netris, cudn_evpn).
 # `make test` measures it on every run and fails on a gap; see
