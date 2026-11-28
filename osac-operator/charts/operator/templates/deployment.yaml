@@ -172,6 +172,14 @@ spec:
             valueFrom:
               fieldRef:
                 fieldPath: metadata.namespace
+          {{- with .Values.global.instanceId }}
+          # Run ID of a deployment sharing an outer cluster with other
+          # deployments: it scopes tenant StorageClass resolution to the
+          # StorageClasses this run provisioned. Empty (the only deployment on
+          # the cluster) leaves resolution unscoped.
+          - name: OSAC_INSTANCE_ID
+            value: {{ . | quote }}
+          {{- end }}
           - name: OSAC_ENABLE_CLUSTER_CONTROLLER
             value: {{ include "osac-operator.controllerEnabled" (list . "clusterOrder" "caas") | quote }}
           - name: OSAC_ENABLE_FULFILLMENT_TRUST_RECONCILER
