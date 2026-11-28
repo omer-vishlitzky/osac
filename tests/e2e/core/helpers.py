@@ -1276,7 +1276,9 @@ def wait_for_hosted_cluster_version_health(
             f"HostedControlPlane in {control_plane_namespace})"
         ) from None
     logger.info("CaaS phase: control plane version healthy")
-    logger.info("CaaS: %s ClusterVersion conditions: %s", name, observed)
+    # The count only. The condition values come from the hosted control
+    # plane's objects, which CodeQL treats as sensitive when logged.
+    logger.info("CaaS: %s ClusterVersion conditions settled (%d)", name, len(observed))
 
 
 def wait_for_guest_cluster_health(

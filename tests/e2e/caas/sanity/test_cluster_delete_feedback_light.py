@@ -89,7 +89,9 @@ def test_cluster_delete_reports_deleting_state_without_provisioning(
             resource_kind=WaitResourceKind.CLUSTER_ORDER,
             resource_id=co_name,
         )
-        logger.info("CaaS: %d worker BMI(s) allocated before the delete: %s", len(worker_bmi_ids), worker_bmi_ids)
+        # Log the count only: the identifiers are not needed to read the
+        # failure, and CodeQL treats the object they come from as sensitive.
+        logger.info("CaaS: %d worker BMI(s) allocated before the delete", len(worker_bmi_ids))
 
         capture_snapshot(request.config, request.node.nodeid)
         cli.delete_cluster(uuid=uuid)
