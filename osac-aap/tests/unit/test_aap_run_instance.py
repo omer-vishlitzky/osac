@@ -5,17 +5,31 @@ organization after its run ID (global.instanceId) and gets its job pods
 created inside its own vcluster (aap.vcluster.apiServerUrl plus the token
 Secret). Both settings default empty and must leave the render byte-identical
 to the vcluster-e2e base, captured in fixtures/aap_vcluster/.
+
+The same runs also create no recurring AAP schedules: configAsCode.
+schedulesEnabled reaches config-as-code as OSAC_AAP_SCHEDULES_ENABLED and
+empties controller_schedules, so nothing is left behind after a failed
+teardown.
 """
 
 import subprocess
+import tempfile
 from pathlib import Path
 
 import yaml
 from ansible.parsing.dataloader import DataLoader
 from ansible.template import Templar
 
+REPO_ROOT = Path(__file__).resolve().parents[3]
 CHART_PATH = Path(__file__).resolve().parents[2] / "charts/aap"
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "aap_vcluster"
+CONFIG_AS_CODE = (
+    REPO_ROOT
+    / "osac-aap/collections/ansible_collections/osac/config_as_code"
+)
+CONFIG_VARS = CONFIG_AS_CODE / "playbooks" / "vars" / "config.yml"
+CONTROLLER_VARS = CONFIG_AS_CODE / "roles" / "aap" / "vars" / "controller.yml"
+VCLUSTER_CI_PROFILE = REPO_ROOT / "osac-installer/values/vcluster-ci/instance.yaml"
 
 INSTANCE = "pr2100v1"
 VCLUSTER_ARGS = (
@@ -31,10 +45,12 @@ EXTERNAL_ARGS = (
 )
 
 
-def _render(*set_strings, show_only=None):
+def _render(*set_strings, show_only=None, values_file=None):
     args = ["helm", "template", "aap-test", str(CHART_PATH)]
     if show_only:
         args += ["--show-only", show_only]
+    if values_file:
+        args += ["-f", str(values_file)]
     for value in set_strings:
         args += ["--set", value]
     return subprocess.run(args, capture_output=True, text=True)
@@ -46,8 +62,12 @@ def _bootstrap_job(*set_strings):
     return list(yaml.safe_load_all(result.stdout))
 
 
-def _secret(*set_strings):
-    result = _render(*set_strings, show_only="templates/config-as-code-secret.yaml")
+def _secret(*set_strings, values_file=None):
+    result = _render(
+        *set_strings,
+        show_only="templates/config-as-code-secret.yaml",
+        values_file=values_file,
+    )
     assert result.returncode == 0, result.stderr
     return next(doc for doc in yaml.safe_load_all(result.stdout) if doc)
 
@@ -235,6 +255,85 @@ def test_plain_http_vcluster_url_fails_the_render():
 
     assert result.returncode != 0
     assert "vcluster.apiServerUrl must be an https:// URL without a path" in result.stderr
+
+
+# --- The recurring AAP schedules (configAsCode.schedulesEnabled) ---
+
+SCHEDULE_NAMES = ["osac-sync", "osac-config-as-code", "osac-publish-templates"]
+
+# A developer shell exporting any of these must not change the render.
+AMBIENT_ENV = (
+    "NAMESPACE",
+    "AAP_INSTANCE_NAME",
+    "AAP_HOSTNAME",
+    "AAP_USERNAME",
+    "AAP_PASSWORD",
+    "AAP_ORGANIZATION_NAME",
+    "AAP_PREFIX",
+    "AAP_PROJECT_NAME",
+    "OSAC_INSTANCE_ID",
+    "OSAC_AAP_SCHEDULES_ENABLED",
+    "OSAC_PUBLISH_TEMPLATES_ENABLED",
+)
+
+
+def _schedules(monkeypatch, *set_strings, values_file=None):
+    """config-as-code's controller_schedules, driven by the chart Secret.
+
+    The bootstrap job and the config-as-code rerun read the Secret through
+    envFrom, so its stringData is exactly the environment the schedules see.
+    """
+    secret = _secret(*set_strings, values_file=values_file)
+    for name in AMBIENT_ENV:
+        monkeypatch.delenv(name, raising=False)
+    for name, value in secret["stringData"].items():
+        monkeypatch.setenv(name, str(value))
+
+    variables = {
+        **yaml.safe_load(CONFIG_VARS.read_text()),
+        **yaml.safe_load(CONTROLLER_VARS.read_text()),
+    }
+    templar = Templar(loader=DataLoader(), variables=variables)
+    return templar.template(variables["controller_schedules"])
+
+
+def test_the_default_secret_creates_the_three_recurring_schedules(monkeypatch):
+    schedules = _schedules(monkeypatch)
+
+    assert [schedule["name"] for schedule in schedules] == SCHEDULE_NAMES
+    assert [schedule["rrule"] for schedule in schedules] == [
+        "DTSTART:20250331T144500Z RRULE:FREQ=MINUTELY;INTERVAL=10",
+        "DTSTART:20250331T144500Z RRULE:FREQ=HOURLY;INTERVAL=1",
+        "DTSTART:20250513T111500Z RRULE:FREQ=MINUTELY;INTERVAL=30",
+    ]
+
+
+def test_the_default_secret_omits_the_schedules_env():
+    """The value defaults to true, so leaving it out keeps every profile's
+    Secret byte-identical to the committed golden."""
+    assert "OSAC_AAP_SCHEDULES_ENABLED" not in _secret()["stringData"]
+
+
+def test_disabling_schedules_empties_the_list(monkeypatch):
+    secret = _secret("configAsCode.schedulesEnabled=false")
+
+    assert secret["stringData"]["OSAC_AAP_SCHEDULES_ENABLED"] == "false"
+    assert _schedules(monkeypatch, "configAsCode.schedulesEnabled=false") == []
+
+
+def test_the_vcluster_ci_profile_creates_no_schedules(monkeypatch):
+    """Short-lived CI runs share one AAP, so the recurring jobs would add
+    load for the run's whole life and outlive a failed teardown."""
+    profile = yaml.safe_load(VCLUSTER_CI_PROFILE.read_text())
+    assert profile["aap"]["configAsCode"]["schedulesEnabled"] is False
+
+    with tempfile.TemporaryDirectory() as tmp:
+        values_file = Path(tmp) / "aap.yaml"
+        values_file.write_text(yaml.safe_dump(profile["aap"]))
+        schedules = _schedules(
+            monkeypatch, *EXTERNAL_ARGS, values_file=values_file
+        )
+    assert schedules == []
 
 
 # --- The roles' run-ID plumbing (group_vars/all/osac_instance.yaml) ---

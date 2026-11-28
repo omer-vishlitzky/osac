@@ -38,6 +38,11 @@ license_manifest_path: "{{ lookup('env', 'LICENSE_MANIFEST_PATH', default='/var/
 remote_cluster_kubeconfig_secret_name: "{{ lookup('env', 'REMOTE_CLUSTER_KUBECONFIG_SECRET_NAME', default='') }}"
 remote_cluster_kubeconfig_secret_key: "{{ lookup('env', 'REMOTE_CLUSTER_KUBECONFIG_SECRET_KEY', default='kubeconfig') }}"
 osac_publish_templates_enabled: "{{ lookup('env', 'OSAC_PUBLISH_TEMPLATES_ENABLED', default='true') | bool }}"
+# Whether config-as-code creates the three recurring schedules (project sync,
+# config-as-code, publish-templates). Short-lived CI runs set this false: one
+# AAP serves many runs, so their schedules would fire for the run's whole
+# life and outlive a failed teardown. True keeps the shipped behavior.
+osac_aap_schedules_enabled: "{{ lookup('env', 'OSAC_AAP_SCHEDULES_ENABLED', default='true') | bool }}"
 osac_import_agents_enabled: "{{ lookup('env', 'OSAC_IMPORT_AGENTS_ENABLED', default='false') | bool }}"
 osac_import_bcm_agents_enabled: "{{ lookup('env', 'OSAC_IMPORT_BCM_AGENTS_ENABLED', default='false') | bool }}"
 addon_operator_max_concurrent_jobs: "{{ lookup('env', 'AAP_ADDON_OPERATOR_MAX_CONCURRENT_JOBS', default='50') | int }}"

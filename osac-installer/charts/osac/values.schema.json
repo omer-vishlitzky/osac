@@ -1517,6 +1517,11 @@
               "default": 50,
               "description": "Maximum number of add-on operator jobs allowed to run concurrently"
             },
+            "schedulesEnabled": {
+              "type": "boolean",
+              "default": true,
+              "description": "Create the recurring AAP schedules (project sync, config-as-code, publish-templates); short-lived CI runs disable them to avoid AAP load and leftover schedules"
+            },
             "manifest": {
               "type": "object",
               "description": "Manifest instance group config-as-code settings",

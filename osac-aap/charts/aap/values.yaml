@@ -65,6 +65,13 @@ vcluster:
 configAsCode:
   manifestSecret: "config-as-code-manifest-ig"
   secret: "config-as-code-ig"
+  # Whether config-as-code creates the three recurring schedules (project
+  # sync, config-as-code, publish-templates). Short-lived CI runs disable
+  # them: one AAP serves many runs, so the schedules fire for the run's
+  # whole life and outlive a failed teardown. True keeps today's behavior;
+  # the config-as-code-ig Secret carries the env var only when disabled, so
+  # the default render is unchanged.
+  schedulesEnabled: true
   # Maximum number of add-on operator jobs allowed to run concurrently.
   addonOperatorMaxConcurrentJobs: 50
   eeImage: ""
