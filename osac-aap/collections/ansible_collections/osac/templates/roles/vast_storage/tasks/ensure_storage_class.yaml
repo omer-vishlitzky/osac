@@ -275,11 +275,12 @@
           kind: StorageClass
           metadata:
             name: "vast-{{ item.protocol }}-{{ tenant_name }}-{{ item.name }}"
-            labels:
-              app.kubernetes.io/managed-by: osac-aap
-              osac.openshift.io/tenant: "{{ tenant_name }}"
-              osac.openshift.io/storage-tier: "{{ item.name }}"
-              osac.openshift.io/storage-protocol: "{{ item.protocol }}"
+            labels: >-
+              {{ {'app.kubernetes.io/managed-by': 'osac-aap',
+                  'osac.openshift.io/tenant': tenant_name,
+                  'osac.openshift.io/storage-tier': item.name,
+                  'osac.openshift.io/storage-protocol': item.protocol}
+                 | combine(osac_instance_labels | default({})) }}
           provisioner: "{{ vast_storage_csi_provisioner_map[item.protocol] }}"
           parameters: >-
             {{ _vast_sc_base_params
@@ -303,11 +304,12 @@
           kind: StorageClass
           metadata:
             name: "vast-{{ item.protocol }}-{{ tenant_name }}-{{ item.name }}"
-            labels:
-              app.kubernetes.io/managed-by: osac-aap
-              osac.openshift.io/tenant: "{{ tenant_name }}"
-              osac.openshift.io/storage-tier: "{{ item.name }}"
-              osac.openshift.io/storage-protocol: "{{ item.protocol }}"
+            labels: >-
+              {{ {'app.kubernetes.io/managed-by': 'osac-aap',
+                  'osac.openshift.io/tenant': tenant_name,
+                  'osac.openshift.io/storage-tier': item.name,
+                  'osac.openshift.io/storage-protocol': item.protocol}
+                 | combine(osac_instance_labels | default({})) }}
           provisioner: "{{ vast_storage_csi_provisioner_map[item.protocol] }}"
           parameters: >-
             {{ _vast_sc_base_params
