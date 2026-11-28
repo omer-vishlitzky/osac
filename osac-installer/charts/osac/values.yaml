@@ -134,9 +134,17 @@ global:
 # hooks fail with ERROR: NETRIS_CA_* instead of skipping the checks).
 cliImage: quay.io/openshift/origin-cli:4.20.0
 
-# Shared PostgreSQL host for the db-init hook.
+# Shared PostgreSQL settings: the host the db-init hook connects to, and the
+# cap the chart puts on the connection URLs it renders for fulfillment and
+# metering.
 dbInit:
   host: "postgres.osac-infra.svc.cluster.local"
+  # pool_max_conns appended to each database URL this chart builds. It caps
+  # each service's pgx pool, so a shared server stays within its connection
+  # limit across installs and CI runs. pgx's own default is max(4, NumCPU).
+  # Connection Secrets supplied through service.database.connection and
+  # metering.database.connection are used as written and are not modified.
+  poolMaxConns: 8
 
 # Kafka cluster coordinates for per-instance topic/user creation. Set enabled
 # to false when service.kafka.connection targets an external Kafka cluster:

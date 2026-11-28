@@ -1892,6 +1892,7 @@ Helm directly; the installation command in Section 4.3 supplies both.
 | `preflight.skipChecks` | schema | Check ids to skip without reasons, for automation. Each is reported as skipped with a fixed reason. An id that does not exist stops the install. | `[]` |
 | `hubAccess.enabled` | schema | Creates hub-access resources and registers the local cluster as its own hub. Set to `true` before installation when the Fulfillment Service and hub run on the same cluster; see [Section 8.3](#83-registering-the-hub). | `false` |
 | `dbInit.host` | schema | Host that the `db-init` pre-installation hook connects to, to create the databases. Set it to your external PostgreSQL host for a production deployment. | Development default; override for production |
+| `dbInit.poolMaxConns` | schema | `pool_max_conns` appended to the connection URLs the chart renders for the fulfillment service and metering. Each value caps that service's pgx pool; lower it when several installations share one PostgreSQL server. A connection Secret you supply through `service.database.connection` is not modified. | `8` |
 | `clusterVersions.enabled`, `clusterVersions.versions[]` | schema | OpenShift Container Platform release images offered to hosted clusters. Each entry has `version`, `image`, and an optional `default`. A default entry also requires `diskImage.name` and `diskImage.sourceRef`, an OCI operating-system disk artifact. | `false` and `[]` |
 
 ### 5.1 Values set on the command line

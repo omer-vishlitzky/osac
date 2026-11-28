@@ -223,9 +223,13 @@ kafka:
 bundledPostgres:
   enabled: false
   # Connection headroom for several concurrent E2E runs on one node. Each
-  # run's three pgx pools are capped by poolMaxConns, so the server total is
-  # bounded; the image default of 100 is too low for shared CI.
+  # run's three pgx pools are capped by its own osac chart value
+  # (dbInit.poolMaxConns, default 8), so the server total is bounded; the
+  # image default of 100 is too low for shared CI.
   maxConnections: 300
+  # pool_max_conns for the database URLs this chart renders itself
+  # (fulfillment-db, metering-db). It does not reach a run's URLs: those
+  # Secrets come from the osac chart's dbInit.poolMaxConns.
   poolMaxConns: 8
   database:
     name: service

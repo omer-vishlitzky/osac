@@ -460,7 +460,8 @@ dbInit:
 
 The `osac-db-config` (URL) and `osac-db-client-cert` (tls.crt/tls.key/ca.crt)
 Secrets in ns `osac` are chart-consumed and are created against
-`dbInit.host` from the start.
+`dbInit.host` from the start. Their URLs carry `pool_max_conns` from
+`dbInit.poolMaxConns` (default 8), which caps each service's pgx pool.
 
 ### 3.3 Verify
 

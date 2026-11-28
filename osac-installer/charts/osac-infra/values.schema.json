@@ -151,7 +151,7 @@
         "poolMaxConns": {
           "type": "integer",
           "minimum": 1,
-          "description": "pool_max_conns appended to every bundled database URL.",
+          "description": "pool_max_conns appended to the database URLs this chart renders (fulfillment-db, metering-db). It does not reach a CI run's URLs; those are rendered by the osac chart from dbInit.poolMaxConns.",
           "default": 8
         }
       }

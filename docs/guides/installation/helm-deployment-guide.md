@@ -270,7 +270,11 @@ steps apply to the umbrella `osac` chart:
    Replace `postgres.example.com` with your server's hostname. Keep
    `bundledPostgres.enabled: false` in both values files for production.
    The chart uses `dbInit.host` for the initialization hook and the
-   generated application connection URLs.
+   generated application connection URLs. Each of those URLs carries
+   `pool_max_conns` from `dbInit.poolMaxConns` (default 8), which caps the
+   service's pgx pool; lower it when several installations share one
+   server. The chart does not modify a connection Secret you supply
+   yourself through `service.database.connection`.
 
 4. Let the umbrella chart create `osac-db-config` and
    `osac-db-metering-config`. Its Certificate resources cause cert-manager

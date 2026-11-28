@@ -268,12 +268,18 @@
     },
     "dbInit": {
       "type": "object",
-      "description": "Shared PostgreSQL host for the db-init hook",
+      "description": "Shared PostgreSQL settings: the db-init hook host and the pgx pool cap on the connection URLs the chart renders",
       "properties": {
         "host": {
           "type": "string",
           "description": "PostgreSQL host for db-init hook",
           "default": "postgres.osac-infra.svc.cluster.local"
+        },
+        "poolMaxConns": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "pool_max_conns appended to each database URL this chart renders for fulfillment and metering. Caps each service's pgx pool. Connection Secrets supplied through service.database.connection and metering.database.connection are not modified.",
+          "default": 8
         }
       },
       "additionalProperties": false
